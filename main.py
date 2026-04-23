@@ -162,6 +162,32 @@ class ChannelStrip(QFrame):
         sliders_layout = QVBoxLayout()
         sliders_layout.setSpacing(4)
 
+        # Input Gain (pre-fader) — Wave Link's "channel gain"
+        gain_lbl = QLabel("INPUT GAIN")
+        gain_lbl.setObjectName("mixLabel")
+        sliders_layout.addWidget(gain_lbl)
+
+        gain_row = QHBoxLayout()
+        self.solo_btn = QPushButton("S")
+        self.solo_btn.setObjectName("soloBtn")
+        self.solo_btn.setCheckable(True)
+        self.solo_btn.setFixedSize(24, 24)
+        self.solo_btn.setToolTip("Solo: mute every other channel in Monitor")
+        self.solo_btn.clicked.connect(self._on_solo_toggle)
+        gain_row.addWidget(self.solo_btn)
+
+        self.gain_slider = QSlider(Qt.Orientation.Horizontal)
+        self.gain_slider.setRange(0, 150)
+        self.gain_slider.setValue(100)
+        self.gain_slider.valueChanged.connect(self._on_gain_vol)
+        gain_row.addWidget(self.gain_slider)
+
+        self.gain_vol_lbl = QLabel("100%")
+        self.gain_vol_lbl.setFixedWidth(30)
+        self.gain_vol_lbl.setObjectName("volumeLabel")
+        gain_row.addWidget(self.gain_vol_lbl)
+        sliders_layout.addLayout(gain_row)
+
         # Monitor
         mon_lbl = QLabel("MONITOR")
         mon_lbl.setObjectName("mixLabel")
@@ -228,6 +254,21 @@ class ChannelStrip(QFrame):
         if hasattr(win, 'schedule_save'):
             win.schedule_save()
 
+    def _on_gain_vol(self, value):
+        self.gain_vol_lbl.setText(f"{value}%")
+        if self.node_id:
+            self.engine.set_input_gain(self.node_id, value / 100.0)
+            win = self.window()
+            if hasattr(win, 'submix_state'):
+                win.submix_state[f"{self.node_id}_gain"] = value / 100.0
+                if hasattr(win, 'schedule_save'):
+                    win.schedule_save()
+
+    def _on_solo_toggle(self):
+        win = self.window()
+        if hasattr(win, 'toggle_solo'):
+            win.toggle_solo(self.node_id)
+
     def _on_mon_vol(self, value):
         self.mon_vol_lbl.setText(f"{value}%")
         if self.node_id:
@@ -286,20 +327,28 @@ class ChannelStrip(QFrame):
         if hasattr(win, 'unhide_node'):
             win.unhide_node(self.node_id)
 
-    def update_from_node(self, mon_vol, mon_mute, str_vol, str_mute, is_hidden):
+    def update_from_node(self, mon_vol, mon_mute, str_vol, str_mute, is_hidden, *, gain=None, is_solo=False):
         """Update UI from stored state."""
         self._mon_muted = mon_mute
         self._str_muted = str_mute
-        
+
         self.mon_slider.blockSignals(True)
         self.str_slider.blockSignals(True)
-        
         self.mon_slider.setValue(int(mon_vol * 100))
         self.str_slider.setValue(int(str_vol * 100))
-        
         self.mon_slider.blockSignals(False)
         self.str_slider.blockSignals(False)
-        
+
+        if gain is not None:
+            self.gain_slider.blockSignals(True)
+            self.gain_slider.setValue(int(gain * 100))
+            self.gain_slider.blockSignals(False)
+            self.gain_vol_lbl.setText(f"{int(gain * 100)}%")
+
+        self.solo_btn.blockSignals(True)
+        self.solo_btn.setChecked(is_solo)
+        self.solo_btn.blockSignals(False)
+
         self.mon_vol_lbl.setText(f"{int(mon_vol * 100)}%")
         self.str_vol_lbl.setText(f"{int(str_vol * 100)}%")
         
@@ -460,6 +509,10 @@ class WaveLinuxWindow(QMainWindow):
         self.virtual_channels = []  # list of names
         self.hidden_nodes = set()
         self.show_hidden = False
+        self.solo_node_id = None       # int pw_id or None — which channel is soloed
+        self._solo_memory = {}         # pw_id -> dict of saved mon/str mute states
+        self.scenes = {}               # name -> full config dict
+        self.active_scene = None       # currently applied scene name
         self.config_path = os.path.expanduser("~/.config/wavelinux/config.json")
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
         
@@ -512,6 +565,31 @@ class WaveLinuxWindow(QMainWindow):
         h_layout.addLayout(logo_col)
 
         h_layout.addStretch()
+
+        # Scene picker (Wave Link "Mix" presets)
+        scene_lbl = QLabel("SCENE:")
+        scene_lbl.setObjectName("scenePickerLabel")
+        h_layout.addWidget(scene_lbl)
+
+        self.scene_combo = QComboBox()
+        self.scene_combo.setObjectName("sceneCombo")
+        self.scene_combo.setMinimumWidth(160)
+        self.scene_combo.currentIndexChanged.connect(self._on_scene_picked)
+        h_layout.addWidget(self.scene_combo)
+
+        self.scene_save_btn = QPushButton("💾")
+        self.scene_save_btn.setObjectName("sceneSaveBtn")
+        self.scene_save_btn.setToolTip("Save current setup as a new scene")
+        self.scene_save_btn.setFixedWidth(30)
+        self.scene_save_btn.clicked.connect(self._on_scene_save_as)
+        h_layout.addWidget(self.scene_save_btn)
+
+        self.scene_del_btn = QPushButton("✕")
+        self.scene_del_btn.setObjectName("sceneDelBtn")
+        self.scene_del_btn.setToolTip("Delete the current scene")
+        self.scene_del_btn.setFixedWidth(30)
+        self.scene_del_btn.clicked.connect(self._on_scene_delete)
+        h_layout.addWidget(self.scene_del_btn)
 
         self.show_hidden_btn = QPushButton("👁  Show Hidden")
         self.show_hidden_btn.setObjectName("showHiddenBtn")
@@ -592,12 +670,21 @@ class WaveLinuxWindow(QMainWindow):
         str_row.addWidget(self.str_out_combo, 1)
         o_layout.addLayout(str_row)
 
-        # Stream Master Slider
+        # Stream Master Slider + Clipguard (Wave Link-style auto-limiter)
+        str_master_row = QHBoxLayout()
         self.str_master_slider = QSlider(Qt.Orientation.Horizontal)
         self.str_master_slider.setRange(0, 100)
         self.str_master_slider.setFixedHeight(20)
         self.str_master_slider.valueChanged.connect(lambda v: self._on_master_vol_change("Stream", v))
-        o_layout.addWidget(self.str_master_slider)
+        str_master_row.addWidget(self.str_master_slider, 1)
+
+        self.clipguard_btn = QPushButton("🛡 Clipguard")
+        self.clipguard_btn.setObjectName("clipguardBtn")
+        self.clipguard_btn.setCheckable(True)
+        self.clipguard_btn.setToolTip("Enable a limiter on the Stream bus so your broadcast never clips")
+        self.clipguard_btn.clicked.connect(self._on_clipguard_toggle)
+        str_master_row.addWidget(self.clipguard_btn)
+        o_layout.addLayout(str_master_row)
 
         o_layout.addStretch()
         bottom_container.addWidget(out_frame, 1)
@@ -652,19 +739,28 @@ class WaveLinuxWindow(QMainWindow):
                 self._clear_layout(item.layout())
 
     def _refresh(self):
-        """Update UI to match PipeWire state without destroying everything."""
-        try:
-            mics = self.engine.get_hardware_inputs()
-            vsinks = self.engine.get_virtual_sinks()
-            apps = self.engine.get_sink_inputs()
-            all_sinks = self.engine.get_all_sinks()
+        """Update UI to match PipeWire state without destroying everything.
+        Cheap path: skip everything when the window is minimised to tray —
+        the UI isn't visible, and we don't need to poll PipeWire 30×/min
+        to keep a hidden window in sync."""
+        if self.tray is not None and not self.isVisible():
+            return
 
-            if mics is None or vsinks is None:
+        try:
+            snap = self.engine.create_snapshot()
+            mics = self.engine.get_hardware_inputs(snap=snap)
+            vsinks = self.engine.get_virtual_sinks(snap=snap)
+            apps = self.engine.get_sink_inputs(snap=snap)
+            all_sinks = self.engine.get_all_sinks(snap=snap)
+
+            # pw-dump returning nothing is usually PipeWire mid-restart.
+            # Show status, keep existing widget state, and let the next
+            # tick reconcile rather than tearing the UI down.
+            if not snap.nodes and not all_sinks:
                 self.status_lbl.setText("PipeWire error — is pipewire running?")
                 return
 
-            # Read engine-side submix volumes once so per-channel sync is cheap.
-            live_by_owner = self.engine.snapshot_sink_inputs_by_owner()
+            live_by_owner = self.engine.snapshot_sink_inputs_by_owner(snap=snap)
 
             # 1. Update Input Channels (Mics & Virtual Sinks)
             current_node_ids = set()
@@ -679,9 +775,10 @@ class WaveLinuxWindow(QMainWindow):
                         self.channel_widgets[pw_id].hide()
                     continue
 
-                # Create submix routes if they don't exist
-                self.engine.route_input_to_submix(pw_id, node.name, node.media_class, "Monitor")
-                self.engine.route_input_to_submix(pw_id, node.name, node.media_class, "Stream")
+                # Create submix routes if they don't exist. Pass the snapshot
+                # so we don't re-run `pactl list modules` four times per tick.
+                self.engine.route_input_to_submix(pw_id, node.name, node.media_class, "Monitor", snap=snap)
+                self.engine.route_input_to_submix(pw_id, node.name, node.media_class, "Stream", snap=snap)
 
                 mon_state = dict(self.submix_state.get(f"{pw_id}_Monitor", {'vol': 1.0, 'mute': False}))
                 str_state = dict(self.submix_state.get(f"{pw_id}_Stream", {'vol': 1.0, 'mute': False}))
@@ -720,7 +817,14 @@ class WaveLinuxWindow(QMainWindow):
 
                 strip = self.channel_widgets[pw_id]
                 strip.show()
-                strip.update_from_node(mon_state['vol'], mon_state['mute'], str_state['vol'], str_state['mute'], is_hidden)
+                gain = self.submix_state.get(f"{pw_id}_gain", 1.0)
+                strip.update_from_node(
+                    mon_state['vol'], mon_state['mute'],
+                    str_state['vol'], str_state['mute'],
+                    is_hidden,
+                    gain=gain,
+                    is_solo=(self.solo_node_id == pw_id),
+                )
                 
                 # Update FX button active state
                 is_any_fx = False
@@ -799,17 +903,18 @@ class WaveLinuxWindow(QMainWindow):
                         combo.setCurrentIndex(idx)
                     combo.blockSignals(False)
 
-            # 4. Update Master Mix Sliders (mix sinks are addressed by name, not wpctl ID).
+            # 4. Update Master Mix Sliders (mix sinks are addressed by name).
+            # Both reads come out of the shared snapshot — no extra pactl calls.
             mon_mix = self.engine.output_mixes.get("Monitor")
             if mon_mix and not self.mon_master_slider.isSliderDown():
-                v, _ = self.engine.get_sink_volume_by_name(mon_mix.sink_name)
+                v, _ = self.engine.get_sink_volume_by_name(mon_mix.sink_name, snap=snap)
                 self.mon_master_slider.blockSignals(True)
                 self.mon_master_slider.setValue(int(v * 100))
                 self.mon_master_slider.blockSignals(False)
 
             str_mix = self.engine.output_mixes.get("Stream")
             if str_mix and not self.str_master_slider.isSliderDown():
-                v, _ = self.engine.get_sink_volume_by_name(str_mix.sink_name)
+                v, _ = self.engine.get_sink_volume_by_name(str_mix.sink_name, snap=snap)
                 self.str_master_slider.blockSignals(True)
                 self.str_master_slider.setValue(int(v * 100))
                 self.str_master_slider.blockSignals(False)
@@ -832,6 +937,10 @@ class WaveLinuxWindow(QMainWindow):
     def _on_mix_out_change(self, mix_name, hw_sink_name):
         if hw_sink_name:
             self.engine.route_mix_to_hardware(mix_name, hw_sink_name)
+        else:
+            # 'None (Disconnected)' — actually unload the loopback so the bus
+            # stops sending to the previous hardware output.
+            self.engine.unroute_mix_from_hardware(mix_name)
 
     def _on_add_channel(self):
         text, ok = QInputDialog.getText(self, "Add Virtual Channel", "Channel Name:")
@@ -856,6 +965,135 @@ class WaveLinuxWindow(QMainWindow):
                 break
         self.save_config()
         self._refresh()
+
+    def _on_clipguard_toggle(self):
+        enable = self.clipguard_btn.isChecked()
+        if enable:
+            ok = self.engine.apply_clipguard("Stream", True)
+            if not ok:
+                self.clipguard_btn.setChecked(False)
+                QMessageBox.warning(
+                    self, "Clipguard",
+                    "Could not start the Stream limiter — check "
+                    "~/.config/wavelinux/fx-logs/limiter-mix_stream.log. "
+                    "swh-plugins (fast_lookahead_limiter_1913) is required."
+                )
+        else:
+            self.engine.apply_clipguard("Stream", False)
+        self.schedule_save()
+
+    # ── Scenes ──────────────────────────────────────────────────────
+
+    def _current_state_snapshot(self):
+        """Capture the routing/mix state that scenes persist. We snapshot
+        *state*, not engine handles — module IDs change across runs."""
+        return {
+            'monitor_hw': self.mon_out_combo.currentData(),
+            'stream_hw': self.str_out_combo.currentData(),
+            'channels': list(self.virtual_channels),
+            'submixes': dict(self.submix_state),
+            'hidden': list(self.hidden_nodes),
+            'app_routing': dict(self.app_routing),
+            'clipguard': self.clipguard_btn.isChecked(),
+        }
+
+    def _populate_scene_combo(self):
+        self.scene_combo.blockSignals(True)
+        self.scene_combo.clear()
+        names = sorted(self.scenes.keys())
+        for name in names:
+            self.scene_combo.addItem(name, name)
+        if self.active_scene and self.active_scene in names:
+            self.scene_combo.setCurrentIndex(names.index(self.active_scene))
+        elif names:
+            self.scene_combo.setCurrentIndex(0)
+        self.scene_combo.blockSignals(False)
+
+    def _on_scene_picked(self, idx):
+        name = self.scene_combo.itemData(idx)
+        if not name or name not in self.scenes:
+            return
+        self._apply_scene(self.scenes[name])
+        self.active_scene = name
+        self.save_config()
+
+    def _apply_scene(self, data):
+        # Clear solo before swapping state so we don't mix memory across scenes.
+        if self.solo_node_id is not None:
+            self._exit_solo()
+
+        self.submix_state = dict(data.get('submixes', {}))
+        self.hidden_nodes = set(data.get('hidden', []))
+        self.app_routing = dict(data.get('app_routing', {}))
+        desired_channels = list(data.get('channels', []))
+
+        # Reconcile virtual channels: create missing, remove extras.
+        for name in desired_channels:
+            if name not in self.virtual_channels:
+                self.engine.create_virtual_sink(name)
+                self.virtual_channels.append(name)
+        for name in list(self.virtual_channels):
+            if name not in desired_channels:
+                _, safe = PipeWireEngine._sanitize_channel_name(name)
+                self.engine.remove_virtual_sink(f"wavelinux_{safe}")
+                self.virtual_channels.remove(name)
+
+        # Hardware routing
+        mon_hw = data.get('monitor_hw')
+        str_hw = data.get('stream_hw')
+        for combo, mix_name, hw in (
+            (self.mon_out_combo, "Monitor", mon_hw),
+            (self.str_out_combo, "Stream", str_hw),
+        ):
+            combo.blockSignals(True)
+            idx = combo.findData(hw) if hw else 0
+            combo.setCurrentIndex(max(idx, 0))
+            combo.blockSignals(False)
+            self._on_mix_out_change(mix_name, hw)
+
+        # Clipguard
+        want_cg = bool(data.get('clipguard', False))
+        if want_cg != self.clipguard_btn.isChecked():
+            self.clipguard_btn.setChecked(want_cg)
+            self.engine.apply_clipguard("Stream", want_cg)
+
+        self._refresh()
+
+    def _on_scene_save_as(self):
+        name, ok = QInputDialog.getText(self, "Save Scene", "Scene name:")
+        if not (ok and name):
+            return
+        name = re.sub(r'\s+', ' ', name).strip()
+        if not name:
+            return
+        if name in self.scenes:
+            yn = QMessageBox.question(
+                self, "Overwrite Scene",
+                f"A scene called '{name}' already exists. Overwrite?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if yn != QMessageBox.StandardButton.Yes:
+                return
+        self.scenes[name] = self._current_state_snapshot()
+        self.active_scene = name
+        self._populate_scene_combo()
+        self.save_config()
+
+    def _on_scene_delete(self):
+        name = self.scene_combo.currentData()
+        if not name:
+            return
+        yn = QMessageBox.question(
+            self, "Delete Scene", f"Delete scene '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if yn != QMessageBox.StandardButton.Yes:
+            return
+        self.scenes.pop(name, None)
+        if self.active_scene == name:
+            self.active_scene = None
+        self._populate_scene_combo()
+        self.save_config()
 
     def _on_emergency_reset(self):
         reply = QMessageBox.warning(
@@ -892,10 +1130,17 @@ class WaveLinuxWindow(QMainWindow):
                 self.hidden_nodes = set(conf.get('hidden', []))
                 self.app_routing = conf.get('app_routing', {})
                 self.virtual_channels = conf.get('channels', [])
-                
+                self.scenes = conf.get('scenes', {}) or {}
+                self.active_scene = conf.get('active_scene')
+
                 # Create standard mixes (always needed)
                 self.engine.create_output_mix("Monitor")
                 self.engine.create_output_mix("Stream")
+
+                # Restore clipguard if it was on last run.
+                if conf.get('clipguard'):
+                    self.engine.apply_clipguard("Stream", True)
+                    self.clipguard_btn.setChecked(True)
 
                 # Recreate virtual channels
                 for name in self.virtual_channels:
@@ -918,23 +1163,65 @@ class WaveLinuxWindow(QMainWindow):
                         combo.setCurrentIndex(idx)
                     combo.blockSignals(False)
                     self._on_mix_out_change(mix_name, hw)
+                self._populate_scene_combo()
         except Exception as e:
-            print(f"Error loading config: {e}")
+            logging.error(f"Error loading config: {e}")
 
     def save_config(self):
+        try:
+            clipguard = self.clipguard_btn.isChecked()
+        except AttributeError:
+            clipguard = False
         conf = {
             'monitor_hw': self.mon_out_combo.currentData(),
             'stream_hw': self.str_out_combo.currentData(),
             'channels': self.virtual_channels,
             'submixes': self.submix_state,
             'hidden': list(self.hidden_nodes),
-            'app_routing': self.app_routing
+            'app_routing': self.app_routing,
+            'clipguard': clipguard,
+            'scenes': self.scenes,
+            'active_scene': self.active_scene,
         }
         try:
-            with open(self.config_path, 'w') as f:
+            tmp = self.config_path + '.tmp'
+            with open(tmp, 'w') as f:
                 json.dump(conf, f, indent=4)
+            os.replace(tmp, self.config_path)
         except Exception as e:
-            print(f"Error saving config: {e}")
+            logging.error(f"Error saving config: {e}")
+
+    def toggle_solo(self, node_id):
+        """Wave Link-style Solo: mute every other channel's Monitor send.
+        Restoring solo brings prior mute states back. Solo is Monitor-only
+        (you don't want soloing to mutate your stream)."""
+        if self.solo_node_id == node_id:
+            self._exit_solo()
+        else:
+            if self.solo_node_id is not None:
+                self._exit_solo()
+            self._enter_solo(node_id)
+        self._refresh()
+
+    def _enter_solo(self, solo_id):
+        self._solo_memory = {}
+        for pw_id in list(self.channel_widgets.keys()):
+            state_key = f"{pw_id}_Monitor"
+            prior = self.submix_state.get(state_key, {'vol': 1.0, 'mute': False})
+            self._solo_memory[pw_id] = dict(prior)
+            muted = (pw_id != solo_id)
+            self.engine.set_submix_mute(pw_id, "Monitor", muted)
+            self.submix_state[state_key] = {'vol': prior.get('vol', 1.0), 'mute': muted}
+        self.solo_node_id = solo_id
+        self.schedule_save()
+
+    def _exit_solo(self):
+        for pw_id, prior in self._solo_memory.items():
+            self.engine.set_submix_mute(pw_id, "Monitor", prior.get('mute', False))
+            self.submix_state[f"{pw_id}_Monitor"] = dict(prior)
+        self._solo_memory = {}
+        self.solo_node_id = None
+        self.schedule_save()
 
     def hide_node(self, node_id):
         """Hide a channel strip by node ID."""
@@ -990,9 +1277,12 @@ class WaveLinuxWindow(QMainWindow):
         event.accept()
 
     def _quit_app(self):
-        """Cleanly unload all modules and exit."""
+        """Cleanly save state, unload all modules, and exit."""
         logging.info("Shutting down WaveLinux...")
         self.refresh_timer.stop()
+        self._save_timer.stop()
+        # Flush any pending slider writes before we tear down the engine.
+        self.save_config()
         self.engine.full_audio_reset()
         logging.info("Audio reset complete. Exiting.")
         QApplication.instance().quit()

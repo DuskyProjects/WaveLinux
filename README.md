@@ -13,19 +13,26 @@ No daemon, no system service.
   apps can play to.
 - Creates two master buses — **Monitor** (what you hear) and **Stream**
   (what OBS records) — each with its own volume and its own hardware
-  output.
+  output, just like Elgato Wave Link.
 - Exposes the Stream bus as a named recording source (`WaveLinux Stream`)
   so OBS picks it up from the input device list directly, instead of
   "Monitor of Null Sink N".
-- Per-channel Monitor/Stream faders, so your mic can be in Monitor but
-  not Stream, or your game audio can be louder for your audience than
-  for you.
+- Three sliders per channel: **Input Gain** (pre-fader), **Monitor send**
+  (what you hear), **Stream send** (what your audience hears). Wave
+  Link's core mental model.
+- Per-channel **Solo** — mutes every other channel in Monitor
+  temporarily so you can hear one source in isolation, and un-solo
+  restores the previous mute layout.
+- **Clipguard** — a master-bus limiter on Stream so your broadcast
+  doesn't clip when something gets loud.
+- **Scenes** — save the current routing/volumes/hidden channels under a
+  name; flip between setups for gaming, streaming, voice calls, etc.
 - Per-app routing — each running app shows up with its own sink picker,
   and the choice persists even when the app is closed.
-- Tries to identify Flatpak/Snap apps by reading `FLATPAK_ID`,
-  `.flatpak-info`, `SNAP_INSTANCE_NAME`, cgroup info, and walking up the
-  `bwrap`/`snap-confine` wrapper chain, so things stop showing up as
-  "audio-src".
+- Flatpak/Snap-aware app identification via `FLATPAK_ID`,
+  `.flatpak-info`, `SNAP_INSTANCE_NAME`, cgroup scopes, and a walk up
+  the `bwrap`/`snap-confine` wrapper chain, so things stop showing up
+  as "audio-src".
 - Optional RNNoise noise suppression on mic channels via PipeWire's
   filter-chain (spawned as a client — it will not try to take over your
   audio system).
@@ -65,6 +72,12 @@ the first place to look.
   per-app fader.
 - The filter-chain gate uses `gate_1410` from `swh-plugins`; if you
   don't have that package installed, the gate effect won't start.
+- No VU meters yet. Wave Link shows real-time levels per channel;
+  WaveLinux doesn't. It would need a peak-detector filter-chain node
+  per channel or a small `pw-record`-based probe — see ROADMAP.
+- Wave Link ships proprietary VST3 effects (e.g. AI voice filter). We
+  use the LADSPA equivalents from `swh-plugins`, which are solid but
+  not the same set.
 
 ## License / credits
 

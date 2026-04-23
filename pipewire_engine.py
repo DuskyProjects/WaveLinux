@@ -46,6 +46,30 @@ class OutputMix:
         self.master_muted = False
 
 
+class EngineSnapshot:
+    """One-shot cache of pactl/pw-dump outputs. Built at the top of a
+    refresh tick and threaded through engine helpers, so a single 2-second
+    tick runs each heavy subprocess call at most once instead of 5+ times.
+
+    Write paths (load/unload-module, move-sink-input) don't use the snapshot
+    — they always re-query to avoid acting on stale data."""
+
+    __slots__ = ("modules_text", "short_modules_text", "sink_inputs_text",
+                 "sinks_text", "nodes", "sinks", "_loopback_index",
+                 "_sink_state_by_name")
+
+    def __init__(self, modules_text="", short_modules_text="",
+                 sink_inputs_text="", sinks_text="", nodes=None, sinks=None):
+        self.modules_text = modules_text or ""
+        self.short_modules_text = short_modules_text or ""
+        self.sink_inputs_text = sink_inputs_text or ""
+        self.sinks_text = sinks_text or ""
+        self.nodes = nodes or []
+        self.sinks = sinks or []
+        self._loopback_index = None     # lazily built
+        self._sink_state_by_name = None # lazily built: name -> (vol, muted)
+
+
 class PipeWireEngine:
     """Full-featured PipeWire audio engine."""
 
@@ -76,6 +100,87 @@ class PipeWireEngine:
     def get_default_sink(self):
         """Find the system's default audio output sink name."""
         return self._run(['pactl', 'get-default-sink'])
+
+    # ── Per-refresh snapshot ───────────────────────────────────────
+
+    def create_snapshot(self):
+        """Fetch every expensive state dump once so a whole refresh tick can
+        share them. Safe to call with PipeWire misbehaving — missing outputs
+        degrade to empty strings/lists."""
+        return EngineSnapshot(
+            modules_text=self._run(['pactl', 'list', 'modules']) or "",
+            short_modules_text=self._run(['pactl', 'list', 'short', 'modules']) or "",
+            sink_inputs_text=self._run(['pactl', 'list', 'sink-inputs']) or "",
+            sinks_text=self._run(['pactl', 'list', 'sinks']) or "",
+            nodes=self._parse_nodes(),
+            sinks=self._parse_short_sinks(),
+        )
+
+    @staticmethod
+    def _parse_sinks_state(text):
+        """Parse `pactl list sinks` into {sink_name: (volume 0..1.5, muted)}."""
+        state = {}
+        curr_name = None
+        curr_vol = None
+        curr_mute = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('Sink #'):
+                if curr_name is not None and curr_vol is not None:
+                    state[curr_name] = (curr_vol, curr_mute)
+                curr_name = None
+                curr_vol = None
+                curr_mute = False
+            elif stripped.startswith('Name:'):
+                curr_name = stripped.split(':', 1)[1].strip()
+            elif stripped.startswith('Mute:'):
+                curr_mute = stripped.split(':', 1)[1].strip().lower() == 'yes'
+            elif stripped.startswith('Volume:') and curr_vol is None:
+                m = re.search(r'/\s*(\d+)%', stripped)
+                if m:
+                    try:
+                        curr_vol = int(m.group(1)) / 100.0
+                    except ValueError:
+                        pass
+        if curr_name is not None and curr_vol is not None:
+            state[curr_name] = (curr_vol, curr_mute)
+        return state
+
+    def _parse_nodes(self):
+        raw = self._run(['pw-dump'], timeout=4)
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        nodes = []
+        for obj in data:
+            if obj.get('type') != 'PipeWire:Interface:Node':
+                continue
+            props = obj.get('info', {}).get('props', {})
+            mc = props.get('media.class', '')
+            if not mc.startswith(('Audio/', 'Stream/')):
+                continue
+            nodes.append(AudioNode(
+                pw_id=obj['id'],
+                name=props.get('node.name', ''),
+                description=props.get('node.description', props.get('node.name', 'Unknown')),
+                media_class=mc,
+                app_name=props.get('application.name'),
+            ))
+        return nodes
+
+    def _parse_short_sinks(self):
+        out = self._run(['pactl', 'list', 'short', 'sinks'])
+        if not out:
+            return []
+        sinks = []
+        for line in out.splitlines():
+            parts = line.split('\t')
+            if len(parts) >= 2:
+                sinks.append({'index': parts[0], 'name': parts[1]})
+        return sinks
 
     @staticmethod
     def friendly_name(raw):
@@ -125,53 +230,30 @@ class PipeWireEngine:
 
     # ── Node Discovery ──────────────────────────────────────────────
 
-    def get_all_nodes(self):
-        raw = self._run(['pw-dump'])
-        if not raw:
-            return []
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return []
-        nodes = []
-        for obj in data:
-            if obj.get('type') != 'PipeWire:Interface:Node':
-                continue
-            props = obj.get('info', {}).get('props', {})
-            mc = props.get('media.class', '')
-            if not mc.startswith(('Audio/', 'Stream/')):
-                continue
-            nodes.append(AudioNode(
-                pw_id=obj['id'],
-                name=props.get('node.name', ''),
-                description=props.get('node.description', props.get('node.name', 'Unknown')),
-                media_class=mc,
-                app_name=props.get('application.name'),
-            ))
-        return nodes
+    def get_all_nodes(self, snap=None):
+        return snap.nodes if snap else self._parse_nodes()
 
-    def get_hardware_outputs(self):
-        return [n for n in self.get_all_nodes()
+    def get_hardware_outputs(self, snap=None):
+        return [n for n in self.get_all_nodes(snap)
                 if n.media_class == 'Audio/Sink'
                 and not n.name.startswith('wavelinux_')]
 
-    def get_hardware_inputs(self):
-        return [n for n in self.get_all_nodes()
+    def get_hardware_inputs(self, snap=None):
+        return [n for n in self.get_all_nodes(snap)
                 if n.media_class == 'Audio/Source'
                 and 'rnnoise' not in n.name.lower()
                 and not n.name.startswith('wavelinux_')]
 
-    def get_virtual_sinks(self):
+    def get_virtual_sinks(self, snap=None):
         """User-created WaveLinux channels only (no internal mix/source sinks)."""
-        all_nodes = self.get_all_nodes()
-        return [n for n in all_nodes
+        return [n for n in self.get_all_nodes(snap)
                 if n.media_class == 'Audio/Sink'
                 and n.name in self.virtual_sink_modules
                 and not n.name.startswith('wavelinux_mix_')
                 and not n.name.startswith('wavelinux_src_')]
 
-    def get_app_streams(self):
-        return [n for n in self.get_all_nodes()
+    def get_app_streams(self, snap=None):
+        return [n for n in self.get_all_nodes(snap)
                 if n.media_class == 'Stream/Output/Audio']
 
     # ── Volume & Mute ──────────────────────────────────────────────
@@ -201,11 +283,18 @@ class PipeWireEngine:
         pct = max(0, min(int(round(volume * 100)), 150))
         self._run(['pactl', 'set-sink-volume', sink_name, f'{pct}%'])
 
-    def get_sink_volume_by_name(self, sink_name):
+    def get_sink_volume_by_name(self, sink_name, snap=None):
+        if snap is not None:
+            if snap._sink_state_by_name is None:
+                snap._sink_state_by_name = self._parse_sinks_state(snap.sinks_text)
+            hit = snap._sink_state_by_name.get(sink_name)
+            if hit is not None:
+                return hit
+            return 1.0, False
+
         out = self._run(['pactl', 'get-sink-volume', sink_name])
         if not out:
             return 1.0, False
-        # "Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: ..."
         muted = False
         mute_out = self._run(['pactl', 'get-sink-mute', sink_name])
         if mute_out and 'yes' in mute_out.lower():
@@ -223,7 +312,7 @@ class PipeWireEngine:
 
     # ── Virtual Sink (Input Channel) Management ────────────────────
 
-    def route_input_to_submix(self, node_id, node_name, media_class, mix_name):
+    def route_input_to_submix(self, node_id, node_name, media_class, mix_name, snap=None):
         """Create a loopback connecting an input source (or sink monitor) to a submix.
         Called on every refresh tick — idempotent: if the loopback we created
         earlier is still alive, do nothing."""
@@ -233,21 +322,20 @@ class PipeWireEngine:
         if not mix:
             return False
 
+        short = snap.short_modules_text if snap else None
+
         # If we already have a live loopback for this pair, we're done.
         known = self.submix_loopbacks.get(key)
-        if known and self._module_is_alive(known):
+        if known and self._module_is_alive(known, short_text=short):
             return True
-        if known and not self._module_is_alive(known):
-            # Stale entry — drop it so we can recreate below.
+        if known:
             self.submix_loopbacks.pop(key, None)
 
         source_id = str(node_id)
         if media_class == 'Audio/Sink':
             source_id = f"{node_name}.monitor"
 
-        # Second chance: a loopback for this exact source+sink pair may already
-        # exist from a previous run. Reuse it instead of stacking duplicates.
-        existing = self._find_loopback_for(source_id, mix.sink_name)
+        existing = self._find_loopback_for(source_id, mix.sink_name, snap=snap)
         if existing:
             self.submix_loopbacks[key] = existing
             return True
@@ -262,29 +350,33 @@ class PipeWireEngine:
         if not out:
             return False
         self.submix_loopbacks[key] = out
+        # We just created the module; sink-input table is stale in the snapshot.
         si = self.get_submix_sink_input(node_id, mix_name)
         if si:
             self._run(['pactl', 'set-sink-input-volume', si, '100%'])
             self._run(['pactl', 'set-sink-input-mute', si, '0'])
         return True
 
-    def _find_loopback_for(self, source_token, sink_token):
-        """Return the module ID of a loopback whose args contain BOTH
-        source=<source_token> and sink=<sink_token>, else None."""
-        out = self._run(['pactl', 'list', 'modules'])
-        if not out:
-            return None
+    def _build_loopback_index(self, modules_text):
+        """Parse a pactl-modules dump once into (source,sink) -> module_id."""
+        index = {}
         curr_id = None
         curr_name = ''
         curr_args = []
-        want_source = f"source={source_token}"
-        want_sink = f"sink={sink_token}"
-        for line in out.splitlines():
+
+        def flush():
+            if curr_id and curr_name == 'module-loopback':
+                src = next((a.split('=', 1)[1] for a in curr_args
+                            if a.startswith('source=')), None)
+                snk = next((a.split('=', 1)[1] for a in curr_args
+                            if a.startswith('sink=')), None)
+                if src and snk:
+                    index.setdefault((src, snk), curr_id)
+
+        for line in modules_text.splitlines():
             stripped = line.strip()
             if stripped.startswith('Module #'):
-                if (curr_id and curr_name == 'module-loopback'
-                        and want_source in curr_args and want_sink in curr_args):
-                    return curr_id
+                flush()
                 curr_id = stripped.split('#', 1)[1].strip()
                 curr_name = ''
                 curr_args = []
@@ -292,10 +384,16 @@ class PipeWireEngine:
                 curr_name = stripped.split(':', 1)[1].strip()
             elif stripped.startswith('Argument:'):
                 curr_args = stripped.split('Argument:', 1)[1].strip().split()
-        if (curr_id and curr_name == 'module-loopback'
-                and want_source in curr_args and want_sink in curr_args):
-            return curr_id
-        return None
+        flush()
+        return index
+
+    def _find_loopback_for(self, source_token, sink_token, snap=None):
+        if snap is not None:
+            if snap._loopback_index is None:
+                snap._loopback_index = self._build_loopback_index(snap.modules_text)
+            return snap._loopback_index.get((source_token, sink_token))
+        modules_text = self._run(['pactl', 'list', 'modules']) or ''
+        return self._build_loopback_index(modules_text).get((source_token, sink_token))
 
     def remove_node_routing(self, node_id):
         """Clean up all loopbacks associated with a removed node."""
@@ -305,17 +403,17 @@ class PipeWireEngine:
                 mod_id = self.submix_loopbacks.pop(key)
                 self._run(['pactl', 'unload-module', str(mod_id)])
 
-    def get_submix_sink_input(self, node_id, mix_name):
+    def get_submix_sink_input(self, node_id, mix_name, snap=None):
         module_id = self.submix_loopbacks.get(f'{node_id}->{mix_name}')
         if module_id is None:
             return None
         module_id = str(module_id)
 
-        out = self._run(['pactl', 'list', 'sink-inputs'])
-        if not out:
+        text = snap.sink_inputs_text if snap else self._run(['pactl', 'list', 'sink-inputs'])
+        if not text:
             return None
         current_si = None
-        for line in out.splitlines():
+        for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith('Sink Input #'):
                 current_si = stripped.split('#', 1)[1].strip()
@@ -341,18 +439,18 @@ class PipeWireEngine:
         else:
             logging.warning(f"Could not find sink-input to mute for {node_id}->{mix_name}")
 
-    def snapshot_sink_inputs_by_owner(self):
+    def snapshot_sink_inputs_by_owner(self, snap=None):
         """Map `owner_module_id -> (volume 0..1.5, muted)` in a single
         `pactl list sink-inputs` pass. Used by the UI to reflect external
         changes (pavucontrol, KMix, media keys) without per-channel calls."""
-        out = self._run(['pactl', 'list', 'sink-inputs'])
-        if not out:
+        text = snap.sink_inputs_text if snap else self._run(['pactl', 'list', 'sink-inputs'])
+        if not text:
             return {}
         by_owner = {}
         curr_owner = None
         curr_vol = None
         curr_mute = False
-        for line in out.splitlines():
+        for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith('Sink Input #'):
                 if curr_owner is not None and curr_vol is not None:
@@ -545,11 +643,11 @@ class PipeWireEngine:
 
     # ── App Routing ────────────────────────────────────────────────
 
-    def get_sink_inputs(self):
-        sinks = self.get_all_sinks()
+    def get_sink_inputs(self, snap=None):
+        sinks = self.get_all_sinks(snap=snap)
         sink_id_to_name = {s['index']: s['name'] for s in sinks}
-        
-        out = self._run(['pactl', 'list', 'sink-inputs'])
+
+        out = snap.sink_inputs_text if snap else self._run(['pactl', 'list', 'sink-inputs'])
         if not out:
             return []
         entries = []
@@ -767,16 +865,44 @@ class PipeWireEngine:
                 pass
         return 1.0
 
-    def get_all_sinks(self):
-        out = self._run(['pactl', 'list', 'short', 'sinks'])
-        if not out:
-            return []
-        sinks = []
-        for line in out.splitlines():
-            parts = line.split('\t')
-            if len(parts) >= 2:
-                sinks.append({'index': parts[0], 'name': parts[1]})
-        return sinks
+    def get_all_sinks(self, snap=None):
+        return snap.sinks if snap else self._parse_short_sinks()
+
+    # ── Wave Link-parity helpers ───────────────────────────────────
+
+    def set_input_gain(self, node_id, volume):
+        """Pre-fader channel gain for mics / virtual sinks (0.0..1.5).
+        Mic volumes go through wpctl by numeric ID; null-sinks go through
+        pactl by name."""
+        self._run(['wpctl', 'set-volume', str(node_id), f'{max(0.0, min(volume, 1.5)):.2f}'])
+
+    def unroute_mix_from_hardware(self, mix_name):
+        """Remove any hardware loopback for the named mix, so 'None' in the
+        combo actually disconnects the bus."""
+        changed = False
+        for key in list(self.loopback_modules.keys()):
+            if key.startswith(mix_name + '->'):
+                self._run(['pactl', 'unload-module', str(self.loopback_modules[key])])
+                del self.loopback_modules[key]
+                changed = True
+        mix = self.output_mixes.get(mix_name)
+        if mix:
+            mix.hardware_output = None
+        return changed
+
+    def apply_clipguard(self, mix_name, enable):
+        """Wave Link's 'Clipguard' is a master-bus limiter. Reuse the FX
+        filter-chain with the limiter preset, keyed off the mix sink."""
+        mix = self.output_mixes.get(mix_name)
+        if not mix:
+            return False
+        channel_key = f'mix_{mix_name.lower()}'
+        if enable:
+            return self.apply_effect(channel_key, 'limiter')
+        return self.remove_effect(channel_key, 'limiter')
+
+    def is_clipguard_active(self, mix_name):
+        return self.is_effect_active(f'mix_{mix_name.lower()}', 'limiter')
 
     # ── Effects / RNNoise ──────────────────────────────────────────
 
@@ -998,16 +1124,15 @@ context.modules = [
         proc = self.rnnoise_processes.get(key)
         return proc is not None and proc.poll() is None
 
-    def _find_module_by_arg(self, pattern):
+    def _find_module_by_arg(self, pattern, modules_text=None):
         """Find a pactl module ID whose argument list contains `pattern`
         as a whole token (space-separated). Substring matches would make
         `source=1` collide with `source=12`."""
-        out = self._run(['pactl', 'list', 'modules'])
-        if not out:
+        text = modules_text if modules_text is not None else self._run(['pactl', 'list', 'modules'])
+        if not text:
             return None
-
         curr_id = None
-        for line in out.splitlines():
+        for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith('Module #'):
                 curr_id = stripped.split('#', 1)[1].strip()
@@ -1019,15 +1144,15 @@ context.modules = [
                 return curr_id
         return None
 
-    def _module_is_alive(self, module_id):
+    def _module_is_alive(self, module_id, short_text=None):
         """Cheap liveness check via `pactl list short modules`."""
         if module_id is None:
             return False
-        out = self._run(['pactl', 'list', 'short', 'modules'])
-        if not out:
+        text = short_text if short_text is not None else self._run(['pactl', 'list', 'short', 'modules'])
+        if not text:
             return False
         mid = str(module_id)
-        for line in out.splitlines():
+        for line in text.splitlines():
             parts = line.split('\t', 1)
             if parts and parts[0].strip() == mid:
                 return True
