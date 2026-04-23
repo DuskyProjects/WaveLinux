@@ -43,8 +43,6 @@ mkdir -p "$ICON_DIR"
 
 if [ -f "$SCRIPT_DIR/icon.png" ]; then
     cp "$SCRIPT_DIR/icon.png" "$ICON_DIR/wavelinux.png"
-    # Update icon cache so GNOME/KDE pick it up immediately
-    gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 fi
 
 cat > "$DESKTOP_FILE" <<EOF
@@ -52,12 +50,15 @@ cat > "$DESKTOP_FILE" <<EOF
 Name=WaveLinux
 Comment=PipeWire Audio Router & Mixer
 Exec=python3 ${SCRIPT_DIR}/main.py
-Icon=${ICON_DIR}/wavelinux.png
+Icon=wavelinux
 Type=Application
 Categories=AudioVideo;Audio;Mixer;
 Keywords=audio;mixer;pipewire;routing;
 StartupNotify=true
 EOF
+
+# Refresh the desktop-file database so the KDE menu picks up the launcher.
+update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 
 echo ""
 echo "✅  WaveLinux installed!"

@@ -197,6 +197,24 @@ QPushButton#removeBtn:hover {
     background: rgba(255,51,102,0.15);
 }
 
+QPushButton#resetBtn {
+    background: rgba(255,51,102,0.12);
+    border: 1px solid rgba(255,51,102,0.35);
+    color: #ff6a8a;
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: 'Outfit', sans-serif;
+}
+QPushButton#resetBtn:hover {
+    background: rgba(255,51,102,0.22);
+    color: #ffffff;
+}
+QPushButton#resetBtn:pressed {
+    background: rgba(255,51,102,0.35);
+}
+
 QPushButton#hideBtn {
     background: transparent;
     border: none;
