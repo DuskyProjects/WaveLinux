@@ -103,7 +103,7 @@ class FXSelectionDialog(QDialog):
 class ChannelStrip(QFrame):
     """A single mixer channel: icon, name, vertical fader, mute, FX."""
 
-    def __init__(self, node_id, name, ch_type, icon, engine, is_mic=False, parent=None):
+    def __init__(self, node_id, name, ch_type, icon, engine, parent=None):
         super().__init__(parent)
         self.setObjectName("channelStrip")
         self.setMinimumWidth(160)
@@ -113,7 +113,7 @@ class ChannelStrip(QFrame):
         self.ch_name = name
         self.ch_type = ch_type
         self.engine = engine
-        self.is_mic = is_mic
+        self.is_mic = ch_type.lower() == "microphone"
         self._muted = False
         self._mon_muted = False
         self._str_muted = False
@@ -150,7 +150,7 @@ class ChannelStrip(QFrame):
         type_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(type_lbl)
 
-        if is_mic:
+        if self.is_mic:
             badge = QLabel("RNNoise")
             badge.setObjectName("rnBadge")
             badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -220,51 +220,45 @@ class ChannelStrip(QFrame):
         self.fx_btn.clicked.connect(self._on_fx_toggle)
         layout.addWidget(self.fx_btn)
 
+    def _stash_submix(self, mix_name, vol, mute):
+        win = self.window()
+        if not hasattr(win, 'submix_state'):
+            return
+        win.submix_state[f"{self.node_id}_{mix_name}"] = {'vol': vol, 'mute': mute}
+        if hasattr(win, 'schedule_save'):
+            win.schedule_save()
+
     def _on_mon_vol(self, value):
         self.mon_vol_lbl.setText(f"{value}%")
         if self.node_id:
             self.engine.set_submix_volume(self.node_id, "Monitor", value / 100.0)
-            win = self.window()
-            if hasattr(win, 'submix_state'):
-                win.submix_state[f"{self.node_id}_Monitor"] = {'vol': value / 100.0, 'mute': self._mon_muted}
-                win.save_config()
+            self._stash_submix("Monitor", value / 100.0, self._mon_muted)
 
     def _on_str_vol(self, value):
         self.str_vol_lbl.setText(f"{value}%")
         if self.node_id:
             self.engine.set_submix_volume(self.node_id, "Stream", value / 100.0)
-            win = self.window()
-            if hasattr(win, 'submix_state'):
-                win.submix_state[f"{self.node_id}_Stream"] = {'vol': value / 100.0, 'mute': self._str_muted}
-                win.save_config()
+            self._stash_submix("Stream", value / 100.0, self._str_muted)
+
+    def _apply_mute_style(self, btn, muted):
+        btn.setText("🔇" if muted else "🔊")
+        btn.setProperty("muted", "true" if muted else "false")
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
 
     def _on_mon_mute(self):
-        self._mon_muted = not getattr(self, '_mon_muted', False)
+        self._mon_muted = not self._mon_muted
         if self.node_id:
             self.engine.set_submix_mute(self.node_id, "Monitor", self._mon_muted)
-            win = self.window()
-            if hasattr(win, 'submix_state'):
-                win.submix_state[f"{self.node_id}_Monitor"] = {'vol': self.mon_slider.value() / 100.0, 'mute': self._mon_muted}
-                win.save_config()
-                
-        self.mon_mute.setText("🔇" if self._mon_muted else "🔊")
-        self.mon_mute.setProperty("muted", "true" if self._mon_muted else "false")
-        self.mon_mute.style().unpolish(self.mon_mute)
-        self.mon_mute.style().polish(self.mon_mute)
+            self._stash_submix("Monitor", self.mon_slider.value() / 100.0, self._mon_muted)
+        self._apply_mute_style(self.mon_mute, self._mon_muted)
 
     def _on_str_mute(self):
-        self._str_muted = not getattr(self, '_str_muted', False)
+        self._str_muted = not self._str_muted
         if self.node_id:
             self.engine.set_submix_mute(self.node_id, "Stream", self._str_muted)
-            win = self.window()
-            if hasattr(win, 'submix_state'):
-                win.submix_state[f"{self.node_id}_Stream"] = {'vol': self.str_slider.value() / 100.0, 'mute': self._str_muted}
-                win.save_config()
-                
-        self.str_mute.setText("🔇" if self._str_muted else "🔊")
-        self.str_mute.setProperty("muted", "true" if self._str_muted else "false")
-        self.str_mute.style().unpolish(self.str_mute)
-        self.str_mute.style().polish(self.str_mute)
+            self._stash_submix("Stream", self.str_slider.value() / 100.0, self._str_muted)
+        self._apply_mute_style(self.str_mute, self._str_muted)
 
     def _on_fx_toggle(self):
         dlg = FXSelectionDialog(self.node_id, self.engine, self)
@@ -472,10 +466,18 @@ class WaveLinuxWindow(QMainWindow):
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self._refresh)
 
+        # Coalesce rapid save requests (sliders fire valueChanged on every pixel).
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.timeout.connect(self.save_config)
+
         self._setup_ui()
         self.load_config()
         self._refresh()
         self.refresh_timer.start(2000)
+
+    def schedule_save(self):
+        self._save_timer.start(500)
 
     def _setup_ui(self):
         self._setup_tray()
@@ -661,13 +663,16 @@ class WaveLinuxWindow(QMainWindow):
                 self.status_lbl.setText("PipeWire error — is pipewire running?")
                 return
 
+            # Read engine-side submix volumes once so per-channel sync is cheap.
+            live_by_owner = self.engine.snapshot_sink_inputs_by_owner()
+
             # 1. Update Input Channels (Mics & Virtual Sinks)
             current_node_ids = set()
-            
+
             for node in (mics + vsinks):
                 pw_id = node.pw_id
                 current_node_ids.add(pw_id)
-                
+
                 is_hidden = pw_id in self.hidden_nodes
                 if is_hidden and not self.show_hidden:
                     if pw_id in self.channel_widgets:
@@ -677,9 +682,19 @@ class WaveLinuxWindow(QMainWindow):
                 # Create submix routes if they don't exist
                 self.engine.route_input_to_submix(pw_id, node.name, node.media_class, "Monitor")
                 self.engine.route_input_to_submix(pw_id, node.name, node.media_class, "Stream")
-                
-                mon_state = self.submix_state.get(f"{pw_id}_Monitor", {'vol': 1.0, 'mute': False})
-                str_state = self.submix_state.get(f"{pw_id}_Stream", {'vol': 1.0, 'mute': False})
+
+                mon_state = dict(self.submix_state.get(f"{pw_id}_Monitor", {'vol': 1.0, 'mute': False}))
+                str_state = dict(self.submix_state.get(f"{pw_id}_Stream", {'vol': 1.0, 'mute': False}))
+
+                # Overlay the engine's real state so external tools (pavucontrol,
+                # media keys) reflect into the UI.
+                for mix_name, state in (("Monitor", mon_state), ("Stream", str_state)):
+                    owner = self.engine.submix_loopbacks.get(f"{pw_id}->{mix_name}")
+                    if owner is None:
+                        continue
+                    live = live_by_owner.get(str(owner))
+                    if live is not None:
+                        state['vol'], state['mute'] = live
 
                 if pw_id not in self.channel_widgets:
                     # Create new widget
@@ -715,6 +730,15 @@ class WaveLinuxWindow(QMainWindow):
                         break
                 
                 strip.fx_btn.setProperty("active", "true" if is_any_fx else "false")
+
+            # Reap widgets whose node has disappeared (unplugged mic, removed
+            # sink, PipeWire restart). Leaving them behind looks like ghosts.
+            for stale in [pid for pid in self.channel_widgets if pid not in current_node_ids]:
+                widget = self.channel_widgets.pop(stale)
+                widget.setParent(None)
+                widget.deleteLater()
+                self.engine.remove_node_routing(stale)
+
             # 2. Update App Routing (Persistent & Grouped)
             # Map app_name -> list of active indices
             apps_by_name = {}
@@ -928,20 +952,23 @@ class WaveLinuxWindow(QMainWindow):
         self._refresh()
 
     def _setup_tray(self):
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logging.info("No system tray available; closing the window will quit.")
+            return
+
         self.tray = QSystemTrayIcon(self)
         self.tray.setIcon(self.tray_icon_obj)
-        
+
         menu = QMenu()
         show_act = QAction("Show WaveLinux", self)
         show_act.triggered.connect(self.showNormal)
         menu.addAction(show_act)
-        
         menu.addSeparator()
-        
         quit_act = QAction("Quit WaveLinux", self)
         quit_act.triggered.connect(self._quit_app)
         menu.addAction(quit_act)
-        
+
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
@@ -954,12 +981,13 @@ class WaveLinuxWindow(QMainWindow):
                 self.showNormal()
 
     def closeEvent(self, event):
-        """Minimize to tray instead of closing."""
-        if self.tray.isVisible():
+        """Minimize to tray when one is available; otherwise actually quit."""
+        if self.tray is not None and self.tray.isVisible():
             event.ignore()
             self.hide()
-        else:
-            self._quit_app()
+            return
+        self._quit_app()
+        event.accept()
 
     def _quit_app(self):
         """Cleanly unload all modules and exit."""
