@@ -1,38 +1,23 @@
 #!/usr/bin/env python3
 """WaveLinux — Native PipeWire Audio Mixer for KDE/Linux"""
 
-import subprocess
 import json
 import logging
 import sys
 import os
+import re
 
-# Try PyQt6 first, fall back to PyQt5
-try:
-    from PyQt6.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QLabel, QSlider, QPushButton, QFrame, QScrollArea, QDialog,
-        QLineEdit, QDialogButtonBox, QComboBox, QToolButton, QSizePolicy,
-        QGraphicsDropShadowEffect, QMessageBox, QSystemTrayIcon, QMenu,
-        QInputDialog
-    )
-    from PyQt6.QtCore import Qt, QTimer, QSize, QPropertyAnimation, QEasingCurve, QLockFile, QDir
-    from PyQt6.QtGui import QFont, QColor, QIcon, QPalette, QLinearGradient, QPainter, QAction, QPixmap, QImage, QBitmap, QRegion
-    QT6 = True
-except ImportError:
-    from PyQt5.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QLabel, QSlider, QPushButton, QFrame, QScrollArea, QDialog,
-        QLineEdit, QDialogButtonBox, QComboBox, QToolButton, QSizePolicy,
-        QGraphicsDropShadowEffect, QMessageBox, QSystemTrayIcon, QMenu, QAction
-    )
-    from PyQt5.QtCore import Qt, QTimer, QSize, QPropertyAnimation, QEasingCurve, QLockFile, QDir
-    from PyQt5.QtGui import QFont, QColor, QIcon, QPalette, QLinearGradient, QPainter
-    QT6 = False
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QSlider, QPushButton, QFrame, QScrollArea, QDialog,
+    QLineEdit, QDialogButtonBox, QComboBox, QMessageBox, QSystemTrayIcon,
+    QMenu, QInputDialog
+)
+from PyQt6.QtCore import Qt, QTimer, QLockFile
+from PyQt6.QtGui import QFont, QIcon, QAction
 
 from pipewire_engine import PipeWireEngine
 from wavelinux_theme import STYLESHEET
-import re
 
 
 # ── FX Selection Dialog ───────────────────────────────────────────
@@ -130,6 +115,8 @@ class ChannelStrip(QFrame):
         self.engine = engine
         self.is_mic = is_mic
         self._muted = False
+        self._mon_muted = False
+        self._str_muted = False
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -332,11 +319,18 @@ class ChannelStrip(QFrame):
         self.str_mute.style().unpolish(self.str_mute)
         self.str_mute.style().polish(self.str_mute)
         
-        # Unhide button toggle
+        # Rewire the hide button for whichever state we're in. disconnect()
+        # raises if nothing is connected, so swallow that narrowly.
+        try:
+            self.hide_btn.clicked.disconnect()
+        except TypeError:
+            pass
         if is_hidden:
             self.hide_btn.setText("👁 Unhide")
-            self.hide_btn.clicked.disconnect()
             self.hide_btn.clicked.connect(self._request_unhide)
+        else:
+            self.hide_btn.setText("👁")
+            self.hide_btn.clicked.connect(self._request_hide)
         self.hide_btn.setStyleSheet("")
 
 
@@ -475,12 +469,13 @@ class WaveLinuxWindow(QMainWindow):
         self.config_path = os.path.expanduser("~/.config/wavelinux/config.json")
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
         
-        self.timer = QTimer()
-        self.timer.timeout.connect(self._refresh)
-        
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self._refresh)
+
         self._setup_ui()
         self.load_config()
         self._refresh()
+        self.refresh_timer.start(2000)
 
     def _setup_ui(self):
         self._setup_tray()
@@ -644,14 +639,6 @@ class WaveLinuxWindow(QMainWindow):
         s_layout.addStretch()
         root.addWidget(status)
 
-        # ── Refresh Timer ──
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self._refresh)
-        self.refresh_timer.start(2000)
-
-        # Initial load
-        self._refresh()
-
     def _clear_layout(self, layout):
         while layout.count():
             item = layout.takeAt(0)
@@ -664,7 +651,6 @@ class WaveLinuxWindow(QMainWindow):
 
     def _refresh(self):
         """Update UI to match PipeWire state without destroying everything."""
-        self.timer.stop()
         try:
             mics = self.engine.get_hardware_inputs()
             vsinks = self.engine.get_virtual_sinks()
@@ -789,17 +775,17 @@ class WaveLinuxWindow(QMainWindow):
                         combo.setCurrentIndex(idx)
                     combo.blockSignals(False)
 
-            # 4. Update Master Mix Sliders
+            # 4. Update Master Mix Sliders (mix sinks are addressed by name, not wpctl ID).
             mon_mix = self.engine.output_mixes.get("Monitor")
             if mon_mix and not self.mon_master_slider.isSliderDown():
-                v, m = self.engine.get_volume(mon_mix.sink_name)
+                v, _ = self.engine.get_sink_volume_by_name(mon_mix.sink_name)
                 self.mon_master_slider.blockSignals(True)
                 self.mon_master_slider.setValue(int(v * 100))
                 self.mon_master_slider.blockSignals(False)
-            
+
             str_mix = self.engine.output_mixes.get("Stream")
             if str_mix and not self.str_master_slider.isSliderDown():
-                v, m = self.engine.get_volume(str_mix.sink_name)
+                v, _ = self.engine.get_sink_volume_by_name(str_mix.sink_name)
                 self.str_master_slider.blockSignals(True)
                 self.str_master_slider.setValue(int(v * 100))
                 self.str_master_slider.blockSignals(False)
@@ -809,8 +795,6 @@ class WaveLinuxWindow(QMainWindow):
         except Exception as e:
             logging.error(f"UI Refresh error: {e}")
             self.status_lbl.setText(f"Refresh error: {str(e)[:30]}...")
-        finally:
-            self.timer.start(2000)
 
 
 
@@ -819,53 +803,33 @@ class WaveLinuxWindow(QMainWindow):
         vol = value / 100.0
         mix = self.engine.output_mixes.get(mix_name)
         if mix:
-            self.engine.set_volume(mix.sink_name, vol)
+            self.engine.set_sink_volume_by_name(mix.sink_name, vol)
 
     def _on_mix_out_change(self, mix_name, hw_sink_name):
         if hw_sink_name:
             self.engine.route_mix_to_hardware(mix_name, hw_sink_name)
 
-    def _show_add_dialog(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Add Virtual Channel")
-        dlg.setFixedSize(360, 180)
-        layout = QVBoxLayout(dlg)
-        layout.setSpacing(12)
-
-        lbl = QLabel("Enter a name for the new audio channel:")
-        lbl.setStyleSheet("font-size: 13px;")
-        layout.addWidget(lbl)
-
-        name_input = QLineEdit()
-        name_input.setPlaceholderText("e.g., Game, Discord, Spotify")
-        layout.addWidget(name_input)
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        btns.accepted.connect(dlg.accept)
-        btns.rejected.connect(dlg.reject)
-        btns.setStyleSheet("""
-            QPushButton { padding: 8px 20px; border-radius: 6px; font-weight: 600; }
-        """)
-        layout.addWidget(btns)
     def _on_add_channel(self):
         text, ok = QInputDialog.getText(self, "Add Virtual Channel", "Channel Name:")
-        if ok and text:
-            self.engine.create_virtual_sink(text)
-            if text not in self.virtual_channels:
-                self.virtual_channels.append(text)
-                self.save_config()
-            self._refresh()
+        if not (ok and text):
+            return
+        clean = re.sub(r'\s+', ' ', text).strip()
+        if not clean:
+            return
+        self.engine.create_virtual_sink(clean)
+        if clean not in self.virtual_channels:
+            self.virtual_channels.append(clean)
+            self.save_config()
+        self._refresh()
 
     def _remove_sink(self, sink_name):
         self.engine.remove_virtual_sink(sink_name)
-        # sink_name is like 'wavelinux_game'
-        friendly = sink_name.replace('wavelinux_', '').replace('_', ' ').title()
-        if friendly in self.virtual_channels:
-            self.virtual_channels.remove(friendly)
-        elif sink_name in self.virtual_channels:
-            self.virtual_channels.remove(sink_name)
+        # Drop whichever display-name entry maps to this sink_name.
+        for display in list(self.virtual_channels):
+            _, safe = PipeWireEngine._sanitize_channel_name(display)
+            if f"wavelinux_{safe}" == sink_name or display == sink_name:
+                self.virtual_channels.remove(display)
+                break
         self.save_config()
         self._refresh()
 
@@ -913,17 +877,23 @@ class WaveLinuxWindow(QMainWindow):
                 for name in self.virtual_channels:
                     self.engine.create_virtual_sink(name)
                     
-                # Restore output mix hardware routing
+                # Restore output mix hardware routing. Block the combo signals
+                # so setCurrentIndex doesn't also trigger the change handler —
+                # we call it explicitly exactly once.
                 mon_hw = conf.get('monitor_hw') or self.engine.get_default_sink()
                 str_hw = conf.get('stream_hw')
-                if mon_hw:
-                    idx = self.mon_out_combo.findData(mon_hw)
-                    if idx >= 0: self.mon_out_combo.setCurrentIndex(idx)
-                    self._on_mix_out_change("Monitor", mon_hw)
-                if str_hw:
-                    idx = self.str_out_combo.findData(str_hw)
-                    if idx >= 0: self.str_out_combo.setCurrentIndex(idx)
-                    self._on_mix_out_change("Stream", str_hw)
+                for combo, mix_name, hw in (
+                    (self.mon_out_combo, "Monitor", mon_hw),
+                    (self.str_out_combo, "Stream", str_hw),
+                ):
+                    if not hw:
+                        continue
+                    combo.blockSignals(True)
+                    idx = combo.findData(hw)
+                    if idx >= 0:
+                        combo.setCurrentIndex(idx)
+                    combo.blockSignals(False)
+                    self._on_mix_out_change(mix_name, hw)
         except Exception as e:
             print(f"Error loading config: {e}")
 
@@ -993,13 +963,11 @@ class WaveLinuxWindow(QMainWindow):
 
     def _quit_app(self):
         """Cleanly unload all modules and exit."""
-        print("WaveLinux: Shutting down audio engine...")
         logging.info("Shutting down WaveLinux...")
-        self.timer.stop()
+        self.refresh_timer.stop()
         self.engine.full_audio_reset()
         logging.info("Audio reset complete. Exiting.")
         QApplication.instance().quit()
-        sys.exit(0)
 
 
 # ── Entry Point ────────────────────────────────────────────────────
