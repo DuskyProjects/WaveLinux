@@ -15,6 +15,7 @@ sudo pacman -S --needed --noconfirm \
     pipewire \
     pipewire-pulse \
     wireplumber \
+    libpulse \
     rnnoise \
     swh-plugins
 

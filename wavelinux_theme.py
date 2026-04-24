@@ -215,6 +215,113 @@ QPushButton#resetBtn:pressed {
     background: rgba(255,51,102,0.35);
 }
 
+/* ── Solo / Clipguard / Scene controls ── */
+QPushButton#soloBtn {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #e0e0ee;
+    border-radius: 8px;
+    font-weight: 700;
+    font-size: 11px;
+}
+QPushButton#soloBtn:hover {
+    background: rgba(255,204,0,0.18);
+    color: #ffd64d;
+}
+QPushButton#soloBtn:checked {
+    background: rgba(255,204,0,0.28);
+    border: 1px solid #ffcc00;
+    color: #ffcc00;
+}
+
+QPushButton#clipguardBtn {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #a0a0b8;
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 600;
+}
+QPushButton#clipguardBtn:hover {
+    background: rgba(0,229,255,0.1);
+}
+QPushButton#clipguardBtn:checked {
+    background: rgba(0,229,255,0.18);
+    border: 1px solid #00e5ff;
+    color: #00e5ff;
+}
+
+QLabel#scenePickerLabel {
+    color: #5a5a72;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    font-family: 'Outfit', sans-serif;
+    padding-right: 6px;
+}
+QComboBox#sceneCombo {
+    min-width: 150px;
+}
+QPushButton#sceneSaveBtn, QPushButton#sceneDelBtn {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #a0a0b8;
+    border-radius: 8px;
+    padding: 6px;
+    font-size: 13px;
+}
+QPushButton#sceneSaveBtn:hover {
+    background: rgba(0,229,255,0.15);
+    color: #00e5ff;
+}
+QPushButton#sceneDelBtn:hover {
+    background: rgba(255,51,102,0.15);
+    color: #ff6a8a;
+}
+
+QPushButton#forgetBtn {
+    background: transparent;
+    border: 1px solid rgba(255,255,255,0.08);
+    color: #5a5a72;
+    border-radius: 6px;
+    padding: 4px;
+    font-size: 11px;
+    font-weight: 600;
+}
+QPushButton#forgetBtn:hover {
+    background: rgba(255,51,102,0.12);
+    border: 1px solid rgba(255,51,102,0.3);
+    color: #ff6a8a;
+}
+QPushButton#forgetBtn:disabled {
+    color: #2a2a3a;
+    border: 1px solid rgba(255,255,255,0.04);
+}
+
+QPushButton#reorderBtn {
+    background: transparent;
+    border: none;
+    color: #5a5a72;
+    font-size: 11px;
+    padding: 0;
+}
+QPushButton#reorderBtn:hover {
+    color: #00e5ff;
+}
+
+/* ── Peak / VU meter ── */
+QProgressBar#peakBar {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.05);
+    border-radius: 3px;
+}
+QProgressBar#peakBar::chunk {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+        stop:0 #00e5ff, stop:0.6 #7000ff, stop:0.85 #ffcc00, stop:1 #ff3366);
+    border-radius: 3px;
+}
+
 QPushButton#hideBtn {
     background: transparent;
     border: none;
