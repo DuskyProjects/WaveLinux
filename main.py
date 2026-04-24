@@ -417,151 +417,122 @@ class ChannelStrip(QFrame):
         self._str_muted = False
 
         layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setSpacing(2)
+        layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
 
-        # Top row: reorder ← / icon / reorder →
-        top_row = QHBoxLayout()
-        self.left_btn = QPushButton("◀")
-        self.left_btn.setObjectName("reorderBtn")
-        self.left_btn.setFixedSize(20, 20)
-        self.left_btn.setToolTip("Move this channel left")
-        self.left_btn.clicked.connect(lambda: self._request_move(-1))
-        top_row.addWidget(self.left_btn)
-
-        top_row.addStretch()
+        # Icon + (optional) FX indicator. Wave Link keeps the header almost
+        # empty — everything extra lives behind the right-click menu.
+        head_row = QHBoxLayout()
+        head_row.setContentsMargins(0, 0, 0, 0)
+        head_row.addStretch()
         icon_lbl = QLabel(icon)
         icon_lbl.setObjectName("channelIcon")
-        top_row.addWidget(icon_lbl)
-        top_row.addStretch()
+        head_row.addWidget(icon_lbl)
+        head_row.addStretch()
+        self.fx_indicator = QLabel("✨")
+        self.fx_indicator.setObjectName("fxIndicator")
+        self.fx_indicator.setToolTip("Effect active — right-click → Effects to edit")
+        self.fx_indicator.setVisible(False)
+        head_row.addWidget(self.fx_indicator)
+        layout.addLayout(head_row)
 
-        self.right_btn = QPushButton("▶")
-        self.right_btn.setObjectName("reorderBtn")
-        self.right_btn.setFixedSize(20, 20)
-        self.right_btn.setToolTip("Move this channel right")
-        self.right_btn.clicked.connect(lambda: self._request_move(1))
-        top_row.addWidget(self.right_btn)
-        layout.addLayout(top_row)
-
-        # Enable right-click context menu
+        # Right-click menu — where reorder / hide / rename / effects / remove live.
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
 
-        # Name
+        # Name (click to rename for virtual channels; mics keep their alsa name).
         name_lbl = QLabel(name)
         name_lbl.setObjectName("channelName")
         name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         name_lbl.setWordWrap(True)
-        name_lbl.setMinimumHeight(24) # allow 2 lines
+        name_lbl.setMinimumHeight(24)  # allow 2 lines
         layout.addWidget(name_lbl)
-
-        # Type label
-        type_lbl = QLabel(ch_type.upper())
-        type_lbl.setObjectName("channelType")
-        type_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(type_lbl)
-
-        if self.is_mic:
-            badge = QLabel("RNNoise")
-            badge.setObjectName("rnBadge")
-            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(badge)
 
         layout.addSpacing(4)
 
-        # Sliders layout
-        sliders_layout = QVBoxLayout()
-        sliders_layout.setSpacing(6)
-
-        # Top controls for this channel: link
-        link_row = QHBoxLayout()
-        self.link_btn = QPushButton("🔗")
-        self.link_btn.setObjectName("soloBtn")
-        self.link_btn.setCheckable(True)
-        self.link_btn.setFixedSize(24, 24)
-        self.link_btn.setToolTip("Link Monitor and Stream faders")
-        self.link_btn.clicked.connect(self._on_link_toggle)
-        link_row.addStretch()
-        link_row.addWidget(self.link_btn)
-        link_row.addStretch()
-        sliders_layout.addLayout(link_row)
-
-        # Peak meter: horizontal progress bar driven by the MeterWorker.
+        # Peak meter sits *between* the name and the faders so it's clearly
+        # "this channel's level", not associated with a specific mix.
         self.peak_bar = QProgressBar()
         self.peak_bar.setObjectName("peakBar")
         self.peak_bar.setRange(0, 1000)
         self.peak_bar.setTextVisible(False)
-        self.peak_bar.setFixedHeight(6)
+        self.peak_bar.setFixedHeight(5)
         self.peak_bar.setValue(0)
-        sliders_layout.addWidget(self.peak_bar)
+        layout.addWidget(self.peak_bar)
 
-        # The two faders side-by-side
+        # Link button: when on, the two mix faders move together.
+        link_row = QHBoxLayout()
+        link_row.addStretch()
+        self.link_btn = QPushButton("🔗")
+        self.link_btn.setObjectName("linkBtn")
+        self.link_btn.setCheckable(True)
+        self.link_btn.setFixedSize(24, 24)
+        self.link_btn.setToolTip("Link the Headphones and Stream faders")
+        self.link_btn.clicked.connect(self._on_link_toggle)
+        link_row.addWidget(self.link_btn)
+        link_row.addStretch()
+        layout.addLayout(link_row)
+
+        # Two-column fader layout (Headphones + Stream).
         faders_row = QHBoxLayout()
         faders_row.setSpacing(10)
 
-        # Monitor Fader Column
         mon_col = QVBoxLayout()
         mon_col.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         mon_label = QLabel("MON")
+        mon_label.setObjectName("mixTagMon")
         mon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        mon_label.setStyleSheet("color: #00e5ff; font-size: 8px; font-weight: bold; letter-spacing: 1px;")
         mon_col.addWidget(mon_label)
         self.mon_vol_lbl = QLabel("100%")
         self.mon_vol_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.mon_vol_lbl.setObjectName("volumeLabel")
         mon_col.addWidget(self.mon_vol_lbl)
-
         self.mon_slider = QSlider(Qt.Orientation.Vertical)
         self.mon_slider.setRange(0, 150)
         self.mon_slider.setValue(100)
-        self.mon_slider.setMinimumHeight(120)
+        self.mon_slider.setMinimumHeight(140)
         self.mon_slider.valueChanged.connect(self._on_mon_vol)
         mon_col.addWidget(self.mon_slider, 1)
-
         self.mon_mute = QPushButton("🎧")
         self.mon_mute.setObjectName("muteBtn")
         self.mon_mute.setFixedSize(28, 28)
+        self.mon_mute.setToolTip("Mute in Headphones mix")
         self.mon_mute.clicked.connect(self._on_mon_mute)
         mon_col.addWidget(self.mon_mute)
         faders_row.addLayout(mon_col)
 
-        # Stream Fader Column
         str_col = QVBoxLayout()
         str_col.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         str_label = QLabel("STR")
+        str_label.setObjectName("mixTagStr")
         str_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        str_label.setStyleSheet("color: #7000ff; font-size: 8px; font-weight: bold; letter-spacing: 1px;")
         str_col.addWidget(str_label)
         self.str_vol_lbl = QLabel("100%")
         self.str_vol_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.str_vol_lbl.setObjectName("volumeLabel")
         str_col.addWidget(self.str_vol_lbl)
-
         self.str_slider = QSlider(Qt.Orientation.Vertical)
         self.str_slider.setRange(0, 150)
         self.str_slider.setValue(100)
-        self.str_slider.setMinimumHeight(120)
+        self.str_slider.setMinimumHeight(140)
         self.str_slider.valueChanged.connect(self._on_str_vol)
         str_col.addWidget(self.str_slider, 1)
-
         self.str_mute = QPushButton("📡")
         self.str_mute.setObjectName("muteBtn")
         self.str_mute.setFixedSize(28, 28)
+        self.str_mute.setToolTip("Mute in Stream mix")
         self.str_mute.clicked.connect(self._on_str_mute)
         str_col.addWidget(self.str_mute)
         faders_row.addLayout(str_col)
 
-        sliders_layout.addLayout(faders_row, 1)
+        layout.addLayout(faders_row, 1)
 
-        layout.addLayout(sliders_layout, 1)
-
-        layout.addSpacing(8)
-
-        # FX / RNNoise button
-        self.fx_btn = QPushButton("✨ Add FX")
-        self.fx_btn.setObjectName("fxBtn")
-        self.fx_btn.clicked.connect(self._on_fx_toggle)
-        layout.addWidget(self.fx_btn)
+        # fx_btn kept as a hidden widget so existing code paths that touch
+        # `strip.fx_btn.setProperty(...)` can keep functioning. The real FX
+        # entry point is the right-click menu.
+        self.fx_btn = QPushButton()
+        self.fx_btn.setVisible(False)
 
     def _stash_submix(self, mix_name, vol, mute):
         win = self.window()
@@ -572,14 +543,18 @@ class ChannelStrip(QFrame):
             win.schedule_save()
 
     def _on_link_toggle(self):
-        if self.link_btn.isChecked():
+        linked = self.link_btn.isChecked()
+        if linked:
+            # Snap Stream to Monitor so they start at the same place.
             self.str_slider.setValue(self.mon_slider.value())
-            self.save_link_state()
+        # Persist regardless of direction — the previous version only saved
+        # when linking ON, so unlinking was silently lost.
+        self._save_link_state(linked)
 
-    def save_link_state(self):
+    def _save_link_state(self, linked):
         win = self.window()
         if hasattr(win, 'submix_state') and self.node_name:
-            win.submix_state[f"{self.node_name}_linked"] = self.link_btn.isChecked()
+            win.submix_state[f"{self.node_name}_linked"] = bool(linked)
             if hasattr(win, 'schedule_save'):
                 win.schedule_save()
 
@@ -626,33 +601,62 @@ class ChannelStrip(QFrame):
         self._apply_mute_style(self.str_mute, self._str_muted)
 
     def _on_fx_toggle(self):
+        """Open the effects dialog and refresh the ✨ indicator."""
         dlg = FXSelectionDialog(self.node_id, self.node_name, self.engine, self)
         dlg.exec()
-        # Visual update will happen in next refresh cycle or we can force it
-        is_any_fx = False
+        self._refresh_fx_indicator()
+
+    def _refresh_fx_indicator(self):
+        if not self.node_id:
+            self.fx_indicator.setVisible(False)
+            return
         for fx in self.engine.get_available_effects():
             if self.engine.is_effect_active(str(self.node_id), fx['id']):
-                is_any_fx = True
-                break
-        
-        self.fx_btn.setProperty("active", "true" if is_any_fx else "false")
-        self.fx_btn.style().unpolish(self.fx_btn)
-        self.fx_btn.style().polish(self.fx_btn)
+                self.fx_indicator.setVisible(True)
+                return
+        self.fx_indicator.setVisible(False)
 
     def _show_context_menu(self, pos):
-        """Right-click context menu for channel strip actions."""
+        """Right-click context menu for channel-strip actions.
+        Lives here instead of on visible buttons so the strip stays as
+        clean as Wave Link's."""
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu { background: #1a1a28; color: #e0e0ee; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 4px; }
-            QMenu::item { padding: 6px 20px; }
-            QMenu::item:selected { background: rgba(0,229,255,0.15); }
-        """)
-        hide_act = menu.addAction("👁 Hide Channel")
-        hide_act.triggered.connect(self._request_hide)
+        menu.setStyleSheet(
+            "QMenu { background: #1a1a28; color: #e0e0ee;"
+            " border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 4px; }"
+            "QMenu::item { padding: 6px 20px; }"
+            "QMenu::item:selected { background: rgba(0,229,255,0.15); }"
+            "QMenu::separator { background: rgba(255,255,255,0.08); height: 1px; margin: 4px 6px; }"
+        )
+
+        fx_act = menu.addAction("✨ Effects…")
+        fx_act.triggered.connect(self._on_fx_toggle)
+
+        menu.addSeparator()
+
+        move_left = menu.addAction("◀ Move Left")
+        move_left.triggered.connect(lambda: self._request_move(-1))
+        move_right = menu.addAction("▶ Move Right")
+        move_right.triggered.connect(lambda: self._request_move(1))
+
+        menu.addSeparator()
+
         if self.ch_type.lower() == "virtual":
-            rename_act = menu.addAction("✏️ Rename Channel")
+            rename_act = menu.addAction("✏️ Rename…")
             rename_act.triggered.connect(self._request_rename)
+            remove_act = menu.addAction("❌ Remove Channel")
+            remove_act.triggered.connect(self._request_remove)
+
+        hide_act = menu.addAction("👁 Hide")
+        hide_act.triggered.connect(self._request_hide)
+
         menu.exec(self.mapToGlobal(pos))
+
+    def _request_remove(self):
+        """Remove a virtual channel (only valid for ch_type == 'virtual')."""
+        win = self.window()
+        if hasattr(win, "_remove_sink") and self.node_name:
+            win._remove_sink(self.node_name)
 
     def _request_hide(self):
         """Request parent window to hide this channel."""
@@ -681,7 +685,8 @@ class ChannelStrip(QFrame):
         self.peak_bar.setValue(int(max(0.0, min(peak_01, 1.0)) * 1000))
 
     def update_from_node(self, mon_vol, mon_mute, str_vol, str_mute, is_hidden):
-        """Update UI from stored state."""
+        """Update UI from stored state. `is_hidden` is informational; the
+        strip is hidden/shown by the parent window, not by this widget."""
         self._mon_muted = mon_mute
         self._str_muted = str_mute
 
@@ -695,7 +700,7 @@ class ChannelStrip(QFrame):
         win = self.window()
         is_linked = False
         if hasattr(win, 'submix_state') and self.node_name:
-            is_linked = win.submix_state.get(f"{self.node_name}_linked", False)
+            is_linked = bool(win.submix_state.get(f"{self.node_name}_linked", False))
 
         self.link_btn.blockSignals(True)
         self.link_btn.setChecked(is_linked)
@@ -703,30 +708,9 @@ class ChannelStrip(QFrame):
 
         self.mon_vol_lbl.setText(f"{int(mon_vol * 100)}%")
         self.str_vol_lbl.setText(f"{int(str_vol * 100)}%")
-        
-        self.mon_mute.setText("🔇" if mon_mute else "🎧")
-        self.mon_mute.setProperty("muted", "true" if mon_mute else "false")
-        self.mon_mute.style().unpolish(self.mon_mute)
-        self.mon_mute.style().polish(self.mon_mute)
-        
-        self.str_mute.setText("🔇" if str_mute else "📡")
-        self.str_mute.setProperty("muted", "true" if str_mute else "false")
-        self.str_mute.style().unpolish(self.str_mute)
-        self.str_mute.style().polish(self.str_mute)
-        
-        # Rewire the hide button for whichever state we're in. disconnect()
-        # raises if nothing is connected, so swallow that narrowly.
-        try:
-            self.hide_btn.clicked.disconnect()
-        except TypeError:
-            pass
-        if is_hidden:
-            self.hide_btn.setText("👁 Unhide")
-            self.hide_btn.clicked.connect(self._request_unhide)
-        else:
-            self.hide_btn.setText("👁")
-            self.hide_btn.clicked.connect(self._request_hide)
-        self.hide_btn.setStyleSheet("")
+
+        self._apply_mute_style(self.mon_mute, mon_mute)
+        self._apply_mute_style(self.str_mute, str_mute)
 
 
 # ── App Routing Row ────────────────────────────────────────────────
@@ -836,18 +820,28 @@ class AppRoutingRow(QWidget):
         saved = hasattr(win, 'app_routing') and self.app_name in win.app_routing
         self.forget_btn.setEnabled((not is_active) and saved)
 
-        # Update combo box
+        # Update combo box. Users can send an app to:
+        #   • any hardware output (ALSA / Bluetooth / JACK)
+        #   • any user-created WaveLinux channel (starred)
+        # Internal mix/source devices stay hidden.
         if not self.combo.view().isVisible():
             self.combo.blockSignals(True)
             curr_data = self.combo.currentData()
             self.combo.clear()
-            self.combo.addItem("None (System Default)", None)
+            self.combo.addItem("System Default", None)
             for s in sinks:
-                display = PipeWireEngine.friendly_name(s['name'])
-                if 'wavelinux_' in s['name']:
-                    display = s['name'].replace('wavelinux_', '').replace('_', ' ').title() + ' ⭐'
-                self.combo.addItem(display, s['name'])
-            
+                name = s['name']
+                if name.startswith('wavelinux_mix_') or name.startswith('wavelinux_src_'):
+                    continue
+                if name.endswith('.monitor'):
+                    continue
+                if name.startswith('wavelinux_'):
+                    pretty = name.replace('wavelinux_', '').replace('_', ' ').title()
+                    display = f"{pretty} ⭐"
+                else:
+                    display = PipeWireEngine.friendly_name(name)
+                self.combo.addItem(display, name)
+
             idx = self.combo.findData(current_sink or curr_data)
             if idx >= 0:
                 self.combo.setCurrentIndex(idx)
@@ -1068,22 +1062,24 @@ class WaveLinuxWindow(QMainWindow):
         out_frame.setObjectName("routingPanel")
         o_layout = QVBoxLayout(out_frame)
         o_layout.setContentsMargins(20, 20, 20, 20)
-        o_title = QLabel("MASTER MIXES")
+        o_title = QLabel("MASTER")
         o_title.setObjectName("sectionLabel")
         o_layout.addWidget(o_title)
         o_layout.addSpacing(10)
-        
-        # Monitor row
+
+        # Headphones row (what you hear).
         mon_row = QHBoxLayout()
-        mon_lbl = QLabel("Monitor:")
-        mon_lbl.setStyleSheet("color: #e0e0ee; font-size: 11px; font-weight: bold;")
+        mon_lbl = QLabel("🎧 Headphones")
+        mon_lbl.setObjectName("masterMixLabel")
         self.mon_out_combo = QComboBox()
-        self.mon_out_combo.currentIndexChanged.connect(lambda idx: self._on_mix_out_change("Monitor", self.mon_out_combo.itemData(idx)))
+        self.mon_out_combo.setToolTip("Pick the physical output you listen on")
+        self.mon_out_combo.currentIndexChanged.connect(
+            lambda idx: self._on_mix_out_change("Monitor", self.mon_out_combo.itemData(idx))
+        )
         mon_row.addWidget(mon_lbl)
         mon_row.addWidget(self.mon_out_combo, 1)
         o_layout.addLayout(mon_row)
-        
-        # Monitor Master Slider
+
         self.mon_master_slider = QSlider(Qt.Orientation.Horizontal)
         self.mon_master_slider.setRange(0, 100)
         self.mon_master_slider.setFixedHeight(20)
@@ -1091,20 +1087,21 @@ class WaveLinuxWindow(QMainWindow):
         o_layout.addWidget(self.mon_master_slider)
         o_layout.addSpacing(10)
 
-        # Stream row — always routes to the WaveLinux virtual device (for OBS)
+        # Stream row (what OBS / your audience hears). Always routes to the
+        # dedicated virtual device so there's one stable thing to pick in
+        # OBS — matching Wave Link's behaviour.
         str_row = QHBoxLayout()
-        str_lbl = QLabel("Stream:")
-        str_lbl.setStyleSheet("color: #e0e0ee; font-size: 11px; font-weight: bold;")
+        str_lbl = QLabel("📡 Stream")
+        str_lbl.setObjectName("masterMixLabel")
         str_row.addWidget(str_lbl)
-        self.str_out_label = QLabel("WaveLinux Stream (Virtual — use in OBS)")
-        self.str_out_label.setStyleSheet("color: #7000ff; font-size: 11px; font-weight: 600;")
+        self.str_out_label = QLabel("OBS input: WaveLinux-Stream")
+        self.str_out_label.setObjectName("streamHintLabel")
         str_row.addWidget(self.str_out_label, 1)
-        # Hidden combo for compatibility with save/load code
+        # Kept for save/load compatibility; hidden.
         self.str_out_combo = QComboBox()
         self.str_out_combo.hide()
         o_layout.addLayout(str_row)
 
-        # Stream Master Slider + Clipguard (Wave Link-style auto-limiter)
         str_master_row = QHBoxLayout()
         self.str_master_slider = QSlider(Qt.Orientation.Horizontal)
         self.str_master_slider.setRange(0, 100)
@@ -1112,11 +1109,12 @@ class WaveLinuxWindow(QMainWindow):
         self.str_master_slider.valueChanged.connect(lambda v: self._on_master_vol_change("Stream", v))
         str_master_row.addWidget(self.str_master_slider, 1)
 
-        self.clipguard_btn = QPushButton("🛡 Clipguard")
+        self.clipguard_btn = QPushButton("🛡")
         self.clipguard_btn.setObjectName("clipguardBtn")
         self.clipguard_btn.setCheckable(True)
+        self.clipguard_btn.setFixedWidth(36)
         if self.engine.effect_available('limiter'):
-            self.clipguard_btn.setToolTip("Enable a limiter on the Stream bus so your broadcast never clips")
+            self.clipguard_btn.setToolTip("Clipguard — limits the Stream mix so your broadcast never clips")
             self.clipguard_btn.clicked.connect(self._on_clipguard_toggle)
         else:
             self.clipguard_btn.setEnabled(False)
@@ -1291,7 +1289,6 @@ class WaveLinuxWindow(QMainWindow):
                             state['vol'], state['mute'] = live
 
                 if pw_id not in self.channel_widgets:
-                    # Create new widget
                     if node in mics:
                         label = PipeWireEngine.friendly_name(node.description)
                         ch_type = "Microphone"
@@ -1305,12 +1302,6 @@ class WaveLinuxWindow(QMainWindow):
                     strip = ChannelStrip(pw_id, nname, label, ch_type, icon, self.engine)
                     self.channel_widgets[pw_id] = strip
                     self.input_layout.addWidget(strip)
-
-                    if ch_type == "Virtual":
-                        rem_btn = QPushButton("❌ Remove")
-                        rem_btn.setObjectName("removeBtn")
-                        rem_btn.clicked.connect(lambda checked, sn=nname: self._remove_sink(sn))
-                        strip.layout().addWidget(rem_btn)
 
                 strip = self.channel_widgets[pw_id]
                 # Keep the strip's pw_id fresh across PipeWire restarts — the
@@ -1342,14 +1333,9 @@ class WaveLinuxWindow(QMainWindow):
                     meter.start()
                     self.meters[pw_id] = meter
                 
-                # Update FX button active state
-                is_any_fx = False
-                for fx in self.engine.get_available_effects():
-                    if self.engine.is_effect_active(str(pw_id), fx['id']):
-                        is_any_fx = True
-                        break
-                
-                strip.fx_btn.setProperty("active", "true" if is_any_fx else "false")
+                # Surface "an effect is on" as a tiny ✨ next to the icon
+                # instead of repainting a big FX button.
+                strip._refresh_fx_indicator()
 
             # Reap widgets (and meters) whose node has disappeared (unplugged
             # mic, removed sink, PipeWire restart).
@@ -1406,19 +1392,22 @@ class WaveLinuxWindow(QMainWindow):
                     self.app_widgets[name].deleteLater()
                     del self.app_widgets[name]
 
-            # 3. Update Monitor Mix hardware dropdown (Stream is fixed to virtual)
+            # 3. Update Monitor output dropdown (Stream is fixed to virtual).
+            # We let ALSA, Bluetooth, and JACK outputs all show up — the only
+            # thing we exclude is WaveLinux's own internal devices.
             combo = self.mon_out_combo
             if not combo.view().isVisible():  # Don't update while user is looking at it
                 curr_data = combo.currentData()
                 combo.blockSignals(True)
                 combo.clear()
-                combo.addItem("None (Disconnected)", None)
+                combo.addItem("None", None)
                 for s in all_sinks:
-                    # Only show real hardware outputs — never WaveLinux
-                    # internal sinks, null-sinks, or other virtual devices.
-                    if s['name'].startswith('alsa_output.'):
-                        combo.addItem(PipeWireEngine.friendly_name(s['name']), s['name'])
-                
+                    name = s['name']
+                    if name.startswith('wavelinux_'):
+                        continue
+                    if name.endswith('.monitor'):
+                        continue
+                    combo.addItem(PipeWireEngine.friendly_name(name), name)
                 idx = combo.findData(curr_data)
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
