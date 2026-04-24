@@ -40,10 +40,10 @@ QFrame#channelStrip {
     background: rgba(22,21,36,0.85);
     border: 1px solid rgba(255,255,255,0.06);
     border-radius: 14px;
-    padding: 10px 8px;
-    min-width: 160px;
-    max-width: 180px;
-    min-height: 380px;
+    padding: 6px 6px;
+    min-width: 140px;
+    max-width: 160px;
+    min-height: 340px;
 }
 QFrame#channelStrip:hover {
     border: 1px solid rgba(0,229,255,0.2);
@@ -51,14 +51,59 @@ QFrame#channelStrip:hover {
 }
 
 QLabel#channelIcon {
-    font-size: 20px;
+    font-size: 22px;
     padding: 2px;
+}
+QLabel#fxIndicator {
+    color: #00e5ff;
+    font-size: 14px;
+    padding: 0 2px;
 }
 QLabel#channelName {
     color: #e0e0ee;
     font-size: 12px;
     font-weight: 600;
     font-family: 'Outfit', sans-serif;
+}
+QLabel#mixTagMon {
+    color: #00e5ff;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+QLabel#mixTagStr {
+    color: #7000ff;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+QLabel#masterMixLabel {
+    color: #e0e0ee;
+    font-size: 12px;
+    font-weight: 700;
+    font-family: 'Outfit', sans-serif;
+    padding-right: 8px;
+}
+QLabel#streamHintLabel {
+    color: #7000ff;
+    font-size: 11px;
+    font-weight: 600;
+}
+QPushButton#linkBtn {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #a0a0b8;
+    border-radius: 12px;
+    font-size: 11px;
+}
+QPushButton#linkBtn:hover {
+    background: rgba(0,229,255,0.1);
+    color: #00e5ff;
+}
+QPushButton#linkBtn:checked {
+    background: rgba(0,229,255,0.2);
+    border: 1px solid #00e5ff;
+    color: #00e5ff;
 }
 QLabel#channelType {
     color: #00e5ff;

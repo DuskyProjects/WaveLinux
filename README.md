@@ -1,53 +1,48 @@
 # WaveLinux
 
-A PipeWire mixer for Linux that lets you split apps into separate buses,
-keep a dedicated **Stream** bus for OBS that doesn't include your own voice
-monitor, and route each app to the mix you want.
+A PipeWire mixer for Linux that behaves like Elgato Wave Link: split
+apps into separate channels, keep a dedicated **Stream** bus for OBS
+that doesn't include your voice monitor, and set the mix your audience
+hears independently of what you hear.
 
-It's a small PyQt6 app that talks to PipeWire through `pactl` and `pw-dump`.
-No daemon, no system service.
+PyQt6 app. Talks to PipeWire through `pactl`, `pw-dump`, `wpctl`, and
+`parec`. No daemon, no system service.
 
 ## What it does
 
-- Creates virtual sinks (Game / Music / Browser / SFX by default) that
-  apps can play to.
-- Two master buses — **Monitor** (what you hear) and **Stream** (what
-  OBS records) — each with its own volume, hardware output, and
-  Clipguard-style limiter.
-- The Stream bus is exposed as a dedicated recording source
-  (`WaveLinux Stream`) so OBS picks it up directly from the input list.
-- **Three sliders per channel**: Input Gain (pre-fader), Monitor send,
-  Stream send — Wave Link's core mental model.
-- Per-channel **Solo** (mutes every other channel in Monitor),
-  **Rename** (in-place, state migrates), and **Reorder** (`◀` / `▶`
-  buttons, persistent).
-- **Per-channel peak meters** driven by a `parec` subprocess each,
-  updating at ~20 Hz with a release envelope so they don't flicker.
-- **FX with parameters** — rnnoise (VAD), high-pass (cutoff),
-  compressor (threshold/ratio/attack/release/makeup), gate, limiter.
-  High-pass uses PipeWire's built-in biquad; the rest are LADSPA via
-  filter-chain. Parameter sliders re-apply the effect live.
-- **Scenes** — save / load / delete named snapshots of the whole
-  setup. `Ctrl+1`..`Ctrl+9` jumps to the first nine in sorted order.
-- **Sound Card Profiles** dialog — switch ALSA profiles (Analog Stereo
-  vs Pro Audio, etc.) from the header without dropping into
+- **🎧 Headphones / 📡 Stream** — two master buses, two knobs. The
+  Stream bus is a named virtual recording device (`WaveLinux-Stream`)
+  that shows up directly in OBS's audio input picker.
+- **Per-channel dual faders** — every channel has one fader for what
+  *you* hear (MON) and one for what your *audience* hears (STR). A
+  🔗 Link button ties them together when you want them to move as one.
+- **Per-channel peak meter** so you can see who's loud, updated at
+  ~20 Hz with a release envelope.
+- **Clipguard** 🛡 on the Stream bus — a brickwall limiter so your
+  broadcast can't clip.
+- **Per-app routing** — every running app shows up as a row with a
+  volume slider and a destination picker (system default, a hardware
+  output, or any WaveLinux channel). Routing persists per app and
+  survives the app being closed.
+- **Flatpak / Snap / wrapper-aware names** — reads `FLATPAK_ID`,
+  `.flatpak-info`, cgroup scopes, and walks up past `bwrap` /
+  `snap-confine` so things stop showing up as "audio-src".
+- **Parameterised effects** per channel — RNNoise, High-Pass,
+  Compressor, Noise Gate, Limiter. Parameter sliders apply live.
+- **Sound card profile picker** (tray menu) — switch ALSA profiles
+  (Analog Stereo vs Pro Audio, etc.) without dropping into
   pavucontrol.
-- Per-app routing with Flatpak / Snap / wrapper-aware app
-  identification. Apps stay in the panel as "(Offline)" when closed;
-  click ✕ to forget a routing.
-- **Autostart** toggle in the tray menu (writes
-  `~/.config/autostart/wavelinux.desktop`).
-- **Hot-plug tray notifications** when a device appears or goes away.
-- **Emergency Reset** unloads every WaveLinux-owned PipeWire module
-  when something wedges.
+- **Autostart** toggle in the tray menu.
+- **Minimal chrome** — icon, name, meter, fader. Everything else
+  (Effects, Rename, Move, Remove, Hide) is one right-click away.
 
 ## Install
 
-Tested on CachyOS / Arch with KDE. Other distros will probably work —
-you need `pipewire`, `pipewire-pulse`, `wireplumber`, `python`,
-`python-pyqt6`, `libpulse` (for `pactl` and `parec`), plus
-`swh-plugins` for the compressor / gate / limiter and the AUR's
-`noise-suppression-for-voice` for RNNoise.
+Tested on CachyOS / Arch with KDE. Any PipeWire distro should work —
+dependencies: `pipewire`, `pipewire-pulse`, `wireplumber`, `python`,
+`python-pyqt6`, `libpulse` (for `pactl` / `parec`), and `swh-plugins`
+for the compressor / gate / limiter. RNNoise needs
+`noise-suppression-for-voice` from the AUR.
 
 From source:
 
@@ -65,36 +60,41 @@ cd WaveLinux
 makepkg -si
 ```
 
-You can also run straight from the repo with `python3 main.py`.
+Run it from source with `python3 main.py`.
 
-## Config and logs
+## Where things live
 
 - Settings: `~/.config/wavelinux/config.json`
 - App log: `~/.config/wavelinux/wavelinux.log`
 - Per-effect filter-chain logs: `~/.config/wavelinux/fx-logs/`
 
-If an effect shows OFF and refuses to turn on, the fx-log is usually
-the first place to look.
+If an effect shows "N/A" or "OFF" and won't turn on, the fx-log is the
+first place to look — the LADSPA plugin it needs may not be installed.
+
+## OBS setup
+
+1. Start WaveLinux. A virtual audio input called **WaveLinux-Stream**
+   appears in PipeWire / pavucontrol / KDE's Audio Volume panel.
+2. In OBS, add an *Audio Input Capture* source and pick
+   `WaveLinux-Stream` (or `Monitor of WaveLinux-Stream` on some
+   setups). That's the whole Stream mix in one channel.
+3. Use each channel's STR fader (and 📡 mute) to decide what gets
+   sent to OBS. Your own audio monitoring stays on the MON side.
 
 ## Known limitations
 
-- Not a replacement for pavucontrol — it won't manage every sink in the
-  system, just WaveLinux-owned buses and app routing.
-- Per-channel Monitor/Stream sliders control the loopback sink-input
-  volume, not the app's own volume. Use the app-routing row for the
-  per-app fader.
-- Each filter-chain effect needs its LADSPA plugin installed
-  (`swh-plugins` for compressor / gate / limiter,
-  `noise-suppression-for-voice` from the AUR for RNNoise). If a
-  plugin isn't on disk the effect shows as "N/A" in the FX dialog
-  with a tooltip pointing at the package you need.
-- No VU meters yet. Wave Link shows real-time levels per channel;
-  WaveLinux doesn't. It would need a peak-detector filter-chain node
-  per channel or a small `pw-record`-based probe — see ROADMAP.
-- Wave Link ships proprietary VST3 effects (e.g. AI voice filter). We
-  use the LADSPA equivalents from `swh-plugins`, which are solid but
-  not the same set.
+- Not a replacement for pavucontrol. WaveLinux only manages its own
+  buses and app routing.
+- Each filter-chain effect needs its LADSPA plugin installed. If a
+  plugin isn't on disk the effect shows "N/A" in the FX dialog with a
+  tooltip naming the package.
+- Wave Link ships proprietary VST3 effects; WaveLinux uses the LADSPA
+  equivalents from `swh-plugins` and PipeWire's built-in biquad HPF.
+  Not exactly the same set of processors, but enough for a clean
+  broadcast chain.
 
 ## License / credits
 
-Do what you want with it. See ROADMAP.md for what's done and what isn't.
+Do what you want with it. See ROADMAP.md for what's done and what's
+not planned (Stream Deck integration, VST3 hosting, global hotkeys,
+Flatpak — with reasons for each).

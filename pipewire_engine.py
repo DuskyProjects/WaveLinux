@@ -529,26 +529,50 @@ class PipeWireEngine:
         safe = re.sub(r'[^A-Za-z0-9_]+', '_', cleaned.lower()).strip('_')
         return cleaned, safe or 'channel'
 
+    @staticmethod
+    def _branding_label(display_clean):
+        """Build the visible device label that shows in KDE's Audio Volume
+        panel, pavucontrol, OBS, etc.
+
+        The hard rule: NO WHITESPACE. `pactl`'s `sink_properties=...`
+        splits on whitespace to find key=value pairs, and its handling of
+        quoted values differs between PulseAudio and PipeWire's pipewire-pulse
+        bridge. The only way to guarantee every front-end shows the right
+        name is to make each property value a single token.
+        """
+        if not display_clean:
+            return "WaveLinux"
+        # Collapse internal whitespace to a single hyphen so 'Voice Chat'
+        # → 'WaveLinux-Voice-Chat'.
+        compact = re.sub(r'\s+', '-', display_clean.strip())
+        return f"WaveLinux-{compact}"
+
     def create_virtual_sink(self, display_name, custom_name=None):
-        """Create a virtual sink (null-sink). Returns the sink name on success."""
+        """Create a virtual null-sink. Returns the sink name on success."""
         display_clean, safe_tail = self._sanitize_channel_name(display_name)
         safe_name = custom_name or f"wavelinux_{safe_tail}"
-        description = f"WaveLinux-{display_clean}" if display_clean else "WaveLinux"
+        description = self._branding_label(display_clean)
 
         existing = self._find_module_by_arg(f"sink_name={safe_name}")
         if existing:
             logging.info(f"Using existing sink {safe_name} (ID: {existing})")
-            # Only track user-created sinks; mix internals are tracked separately.
             if not safe_name.startswith('wavelinux_mix_'):
                 self.virtual_sink_modules[safe_name] = existing
             return safe_name
 
-        # Escape any embedded double-quote in the description so sink_properties parses.
-        desc_escaped = description.replace('"', '\\"')
+        # No quotes — the description is guaranteed whitespace-free now.
         cmd = [
             "pactl", "load-module", "module-null-sink",
             f"sink_name={safe_name}",
-            f'sink_properties=device.description="{desc_escaped}" node.description="{desc_escaped}" node.nick="{desc_escaped}" media.name="{desc_escaped}" application.name="{desc_escaped}" media.class=Audio/Sink'
+            (
+                f"sink_properties="
+                f"device.description={description} "
+                f"node.description={description} "
+                f"node.nick={description} "
+                f"media.name={description} "
+                f"application.name={description} "
+                f"media.class=Audio/Sink"
+            ),
         ]
         out = self._run(cmd)
         if out:
@@ -589,31 +613,37 @@ class PipeWireEngine:
 
     def create_output_mix(self, name):
         """Create a mix bus: a null-sink plus a virtual source so apps like OBS
-        can pick it up as a dedicated recording device (e.g. 'Wave Link Stream')."""
+        can pick it up as a dedicated recording device (e.g. 'WaveLinux-Stream')."""
         _, safe_name = self._sanitize_channel_name(name)
         sink_name = f"wavelinux_mix_{safe_name}"
         source_name = f"wavelinux_src_{safe_name}"
-        description = f"WaveLinux-{name}"
-        desc_escaped = description.replace('"', '\\"')
+        description = self._branding_label(name)
 
-        # 1. Sink (the thing apps play *to*).
+        # 1. The thing apps play *to*.
         if self.create_virtual_sink(name, custom_name=sink_name) is None:
             return None
         sink_module_id = (self.virtual_sink_modules.get(sink_name)
                           or self._find_module_by_arg(f"sink_name={sink_name}"))
 
         # 2. Dedicated recording source so OBS / browsers see a named device
-        # instead of a generic "Monitor of null sink".
+        # instead of a generic "Monitor of null sink". Whitespace-free
+        # description values so pactl's sink_properties parser can't fumble.
         src_module_id = self._find_module_by_arg(f"source_name={source_name}")
         if not src_module_id:
             src_module_id = self._run([
                 'pactl', 'load-module', 'module-virtual-source',
                 f'source_name={source_name}',
                 f'master={sink_name}.monitor',
-                (f'source_properties=device.description="{desc_escaped}" '
-                 f'node.description="{desc_escaped}" media.name="{desc_escaped}" '
-                 f'application.name="{desc_escaped}" media.class=Audio/Source '
-                 f'device.class=sound node.nick="{desc_escaped}"'),
+                (
+                    f"source_properties="
+                    f"device.description={description} "
+                    f"node.description={description} "
+                    f"node.nick={description} "
+                    f"media.name={description} "
+                    f"application.name={description} "
+                    f"media.class=Audio/Source "
+                    f"device.class=sound"
+                ),
             ])
 
         mix = OutputMix(name, sink_module_id=sink_module_id, sink_name=sink_name)
