@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QDialogButtonBox, QComboBox, QMessageBox, QSystemTrayIcon,
     QMenu, QInputDialog
 )
-from PyQt6.QtCore import Qt, QTimer, QLockFile
+from PyQt6.QtCore import Qt, QTimer, QLockFile, QProcess
 from PyQt6.QtGui import QFont, QIcon, QAction
 
 from pipewire_engine import PipeWireEngine
@@ -74,12 +74,25 @@ class FXSelectionDialog(QDialog):
             toggle_btn.setCheckable(True)
             active = self.engine.is_effect_active(self.node_id, fx['id'])
             toggle_btn.setChecked(active)
-            toggle_btn.setText("ON" if active else "OFF")
             toggle_btn.setFixedWidth(60)
-            
-            # Use a closure to capture fx['id']
-            toggle_btn.clicked.connect(lambda checked, fid=fx['id'], btn=toggle_btn: self._on_toggle(fid, btn))
-            
+
+            available = self.engine.effect_available(fx['id'])
+            if not available:
+                toggle_btn.setText("N/A")
+                toggle_btn.setEnabled(False)
+                toggle_btn.setToolTip(
+                    "LADSPA plugin not installed.\n"
+                    "rnnoise needs noise-suppression-for-voice (AUR); "
+                    "compressor/gate/limiter need swh-plugins."
+                )
+                info_lbl.setStyleSheet("color: #ff6a8a; font-size: 10px;")
+                info_lbl.setText(fx['desc'] + " — plugin missing")
+            else:
+                toggle_btn.setText("ON" if active else "OFF")
+                toggle_btn.clicked.connect(
+                    lambda checked, fid=fx['id'], btn=toggle_btn: self._on_toggle(fid, btn)
+                )
+
             fx_layout.addWidget(toggle_btn)
             layout.addWidget(fx_frame)
             
@@ -103,13 +116,14 @@ class FXSelectionDialog(QDialog):
 class ChannelStrip(QFrame):
     """A single mixer channel: icon, name, vertical fader, mute, FX."""
 
-    def __init__(self, node_id, name, ch_type, icon, engine, parent=None):
+    def __init__(self, node_id, node_name, name, ch_type, icon, engine, parent=None):
         super().__init__(parent)
         self.setObjectName("channelStrip")
         self.setMinimumWidth(160)
         self.setMaximumWidth(180)
         self.setMaximumHeight(320)
-        self.node_id = node_id
+        self.node_id = node_id          # PipeWire numeric id (ephemeral)
+        self.node_name = node_name      # PipeWire node.name (stable across restarts)
         self.ch_name = name
         self.ch_type = ch_type
         self.engine = engine
@@ -248,9 +262,9 @@ class ChannelStrip(QFrame):
 
     def _stash_submix(self, mix_name, vol, mute):
         win = self.window()
-        if not hasattr(win, 'submix_state'):
+        if not hasattr(win, 'submix_state') or not self.node_name:
             return
-        win.submix_state[f"{self.node_id}_{mix_name}"] = {'vol': vol, 'mute': mute}
+        win.submix_state[f"{self.node_name}_{mix_name}"] = {'vol': vol, 'mute': mute}
         if hasattr(win, 'schedule_save'):
             win.schedule_save()
 
@@ -259,15 +273,15 @@ class ChannelStrip(QFrame):
         if self.node_id:
             self.engine.set_input_gain(self.node_id, value / 100.0)
             win = self.window()
-            if hasattr(win, 'submix_state'):
-                win.submix_state[f"{self.node_id}_gain"] = value / 100.0
+            if hasattr(win, 'submix_state') and self.node_name:
+                win.submix_state[f"{self.node_name}_gain"] = value / 100.0
                 if hasattr(win, 'schedule_save'):
                     win.schedule_save()
 
     def _on_solo_toggle(self):
         win = self.window()
-        if hasattr(win, 'toggle_solo'):
-            win.toggle_solo(self.node_id)
+        if hasattr(win, 'toggle_solo') and self.node_name:
+            win.toggle_solo(self.node_name)
 
     def _on_mon_vol(self, value):
         self.mon_vol_lbl.setText(f"{value}%")
@@ -318,14 +332,14 @@ class ChannelStrip(QFrame):
     def _request_hide(self):
         """Request parent window to hide this channel."""
         win = self.window()
-        if hasattr(win, 'hide_node'):
-            win.hide_node(self.node_id)
-            
+        if hasattr(win, 'hide_node') and self.node_name:
+            win.hide_node(self.node_name)
+
     def _request_unhide(self):
         """Request parent window to unhide this channel."""
         win = self.window()
-        if hasattr(win, 'unhide_node'):
-            win.unhide_node(self.node_id)
+        if hasattr(win, 'unhide_node') and self.node_name:
+            win.unhide_node(self.node_name)
 
     def update_from_node(self, mon_vol, mon_mute, str_vol, str_mute, is_hidden, *, gain=None, is_solo=False):
         """Update UI from stored state."""
@@ -423,7 +437,14 @@ class AppRoutingRow(QWidget):
         self.combo.setFixedWidth(220)
         self.combo.currentIndexChanged.connect(self._on_route_change)
         layout.addWidget(self.combo)
-        
+
+        self.forget_btn = QPushButton("✕")
+        self.forget_btn.setObjectName("forgetBtn")
+        self.forget_btn.setFixedWidth(26)
+        self.forget_btn.setToolTip("Forget this app so it stops showing up in the list")
+        self.forget_btn.clicked.connect(self._on_forget)
+        layout.addWidget(self.forget_btn)
+
         self.update_state([], sinks, None)
 
     def _on_vol_change(self, value):
@@ -442,10 +463,17 @@ class AppRoutingRow(QWidget):
             win.app_routing[self.app_name] = sink_name
             win.save_config()
 
+    def _on_forget(self):
+        """Remove this app from persisted app_routing. Only meaningful for
+        offline apps; running apps would just re-appear next refresh."""
+        win = self.window()
+        if hasattr(win, 'forget_app'):
+            win.forget_app(self.app_name)
+
     def update_state(self, active_indices, sinks, current_sink):
         self._active_indices = active_indices
         is_active = len(active_indices) > 0
-        
+
         # Dim if inactive
         if not is_active:
             self.name_lbl.setText(f"{self.app_name} (Offline)")
@@ -457,12 +485,18 @@ class AppRoutingRow(QWidget):
             self.vol_slider.setEnabled(True)
             self.vol_lbl.setStyleSheet("")
             self.name_lbl.setStyleSheet("")
-            
+
             # Update volume from engine
             vol = self.engine.get_sink_input_volume(active_indices[0])
             self.vol_slider.blockSignals(True)
             self.vol_slider.setValue(int(vol * 100))
             self.vol_slider.blockSignals(False)
+
+        # Forget is only useful for offline apps with a remembered routing;
+        # for a running app, it would be hidden and come right back.
+        win = self.window()
+        saved = hasattr(win, 'app_routing') and self.app_name in win.app_routing
+        self.forget_btn.setEnabled((not is_active) and saved)
 
         # Update combo box
         if not self.combo.view().isVisible():
@@ -507,15 +541,20 @@ class WaveLinuxWindow(QMainWindow):
         self.submix_state = {}      # "node_id_MixName" -> {'vol': 1.0, 'mute': False}
         self.app_routing = {}       # app_name -> sink_name (persistent)
         self.virtual_channels = []  # list of names
-        self.hidden_nodes = set()
+        # All user-facing state is keyed by PipeWire node.name (stable across
+        # PipeWire restarts); pw_id is only used when talking to the engine.
+        self.hidden_nodes = set()      # {node.name}
         self.show_hidden = False
-        self.solo_node_id = None       # int pw_id or None — which channel is soloed
-        self._solo_memory = {}         # pw_id -> dict of saved mon/str mute states
+        self.solo_node_name = None     # node.name or None — which channel is soloed
+        self._solo_memory = {}         # node.name -> saved Monitor mute-state dict
         self.scenes = {}               # name -> full config dict
         self.active_scene = None       # currently applied scene name
         self.config_path = os.path.expanduser("~/.config/wavelinux/config.json")
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
         
+        # The 2-second timer is our fallback — the event subscriber below
+        # drives most refreshes, and we want a backstop in case pactl
+        # subscribe is unavailable or misses an event.
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self._refresh)
 
@@ -524,13 +563,49 @@ class WaveLinuxWindow(QMainWindow):
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self.save_config)
 
+        # Coalesce rapid refresh requests (pactl subscribe can fire 5+ events
+        # for a single operation); one refresh per 150 ms is plenty.
+        self._event_refresh_timer = QTimer(self)
+        self._event_refresh_timer.setSingleShot(True)
+        self._event_refresh_timer.setInterval(150)
+        self._event_refresh_timer.timeout.connect(self._refresh)
+
         self._setup_ui()
         self.load_config()
         self._refresh()
         self.refresh_timer.start(2000)
+        self._start_event_subscriber()
 
     def schedule_save(self):
         self._save_timer.start(500)
+
+    def _start_event_subscriber(self):
+        """Run `pactl subscribe` under a QProcess so an external mute/volume
+        change (pavucontrol, media keys, another app) triggers a refresh
+        within ~150 ms instead of waiting up to 2 s for the poll timer.
+        The poll timer is kept as a backstop."""
+        self._event_proc = QProcess(self)
+        self._event_proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self._event_proc.readyReadStandardOutput.connect(self._on_pactl_event)
+        self._event_proc.errorOccurred.connect(self._on_event_proc_error)
+        try:
+            self._event_proc.start("pactl", ["subscribe"])
+        except Exception as e:
+            logging.warning(f"pactl subscribe unavailable: {e} — falling back to poll")
+
+    def _on_pactl_event(self):
+        """Any event at all just kicks the debounce; we don't filter here
+        because the refresh body is already cheap under the snapshot cache."""
+        try:
+            _ = bytes(self._event_proc.readAllStandardOutput())
+        except Exception:
+            pass
+        if self.tray is not None and not self.isVisible():
+            return
+        self._event_refresh_timer.start()
+
+    def _on_event_proc_error(self, err):
+        logging.warning(f"pactl subscribe error: {err}")
 
     def _setup_ui(self):
         self._setup_tray()
@@ -681,8 +756,14 @@ class WaveLinuxWindow(QMainWindow):
         self.clipguard_btn = QPushButton("🛡 Clipguard")
         self.clipguard_btn.setObjectName("clipguardBtn")
         self.clipguard_btn.setCheckable(True)
-        self.clipguard_btn.setToolTip("Enable a limiter on the Stream bus so your broadcast never clips")
-        self.clipguard_btn.clicked.connect(self._on_clipguard_toggle)
+        if self.engine.effect_available('limiter'):
+            self.clipguard_btn.setToolTip("Enable a limiter on the Stream bus so your broadcast never clips")
+            self.clipguard_btn.clicked.connect(self._on_clipguard_toggle)
+        else:
+            self.clipguard_btn.setEnabled(False)
+            self.clipguard_btn.setToolTip(
+                "Install swh-plugins (fast_lookahead_limiter_1913) to enable Clipguard."
+            )
         str_master_row.addWidget(self.clipguard_btn)
         o_layout.addLayout(str_master_row)
 
@@ -768,8 +849,9 @@ class WaveLinuxWindow(QMainWindow):
             for node in (mics + vsinks):
                 pw_id = node.pw_id
                 current_node_ids.add(pw_id)
+                nname = node.name
 
-                is_hidden = pw_id in self.hidden_nodes
+                is_hidden = nname in self.hidden_nodes
                 if is_hidden and not self.show_hidden:
                     if pw_id in self.channel_widgets:
                         self.channel_widgets[pw_id].hide()
@@ -777,11 +859,11 @@ class WaveLinuxWindow(QMainWindow):
 
                 # Create submix routes if they don't exist. Pass the snapshot
                 # so we don't re-run `pactl list modules` four times per tick.
-                self.engine.route_input_to_submix(pw_id, node.name, node.media_class, "Monitor", snap=snap)
-                self.engine.route_input_to_submix(pw_id, node.name, node.media_class, "Stream", snap=snap)
+                self.engine.route_input_to_submix(pw_id, nname, node.media_class, "Monitor", snap=snap)
+                self.engine.route_input_to_submix(pw_id, nname, node.media_class, "Stream", snap=snap)
 
-                mon_state = dict(self.submix_state.get(f"{pw_id}_Monitor", {'vol': 1.0, 'mute': False}))
-                str_state = dict(self.submix_state.get(f"{pw_id}_Stream", {'vol': 1.0, 'mute': False}))
+                mon_state = dict(self.submix_state.get(f"{nname}_Monitor", {'vol': 1.0, 'mute': False}))
+                str_state = dict(self.submix_state.get(f"{nname}_Stream", {'vol': 1.0, 'mute': False}))
 
                 # Overlay the engine's real state so external tools (pavucontrol,
                 # media keys) reflect into the UI.
@@ -796,34 +878,39 @@ class WaveLinuxWindow(QMainWindow):
                 if pw_id not in self.channel_widgets:
                     # Create new widget
                     if node in mics:
-                        name = PipeWireEngine.friendly_name(node.description)
+                        label = PipeWireEngine.friendly_name(node.description)
                         ch_type = "Microphone"
                         icon = "🎤"
                     else:
-                        safe_name = node.name.replace('wavelinux_', '')
-                        name = safe_name.replace('_', ' ').title()
+                        safe_name = nname.replace('wavelinux_', '')
+                        label = safe_name.replace('_', ' ').title()
                         ch_type = "Virtual"
                         icon = "🎵"
-                    
-                    strip = ChannelStrip(pw_id, name, ch_type, icon, self.engine)
+
+                    strip = ChannelStrip(pw_id, nname, label, ch_type, icon, self.engine)
                     self.channel_widgets[pw_id] = strip
                     self.input_layout.addWidget(strip)
-                    
+
                     if ch_type == "Virtual":
                         rem_btn = QPushButton("❌ Remove")
                         rem_btn.setObjectName("removeBtn")
-                        rem_btn.clicked.connect(lambda checked, sn=node.name: self._remove_sink(sn))
+                        rem_btn.clicked.connect(lambda checked, sn=nname: self._remove_sink(sn))
                         strip.layout().addWidget(rem_btn)
 
                 strip = self.channel_widgets[pw_id]
+                # Keep the strip's pw_id fresh across PipeWire restarts — the
+                # node.name stays stable but the numeric id can change.
+                strip.node_id = pw_id
                 strip.show()
-                gain = self.submix_state.get(f"{pw_id}_gain", 1.0)
+                gain = self.submix_state.get(f"{nname}_gain", 1.0)
+                if isinstance(gain, dict):  # legacy pw_id-keyed dict
+                    gain = 1.0
                 strip.update_from_node(
                     mon_state['vol'], mon_state['mute'],
                     str_state['vol'], str_state['mute'],
                     is_hidden,
                     gain=gain,
-                    is_solo=(self.solo_node_id == pw_id),
+                    is_solo=(self.solo_node_name == nname),
                 )
                 
                 # Update FX button active state
@@ -1019,7 +1106,7 @@ class WaveLinuxWindow(QMainWindow):
 
     def _apply_scene(self, data):
         # Clear solo before swapping state so we don't mix memory across scenes.
-        if self.solo_node_id is not None:
+        if self.solo_node_name is not None:
             self._exit_solo()
 
         self.submix_state = dict(data.get('submixes', {}))
@@ -1126,8 +1213,8 @@ class WaveLinuxWindow(QMainWindow):
         try:
             with open(self.config_path, 'r') as f:
                 conf = json.load(f)
-                self.submix_state = conf.get('submixes', {})
-                self.hidden_nodes = set(conf.get('hidden', []))
+                self.submix_state = self._migrate_submix_state(conf.get('submixes', {}))
+                self.hidden_nodes = self._migrate_hidden_nodes(conf.get('hidden', []))
                 self.app_routing = conf.get('app_routing', {})
                 self.virtual_channels = conf.get('channels', [])
                 self.scenes = conf.get('scenes', {}) or {}
@@ -1167,6 +1254,35 @@ class WaveLinuxWindow(QMainWindow):
         except Exception as e:
             logging.error(f"Error loading config: {e}")
 
+    @staticmethod
+    def _migrate_submix_state(raw):
+        """Drop legacy entries keyed by the ephemeral pw_id (e.g. '42_Monitor').
+        New keys use PipeWire node.name (e.g. 'wavelinux_game_Monitor',
+        'alsa_input.pci-..._Monitor'), which survives a PipeWire restart."""
+        if not isinstance(raw, dict):
+            return {}
+        clean = {}
+        for key, val in raw.items():
+            if not isinstance(key, str) or '_' not in key:
+                continue
+            prefix = key.rsplit('_', 1)[0]
+            try:
+                int(prefix)
+                # Legacy pw_id key — drop it rather than carry junk forward.
+                continue
+            except ValueError:
+                pass
+            clean[key] = val
+        return clean
+
+    @staticmethod
+    def _migrate_hidden_nodes(raw):
+        """Only keep entries that look like node.names (non-empty strings).
+        Old configs stored ints; those are worthless across restarts."""
+        if not isinstance(raw, (list, set, tuple)):
+            return set()
+        return {entry for entry in raw if isinstance(entry, str) and entry}
+
     def save_config(self):
         try:
             clipguard = self.clipguard_btn.isChecked()
@@ -1191,47 +1307,64 @@ class WaveLinuxWindow(QMainWindow):
         except Exception as e:
             logging.error(f"Error saving config: {e}")
 
-    def toggle_solo(self, node_id):
+    def toggle_solo(self, node_name):
         """Wave Link-style Solo: mute every other channel's Monitor send.
         Restoring solo brings prior mute states back. Solo is Monitor-only
         (you don't want soloing to mutate your stream)."""
-        if self.solo_node_id == node_id:
+        if self.solo_node_name == node_name:
             self._exit_solo()
         else:
-            if self.solo_node_id is not None:
+            if self.solo_node_name is not None:
                 self._exit_solo()
-            self._enter_solo(node_id)
+            self._enter_solo(node_name)
         self._refresh()
 
-    def _enter_solo(self, solo_id):
+    def _enter_solo(self, solo_name):
         self._solo_memory = {}
-        for pw_id in list(self.channel_widgets.keys()):
-            state_key = f"{pw_id}_Monitor"
+        for strip in self.channel_widgets.values():
+            if not strip.node_name:
+                continue
+            state_key = f"{strip.node_name}_Monitor"
             prior = self.submix_state.get(state_key, {'vol': 1.0, 'mute': False})
-            self._solo_memory[pw_id] = dict(prior)
-            muted = (pw_id != solo_id)
-            self.engine.set_submix_mute(pw_id, "Monitor", muted)
+            self._solo_memory[strip.node_name] = dict(prior)
+            muted = (strip.node_name != solo_name)
+            self.engine.set_submix_mute(strip.node_id, "Monitor", muted)
             self.submix_state[state_key] = {'vol': prior.get('vol', 1.0), 'mute': muted}
-        self.solo_node_id = solo_id
+        self.solo_node_name = solo_name
         self.schedule_save()
 
     def _exit_solo(self):
-        for pw_id, prior in self._solo_memory.items():
-            self.engine.set_submix_mute(pw_id, "Monitor", prior.get('mute', False))
-            self.submix_state[f"{pw_id}_Monitor"] = dict(prior)
+        name_to_id = {s.node_name: s.node_id for s in self.channel_widgets.values() if s.node_name}
+        for node_name, prior in self._solo_memory.items():
+            pw_id = name_to_id.get(node_name)
+            if pw_id is not None:
+                self.engine.set_submix_mute(pw_id, "Monitor", prior.get('mute', False))
+            self.submix_state[f"{node_name}_Monitor"] = dict(prior)
         self._solo_memory = {}
-        self.solo_node_id = None
+        self.solo_node_name = None
         self.schedule_save()
 
-    def hide_node(self, node_id):
-        """Hide a channel strip by node ID."""
-        self.hidden_nodes.add(node_id)
+    def forget_app(self, app_name):
+        """Drop persisted routing for an offline app so it stops cluttering
+        the panel. Running apps are allowed to come back because they'll
+        just reappear on the next refresh."""
+        if app_name in self.app_routing:
+            del self.app_routing[app_name]
+        widget = self.app_widgets.pop(app_name, None)
+        if widget is not None:
+            widget.setParent(None)
+            widget.deleteLater()
+        self.save_config()
         self._refresh()
-        
-    def unhide_node(self, node_id):
-        """Unhide a channel strip by node ID."""
-        if node_id in self.hidden_nodes:
-            self.hidden_nodes.remove(node_id)
+
+    def hide_node(self, node_name):
+        self.hidden_nodes.add(node_name)
+        self.schedule_save()
+        self._refresh()
+
+    def unhide_node(self, node_name):
+        self.hidden_nodes.discard(node_name)
+        self.schedule_save()
         self._refresh()
 
     def _toggle_show_hidden(self):
@@ -1281,8 +1414,13 @@ class WaveLinuxWindow(QMainWindow):
         logging.info("Shutting down WaveLinux...")
         self.refresh_timer.stop()
         self._save_timer.stop()
+        self._event_refresh_timer.stop()
         # Flush any pending slider writes before we tear down the engine.
         self.save_config()
+        proc = getattr(self, "_event_proc", None)
+        if proc is not None and proc.state() != QProcess.ProcessState.NotRunning:
+            proc.kill()
+            proc.waitForFinished(500)
         self.engine.full_audio_reset()
         logging.info("Audio reset complete. Exiting.")
         QApplication.instance().quit()

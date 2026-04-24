@@ -70,8 +70,11 @@ the first place to look.
 - Per-channel Monitor/Stream sliders control the loopback sink-input
   volume, not the app's own volume. Use the app-routing row for the
   per-app fader.
-- The filter-chain gate uses `gate_1410` from `swh-plugins`; if you
-  don't have that package installed, the gate effect won't start.
+- Each filter-chain effect needs its LADSPA plugin installed
+  (`swh-plugins` for compressor / gate / limiter,
+  `noise-suppression-for-voice` from the AUR for RNNoise). If a
+  plugin isn't on disk the effect shows as "N/A" in the FX dialog
+  with a tooltip pointing at the package you need.
 - No VU meters yet. Wave Link shows real-time levels per channel;
   WaveLinux doesn't. It would need a peak-detector filter-chain node
   per channel or a small `pw-record`-based probe — see ROADMAP.

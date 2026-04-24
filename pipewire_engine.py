@@ -73,15 +73,60 @@ class EngineSnapshot:
 class PipeWireEngine:
     """Full-featured PipeWire audio engine."""
 
+    # Common LADSPA search paths across distros.
+    _LADSPA_PATHS = (
+        "/usr/lib/ladspa",
+        "/usr/lib64/ladspa",
+        "/usr/local/lib/ladspa",
+        "/usr/lib/x86_64-linux-gnu/ladspa",
+    )
+
     def __init__(self):
         self.virtual_sink_modules = {}   # safe_name -> pactl module id
         self.output_mixes = {}           # mix_name -> OutputMix
         self.rnnoise_processes = {}      # channel_key -> subprocess
         self.loopback_modules = {}       # "mix_name->hw_name" -> module id
         self.submix_loopbacks = {}       # "node_id->mix_name" -> module id
-        
+
+        # Which LADSPA plugins are actually present on this system —
+        # filter-chain will silently fail-to-start if we reference one that
+        # isn't installed, so we probe once at startup.
+        self.ladspa_plugins = self._probe_ladspa_plugins()
+
         # Ensure clean state from any previous crashes
         self.cleanup()
+
+    @classmethod
+    def _probe_ladspa_plugins(cls):
+        """Return a set of LADSPA plugin names (sans .so) found on disk.
+        Honours $LADSPA_PATH plus common distro locations."""
+        env_path = os.environ.get("LADSPA_PATH", "")
+        roots = [p for p in env_path.split(":") if p] + list(cls._LADSPA_PATHS)
+        found = set()
+        for root in roots:
+            try:
+                for entry in os.listdir(root):
+                    if entry.endswith(".so"):
+                        found.add(entry[:-3])
+            except OSError:
+                continue
+        return found
+
+    def ladspa_plugin_available(self, name):
+        return name in self.ladspa_plugins
+
+    def effect_available(self, effect_id):
+        """Return True if the filter-chain backend for this effect has
+        everything it needs on disk. Keeps the FX UI from offering things
+        that will silently fail at spawn time."""
+        requirements = {
+            'rnnoise':    ('librnnoise_ladspa',),
+            'compressor': ('sc4_1882',),
+            'gate':       ('gate_1410',),
+            'limiter':    ('fast_lookahead_limiter_1913',),
+        }
+        needed = requirements.get(effect_id, ())
+        return all(self.ladspa_plugin_available(n) for n in needed)
 
     # ── Helpers ─────────────────────────────────────────────────────
 

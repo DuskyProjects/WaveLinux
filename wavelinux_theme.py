@@ -280,6 +280,25 @@ QPushButton#sceneDelBtn:hover {
     color: #ff6a8a;
 }
 
+QPushButton#forgetBtn {
+    background: transparent;
+    border: 1px solid rgba(255,255,255,0.08);
+    color: #5a5a72;
+    border-radius: 6px;
+    padding: 4px;
+    font-size: 11px;
+    font-weight: 600;
+}
+QPushButton#forgetBtn:hover {
+    background: rgba(255,51,102,0.12);
+    border: 1px solid rgba(255,51,102,0.3);
+    color: #ff6a8a;
+}
+QPushButton#forgetBtn:disabled {
+    color: #2a2a3a;
+    border: 1px solid rgba(255,255,255,0.04);
+}
+
 QPushButton#hideBtn {
     background: transparent;
     border: none;

@@ -52,8 +52,23 @@ dedicated stream recording device, and scenes.
       threads the cached text through every helper that needs it.
       Refresh is also short-circuited when the window is hidden to the
       tray.
+- [x] **Event-driven refresh**. `pactl subscribe` runs under a QProcess
+      and kicks a 150 ms debounce whenever the audio graph changes, so
+      an external mute / volume tweak (pavucontrol, media keys, another
+      app) lands in the UI within ~150 ms instead of waiting up to 2 s
+      for the poll timer. The 2 s poll stays as a backstop.
 - [x] **Atomic config writes** (temp file + `os.replace`) so a crash
       mid-save can't corrupt `config.json`.
+- [x] **Stable per-channel state**. Submix volume / mute / gain and
+      the hidden set are keyed by PipeWire `node.name` (which survives
+      a PipeWire restart), not the ephemeral numeric id. A one-shot
+      migration drops any legacy pw_id-keyed entries on load.
+- [x] **LADSPA plugin probe**. On startup the engine scans
+      `$LADSPA_PATH` + common distro paths for each effect's backing
+      `.so`; the FX dialog shows unavailable effects as "N/A" with a
+      tooltip explaining which package is missing, and Clipguard
+      refuses to enable when `fast_lookahead_limiter_1913` isn't
+      installed. No more silent fail-to-start.
 
 ### App identification
 - [x] **Flatpak / Snap / wrapper-aware app names**. Reads
@@ -62,6 +77,9 @@ dedicated stream recording device, and scenes.
       like `audio-src` trigger the deeper lookup.
 - [x] **App-routing persistence**. Routing choices are remembered per
       app name; apps stay in the panel as "(Offline)" when closed.
+- [x] **Forget offline apps**. Each offline routing row has a ✕
+      button that drops the saved entry from `app_routing` and removes
+      the row, so the panel doesn't grow forever as you try new apps.
 
 ### Packaging / install
 - [x] **`install.sh`** for Arch / CachyOS with pacman + paru/yay fallback
@@ -111,21 +129,6 @@ dedicated stream recording device, and scenes.
 - **VST3 hosting** — Wave Link runs proprietary Elgato VST3 plugins;
   WaveLinux stays on LADSPA via filter-chain.
 
-## Caveats that aren't on the backlog
-
-- Per-channel state (input gain, submix mutes) is keyed by PipeWire
-  node ID, which can change across PipeWire restarts. Moving to
-  node-name keying would persist this properly across restarts.
-- Mute state for the per-channel Monitor/Stream faders is tracked
-  inside the app and reconciled on refresh — a very fast external
-  toggle could flip state between ticks.
-- The gate effect needs `gate_1410` from `swh-plugins`; if missing, the
-  gate toggle will fail-fast and the reason lives in
-  `~/.config/wavelinux/fx-logs/gate-<channel>.log`.
-- The app polls PipeWire every 2 seconds; it doesn't subscribe to
-  PipeWire events. Fine for a desk tool, not great as a background
-  service.
-
 ## Architecture
 
 - **Language**: Python 3.11+.
@@ -141,5 +144,16 @@ dedicated stream recording device, and scenes.
   `pactl list modules / short modules / sink-inputs / sinks / short
   sinks` and `pw-dump` once per tick and threads the cached text
   through engine helpers.
+- **Event subscriber**: `pactl subscribe` runs under a `QProcess`;
+  each event nudges a 150 ms debounce. The 2 s poll is the backstop
+  when the subscriber is unavailable or misses an event.
+- **LADSPA probe**: engine scans `$LADSPA_PATH` plus the common
+  distro paths at startup and exposes an `effect_available()` helper
+  so the UI can grey out effects whose backing plugin isn't
+  installed.
+- **State keys**: all persisted per-channel state uses PipeWire
+  `node.name` (e.g. `alsa_input.pci-...`, `wavelinux_game`), which
+  survives PipeWire restarts. The ephemeral numeric id is only
+  passed to the engine for pactl calls.
 - **Config**: `~/.config/wavelinux/config.json` (written atomically).
 - **Log**: `~/.config/wavelinux/wavelinux.log`.
