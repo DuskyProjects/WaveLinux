@@ -43,6 +43,7 @@ QFrame#channelStrip {
     padding: 10px 8px;
     min-width: 160px;
     max-width: 180px;
+    min-height: 380px;
 }
 QFrame#channelStrip:hover {
     border: 1px solid rgba(0,229,255,0.2);

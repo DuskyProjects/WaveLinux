@@ -533,7 +533,7 @@ class PipeWireEngine:
         """Create a virtual sink (null-sink). Returns the sink name on success."""
         display_clean, safe_tail = self._sanitize_channel_name(display_name)
         safe_name = custom_name or f"wavelinux_{safe_tail}"
-        description = f"WaveLinux {display_clean}" if display_clean else "WaveLinux"
+        description = f"WaveLinux-{display_clean}" if display_clean else "WaveLinux"
 
         existing = self._find_module_by_arg(f"sink_name={safe_name}")
         if existing:
@@ -548,7 +548,7 @@ class PipeWireEngine:
         cmd = [
             "pactl", "load-module", "module-null-sink",
             f"sink_name={safe_name}",
-            f'sink_properties=device.description="{desc_escaped}" application.name="WaveLinux" media.class=Audio/Sink'
+            f'sink_properties=device.description="{desc_escaped}" node.description="{desc_escaped}" node.nick="{desc_escaped}" media.name="{desc_escaped}" application.name="{desc_escaped}" media.class=Audio/Sink'
         ]
         out = self._run(cmd)
         if out:
@@ -589,11 +589,11 @@ class PipeWireEngine:
 
     def create_output_mix(self, name):
         """Create a mix bus: a null-sink plus a virtual source so apps like OBS
-        can pick it up as a dedicated recording device (e.g. 'WaveLinux Stream')."""
+        can pick it up as a dedicated recording device (e.g. 'Wave Link Stream')."""
         _, safe_name = self._sanitize_channel_name(name)
         sink_name = f"wavelinux_mix_{safe_name}"
         source_name = f"wavelinux_src_{safe_name}"
-        description = f"WaveLinux {name}"
+        description = f"WaveLinux-{name}"
         desc_escaped = description.replace('"', '\\"')
 
         # 1. Sink (the thing apps play *to*).
@@ -611,7 +611,8 @@ class PipeWireEngine:
                 f'source_name={source_name}',
                 f'master={sink_name}.monitor',
                 (f'source_properties=device.description="{desc_escaped}" '
-                 f'application.name="WaveLinux" media.class=Audio/Source '
+                 f'node.description="{desc_escaped}" media.name="{desc_escaped}" '
+                 f'application.name="{desc_escaped}" media.class=Audio/Source '
                  f'device.class=sound node.nick="{desc_escaped}"'),
             ])
 
@@ -1074,8 +1075,8 @@ context.properties = {
 context.modules = [
     {{ name = libpipewire-module-filter-chain
         args = {{
-            node.description = "WaveLinux Denoise ({channel_key})"
-            media.name       = "WaveLinux Denoise ({channel_key})"
+            node.description = "WaveLinux-Denoise ({channel_key})"
+            media.name       = "WaveLinux-Denoise ({channel_key})"
             filter.graph = {{
                 nodes = [
                     {{
@@ -1262,8 +1263,8 @@ context.modules = [
 context.modules = [
     {{ name = libpipewire-module-filter-chain
         args = {{
-            node.description = "WaveLinux {effect_id} ({channel_key})"
-            media.name       = "WaveLinux {effect_id} ({channel_key})"
+            node.description = "WaveLinux-{effect_id} ({channel_key})"
+            media.name       = "WaveLinux-{effect_id} ({channel_key})"
             filter.graph = {{{filter_graph}
             }}
             capture.props = {{
