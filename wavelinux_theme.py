@@ -299,6 +299,29 @@ QPushButton#forgetBtn:disabled {
     border: 1px solid rgba(255,255,255,0.04);
 }
 
+QPushButton#reorderBtn {
+    background: transparent;
+    border: none;
+    color: #5a5a72;
+    font-size: 11px;
+    padding: 0;
+}
+QPushButton#reorderBtn:hover {
+    color: #00e5ff;
+}
+
+/* ── Peak / VU meter ── */
+QProgressBar#peakBar {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.05);
+    border-radius: 3px;
+}
+QProgressBar#peakBar::chunk {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+        stop:0 #00e5ff, stop:0.6 #7000ff, stop:0.85 #ffcc00, stop:1 #ff3366);
+    border-radius: 3px;
+}
+
 QPushButton#hideBtn {
     background: transparent;
     border: none;

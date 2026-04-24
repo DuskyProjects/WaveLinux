@@ -124,6 +124,8 @@ class PipeWireEngine:
             'compressor': ('sc4_1882',),
             'gate':       ('gate_1410',),
             'limiter':    ('fast_lookahead_limiter_1913',),
+            # highpass uses PipeWire's builtin biquad — always available.
+            'highpass':   (),
         }
         needed = requirements.get(effect_id, ())
         return all(self.ladspa_plugin_available(n) for n in needed)
@@ -949,6 +951,81 @@ class PipeWireEngine:
     def is_clipguard_active(self, mix_name):
         return self.is_effect_active(f'mix_{mix_name.lower()}', 'limiter')
 
+    # ── Card / profile switching ───────────────────────────────────
+
+    def list_cards(self):
+        """Return [{name, description, active_profile, profiles:[{name,description,available}]}]
+        for each ALSA card PipeWire knows about."""
+        out = self._run(['pactl', 'list', 'cards'])
+        if not out:
+            return []
+        cards = []
+        curr = None
+        section = None  # 'profiles' | None
+        for raw in out.splitlines():
+            line = raw.rstrip()
+            stripped = line.strip()
+            if stripped.startswith('Card #'):
+                if curr is not None:
+                    cards.append(curr)
+                curr = {
+                    'name': '', 'description': '', 'active_profile': '',
+                    'profiles': [],
+                }
+                section = None
+                continue
+            if curr is None:
+                continue
+            if stripped.startswith('Name:'):
+                curr['name'] = stripped.split(':', 1)[1].strip()
+            elif stripped.startswith('Active Profile:'):
+                curr['active_profile'] = stripped.split(':', 1)[1].strip()
+            elif stripped.startswith('device.description ='):
+                curr['description'] = stripped.split('=', 1)[1].strip().strip('"')
+            elif stripped.startswith('Profiles:'):
+                section = 'profiles'
+            elif section == 'profiles' and line.startswith('\t\t'):
+                # "\t\tprofile_name: Friendly Description (sinks: 1, sources: 1, priority: 7538, available: yes)"
+                entry = stripped
+                if ':' in entry:
+                    pname, rest = entry.split(':', 1)
+                    avail = 'available: yes' in rest or 'available: unknown' in rest
+                    # Everything before the final "(...)" block is the description.
+                    desc = rest.strip()
+                    lparen = desc.rfind('(')
+                    if lparen >= 0:
+                        desc = desc[:lparen].strip()
+                    curr['profiles'].append({
+                        'name': pname.strip(),
+                        'description': desc or pname.strip(),
+                        'available': avail,
+                    })
+            elif stripped.startswith(('Ports:', 'Sinks:', 'Sources:', 'Properties:')):
+                section = None
+        if curr is not None:
+            cards.append(curr)
+        return cards
+
+    def set_card_profile(self, card_name, profile_name):
+        return self._run(['pactl', 'set-card-profile', card_name, profile_name]) is not None or True
+
+    # ── Rename ─────────────────────────────────────────────────────
+
+    def rename_virtual_sink(self, old_sink_name, new_display_name):
+        """Destroy the user virtual sink and re-create it under a new name.
+        Returns the new sink_name (e.g. 'wavelinux_voice_chat') or None."""
+        if not old_sink_name.startswith('wavelinux_'):
+            return None
+        display_clean, safe_tail = self._sanitize_channel_name(new_display_name)
+        new_sink_name = f"wavelinux_{safe_tail}"
+        if new_sink_name == old_sink_name:
+            return old_sink_name
+        # Unload the old sink (drops its loopbacks too).
+        self.remove_virtual_sink(old_sink_name)
+        if self.create_virtual_sink(new_display_name) is None:
+            return None
+        return new_sink_name
+
     # ── Effects / RNNoise ──────────────────────────────────────────
 
     # Boilerplate that keeps spawned `pipewire -c` processes from trying to
@@ -987,10 +1064,12 @@ context.properties = {
         logging.error(f"FX process for {key} exited immediately; see {log_path}")
         return False
 
-    def start_rnnoise(self, channel_key='default'):
+    def start_rnnoise(self, channel_key='default', params=None):
         config_dir = os.path.expanduser('~/.config/pipewire')
         os.makedirs(config_dir, exist_ok=True)
         config_path = os.path.join(config_dir, f'wavelinux-rnnoise-{channel_key}.conf')
+        values = self._resolved_params('rnnoise', params)
+        control_block = self._render_control_block(values)
         config = self._FX_PREAMBLE + f"""
 context.modules = [
     {{ name = libpipewire-module-filter-chain
@@ -1004,9 +1083,7 @@ context.modules = [
                         name   = rnnoise
                         plugin = librnnoise_ladspa
                         label  = noise_suppressor_mono
-                        control = {{
-                            "VAD Threshold (%)" = 50.0
-                        }}
+{control_block}
                     }}
                 ]
             }}
@@ -1054,6 +1131,8 @@ context.modules = [
         return [
             {'id': 'rnnoise', 'name': 'Noise Suppression', 'icon': '🎙️',
              'desc': 'AI-powered background noise removal'},
+            {'id': 'highpass', 'name': 'High-Pass Filter', 'icon': '🎵',
+             'desc': 'Roll off low rumble (fans, handling noise)'},
             {'id': 'compressor', 'name': 'Compressor', 'icon': '📉',
              'desc': 'Smooth out loud/quiet differences'},
             {'id': 'gate', 'name': 'Noise Gate', 'icon': '🚪',
@@ -1062,67 +1141,117 @@ context.modules = [
              'desc': 'Prevent audio clipping'},
         ]
 
-    def apply_effect(self, channel_key, effect_id):
-        """Apply a built-in effect to a channel via filter-chain."""
+    # Parameter descriptors for the FX UI. Each entry is
+    # (pactl_control_key, display_label, min, max, default, suffix).
+    _EFFECT_PARAMS = {
+        'rnnoise': [
+            ('VAD Threshold (%)', 'VAD Threshold', 0.0, 100.0, 50.0, '%'),
+        ],
+        'highpass': [
+            ('Freq', 'Cutoff', 20.0, 500.0, 80.0, ' Hz'),
+        ],
+        'compressor': [
+            ('threshold_db', 'Threshold', -60.0, 0.0, -20.0, ' dB'),
+            ('ratio', 'Ratio', 1.0, 20.0, 4.0, ':1'),
+            ('attack_ms', 'Attack', 0.1, 200.0, 5.0, ' ms'),
+            ('release_ms', 'Release', 5.0, 1000.0, 100.0, ' ms'),
+            ('makeup_gain_db', 'Makeup', 0.0, 24.0, 0.0, ' dB'),
+        ],
+        'gate': [
+            ('Threshold (dB)', 'Threshold', -80.0, 0.0, -40.0, ' dB'),
+            ('Attack (ms)', 'Attack', 0.1, 100.0, 2.5, ' ms'),
+            ('Hold (ms)', 'Hold', 0.0, 500.0, 10.0, ' ms'),
+            ('Decay (ms)', 'Release', 10.0, 2000.0, 200.0, ' ms'),
+            ('Range (dB)', 'Range', -80.0, 0.0, -40.0, ' dB'),
+        ],
+        'limiter': [
+            ('Input gain (dB)', 'Input Gain', -20.0, 20.0, 0.0, ' dB'),
+            ('Limit (dB)', 'Ceiling', -20.0, 0.0, -1.0, ' dB'),
+            ('Release time (s)', 'Release', 0.01, 2.0, 0.1, ' s'),
+        ],
+    }
+
+    @classmethod
+    def get_effect_params(cls, effect_id):
+        return list(cls._EFFECT_PARAMS.get(effect_id, []))
+
+    def _resolved_params(self, effect_id, overrides):
+        """Merge user overrides on top of defaults from _EFFECT_PARAMS."""
+        out = {key: default for (key, _l, _mn, _mx, default, _u)
+               in self._EFFECT_PARAMS.get(effect_id, [])}
+        if overrides:
+            for k, v in overrides.items():
+                if k in out:
+                    out[k] = float(v)
+        return out
+
+    @staticmethod
+    def _render_control_block(params):
+        """Emit filter-chain control block: `control = { "Key" = val ... }`."""
+        lines = []
+        for k, v in params.items():
+            lines.append(f'                            "{k}" = {float(v):.3f}')
+        body = "\n".join(lines)
+        return f"                        control = {{\n{body}\n                        }}"
+
+    def apply_effect(self, channel_key, effect_id, params=None):
+        """Apply a built-in effect to a channel via filter-chain.
+        `params` overrides individual control values (see _EFFECT_PARAMS)."""
+        # rnnoise keeps its dedicated config path because it's the default mic
+        # effect and we want its conf file to stay predictable.
         if effect_id == 'rnnoise':
-            return self.start_rnnoise(channel_key)
-        # For other effects, we create PipeWire filter chains
+            return self.start_rnnoise(channel_key, params=params)
+
         config_dir = os.path.expanduser('~/.config/pipewire')
         os.makedirs(config_dir, exist_ok=True)
+        values = self._resolved_params(effect_id, params)
 
-        if effect_id == 'gate':
-            # gate_1410 ships in swh-plugins (which install.sh already installs).
-            filter_graph = """
+        if effect_id == 'highpass':
+            # PipeWire's native biquad — no LADSPA needed.
+            filter_graph = f"""
                 nodes = [
-                    {
+                    {{
+                        type  = builtin
+                        name  = highpass
+                        label = bq_highpass
+{self._render_control_block(values)}
+                    }}
+                ]
+"""
+        elif effect_id == 'gate':
+            filter_graph = f"""
+                nodes = [
+                    {{
                         type  = ladspa
                         name  = gate
                         plugin = gate_1410
                         label = gate
-                        control = {
-                            "LF key filter (Hz)" = 100.0
-                            "HF key filter (Hz)" = 10000.0
-                            "Threshold (dB)" = -40.0
-                            "Attack (ms)" = 2.5
-                            "Hold (ms)" = 10.0
-                            "Decay (ms)" = 200.0
-                            "Range (dB)" = -40.0
-                        }
-                    }
+{self._render_control_block(values)}
+                    }}
                 ]
 """
         elif effect_id == 'compressor':
-            filter_graph = """
+            filter_graph = f"""
                 nodes = [
-                    {
+                    {{
                         type  = ladspa
                         name  = compressor
                         plugin = sc4_1882
                         label = sc4
-                        control = {
-                            "threshold_db" = -20.0
-                            "ratio" = 4.0
-                            "attack_ms" = 5.0
-                            "release_ms" = 100.0
-                            "makeup_gain_db" = 0.0
-                        }
-                    }
+{self._render_control_block(values)}
+                    }}
                 ]
 """
         elif effect_id == 'limiter':
-            filter_graph = """
+            filter_graph = f"""
                 nodes = [
-                    {
+                    {{
                         type  = ladspa
                         name  = limiter
                         plugin = fast_lookahead_limiter_1913
                         label = fastLookaheadLimiter
-                        control = {
-                            "Input gain (dB)" = 0.0
-                            "Limit (dB)" = -1.0
-                            "Release time (s)" = 0.1
-                        }
-                    }
+{self._render_control_block(values)}
+                    }}
                 ]
 """
         else:

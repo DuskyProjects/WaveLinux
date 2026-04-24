@@ -11,40 +11,45 @@ No daemon, no system service.
 
 - Creates virtual sinks (Game / Music / Browser / SFX by default) that
   apps can play to.
-- Creates two master buses — **Monitor** (what you hear) and **Stream**
-  (what OBS records) — each with its own volume and its own hardware
-  output, just like Elgato Wave Link.
-- Exposes the Stream bus as a named recording source (`WaveLinux Stream`)
-  so OBS picks it up from the input device list directly, instead of
-  "Monitor of Null Sink N".
-- Three sliders per channel: **Input Gain** (pre-fader), **Monitor send**
-  (what you hear), **Stream send** (what your audience hears). Wave
-  Link's core mental model.
-- Per-channel **Solo** — mutes every other channel in Monitor
-  temporarily so you can hear one source in isolation, and un-solo
-  restores the previous mute layout.
-- **Clipguard** — a master-bus limiter on Stream so your broadcast
-  doesn't clip when something gets loud.
-- **Scenes** — save the current routing/volumes/hidden channels under a
-  name; flip between setups for gaming, streaming, voice calls, etc.
-- Per-app routing — each running app shows up with its own sink picker,
-  and the choice persists even when the app is closed.
-- Flatpak/Snap-aware app identification via `FLATPAK_ID`,
-  `.flatpak-info`, `SNAP_INSTANCE_NAME`, cgroup scopes, and a walk up
-  the `bwrap`/`snap-confine` wrapper chain, so things stop showing up
-  as "audio-src".
-- Optional RNNoise noise suppression on mic channels via PipeWire's
-  filter-chain (spawned as a client — it will not try to take over your
-  audio system).
-- An **Emergency Reset** button that unloads every WaveLinux-owned
-  PipeWire module, for when something has wedged.
+- Two master buses — **Monitor** (what you hear) and **Stream** (what
+  OBS records) — each with its own volume, hardware output, and
+  Clipguard-style limiter.
+- The Stream bus is exposed as a dedicated recording source
+  (`WaveLinux Stream`) so OBS picks it up directly from the input list.
+- **Three sliders per channel**: Input Gain (pre-fader), Monitor send,
+  Stream send — Wave Link's core mental model.
+- Per-channel **Solo** (mutes every other channel in Monitor),
+  **Rename** (in-place, state migrates), and **Reorder** (`◀` / `▶`
+  buttons, persistent).
+- **Per-channel peak meters** driven by a `parec` subprocess each,
+  updating at ~20 Hz with a release envelope so they don't flicker.
+- **FX with parameters** — rnnoise (VAD), high-pass (cutoff),
+  compressor (threshold/ratio/attack/release/makeup), gate, limiter.
+  High-pass uses PipeWire's built-in biquad; the rest are LADSPA via
+  filter-chain. Parameter sliders re-apply the effect live.
+- **Scenes** — save / load / delete named snapshots of the whole
+  setup. `Ctrl+1`..`Ctrl+9` jumps to the first nine in sorted order.
+- **Sound Card Profiles** dialog — switch ALSA profiles (Analog Stereo
+  vs Pro Audio, etc.) from the header without dropping into
+  pavucontrol.
+- Per-app routing with Flatpak / Snap / wrapper-aware app
+  identification. Apps stay in the panel as "(Offline)" when closed;
+  click ✕ to forget a routing.
+- **Autostart** toggle in the tray menu (writes
+  `~/.config/autostart/wavelinux.desktop`).
+- **Hot-plug tray notifications** when a device appears or goes away.
+- **Emergency Reset** unloads every WaveLinux-owned PipeWire module
+  when something wedges.
 
 ## Install
 
 Tested on CachyOS / Arch with KDE. Other distros will probably work —
-you need `pipewire`, `pipewire-pulse`, `wireplumber`, `python` and
-`python-pyqt6`, plus `swh-plugins` for the compressor/gate/limiter and
-the AUR's `noise-suppression-for-voice` for RNNoise.
+you need `pipewire`, `pipewire-pulse`, `wireplumber`, `python`,
+`python-pyqt6`, `libpulse` (for `pactl` and `parec`), plus
+`swh-plugins` for the compressor / gate / limiter and the AUR's
+`noise-suppression-for-voice` for RNNoise.
+
+From source:
 
 ```bash
 git clone https://github.com/excalprimeacct-gif/WaveLinux.git
@@ -52,7 +57,15 @@ cd WaveLinux
 ./install.sh
 ```
 
-Or just `python3 main.py` from the repo.
+Or via the bundled AUR PKGBUILD:
+
+```bash
+git clone https://github.com/excalprimeacct-gif/WaveLinux.git
+cd WaveLinux
+makepkg -si
+```
+
+You can also run straight from the repo with `python3 main.py`.
 
 ## Config and logs
 
