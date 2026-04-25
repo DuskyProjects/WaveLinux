@@ -3,15 +3,19 @@
 
 import json
 import logging
+import shutil
+import subprocess
 import sys
 import os
 import re
+import time
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QSlider, QPushButton, QFrame, QScrollArea, QDialog,
     QLineEdit, QDialogButtonBox, QComboBox, QMessageBox, QSystemTrayIcon,
-    QMenu, QInputDialog, QProgressBar, QSizePolicy
+    QMenu, QInputDialog, QProgressBar, QSizePolicy, QTabWidget,
+    QSpinBox, QCheckBox
 )
 from PyQt6.QtCore import Qt, QTimer, QLockFile, QProcess, pyqtSignal, QObject
 from PyQt6.QtGui import QFont, QIcon, QAction
@@ -36,9 +40,9 @@ class MeterWorker(QObject):
         self.source_name = source_name
         self._proc = None
         self._buf = bytearray()
-        # Emit at most ~20 Hz so we don't spam the UI. parec is already
-        # chunked by the PulseAudio bridge.
-        self._sample_bytes = 48000 * 2 // 20   # 50 ms of s16 mono at 48 kHz
+        # ~40 Hz updates (25 ms window). Smooth enough for a proper VU feel
+        # without spamming the UI; parec's own chunking keeps this cheap.
+        self._sample_bytes = 48000 * 2 // 40
         self._last_peak = 0.0
 
     def start(self):
@@ -53,7 +57,7 @@ class MeterWorker(QObject):
             "--format=s16le",
             "--channels=1",
             "--raw",
-            "--latency-msec=50",
+            "--latency-msec=25",
         ]
         self._proc.start("parec", args)
 
@@ -278,44 +282,78 @@ class FXSelectionDialog(QDialog):
         self._toggle_btns[fid] = toggle_btn
         vlay.addLayout(header)
 
-        # Parameter panel (shown only when the effect is ON).
+        # Help text (plain-English description of what this effect does)
+        # and preset buttons live together in the expanding panel.
         params = self.engine.get_effect_params(fid)
-        if params:
+        help_text = self.engine.get_effect_help(fid)
+        presets = self.engine.get_effect_presets(fid)
+
+        if params or help_text or presets:
             param_frame = QFrame()
             param_frame.setStyleSheet("background: transparent;")
             pf_layout = QVBoxLayout(param_frame)
-            pf_layout.setContentsMargins(40, 6, 4, 2)
-            pf_layout.setSpacing(4)
-            stored = self._current_params(fid)
+            pf_layout.setContentsMargins(16, 6, 4, 2)
+            pf_layout.setSpacing(6)
 
-            self._param_sliders[fid] = {}
-            for key, label, pmin, pmax, default, suffix in params:
-                row = QHBoxLayout()
-                lbl = QLabel(label)
-                lbl.setStyleSheet("color: #a0a0b8; font-size: 11px; min-width: 80px;")
-                row.addWidget(lbl)
-
-                slider = QSlider(Qt.Orientation.Horizontal)
-                slider.setRange(0, 1000)
-                val = float(stored.get(key, default))
-                frac = 0.0 if pmax == pmin else (val - pmin) / (pmax - pmin)
-                slider.setValue(max(0, min(1000, int(round(frac * 1000)))))
-                slider.setProperty("pmin", pmin)
-                slider.setProperty("pmax", pmax)
-                slider.setProperty("pkey", key)
-                slider.setProperty("psuffix", suffix)
-                row.addWidget(slider, 1)
-
-                value_lbl = QLabel(self._fmt_value(val, suffix))
-                value_lbl.setStyleSheet("color: #e0e0ee; font-size: 11px; min-width: 64px;")
-                value_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                row.addWidget(value_lbl)
-
-                slider.valueChanged.connect(
-                    lambda v, fid=fid, s=slider, lbl=value_lbl: self._on_param_changed(fid, s, lbl)
+            if help_text:
+                help_lbl = QLabel(help_text)
+                help_lbl.setObjectName("effectHelp")
+                help_lbl.setWordWrap(True)
+                help_lbl.setStyleSheet(
+                    "color: #8b8b9e; font-size: 11px;"
+                    " background: rgba(0,229,255,0.04);"
+                    " border-left: 2px solid rgba(0,229,255,0.3);"
+                    " padding: 6px 8px; border-radius: 4px;"
                 )
-                self._param_sliders[fid][key] = (slider, value_lbl)
-                pf_layout.addLayout(row)
+                pf_layout.addWidget(help_lbl)
+
+            if presets:
+                preset_row = QHBoxLayout()
+                preset_row.setSpacing(6)
+                label_lbl = QLabel("Presets:")
+                label_lbl.setStyleSheet("color: #6b6b82; font-size: 10px; font-weight: 700;")
+                preset_row.addWidget(label_lbl)
+                for pname, pvalues in presets:
+                    btn = QPushButton(pname)
+                    btn.setObjectName("presetBtn")
+                    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    btn.clicked.connect(
+                        lambda checked, fid=fid, pv=pvalues: self._apply_preset(fid, pv)
+                    )
+                    preset_row.addWidget(btn)
+                preset_row.addStretch()
+                pf_layout.addLayout(preset_row)
+
+            if params:
+                stored = self._current_params(fid)
+                self._param_sliders[fid] = {}
+                for key, label, pmin, pmax, default, suffix in params:
+                    row = QHBoxLayout()
+                    lbl = QLabel(label)
+                    lbl.setStyleSheet("color: #a0a0b8; font-size: 11px; min-width: 80px;")
+                    row.addWidget(lbl)
+
+                    slider = QSlider(Qt.Orientation.Horizontal)
+                    slider.setRange(0, 1000)
+                    val = float(stored.get(key, default))
+                    frac = 0.0 if pmax == pmin else (val - pmin) / (pmax - pmin)
+                    slider.setValue(max(0, min(1000, int(round(frac * 1000)))))
+                    slider.setProperty("pmin", pmin)
+                    slider.setProperty("pmax", pmax)
+                    slider.setProperty("pkey", key)
+                    slider.setProperty("psuffix", suffix)
+                    row.addWidget(slider, 1)
+
+                    value_lbl = QLabel(self._fmt_value(val, suffix))
+                    value_lbl.setStyleSheet("color: #e0e0ee; font-size: 11px; min-width: 64px;")
+                    value_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    row.addWidget(value_lbl)
+
+                    slider.valueChanged.connect(
+                        lambda v, fid=fid, s=slider, lbl=value_lbl: self._on_param_changed(fid, s, lbl)
+                    )
+                    self._param_sliders[fid][key] = (slider, value_lbl)
+                    pf_layout.addLayout(row)
 
             param_frame.setVisible(active and available)
             self._param_frames[fid] = param_frame
@@ -341,10 +379,15 @@ class FXSelectionDialog(QDialog):
         ep = p.effect_params.get(self.node_name, {}).get(effect_id, {})
         return dict(ep)
 
-    def _save_params(self, effect_id, params):
+    def _main_window(self):
+        """Walk up to the WaveLinuxWindow (only place that has effect_params)."""
         p = self.parent()
         while p is not None and not hasattr(p, 'effect_params'):
             p = p.parent()
+        return p
+
+    def _save_params(self, effect_id, params):
+        p = self._main_window()
         if p is None:
             return
         p.effect_params.setdefault(self.node_name, {})[effect_id] = dict(params)
@@ -352,6 +395,24 @@ class FXSelectionDialog(QDialog):
             p.schedule_save()
         elif hasattr(p, 'save_config'):
             p.save_config()
+
+    def _set_active(self, effect_id, enabled):
+        """Remember which effects the user has turned on for this channel,
+        keyed by the stable PipeWire node.name so they survive restarts."""
+        p = self._main_window()
+        if p is None:
+            return
+        lst = p.active_effects.setdefault(self.node_name, [])
+        if enabled:
+            if effect_id not in lst:
+                lst.append(effect_id)
+        else:
+            if effect_id in lst:
+                lst.remove(effect_id)
+            if not lst:
+                p.active_effects.pop(self.node_name, None)
+        if hasattr(p, 'schedule_save'):
+            p.schedule_save()
 
     def _collect_params(self, effect_id):
         out = {}
@@ -372,13 +433,37 @@ class FXSelectionDialog(QDialog):
             params = self._collect_params(effect_id)
             self.engine.apply_effect(self.node_id, effect_id, params=params or None)
             self._save_params(effect_id, params)
+            self._set_active(effect_id, True)
             if frame:
                 frame.setVisible(True)
         else:
             btn.setText("OFF")
             self.engine.remove_effect(self.node_id, effect_id)
+            self._set_active(effect_id, False)
             if frame:
                 frame.setVisible(False)
+
+    def _apply_preset(self, effect_id, values):
+        """A preset sets every slider in the effect panel and re-applies
+        the effect live if it's already on."""
+        sliders = self._param_sliders.get(effect_id, {})
+        for key, (slider, value_lbl) in sliders.items():
+            if key not in values:
+                continue
+            pmin = float(slider.property("pmin"))
+            pmax = float(slider.property("pmax"))
+            target = float(values[key])
+            frac = 0.0 if pmax == pmin else (target - pmin) / (pmax - pmin)
+            slider.blockSignals(True)
+            slider.setValue(max(0, min(1000, int(round(frac * 1000)))))
+            slider.blockSignals(False)
+            suffix = slider.property("psuffix") or ""
+            value_lbl.setText(self._fmt_value(target, suffix))
+        params = self._collect_params(effect_id)
+        self._save_params(effect_id, params)
+        if self.engine.is_effect_active(self.node_id, effect_id):
+            self.engine.remove_effect(self.node_id, effect_id)
+            self.engine.apply_effect(self.node_id, effect_id, params=params)
 
     def _on_param_changed(self, effect_id, slider, value_lbl):
         pmin = float(slider.property("pmin"))
@@ -489,7 +574,7 @@ class ChannelStrip(QFrame):
         self.mon_vol_lbl.setObjectName("volumeLabel")
         mon_col.addWidget(self.mon_vol_lbl)
         self.mon_slider = QSlider(Qt.Orientation.Vertical)
-        self.mon_slider.setRange(0, 150)
+        self.mon_slider.setRange(0, 100)
         self.mon_slider.setValue(100)
         self.mon_slider.setMinimumHeight(140)
         self.mon_slider.valueChanged.connect(self._on_mon_vol)
@@ -513,7 +598,7 @@ class ChannelStrip(QFrame):
         self.str_vol_lbl.setObjectName("volumeLabel")
         str_col.addWidget(self.str_vol_lbl)
         self.str_slider = QSlider(Qt.Orientation.Vertical)
-        self.str_slider.setRange(0, 150)
+        self.str_slider.setRange(0, 100)
         self.str_slider.setValue(100)
         self.str_slider.setMinimumHeight(140)
         self.str_slider.valueChanged.connect(self._on_str_vol)
@@ -632,6 +717,12 @@ class ChannelStrip(QFrame):
         fx_act = menu.addAction("✨ Effects…")
         fx_act.triggered.connect(self._on_fx_toggle)
 
+        # Optional: VST / LV2 hosting via Carla. Shown only if `carla` is
+        # on $PATH; otherwise we'd be advertising broken functionality.
+        if shutil.which("carla"):
+            vst_act = menu.addAction("🎹 Open VST plugin (Carla)…")
+            vst_act.triggered.connect(self._launch_carla)
+
         menu.addSeparator()
 
         move_left = menu.addAction("◀ Move Left")
@@ -657,6 +748,21 @@ class ChannelStrip(QFrame):
         win = self.window()
         if hasattr(win, "_remove_sink") and self.node_name:
             win._remove_sink(self.node_name)
+
+    def _launch_carla(self):
+        """Spawn Carla so the user can host a VST/VST3/LV2 plugin and
+        route it into this channel. We don't supervise the Carla process;
+        the user wires its input/output in Carla itself. This keeps us
+        out of the business of hosting proprietary plugin formats."""
+        try:
+            subprocess.Popen(["carla"])
+        except FileNotFoundError:
+            QMessageBox.information(
+                self, "Carla not found",
+                "Install Carla (e.g. `sudo pacman -S carla`) to host VST3 / "
+                "LV2 plugins. WaveLinux doesn't host VST3 directly — it "
+                "bridges to Carla, which does."
+            )
 
     def _request_hide(self):
         """Request parent window to hide this channel."""
@@ -839,7 +945,7 @@ class AppRoutingRow(QWidget):
                     pretty = name.replace('wavelinux_', '').replace('_', ' ').title()
                     display = f"{pretty} ⭐"
                 else:
-                    display = PipeWireEngine.friendly_name(name)
+                    display = self.engine.display_name_for_sink(name)
                 self.combo.addItem(display, name)
 
             idx = self.combo.findData(current_sink or curr_data)
@@ -872,12 +978,16 @@ class WaveLinuxWindow(QMainWindow):
         self.app_widgets = {}       # app_index -> AppRoutingRow
         self.submix_state = {}      # "node_id_MixName" -> {'vol': 1.0, 'mute': False}
         self.app_routing = {}       # app_name -> sink_name (persistent)
+        self.app_last_seen = {}     # app_name -> epoch seconds (for stale prune)
+        self.app_prune_days = 14    # forget routing entries not seen in this many days
         self.virtual_channels = []  # list of names
         # All user-facing state is keyed by PipeWire node.name (stable across
         # PipeWire restarts); pw_id is only used when talking to the engine.
         self.hidden_nodes = set()      # {node.name}
         self.show_hidden = False
         self.effect_params = {}        # node.name -> effect_id -> {param_key: value}
+        self.active_effects = {}       # node.name -> [effect_id, ...] — restored each run
+        self._effects_applied = set()  # node.name keys we've already reconciled this session
         self.channel_order = []        # [node.name, ...] — persistent UI order
         self.meters = {}               # pw_id -> MeterWorker
         self._known_node_names = set() # for hot-plug detection
@@ -910,8 +1020,127 @@ class WaveLinuxWindow(QMainWindow):
 
     def _open_settings(self):
         self._refresh_hidden_list()
+        self._refresh_advanced_tab()
         self.settings_dialog.show()
         self.settings_dialog.raise_()
+
+    def _build_advanced_tab(self):
+        """Fine-grained knobs that most users never need. Each setting is
+        applied immediately and persisted to config.json."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(12)
+
+        def _heading(text):
+            lbl = QLabel(text)
+            lbl.setObjectName("sectionLabel")
+            layout.addWidget(lbl)
+
+        # App prune cutoff
+        _heading("APP ROUTING")
+        prune_row = QHBoxLayout()
+        prune_row.addWidget(QLabel("Forget offline apps after (days):"))
+        self.prune_spin = QSpinBox()
+        self.prune_spin.setRange(1, 365)
+        self.prune_spin.setValue(self.app_prune_days)
+        self.prune_spin.valueChanged.connect(self._on_prune_days_change)
+        prune_row.addWidget(self.prune_spin)
+        prune_row.addStretch()
+        layout.addLayout(prune_row)
+
+        forget_all_btn = QPushButton("Forget all offline apps now")
+        forget_all_btn.setObjectName("removeBtn")
+        forget_all_btn.clicked.connect(self._forget_all_offline)
+        layout.addWidget(forget_all_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        # Startup / tray
+        _heading("STARTUP & TRAY")
+        self.autostart_check = QCheckBox("Start WaveLinux at login")
+        self.autostart_check.setChecked(self.is_autostart_enabled())
+        self.autostart_check.toggled.connect(self.set_autostart)
+        layout.addWidget(self.autostart_check)
+
+        profiles_btn = QPushButton("Sound Card Profiles…")
+        profiles_btn.setObjectName("showHiddenBtn")
+        profiles_btn.clicked.connect(self._open_card_profiles)
+        layout.addWidget(profiles_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        # LADSPA / diagnostics
+        _heading("DIAGNOSTICS")
+        probed = len(self.engine.ladspa_plugins)
+        ladspa_lbl = QLabel(
+            f"LADSPA plugins detected: {probed}\n"
+            f"Paths searched: $LADSPA_PATH + /usr/lib/ladspa, /usr/lib64/ladspa, "
+            f"/usr/local/lib/ladspa, /usr/lib/x86_64-linux-gnu/ladspa, "
+            f"~/.ladspa, ~/.local/lib/ladspa."
+        )
+        ladspa_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
+        ladspa_lbl.setWordWrap(True)
+        layout.addWidget(ladspa_lbl)
+
+        emergency_btn = QPushButton("Emergency Reset (unload all WaveLinux modules)")
+        emergency_btn.setObjectName("removeBtn")
+        emergency_btn.clicked.connect(self._on_emergency_reset)
+        layout.addWidget(emergency_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        layout.addStretch(1)
+        return tab
+
+    def _refresh_advanced_tab(self):
+        # Called when the dialog opens so values reflect any recent change.
+        if hasattr(self, 'prune_spin'):
+            self.prune_spin.blockSignals(True)
+            self.prune_spin.setValue(self.app_prune_days)
+            self.prune_spin.blockSignals(False)
+        if hasattr(self, 'autostart_check'):
+            self.autostart_check.blockSignals(True)
+            self.autostart_check.setChecked(self.is_autostart_enabled())
+            self.autostart_check.blockSignals(False)
+
+    def _on_prune_days_change(self, value):
+        self.app_prune_days = int(value)
+        self.schedule_save()
+
+    def _forget_all_offline(self):
+        """One-shot: drop every app_routing entry whose app isn't currently
+        making sound. Refreshes the panel immediately."""
+        active_names = {name for name in self.app_widgets
+                        if self.app_widgets[name]._active_indices}
+        to_forget = [n for n in list(self.app_routing.keys()) if n not in active_names]
+        if not to_forget:
+            QMessageBox.information(self.settings_dialog, "Forget offline apps",
+                                    "No offline apps to forget.")
+            return
+        yn = QMessageBox.question(
+            self.settings_dialog, "Forget offline apps",
+            f"Drop saved routing for {len(to_forget)} offline app(s)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if yn != QMessageBox.StandardButton.Yes:
+            return
+        for name in to_forget:
+            self.app_routing.pop(name, None)
+            self.app_last_seen.pop(name, None)
+            widget = self.app_widgets.pop(name, None)
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self.save_config()
+        self._refresh()
+
+    def _on_emergency_reset(self):
+        yn = QMessageBox.warning(
+            self.settings_dialog, "Emergency Reset",
+            "Unload ALL WaveLinux audio modules and rebuild from config? "
+            "Use this if your audio has wedged.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if yn == QMessageBox.StandardButton.Yes:
+            self.engine.full_audio_reset()
+            self._effects_applied.clear()
+            self.load_config()
+            self._refresh()
 
     def _refresh_hidden_list(self):
         """Rebuild the hidden channels list in the Settings dialog."""
@@ -935,9 +1164,11 @@ class WaveLinuxWindow(QMainWindow):
             lbl.setStyleSheet("color: #e0e0ee; font-size: 12px;")
             row.addWidget(lbl, 1)
 
-            unhide_btn = QPushButton("👁 Show")
+            unhide_btn = QPushButton("👁  Show")
             unhide_btn.setObjectName("addBtn")
-            unhide_btn.setFixedHeight(28)
+            unhide_btn.setMinimumWidth(96)
+            unhide_btn.setMinimumHeight(30)
+            unhide_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             unhide_btn.clicked.connect(lambda checked, nn=node_name: self._unhide_from_settings(nn))
             row.addWidget(unhide_btn)
 
@@ -1036,13 +1267,25 @@ class WaveLinuxWindow(QMainWindow):
         input_lbl.setObjectName("sectionLabel")
         body.addWidget(input_lbl)
 
-        # Inputs Area
+        # Inputs area — wrapped in a horizontal scroll so the strips stay
+        # usable below 1200 px window width. The inner widget keeps its
+        # natural sizeHint (strip count × ~160 px) instead of being
+        # squashed by the scroll area, which is why `setWidgetResizable`
+        # is False here.
+        self.inputs_scroll = QScrollArea()
+        self.inputs_scroll.setObjectName("inputsScroll")
+        self.inputs_scroll.setWidgetResizable(False)
+        self.inputs_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.inputs_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.inputs_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.inputs_container = QWidget()
+        self.inputs_container.setObjectName("inputsContainer")
         self.input_layout = QHBoxLayout(self.inputs_container)
         self.input_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.input_layout.setContentsMargins(4, 4, 4, 4)
         self.input_layout.setSpacing(10)
-        
-        body.addWidget(self.inputs_container, 1)
+        self.inputs_scroll.setWidget(self.inputs_container)
+        body.addWidget(self.inputs_scroll, 1)
 
         root.addLayout(body, 1)
 
@@ -1126,45 +1369,52 @@ class WaveLinuxWindow(QMainWindow):
 
         bottom_container.addWidget(out_frame, 1)
 
-        # App Routing Dialog (Settings)
+        # Settings dialog — tabbed (Apps / Hidden / Advanced).
         self.settings_dialog = QDialog(self)
-        self.settings_dialog.setWindowTitle("Settings - App Routing")
-        self.settings_dialog.setMinimumSize(600, 400)
+        self.settings_dialog.setWindowTitle("WaveLinux Settings")
+        self.settings_dialog.setMinimumSize(640, 480)
         self.settings_dialog.setStyleSheet(STYLESHEET)
-        
         sd_layout = QVBoxLayout(self.settings_dialog)
-        
+        sd_layout.setContentsMargins(16, 16, 16, 16)
+        tabs = QTabWidget(self.settings_dialog)
+        sd_layout.addWidget(tabs)
+
+        # — Apps tab —
+        apps_tab = QWidget()
+        apps_layout = QVBoxLayout(apps_tab)
+        apps_layout.setContentsMargins(8, 8, 8, 8)
         r_title = QLabel("APP ROUTING")
         r_title.setObjectName("sectionLabel")
-        sd_layout.addWidget(r_title)
-        sd_layout.addSpacing(10)
-
+        apps_layout.addWidget(r_title)
         self.routing_scroll = QScrollArea()
         self.routing_scroll.setWidgetResizable(True)
         self.routing_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.routing_scroll.setStyleSheet("background: transparent;")
-        
         self.routing_container = QWidget()
         self.routing_layout = QVBoxLayout(self.routing_container)
         self.routing_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.routing_layout.setContentsMargins(0, 0, 0, 0)
-        
         self.routing_scroll.setWidget(self.routing_container)
-        sd_layout.addWidget(self.routing_scroll, 1)
+        apps_layout.addWidget(self.routing_scroll, 1)
+        tabs.addTab(apps_tab, "Apps")
 
-        # Hidden Channels section
-        sd_layout.addSpacing(16)
+        # — Hidden channels tab —
+        hidden_tab = QWidget()
+        hidden_layout = QVBoxLayout(hidden_tab)
+        hidden_layout.setContentsMargins(8, 8, 8, 8)
         hidden_title = QLabel("HIDDEN CHANNELS")
         hidden_title.setObjectName("sectionLabel")
-        sd_layout.addWidget(hidden_title)
-        sd_layout.addSpacing(6)
-
+        hidden_layout.addWidget(hidden_title)
         self.hidden_list_container = QWidget()
         self.hidden_list_layout = QVBoxLayout(self.hidden_list_container)
         self.hidden_list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.hidden_list_layout.setContentsMargins(0, 0, 0, 0)
         self.hidden_list_layout.setSpacing(4)
-        sd_layout.addWidget(self.hidden_list_container)
+        hidden_layout.addWidget(self.hidden_list_container, 1)
+        tabs.addTab(hidden_tab, "Hidden")
+
+        # — Advanced tab —
+        tabs.addTab(self._build_advanced_tab(), "Advanced")
 
         bottom_outer.addLayout(bottom_container)
 
@@ -1333,6 +1583,20 @@ class WaveLinuxWindow(QMainWindow):
                     meter.start()
                     self.meters[pw_id] = meter
                 
+                # Re-apply any saved effects the first time this node shows
+                # up in the session. `active_effects` is keyed by node.name
+                # (stable across PipeWire restarts); filter-chain processes
+                # live on the ephemeral pw_id, so we have to re-spawn them.
+                if nname and nname not in self._effects_applied:
+                    self._effects_applied.add(nname)
+                    for fid in list(self.active_effects.get(nname, [])):
+                        if not self.engine.effect_available(fid):
+                            continue
+                        if self.engine.is_effect_active(str(pw_id), fid):
+                            continue
+                        params = self.effect_params.get(nname, {}).get(fid) or None
+                        self.engine.apply_effect(str(pw_id), fid, params=params)
+
                 # Surface "an effect is on" as a tiny ✨ next to the icon
                 # instead of repainting a big FX button.
                 strip._refresh_fx_indicator()
@@ -1348,9 +1612,14 @@ class WaveLinuxWindow(QMainWindow):
                 if meter is not None:
                     meter.stop()
 
+            # Let the strips container compute its natural width so the
+            # enclosing horizontal scroll area can size / scroll correctly.
+            self.inputs_container.adjustSize()
+
             # 2. Update App Routing (Persistent & Grouped)
             # Map app_name -> list of active indices
             apps_by_name = {}
+            now = int(time.time())
             for app in apps:
                 app_name = app.get('app_name') or app.get('binary') or "Unknown App"
                 if app_name not in apps_by_name:
@@ -1358,6 +1627,9 @@ class WaveLinuxWindow(QMainWindow):
                 idx = app.get('index')
                 if idx:
                     apps_by_name[app_name].append(idx)
+                    # Touch the last-seen stamp so this app's saved routing
+                    # survives another prune cycle.
+                    self.app_last_seen[app_name] = now
                     # Apply persistent routing immediately if new instance
                     preferred_sink = self.app_routing.get(app_name)
                     if preferred_sink and app.get('sink') != preferred_sink:
@@ -1393,8 +1665,9 @@ class WaveLinuxWindow(QMainWindow):
                     del self.app_widgets[name]
 
             # 3. Update Monitor output dropdown (Stream is fixed to virtual).
-            # We let ALSA, Bluetooth, and JACK outputs all show up — the only
-            # thing we exclude is WaveLinux's own internal devices.
+            # Use the PipeWire Description field so Bluetooth sinks show real
+            # model names ('Sony WH-1000XM4') instead of garbled 'Bd 10 1'
+            # from the ALSA node.name.
             combo = self.mon_out_combo
             if not combo.view().isVisible():  # Don't update while user is looking at it
                 curr_data = combo.currentData()
@@ -1407,7 +1680,7 @@ class WaveLinuxWindow(QMainWindow):
                         continue
                     if name.endswith('.monitor'):
                         continue
-                    combo.addItem(PipeWireEngine.friendly_name(name), name)
+                    combo.addItem(self.engine.display_name_for_sink(name, snap=snap), name)
                 idx = combo.findData(curr_data)
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
@@ -1511,10 +1784,20 @@ class WaveLinuxWindow(QMainWindow):
                 conf = json.load(f)
                 self.submix_state = self._migrate_submix_state(conf.get('submixes', {}))
                 self.hidden_nodes = self._migrate_hidden_nodes(conf.get('hidden', []))
-                self.app_routing = conf.get('app_routing', {})
+                self.app_routing = conf.get('app_routing', {}) or {}
+                self.app_last_seen = {
+                    k: int(v) for k, v in (conf.get('app_last_seen', {}) or {}).items()
+                    if isinstance(k, str) and isinstance(v, (int, float))
+                }
+                self.app_prune_days = int(conf.get('app_prune_days', self.app_prune_days) or 14)
+                self._prune_stale_apps()
                 self.virtual_channels = conf.get('channels', [])
                 self.channel_order = conf.get('channel_order', []) or []
                 self.effect_params = conf.get('effect_params', {}) or {}
+                self.active_effects = {
+                    k: list(v) for k, v in (conf.get('active_effects', {}) or {}).items()
+                    if isinstance(v, list)
+                }
 
                 # Re-apply saved effects for each node as they come back
                 # online. We can only act on user virtual sinks here because
@@ -1603,6 +1886,9 @@ class WaveLinuxWindow(QMainWindow):
             'clipguard': clipguard,
             'channel_order': self.channel_order,
             'effect_params': self.effect_params,
+            'active_effects': self.active_effects,
+            'app_last_seen': self.app_last_seen,
+            'app_prune_days': self.app_prune_days,
         }
         try:
             tmp = self.config_path + '.tmp'
@@ -1620,12 +1906,33 @@ class WaveLinuxWindow(QMainWindow):
         just reappear on the next refresh."""
         if app_name in self.app_routing:
             del self.app_routing[app_name]
+        self.app_last_seen.pop(app_name, None)
         widget = self.app_widgets.pop(app_name, None)
         if widget is not None:
             widget.setParent(None)
             widget.deleteLater()
         self.save_config()
         self._refresh()
+
+    def _prune_stale_apps(self):
+        """On load, drop saved app_routing entries we haven't seen in
+        `app_prune_days`. Apps get their last_seen stamp refreshed every
+        tick they're active, so quietly-running notification-only apps
+        (Discord background, Slack, etc.) keep their slot. The 'offline'
+        forever-clutter problem shows up when you install an app, route
+        it once, and never open it again — that's what this reaps."""
+        if self.app_prune_days <= 0:
+            return
+        cutoff = int(time.time()) - self.app_prune_days * 24 * 3600
+        stale = [
+            name for name in list(self.app_routing.keys())
+            if self.app_last_seen.get(name, 0) < cutoff
+        ]
+        for name in stale:
+            self.app_routing.pop(name, None)
+            self.app_last_seen.pop(name, None)
+        if stale:
+            logging.info(f"Pruned {len(stale)} stale app routing entries: {', '.join(stale[:5])}")
 
     # ── Channel reorder / rename ──────────────────────────────────
 
@@ -1728,6 +2035,9 @@ class WaveLinuxWindow(QMainWindow):
             self.hidden_nodes.add(new_name)
         if old_name in self.effect_params:
             self.effect_params[new_name] = self.effect_params.pop(old_name)
+        if old_name in self.active_effects:
+            self.active_effects[new_name] = self.active_effects.pop(old_name)
+        self._effects_applied.discard(old_name)
         if old_name in self.channel_order:
             i = self.channel_order.index(old_name)
             self.channel_order[i] = new_name

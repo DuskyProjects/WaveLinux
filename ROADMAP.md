@@ -35,9 +35,18 @@ device for OBS, and Clipguard.
 - [x] **Tray integration** with graceful fallback to quit-on-close
       when no system tray is available. Tray menu also exposes Sound
       Card Profiles and Start-at-login.
-- [x] **Scenes / Solo / Emergency Reset buttons are gone** — they
-      weren't in Wave Link and added noise. Solo was replaced by
-      Link; Reset lives as an engine call if needed.
+- [x] **Scenes / Solo / header Reset are gone** — they weren't in
+      Wave Link and added noise. Solo was replaced by Link; Reset
+      now lives in Settings → Advanced where it's out of the way.
+- [x] **Settings dialog is tabbed** — Apps / Hidden / Advanced.
+      Advanced holds app-prune cutoff, autostart toggle, card
+      profiles, a LADSPA plugin diagnostic count, a "Forget all
+      offline apps now" button, and Emergency Reset.
+- [x] **Inputs row horizontally scrolls** when the window is
+      narrower than the strips need. The strips stop being squashed
+      below fullscreen; a horizontal scrollbar appears as needed.
+- [x] **Peak meter at ~40 Hz** (was 20 Hz) with 25 ms parec latency
+      for more responsive live-audio feedback.
 
 ### Core audio engine
 - [x] **User virtual channels** (`wavelinux_<name>`) with a
@@ -75,14 +84,36 @@ device for OBS, and Clipguard.
 - [x] **Atomic config writes** (temp file + `os.replace`).
 - [x] **LADSPA plugin probe** at startup; unavailable effects show
       "N/A" in the FX dialog with a tooltip naming the package.
-- [x] **Built-in High-Pass Filter** (PipeWire `bq_highpass` — no
-      LADSPA plugin needed).
+- [x] **Built-in High-Pass Filter and 3-Band parametric EQ** —
+      both implemented on PipeWire's `bq_highpass` / `bq_lowshelf` /
+      `bq_peaking` / `bq_highshelf` so they work without any LADSPA
+      plugin installed.
 - [x] **Parameterised FX**. Threshold / ratio / attack / release /
-      VAD / cutoff sliders for rnnoise, highpass, compressor, gate,
-      limiter. Params are per-(`node.name`, `effect_id`), persisted,
-      and applied live.
+      VAD / cutoff / EQ gain sliders for rnnoise, highpass, eq,
+      compressor, gate, limiter. Params are per-(`node.name`,
+      `effect_id`), persisted, and applied live.
+- [x] **Effect persistence** — on/off state plus parameters are
+      keyed by node.name, saved to config, and auto-reapplied when
+      the channel reappears after a restart.
+- [x] **FX dialog help + presets** — every effect has a plain-English
+      description in the dialog and 2–3 preset buttons that snap
+      every parameter to a sane starting point.
+- [x] **Optional VST / VST3 / LV2 hosting via Carla**. The channel
+      right-click menu grows a "🎹 Open VST plugin (Carla)…" entry
+      when `carla` is on `$PATH`. WaveLinux itself doesn't host VST3
+      — that needs a real plugin host and Carla is the stable Linux
+      answer — so we bridge to it rather than reimplement it.
 - [x] **ALSA card profile picker** (`pactl set-card-profile`) —
-      reach it from the tray menu.
+      reach it from the tray menu or Settings → Advanced.
+- [x] **Broadened LADSPA probe** — `$LADSPA_PATH`, user paths
+      (`~/.ladspa`, `~/.local/lib/ladspa`), and prefix-matching so a
+      plugin named `fast_lookahead_limiter_1913.so` still answers to
+      `fast_lookahead_limiter` in the requirements list. Clipguard
+      no longer fails to enable on systems where the plugin is
+      actually installed.
+- [x] **Volume ceiling at 100%** everywhere. PipeWire allows up to
+      150% but it sounds clipped; `PipeWireEngine.MAX_VOLUME` is
+      clamped in every write path.
 
 ### App identification
 - [x] **Flatpak / Snap / wrapper-aware app names** via
@@ -91,6 +122,16 @@ device for OBS, and Clipguard.
 - [x] **App-routing persistence** with per-row "(Offline)" markers,
       and a ✕ button that *forgets* an offline app so `app_routing`
       doesn't grow forever.
+- [x] **Automatic stale-routing prune**. Each app has a last-seen
+      epoch stamp that's refreshed every tick it's active; apps
+      that haven't been seen in `app_prune_days` (default 14, set
+      in Settings → Advanced) are dropped on startup. Quiet apps
+      (Discord / Slack / Telegram) keep their slot as long as they
+      still hold their PulseAudio client; long-abandoned entries
+      go away.
+- [x] **Curated app-id table** — Flatpak / .desktop app IDs like
+      `com.spotify.client` now render as "Spotify" instead of
+      the generic "audio-src" the Flatpak'd Spotify sets.
 
 ### Packaging
 - [x] **`install.sh`** for Arch / CachyOS with pacman + paru/yay
@@ -102,8 +143,9 @@ device for OBS, and Clipguard.
 ## Explicitly not planned
 
 - **Stream Deck integration** — out of scope for a plain desktop app.
-- **VST3 hosting** — Wave Link runs proprietary Elgato VST3 plugins;
-  WaveLinux stays on LADSPA via filter-chain.
+- **Native VST3 hosting** — Wave Link runs proprietary Elgato VST3
+  plugins. WaveLinux bridges to Carla for VST/VST3/LV2 (see above);
+  we're not going to embed a VST3 host inside the app.
 - **Drag-and-drop reorder** — Move Left / Move Right in the
   right-click menu does the same job without layout fragility.
 - **True global hotkeys** — Wayland doesn't expose a cross-compositor

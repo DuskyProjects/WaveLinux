@@ -345,6 +345,20 @@ QPushButton#forgetBtn:disabled {
     border: 1px solid rgba(255,255,255,0.04);
 }
 
+QPushButton#presetBtn {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #a0a0b8;
+    border-radius: 6px;
+    padding: 3px 10px;
+    font-size: 10px;
+}
+QPushButton#presetBtn:hover {
+    background: rgba(0,229,255,0.12);
+    color: #00e5ff;
+    border: 1px solid rgba(0,229,255,0.3);
+}
+
 QPushButton#reorderBtn {
     background: transparent;
     border: none;
