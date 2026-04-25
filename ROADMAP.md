@@ -74,8 +74,18 @@ device for OBS, and Clipguard.
       sync push runs on the first tick for each node so saved mutes
       aren't clobbered by live PipeWire state.
 - [x] **Clipguard** — Wave Link-style limiter on the Stream bus.
-      Button is disabled with an informative tooltip if the
-      `fast_lookahead_limiter_1913` LADSPA plugin isn't installed.
+      Uses the `fast_lookahead_limiter_1913` LADSPA plugin when
+      available, otherwise falls back to PipeWire's builtin
+      `linear` + `clamp` chain so the button works even on a
+      stock PipeWire install.
+- [x] **FX bus per channel** — when one or more effects are
+      enabled on a mic / virtual sink, the engine spawns a
+      stage-per-effect filter-chain whose first stage's
+      `target.object` is bound to the original source and whose
+      final stage exposes a virtual `Audio/Source`. The submix
+      loopbacks pull from that source instead of the raw mic, so
+      the effects are actually **audible** (and re-routing happens
+      automatically when effects toggle on or off).
 - [x] **Snapshot-cached refresh**. Each refresh tick runs each heavy
       `pactl` / `pw-dump` invocation exactly once; helpers read from
       the cached text.
@@ -119,6 +129,32 @@ device for OBS, and Clipguard.
 - [x] **Flatpak / Snap / wrapper-aware app names** via
       `/proc/<pid>/environ`, `.flatpak-info`, cgroup scopes, and
       `ppid` walking past `bwrap` / `snap-confine` / `flatpak`.
+- [x] **`.desktop` file discovery** — we index every
+      `/usr/share/applications/*.desktop` (and the user / Flatpak
+      mirrors) and resolve a sink-input's PID through
+      `/proc/<pid>/exe` and `comm` to the matching `Name=` field.
+      That's how native AUR Spotify (`/usr/bin/spotify`) now
+      shows as "Spotify" instead of "audio-src".
+- [x] **Install-path inference** — when a process's binary lives
+      under `…/steamapps/common/<Title>/`, `…/drive_c/Program
+      Files/<Title>/`, `/Games/<Title>/`, etc., the directory
+      title is used as the friendly app name. Lets games like
+      War Thunder (binary: `aces`) show their real title.
+- [x] **Local-host filter** — sink-inputs whose visible name
+      matches the system hostname (e.g. `DuskyPC`) are dropped
+      from App Routing. PipeWire surfaces system-level streams
+      under the host name when nothing better is available; we
+      know we're not an app on our own mixer.
+- [x] **Configured apps stay visible after closing** — the App
+      Routing panel keeps a row for every app we've seen within
+      the prune window, not just apps with a saved sink target.
+      Closing Spotify no longer makes its row vanish.
+- [x] **Mics default Monitor=muted on first launch** — a brand
+      new mic is auto-muted in the Monitor (headphones) mix so
+      a fresh install doesn't immediately scream the user's voice
+      back at them through their speakers. External mute changes
+      (pavucontrol, media keys) are also written back to config
+      so they survive a restart.
 - [x] **App-routing persistence** with per-row "(Offline)" markers,
       and a ✕ button that *forgets* an offline app so `app_routing`
       doesn't grow forever.
@@ -140,12 +176,31 @@ device for OBS, and Clipguard.
       `/usr/bin/wavelinux`, registers desktop + icon entries.
 - [x] **Autostart toggle** in the tray menu.
 
+## Planned (not yet shipped)
+
+- [ ] **Native VST host as an FX list entry** — currently the
+      "Open VST plugin (Carla)…" right-click action launches Carla
+      as a separate app, leaving the user to wire its inputs and
+      outputs by hand. The intent is for VST to be a row in the
+      effects dialog itself, just like High-Pass / EQ / Compressor,
+      so it slots into the channel chain transparently. That
+      requires hosting an actual VST runtime (LV2 may come along
+      for the ride) and an in-app graph editor, and it's a real
+      lift — deferred to a future session.
+- [ ] **Peak meter on a worker thread** — `parec` output is parsed
+      on the Qt event loop today, which means heavy UI work can
+      delay meter updates. Moving each `MeterWorker` onto a
+      `QThread` should remove the lag. Deferred (touches every
+      strip's lifecycle and the shutdown path).
+
 ## Explicitly not planned
 
 - **Stream Deck integration** — out of scope for a plain desktop app.
-- **Native VST3 hosting** — Wave Link runs proprietary Elgato VST3
-  plugins. WaveLinux bridges to Carla for VST/VST3/LV2 (see above);
-  we're not going to embed a VST3 host inside the app.
+  <!-- Native VST hosting was previously listed here as out of scope.
+       It's been moved to the "Planned (not yet shipped)" section: a
+       VST row inside the FX dialog is a long-running goal, just one
+       big enough to need its own session. -->
+
 - **Drag-and-drop reorder** — Move Left / Move Right in the
   right-click menu does the same job without layout fragility.
 - **True global hotkeys** — Wayland doesn't expose a cross-compositor

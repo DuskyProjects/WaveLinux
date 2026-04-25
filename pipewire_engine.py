@@ -6,8 +6,11 @@ multiple output mixes, effects chains, and RNNoise noise suppression.
 import subprocess
 import json
 import os
+import shlex
 import signal
 import re
+import socket
+import time
 import logging
 
 _LOG_PATH = os.path.expanduser("~/.config/wavelinux/wavelinux.log")
@@ -93,6 +96,22 @@ class PipeWireEngine:
         self.rnnoise_processes = {}      # channel_key -> subprocess
         self.loopback_modules = {}       # "mix_name->hw_name" -> module id
         self.submix_loopbacks = {}       # "node_id->mix_name" -> module id
+        # Tracks the *source* token used when each submix loopback was
+        # created. When effects on a mic toggle on/off, the loopback's
+        # source has to swap from the raw mic to the FX bus output (or
+        # back) — this lets `route_input_to_submix` notice the change and
+        # rebuild the loopback rather than silently keeping the old wiring.
+        self.submix_sources = {}         # "node_id->mix_name" -> source_token
+        # FX bus per channel. Keyed by the stable PipeWire node.name (mic
+        # name or virtual sink name), so this survives PipeWire restarts.
+        # Each entry is the active chain on a channel: an ordered list of
+        # effect_ids, the per-effect parameter map, the spawned filter-chain
+        # process keys, the capture target (raw mic / sink monitor), and
+        # the resulting virtual-source name that downstream loopbacks pull
+        # from. None / missing = no chain running on that channel.
+        self.channel_fx = {}             # node_name -> {effects, params, procs,
+                                         #               source, capture_target,
+                                         #               safe_key}
 
         # Which LADSPA plugins are actually present on this system —
         # filter-chain will silently fail-to-start if we reference one that
@@ -134,15 +153,21 @@ class PipeWireEngine:
     def effect_available(self, effect_id):
         """Return True if the filter-chain backend for this effect has
         everything it needs on disk. Keeps the FX UI from offering things
-        that will silently fail at spawn time."""
+        that will silently fail at spawn time.
+
+        The limiter is special — when the LADSPA fast_lookahead_limiter is
+        missing we still expose the effect because PipeWire's builtin
+        `clamp` is a usable brick-wall fallback. The graph builder picks
+        which path to render at spawn time."""
         requirements = {
             'rnnoise':    ('librnnoise_ladspa',),
             'compressor': ('sc4_1882',),
             'gate':       ('gate_1410',),
-            'limiter':    ('fast_lookahead_limiter',),  # matches *_1913 too
             # highpass and eq use PipeWire's builtin biquad — always available.
             'highpass':   (),
             'eq':         (),
+            # Limiter: LADSPA preferred, builtin clamp fallback — always offered.
+            'limiter':    (),
         }
         needed = requirements.get(effect_id, ())
         return all(self.ladspa_plugin_available(n) for n in needed)
@@ -449,7 +474,12 @@ class PipeWireEngine:
     def route_input_to_submix(self, node_id, node_name, media_class, mix_name, snap=None):
         """Create a loopback connecting an input source (or sink monitor) to a submix.
         Called on every refresh tick — idempotent: if the loopback we created
-        earlier is still alive, do nothing."""
+        earlier is still alive AND its source still matches the current FX
+        state, do nothing. When the channel's FX chain toggles on or off the
+        source token changes (raw mic ↔ FX virtual-source), in which case we
+        unload the stale loopback and re-create it pointing at the new
+        source. Without that swap, enabling effects would leave the audio
+        flowing direct from the mic to the mixes, bypassing the chain."""
         key = f'{node_id}->{mix_name}'
 
         mix = self.output_mixes.get(mix_name)
@@ -458,20 +488,34 @@ class PipeWireEngine:
 
         short = snap.short_modules_text if snap else None
 
-        # If we already have a live loopback for this pair, we're done.
-        known = self.submix_loopbacks.get(key)
-        if known and self._module_is_alive(known, short_text=short):
-            return True
-        if known:
-            self.submix_loopbacks.pop(key, None)
-
-        source_id = str(node_id)
-        if media_class == 'Audio/Sink':
+        # The "true" source token: FX chain output if the channel has any
+        # effects running, otherwise the raw mic / sink-monitor.
+        fx_source = self.get_channel_fx_source(node_name)
+        if fx_source:
+            source_id = fx_source
+        elif media_class == 'Audio/Sink':
             source_id = f"{node_name}.monitor"
+        else:
+            source_id = str(node_id)
+
+        # If a loopback we created earlier is still live AND its source
+        # matches the current routing (FX state hasn't changed), keep it.
+        known = self.submix_loopbacks.get(key)
+        known_source = self.submix_sources.get(key)
+        if known and known_source == source_id and self._module_is_alive(known, short_text=short):
+            return True
+        # Otherwise drop the stale entry. If the source changed (FX flip),
+        # actively unload the module so we don't leave dangling audio.
+        if known:
+            if known_source != source_id:
+                self._run(['pactl', 'unload-module', str(known)])
+            self.submix_loopbacks.pop(key, None)
+            self.submix_sources.pop(key, None)
 
         existing = self._find_loopback_for(source_id, mix.sink_name, snap=snap)
         if existing:
             self.submix_loopbacks[key] = existing
+            self.submix_sources[key] = source_id
             return True
 
         out = self._run([
@@ -484,6 +528,7 @@ class PipeWireEngine:
         if not out:
             return False
         self.submix_loopbacks[key] = out
+        self.submix_sources[key] = source_id
         # We just created the module; sink-input table is stale in the snapshot.
         si = self.get_submix_sink_input(node_id, mix_name)
         if si:
@@ -535,6 +580,7 @@ class PipeWireEngine:
         for key in list(self.submix_loopbacks.keys()):
             if key.startswith(f"{node_id}->"):
                 mod_id = self.submix_loopbacks.pop(key)
+                self.submix_sources.pop(key, None)
                 self._run(['pactl', 'unload-module', str(mod_id)])
 
     def get_submix_sink_input(self, node_id, mix_name, snap=None):
@@ -893,6 +939,37 @@ class PipeWireEngine:
         tail = app_id.rsplit('.', 1)[-1]
         return tail.replace('-', ' ').replace('_', ' ').strip() or app_id
 
+    @classmethod
+    def _host_aliases(cls):
+        """Return the set of strings that identify *this machine* — used to
+        filter sink-inputs that PipeWire hangs off the local host instead of
+        a real app. Cached so we don't re-stat /proc on every refresh."""
+        cached = getattr(cls, '_host_alias_cache', None)
+        if cached is not None:
+            return cached
+        names = set()
+        try:
+            h = socket.gethostname()
+            if h:
+                names.add(h.lower())
+                # `socket.gethostname()` may return the FQDN — also keep just
+                # the short hostname so 'duskypc.local' still matches 'duskypc'.
+                short = h.split('.', 1)[0]
+                if short:
+                    names.add(short.lower())
+        except Exception:
+            pass
+        try:
+            with open('/etc/hostname', 'r') as f:
+                h = f.read().strip()
+                if h:
+                    names.add(h.lower())
+                    names.add(h.split('.', 1)[0].lower())
+        except OSError:
+            pass
+        cls._host_alias_cache = names
+        return names
+
     @staticmethod
     def _read_proc_cmdline(pid):
         try:
@@ -988,6 +1065,196 @@ class PipeWireEngine:
 
         return None
 
+    # Common wrapper / launcher binaries that should be peeled off of an
+    # `Exec=` line when looking up the *real* binary a .desktop entry runs.
+    _EXEC_WRAPPERS = {
+        'env', 'gtk-launch', 'flatpak', 'flatpak-spawn',
+        'snap', 'snap-confine', 'sh', 'bash', 'zsh',
+        'pkexec', 'sudo', 'gamemoderun', 'mangohud', 'optirun',
+        'primusrun', 'prime-run', 'nice', 'taskset', 'systemd-run',
+        'wine', 'wine64', 'wineserver',
+    }
+
+    @classmethod
+    def _desktop_app_index(cls):
+        """Build a one-shot index of every .desktop file on the system mapping
+        the binary basename → display Name.  Lets us name a native app like
+        AUR Spotify ('spotify' on $PATH) by reading its own /usr/share/
+        applications/spotify.desktop instead of relying on a hand-curated alias
+        table.  Cached for 60 s so refresh ticks don't keep re-scanning."""
+        now = time.time()
+        cache = getattr(cls, '_desktop_cache', None)
+        cache_at = getattr(cls, '_desktop_cache_at', 0)
+        if cache is not None and (now - cache_at) < 60:
+            return cache
+
+        roots = [
+            "/usr/share/applications",
+            "/usr/local/share/applications",
+            os.path.expanduser("~/.local/share/applications"),
+            "/var/lib/flatpak/exports/share/applications",
+            os.path.expanduser("~/.local/share/flatpak/exports/share/applications"),
+        ]
+        index = {}
+        for root in roots:
+            try:
+                entries = os.listdir(root)
+            except OSError:
+                continue
+            for entry in entries:
+                if not entry.endswith('.desktop'):
+                    continue
+                path = os.path.join(root, entry)
+                name, exec_line, no_display = cls._parse_desktop_file(path)
+                if no_display or not name or not exec_line:
+                    continue
+                bin_name = cls._resolve_exec_binary(exec_line)
+                if bin_name and bin_name.lower() not in index:
+                    index[bin_name.lower()] = name
+        cls._desktop_cache = index
+        cls._desktop_cache_at = now
+        return index
+
+    @staticmethod
+    def _parse_desktop_file(path):
+        """Return (Name, Exec, NoDisplay) from the [Desktop Entry] section
+        of a .desktop file.  Anything outside the main section is ignored."""
+        name = None
+        exec_line = None
+        no_display = False
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                in_main = False
+                for line in f:
+                    s = line.strip()
+                    if s.startswith('[') and s.endswith(']'):
+                        in_main = (s == '[Desktop Entry]')
+                        continue
+                    if not in_main:
+                        continue
+                    if s.startswith('Name=') and name is None:
+                        name = s.split('=', 1)[1].strip() or None
+                    elif s.startswith('Exec=') and exec_line is None:
+                        exec_line = s.split('=', 1)[1].strip() or None
+                    elif s.startswith('NoDisplay='):
+                        no_display = s.split('=', 1)[1].strip().lower() == 'true'
+        except OSError:
+            return None, None, False
+        return name, exec_line, no_display
+
+    @classmethod
+    def _resolve_exec_binary(cls, exec_line):
+        """Pick the actual program out of a freedesktop Exec= field.  Strips
+        leading wrappers (`env VAR=val …`, `flatpak run --branch=… app`,
+        `gamemoderun mangohud bin`) and returns the real binary's basename."""
+        # Drop `%U` / `%F` style format placeholders before splitting.
+        cleaned = re.sub(r'%[a-zA-Z]', '', exec_line).strip()
+        if not cleaned:
+            return None
+        try:
+            tokens = shlex.split(cleaned, posix=True)
+        except ValueError:
+            tokens = cleaned.split()
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            base = os.path.basename(t).lower()
+            # Wrapper itself — skip past, then past any flags/env-vars.
+            if base in cls._EXEC_WRAPPERS:
+                i += 1
+                while i < len(tokens) and (
+                    tokens[i].startswith('-')
+                    or '=' in tokens[i]  # env-style "VAR=value"
+                ):
+                    i += 1
+                continue
+            # `flatpak run com.spotify.Client` style — already past wrappers.
+            return os.path.basename(t)
+        return None
+
+    # Directory patterns that map a binary's install location to a game /
+    # app title. Each tuple is (compiled-regex, "human-readable shape"). The
+    # first capture group is the title to surface. Order matters — Steam
+    # patterns win over the generic "/Games/<title>" fallback.
+    _PATH_TITLE_PATTERNS = (
+        # Steam — both stock layout and SteamLibrary-on-secondary-disk.
+        re.compile(r'/[Ss]team(?:[Ll]ibrary)?/steamapps/common/([^/]+)/'),
+        re.compile(r'/\.steam/[^/]+/steamapps/common/([^/]+)/'),
+        re.compile(r'/SteamApps/common/([^/]+)/', re.IGNORECASE),
+        # Heroic / Lutris / Bottles — Wine prefixes have a `drive_c` root.
+        re.compile(r'/drive_c/(?:Program Files(?: \(x86\))?|Games|GOG Games)/([^/]+)/', re.IGNORECASE),
+        # Itch / GOG / Lutris generic install dirs.
+        re.compile(r'/(?:Games|GOG Games|gog-games|itch|Lutris/games)/([^/]+)/', re.IGNORECASE),
+        # /opt/<App>/<bin> — many vendor packages install this way.
+        re.compile(r'^/opt/([^/]+)/'),
+    )
+
+    def _infer_name_from_exe(self, pid, current_name=None):
+        """When a process's comm is a generic launcher binary (e.g. 'aces' for
+        War Thunder, 'eldenring' for Elden Ring, 'launcher' for too many
+        games to count) but its on-disk path includes the title, use the
+        directory name as the app's friendly name. The current `comm` is
+        passed in only so we can prefer it when nothing better is found."""
+        if not pid:
+            return None
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            exe = ""
+        # Wine / Proton games run as /usr/bin/wine64-preloader → check the
+        # cmdline for the actual .exe path too.
+        cmdline = self._read_proc_cmdline(pid)
+        haystacks = [exe]
+        if cmdline:
+            haystacks.extend(cmdline)
+        for hs in haystacks:
+            if not hs:
+                continue
+            for pattern in self._PATH_TITLE_PATTERNS:
+                m = pattern.search(hs)
+                if m:
+                    title = m.group(1).strip()
+                    # Skip obvious noise — empty, dotted (e.g. ".cache"), or
+                    # the same as the current name (no upgrade).
+                    if not title or title.startswith('.'):
+                        continue
+                    if current_name and title.lower() == current_name.lower():
+                        continue
+                    return title
+        return None
+
+    def _identify_via_desktop(self, pid):
+        """Best-effort: resolve the running PID to a .desktop entry's Name=
+        by looking at /proc/<pid>/exe and /proc/<pid>/comm."""
+        if not pid:
+            return None
+        index = self._desktop_app_index()
+        if not index:
+            return None
+        # Try the resolved binary path first (handles `/usr/bin/spotify` →
+        # 'spotify' even when comm reports something different).
+        candidates = []
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+            if exe:
+                candidates.append(os.path.basename(exe).lower())
+        except OSError:
+            pass
+        try:
+            with open(f"/proc/{pid}/comm", "r") as f:
+                comm = f.read().strip().lower()
+                if comm:
+                    candidates.append(comm)
+        except OSError:
+            pass
+        cmdline = self._read_proc_cmdline(pid)
+        if cmdline:
+            candidates.append(os.path.basename(cmdline[0]).lower())
+        for c in candidates:
+            if c in index:
+                return index[c]
+        return None
+
     def _app_name_from_pid(self, pid):
         """Best-effort process-name lookup, skipping wrapper binaries."""
         if not pid:
@@ -1038,12 +1305,29 @@ class PipeWireEngine:
         is_internal = (
             'wavelinux_mix' in node_name or
             'wavelinux_src' in node_name or
+            'wavelinux.fx' in node_name or
             'rnnoise' in node_name or
             'loopback' in node_name or
             'wavelinux_mix' in media_name
         )
         if is_internal:
             return
+
+        # Filter out sink-inputs that look like the local machine itself.
+        # PipeWire surfaces its own host (e.g. "DuskyPC") as an app whenever a
+        # system-level stream — `speech-dispatcher`, the X11 bell, RTP receiver,
+        # etc. — has nothing better to report. We are not an app on our own
+        # mixer, so suppress anything whose visible name *is* our hostname.
+        host = self._host_aliases()
+        if host:
+            check = (
+                current.get('application.name', '').strip().lower(),
+                current.get('node.description', '').strip().lower(),
+                current.get('node.nick', '').strip().lower(),
+                current.get('media.name', '').strip().lower(),
+            )
+            if any(c and c in host for c in check):
+                return
 
         # Stable-first name resolution. Flatpak'd apps (Spotify, Discord…)
         # often set `application.name` to "audio-src" while their real
@@ -1052,6 +1336,11 @@ class PipeWireEngine:
         # `application.name`.
         pid = current.get('pid') or current.get('application.process.id')
         sandbox_name = self._identify_sandboxed_app(pid)
+        # Native (non-sandboxed) apps still publish a .desktop file with the
+        # real display name. Read that — it's the truth about what AUR/dpkg
+        # think the app is called — so e.g. native Spotify resolves to
+        # 'Spotify' instead of 'audio-src' or 'spotify'.
+        desktop_name = self._identify_via_desktop(pid)
 
         # Any of these reverse-DNS-style ids gets run through the curated
         # _KNOWN_APP_IDS table too.
@@ -1069,6 +1358,7 @@ class PipeWireEngine:
 
         candidates = [
             sandbox_name,
+            desktop_name,
             raw_app_name,
             current.get('snap.name'),
             current.get('application.display_name'),
@@ -1081,7 +1371,10 @@ class PipeWireEngine:
         if not name or name.lower() in self._GENERIC_APP_NAMES:
             proc_name = self._app_name_from_pid(pid)
             if proc_name:
-                name = proc_name
+                # The bare process name might still be a wrapper (e.g. 'aces'
+                # for War Thunder) — let install-path inference upgrade it.
+                inferred = self._infer_name_from_exe(pid, proc_name)
+                name = inferred or proc_name
 
         if not name:
             name = current.get('node.name') or current.get('media.name') or f"App #{current.get('index', '?')}"
@@ -1555,21 +1848,25 @@ context.modules = [
         body = "\n".join(lines)
         return f"                        control = {{\n{body}\n                        }}"
 
-    def apply_effect(self, channel_key, effect_id, params=None):
-        """Apply a built-in effect to a channel via filter-chain.
-        `params` overrides individual control values (see _EFFECT_PARAMS)."""
-        # rnnoise keeps its dedicated config path because it's the default mic
-        # effect and we want its conf file to stay predictable.
+    def _build_filter_graph(self, effect_id, values):
+        """Render the `filter.graph` body for a given effect. Returns None for
+        unknown effect ids. Shared by both the legacy single-effect spawn
+        path (used by clipguard) and the per-stage chain path (`set_channel_fx`)."""
         if effect_id == 'rnnoise':
-            return self.start_rnnoise(channel_key, params=params)
-
-        config_dir = os.path.expanduser('~/.config/pipewire')
-        os.makedirs(config_dir, exist_ok=True)
-        values = self._resolved_params(effect_id, params)
-
+            return f"""
+                nodes = [
+                    {{
+                        type   = ladspa
+                        name   = rnnoise
+                        plugin = librnnoise_ladspa
+                        label  = noise_suppressor_mono
+{self._render_control_block(values)}
+                    }}
+                ]
+"""
         if effect_id == 'highpass':
             # PipeWire's native biquad — no LADSPA needed.
-            filter_graph = f"""
+            return f"""
                 nodes = [
                     {{
                         type  = builtin
@@ -1579,11 +1876,9 @@ context.modules = [
                     }}
                 ]
 """
-        elif effect_id == 'eq':
+        if effect_id == 'eq':
             # Three-stage biquad chain: low shelf → mid peaking → high shelf.
-            # Built into PipeWire so works on any system with pipewire
-            # installed — no LADSPA plugins required.
-            filter_graph = f"""
+            return f"""
                 nodes = [
                     {{
                         type  = builtin
@@ -1621,8 +1916,8 @@ context.modules = [
                     {{ output = "eq_mid:Out"  input = "eq_high:In" }}
                 ]
 """
-        elif effect_id == 'gate':
-            filter_graph = f"""
+        if effect_id == 'gate':
+            return f"""
                 nodes = [
                     {{
                         type  = ladspa
@@ -1633,8 +1928,8 @@ context.modules = [
                     }}
                 ]
 """
-        elif effect_id == 'compressor':
-            filter_graph = f"""
+        if effect_id == 'compressor':
+            return f"""
                 nodes = [
                     {{
                         type  = ladspa
@@ -1645,8 +1940,16 @@ context.modules = [
                     }}
                 ]
 """
-        elif effect_id == 'limiter':
-            filter_graph = f"""
+        if effect_id == 'limiter':
+            # Prefer the swh-plugins fast lookahead limiter when present —
+            # real lookahead, real release. Without it, fall back to a
+            # builtin chain: a `linear` gain stage for the input-gain
+            # parameter, then `clamp` set to the user-chosen ceiling.
+            # That isn't a true broadcast limiter (no soft knee, no
+            # release behaviour) but it stops audio from clipping, which
+            # is what Clipguard exists to do.
+            if self.ladspa_plugin_available('fast_lookahead_limiter_1913'):
+                return f"""
                 nodes = [
                     {{
                         type  = ladspa
@@ -1657,8 +1960,48 @@ context.modules = [
                     }}
                 ]
 """
-        else:
-            return False  # Unknown effect
+            ceiling_db = float(values.get('Limit (dB)', -1.0))
+            input_db   = float(values.get('Input gain (dB)', 0.0))
+            ceiling = max(0.0001, min(1.0, 10 ** (ceiling_db / 20.0)))
+            in_gain = 10 ** (input_db / 20.0)
+            return f"""
+                nodes = [
+                    {{
+                        type  = builtin
+                        name  = lim_in
+                        label = linear
+                        control = {{ "Mult" = {in_gain:.4f} "Add" = 0.0 }}
+                    }}
+                    {{
+                        type  = builtin
+                        name  = lim_out
+                        label = clamp
+                        control = {{ "Min" = {-ceiling:.4f} "Max" = {ceiling:.4f} }}
+                    }}
+                ]
+                links = [
+                    {{ output = "lim_in:Out" input = "lim_out:In" }}
+                ]
+"""
+        return None
+
+    def apply_effect(self, channel_key, effect_id, params=None):
+        """Apply a single effect via filter-chain. Used by the master-bus
+        clipguard (limiter on the Stream mix). For per-channel mic effects,
+        prefer `set_channel_fx` — it builds a real chain and routes the mic
+        through it, where this just spawns a free-floating filter-chain."""
+        # rnnoise keeps its dedicated config path because the original
+        # codebase shipped it as the default mic effect — keeping the file
+        # name predictable means stale configs from prior runs don't pile up.
+        if effect_id == 'rnnoise':
+            return self.start_rnnoise(channel_key, params=params)
+
+        config_dir = os.path.expanduser('~/.config/pipewire')
+        os.makedirs(config_dir, exist_ok=True)
+        values = self._resolved_params(effect_id, params)
+        filter_graph = self._build_filter_graph(effect_id, values)
+        if filter_graph is None:
+            return False
 
         config_path = os.path.join(config_dir, f'wavelinux-fx-{channel_key}-{effect_id}.conf')
         config = self._FX_PREAMBLE + f"""
@@ -1701,6 +2044,199 @@ context.modules = [
         proc = self.rnnoise_processes.get(key)
         return proc is not None and proc.poll() is None
 
+    # ── Chain API (per-channel FX bus) ─────────────────────────────
+    #
+    # The legacy apply_effect / remove_effect / is_effect_active functions
+    # spawn a free-floating filter-chain that processes audio it never
+    # actually sees (it captures from PipeWire's default source, not the
+    # user's chosen channel). The chain API below replaces that with a
+    # real bus: each enabled effect is its own pipewire filter-chain stage
+    # whose `capture.props.target.object` is bound to the previous stage's
+    # output (or the channel's mic for the first stage). The final stage
+    # exposes a virtual Audio/Source that the submix loopbacks pull from
+    # — which is what makes the effects audible.
+
+    # Order to apply effects in the chain. Anything not in this list
+    # appears at the end in user-specified order.
+    _CHAIN_ORDER = ('rnnoise', 'highpass', 'eq', 'compressor', 'gate', 'limiter')
+
+    @classmethod
+    def _ordered_chain(cls, effects):
+        """Sort an effect list by the canonical signal-flow order so that
+        e.g. denoise always runs before EQ regardless of toggle order."""
+        rank = {fid: i for i, fid in enumerate(cls._CHAIN_ORDER)}
+        return sorted(effects, key=lambda fid: (rank.get(fid, len(rank)), fid))
+
+    @staticmethod
+    def _safe_channel_key(node_name):
+        """node.name → safe identifier usable in pipewire node names and
+        on-disk paths. 'alsa_input.usb-Foo_Bar.analog-stereo' → 'alsa_input_usb_foo_bar_analog_stereo'."""
+        cleaned = re.sub(r'[^A-Za-z0-9]+', '_', (node_name or '').lower()).strip('_')
+        return cleaned or 'chan'
+
+    def _stage_source_name(self, safe_key, idx, effect_id):
+        """The Audio/Source node.name a chain stage exposes. Stable enough
+        to use as the next stage's `target.object`."""
+        return f'wavelinux.fx.{safe_key}.{idx}.{effect_id}.source'
+
+    def _build_fx_stage_config(self, safe_key, idx, effect_id, params, capture_target):
+        """Write a per-stage filter-chain config to disk and return its
+        path, plus the source node.name the stage will expose. Returns
+        (None, None) on unknown effect."""
+        config_dir = os.path.expanduser('~/.config/pipewire')
+        os.makedirs(config_dir, exist_ok=True)
+
+        values = self._resolved_params(effect_id, params)
+        filter_graph = self._build_filter_graph(effect_id, values)
+        if filter_graph is None:
+            return None, None
+
+        source_name = self._stage_source_name(safe_key, idx, effect_id)
+        capture_name = f'wavelinux.fx.{safe_key}.{idx}.{effect_id}.capture'
+
+        config = self._FX_PREAMBLE + f"""
+context.modules = [
+    {{ name = libpipewire-module-filter-chain
+        args = {{
+            node.description = "WaveLinux-{effect_id} ({safe_key}#{idx})"
+            media.name       = "WaveLinux-{effect_id} ({safe_key}#{idx})"
+            filter.graph = {{{filter_graph}
+            }}
+            capture.props = {{
+                node.name     = "{capture_name}"
+                target.object = "{capture_target}"
+                audio.rate    = 48000
+            }}
+            playback.props = {{
+                node.name    = "{source_name}"
+                media.class  = Audio/Source
+                audio.rate   = 48000
+            }}
+        }}
+    }}
+]
+"""
+        config_path = os.path.join(
+            config_dir, f'wavelinux-chain-{safe_key}-{idx}-{effect_id}.conf'
+        )
+        with open(config_path, 'w') as f:
+            f.write(config)
+        return config_path, source_name
+
+    def set_channel_fx(self, node_name, capture_target, effects, params_map=None):
+        """Replace this channel's effect chain. Tears down whatever was
+        running, then spawns one filter-chain process per enabled effect,
+        each capturing from the previous stage's output (or `capture_target`
+        for the first stage). Returns the final source node.name when at
+        least one stage came up, else None.
+
+        - `node_name`: stable PipeWire node.name of the channel (mic or
+          virtual sink). State is keyed by this so it survives restarts.
+        - `capture_target`: the source the FIRST stage captures from.
+          For mics this is the mic's node.name; for virtual sinks pass
+          `f"{sink_name}.monitor"`.
+        - `effects`: effect_id list; reordered to canonical signal flow.
+        - `params_map`: {effect_id: {param_key: value}}.
+        """
+        if not node_name:
+            return None
+        params_map = params_map or {}
+
+        # Always reset first — this both makes the call idempotent and
+        # gives us a clean baseline when the user changes a parameter and
+        # we re-spawn with new control values.
+        self.clear_channel_fx(node_name)
+
+        # Filter to effects whose backend plugin is actually installed.
+        # Skipping unavailable effects silently is intentional: the FX UI
+        # already greys out unavailable rows; if a saved chain references
+        # one anyway, we'd rather light up the rest of the chain than
+        # leave the channel completely processed-bypass-style.
+        ordered = [fid for fid in self._ordered_chain(effects)
+                   if self.effect_available(fid)]
+        if not ordered:
+            return None
+
+        safe_key = self._safe_channel_key(node_name)
+        spawned = []          # list of (proc_key, effect_id, source_name)
+        current_target = capture_target
+
+        for i, effect_id in enumerate(ordered):
+            params = params_map.get(effect_id) or None
+            config_path, source_name = self._build_fx_stage_config(
+                safe_key, i, effect_id, params, current_target,
+            )
+            if config_path is None:
+                continue
+            log_path = self._fx_log_path(safe_key, f'{i}_{effect_id}')
+            proc_key = f'chain_{safe_key}_{i}_{effect_id}'
+            if self._spawn_fx(config_path, log_path, proc_key):
+                spawned.append((proc_key, effect_id, source_name))
+                current_target = source_name
+            else:
+                logging.warning(
+                    f"FX chain stage {i} ({effect_id}) failed to spawn for "
+                    f"{node_name}; subsequent stages may not work."
+                )
+
+        if not spawned:
+            return None
+
+        final_source = spawned[-1][2]
+        self.channel_fx[node_name] = {
+            'effects': [eid for (_pk, eid, _src) in spawned],
+            'params':  {eid: dict(params_map.get(eid, {}))
+                        for (_pk, eid, _src) in spawned},
+            'procs':   [pk for (pk, _eid, _src) in spawned],
+            'source':  final_source,
+            'capture_target': capture_target,
+            'safe_key': safe_key,
+        }
+        return final_source
+
+    def clear_channel_fx(self, node_name):
+        """Tear down the FX chain on a channel. Idempotent."""
+        info = self.channel_fx.pop(node_name, None)
+        if not info:
+            return False
+        for pk in info.get('procs', []):
+            # _spawn_fx parks each stage in self.rnnoise_processes keyed
+            # by proc_key, so we can hand the kill back to stop_rnnoise.
+            self.stop_rnnoise(pk)
+        return True
+
+    def get_channel_fx_source(self, node_name):
+        """Return the final FX virtual source for a channel, or None."""
+        info = self.channel_fx.get(node_name)
+        if not info:
+            return None
+        # If any stage's process died, drop the chain so callers re-route
+        # the loopback back to the raw mic instead of a dead source.
+        for pk in info.get('procs', []):
+            proc = self.rnnoise_processes.get(pk)
+            if proc is None or proc.poll() is not None:
+                self.clear_channel_fx(node_name)
+                return None
+        return info.get('source')
+
+    def is_channel_fx_running(self, node_name):
+        return self.get_channel_fx_source(node_name) is not None
+
+    def is_channel_effect_active(self, node_name, effect_id):
+        info = self.channel_fx.get(node_name)
+        if not info:
+            return False
+        if effect_id not in info.get('effects', []):
+            return False
+        # Same liveness check as get_channel_fx_source — a dead stage means
+        # the chain is no longer doing what the user thinks it is.
+        return self.get_channel_fx_source(node_name) is not None
+
+    def get_channel_effects(self, node_name):
+        """Ordered list of effect ids currently running on a channel."""
+        info = self.channel_fx.get(node_name)
+        return list(info.get('effects', [])) if info else []
+
     def _find_module_by_arg(self, pattern, modules_text=None):
         """Find a pactl module ID whose argument list contains `pattern`
         as a whole token (space-separated). Substring matches would make
@@ -1739,14 +2275,22 @@ context.modules = [
 
     def cleanup(self):
         """Hard cleanup of all wavelinux PipeWire modules."""
-        # Clean local process trackers
+        # Tear down channel chains first so their stage processes go away
+        # cleanly (they're tracked in rnnoise_processes too — clear_channel_fx
+        # routes through stop_rnnoise — but doing them via the chain API
+        # also frees the channel_fx state).
+        for nname in list(self.channel_fx.keys()):
+            self.clear_channel_fx(nname)
+        # Anything still parked in rnnoise_processes (legacy single-effect
+        # spawns, master-bus clipguard) gets the same treatment.
         for key in list(self.rnnoise_processes.keys()):
             self.stop_rnnoise(key)
-            
+
         self.virtual_sink_modules.clear()
         self.output_mixes.clear()
         self.loopback_modules.clear()
         self.submix_loopbacks.clear()
+        self.submix_sources.clear()
 
         # Hard sweep using full list (short mode doesn't show arguments)
         out = self._run(['pactl', 'list', 'modules'])
