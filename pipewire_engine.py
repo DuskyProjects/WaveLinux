@@ -56,7 +56,7 @@ class EngineSnapshot:
 
     __slots__ = ("modules_text", "short_modules_text", "sink_inputs_text",
                  "sinks_text", "nodes", "sinks", "_loopback_index",
-                 "_sink_state_by_name")
+                 "_sink_state_by_name", "_sink_descriptions")
 
     def __init__(self, modules_text="", short_modules_text="",
                  sink_inputs_text="", sinks_text="", nodes=None, sinks=None):
@@ -68,17 +68,23 @@ class EngineSnapshot:
         self.sinks = sinks or []
         self._loopback_index = None     # lazily built
         self._sink_state_by_name = None # lazily built: name -> (vol, muted)
+        self._sink_descriptions = None  # lazily built: name -> description
 
 
 class PipeWireEngine:
     """Full-featured PipeWire audio engine."""
 
-    # Common LADSPA search paths across distros.
+    # Common LADSPA search paths across distros. We additionally honour
+    # $LADSPA_PATH (colon-separated, like PATH) at probe time.
     _LADSPA_PATHS = (
         "/usr/lib/ladspa",
         "/usr/lib64/ladspa",
         "/usr/local/lib/ladspa",
+        "/usr/local/lib64/ladspa",
         "/usr/lib/x86_64-linux-gnu/ladspa",
+        "/usr/lib/aarch64-linux-gnu/ladspa",
+        os.path.expanduser("~/.ladspa"),
+        os.path.expanduser("~/.local/lib/ladspa"),
     )
 
     def __init__(self):
@@ -113,7 +119,17 @@ class PipeWireEngine:
         return found
 
     def ladspa_plugin_available(self, name):
-        return name in self.ladspa_plugins
+        """Case-insensitive exact or prefix match — distros sometimes drop
+        the `_1913` version suffix or use different capitalisation."""
+        if name in self.ladspa_plugins:
+            return True
+        low = name.lower()
+        for plugin in self.ladspa_plugins:
+            if plugin.lower() == low:
+                return True
+            if plugin.lower().startswith(low + "_"):
+                return True
+        return False
 
     def effect_available(self, effect_id):
         """Return True if the filter-chain backend for this effect has
@@ -123,9 +139,10 @@ class PipeWireEngine:
             'rnnoise':    ('librnnoise_ladspa',),
             'compressor': ('sc4_1882',),
             'gate':       ('gate_1410',),
-            'limiter':    ('fast_lookahead_limiter_1913',),
-            # highpass uses PipeWire's builtin biquad — always available.
+            'limiter':    ('fast_lookahead_limiter',),  # matches *_1913 too
+            # highpass and eq use PipeWire's builtin biquad — always available.
             'highpass':   (),
+            'eq':         (),
         }
         needed = requirements.get(effect_id, ())
         return all(self.ladspa_plugin_available(n) for n in needed)
@@ -133,6 +150,13 @@ class PipeWireEngine:
     # ── Helpers ─────────────────────────────────────────────────────
 
     def _run(self, cmd, timeout=2):
+        # Defensive: drop None entries and stringify everything. Historically
+        # this helper crashed the whole UI when any caller accidentally passed
+        # None (e.g. the App Routing "System Default" case), because even the
+        # error-logging path did `' '.join(cmd)` which trips on None.
+        cmd = [str(c) for c in cmd if c is not None]
+        if not cmd:
+            return None
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
             if r.returncode == 0:
@@ -162,6 +186,30 @@ class PipeWireEngine:
             nodes=self._parse_nodes(),
             sinks=self._parse_short_sinks(),
         )
+
+    @staticmethod
+    def _parse_sink_descriptions(text):
+        """Return {sink_name: friendly_description} from `pactl list sinks`.
+        We use descriptions for UI labels because PipeWire puts model info
+        (e.g. 'Sony WH-1000XM4') there, while node.name is usually
+        something like 'bluez_output.8C_1D_96_4A_59_0B.1'."""
+        out = {}
+        curr_name = None
+        curr_desc = None
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('Sink #'):
+                if curr_name is not None and curr_desc:
+                    out[curr_name] = curr_desc
+                curr_name = None
+                curr_desc = None
+            elif stripped.startswith('Name:'):
+                curr_name = stripped.split(':', 1)[1].strip()
+            elif stripped.startswith('Description:'):
+                curr_desc = stripped.split(':', 1)[1].strip()
+        if curr_name is not None and curr_desc:
+            out[curr_name] = curr_desc
+        return out
 
     @staticmethod
     def _parse_sinks_state(text):
@@ -229,51 +277,90 @@ class PipeWireEngine:
                 sinks.append({'index': parts[0], 'name': parts[1]})
         return sinks
 
+    # Anything matching this is junk that usually comes from short ALSA
+    # descriptions ("Bd 10 1" is the tail of a Bluetooth MAC after we've
+    # collapsed separators). Trigger a fallback up the lookup chain.
+    _JUNK_NAME_RE = re.compile(r'^(?:[A-Za-z]{1,3}\s?\d+\s?\d+)$|^Unknown', re.IGNORECASE)
+
+    @staticmethod
+    def _pretty_bt(raw):
+        """Turn a PipeWire Bluetooth node.name
+        ('bluez_output.8C_1D_96_4A_59_0B.1') or an ALSA dashed form into
+        a MAC. We can't derive the model from the MAC — callers need to
+        prefer description for Bluetooth — but at least we won't output
+        'Bd 96 1' garbage."""
+        m = re.search(r'([0-9A-Fa-f]{2}(?:[:_-][0-9A-Fa-f]{2}){5})', raw)
+        if m:
+            return "Bluetooth " + m.group(1).replace('_', ':').upper()
+        return None
+
     @staticmethod
     def friendly_name(raw):
         if not raw:
             return "Unknown"
-        name = raw
-        
-        # Strip common ALSA prefixes
-        for prefix in ['Alsa Output.', 'Alsa Input.', 'alsa_output.', 'alsa_input.']:
+        original = raw
+        name = raw.strip()
+
+        # Strip common ALSA prefixes.
+        for prefix in ['Alsa Output.', 'Alsa Input.', 'alsa_output.',
+                       'alsa_input.', 'bluez_output.', 'bluez_input.']:
             if name.lower().startswith(prefix.lower()):
                 name = name[len(prefix):]
-                
-        # Remove PCI addresses
+
+        # Before we mangle it, recognise Bluetooth device node.names so
+        # they stop being rendered as "Bd 10 1".
+        if raw.lower().startswith(('bluez_output.', 'bluez_input.')):
+            bt = PipeWireEngine._pretty_bt(raw)
+            if bt:
+                return bt
+
+        # Drop PCI / USB addresses.
         name = re.sub(r'pci-[0-9a-fA-F._-]+\.', '', name, flags=re.IGNORECASE)
         name = re.sub(r'Pci-[0-9a-fA-F. -]+Platform-\w+\s*', '', name, flags=re.IGNORECASE)
-        
-        # Strip verbose hardware descriptions
+        name = re.sub(r'usb-[A-Za-z0-9_]+_[A-Za-z0-9_]+-\d+\.', '', name, flags=re.IGNORECASE)
+
+        # Strip verbose boilerplate.
         verbose_terms = [
             'High Definition Audio Controller',
             'HD Audio Controller',
             'Raptor Lake', 'Alder Lake', 'Comet Lake', 'Tiger Lake',
-            'Starship/Matisse', 'Family 17h', 'Family 19h',
-            'USB Audio', 'Generic'
+            'Meteor Lake', 'Cannon Lake', 'Coffee Lake', 'Sunrise Point',
+            'Cezanne', 'Renoir', 'Rembrandt', 'Phoenix',
+            'Starship/Matisse', 'Matisse', 'Family 17h', 'Family 19h',
+            'PCH', 'USB Audio', 'Generic', 'Built-in',
         ]
         for term in verbose_terms:
-            name = re.sub(r'\b' + term + r'\b', '', name, flags=re.IGNORECASE)
-            
-        # Clean up separators
+            name = re.sub(r'\b' + re.escape(term) + r'\b', '', name, flags=re.IGNORECASE)
+
+        # Onboard Intel HDA: "CX8200 Analog" / "ALC256 Analog" etc. Users
+        # know these as 'onboard'. Replace with something sensible.
+        if re.search(r'\bALC\d+\b', name, re.IGNORECASE):
+            # Keep the "Analog Stereo" / "Digital Microphone" suffix for context.
+            suffix = re.search(r'(Analog|Digital|HDMI)\b.*', name, re.IGNORECASE)
+            name = "Onboard"
+            if suffix:
+                name = f"Onboard {suffix.group(0).strip().title()}"
+
+        # Clean up separators.
         name = name.replace('_', ' ').replace('.', ' ').replace('-', ' ')
-        
-        # Remove duplicate spaces
         name = re.sub(r'\s+', ' ', name).strip()
-        
-        if name:
-            name = name.title()
-            
-        # Truncate if still too long
-        if len(name) > 24:
-            # If it's very long, maybe just grab the last words which often contain the actual profile (e.g. Analog Stereo)
+
+        # If we've sanitised it into nothing or 'Bd 10 1'-style junk,
+        # fall back to the raw string.
+        if not name or PipeWireEngine._JUNK_NAME_RE.match(name):
+            return original
+
+        name = name.title()
+
+        # Truncate if still too long.
+        if len(name) > 28:
             parts = name.split()
             if len(parts) > 3:
                 name = " ".join(parts[-3:])
-            if len(name) > 24:
-                name = name[:22] + '…'
-                
-        return name or raw
+            if len(name) > 28:
+                name = name[:26] + '…'
+
+        return name or original
 
     # ── Node Discovery ──────────────────────────────────────────────
 
@@ -327,7 +414,7 @@ class PipeWireEngine:
 
     def set_sink_volume_by_name(self, sink_name, volume):
         """wpctl expects numeric IDs; pactl addresses sinks by name."""
-        pct = max(0, min(int(round(volume * 100)), 150))
+        pct = max(0, min(int(round(self._clamp(volume) * 100)), 100))
         self._run(['pactl', 'set-sink-volume', sink_name, f'{pct}%'])
 
     def get_sink_volume_by_name(self, sink_name, snap=None):
@@ -475,7 +562,8 @@ class PipeWireEngine:
     def set_submix_volume(self, node_id, mix_name, volume):
         si = self.get_submix_sink_input(node_id, mix_name)
         if si:
-            self._run(['pactl', 'set-sink-input-volume', si, f'{int(volume*100)}%'])
+            pct = max(0, min(int(round(self._clamp(volume) * 100)), 100))
+            self._run(['pactl', 'set-sink-input-volume', si, f'{pct}%'])
         else:
             logging.warning(f"Could not find sink-input for {node_id}->{mix_name}")
 
@@ -763,7 +851,56 @@ class PipeWireEngine:
         "audio-src", "audio-sink", "speech-dispatcher", "unknown",
         "libcanberra", "playback", "pipewire", "pipewire-pulse",
         "pulseaudio", "alsa-plugins", "alsa plug-in", "alsa-plug-in",
+        "audiostreamforandroid", "application", "pw-loopback",
+        # Chromium/Electron Flatpak apps often default to these:
+        "chromium", "electron", "chrome",
     }
+
+    # Reverse-DNS → friendly-name fallback for Flatpak / .desktop app IDs
+    # we've seen in the wild. Wins when heuristics can't pick a good name.
+    _KNOWN_APP_IDS = {
+        "com.spotify.client": "Spotify",
+        "com.spotify.spotify": "Spotify",
+        "com.discordapp.discord": "Discord",
+        "com.discordapp.discordcanary": "Discord Canary",
+        "com.discordapp.discordptb": "Discord PTB",
+        "com.obsproject.studio": "OBS Studio",
+        "com.valvesoftware.steam": "Steam",
+        "org.mozilla.firefox": "Firefox",
+        "org.mozilla.thunderbird": "Thunderbird",
+        "com.google.chrome": "Chrome",
+        "com.brave.browser": "Brave",
+        "org.telegram.desktop": "Telegram",
+        "com.slack.slack": "Slack",
+        "us.zoom.zoom": "Zoom",
+        "com.microsoft.teams": "Microsoft Teams",
+        "org.videolan.vlc": "VLC",
+        "io.mpv.mpv": "mpv",
+        "com.github.iwalton3.jellyfin-media-player": "Jellyfin",
+        "tv.plex.plexmediaplayer": "Plex",
+    }
+
+    @classmethod
+    def _canonicalize_app_id(cls, app_id):
+        if not app_id:
+            return None
+        mapped = cls._KNOWN_APP_IDS.get(app_id.lower())
+        if mapped:
+            return mapped
+        # Strip the reverse-DNS prefix: com.spotify.Client → Client
+        # That's better than the generic fallback but worse than the
+        # curated mapping above, hence checked second.
+        tail = app_id.rsplit('.', 1)[-1]
+        return tail.replace('-', ' ').replace('_', ' ').strip() or app_id
+
+    @staticmethod
+    def _read_proc_cmdline(pid):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+        except OSError:
+            return []
+        return [p.decode('utf-8', 'replace') for p in raw.split(b'\x00') if p]
 
     @staticmethod
     def _read_proc_env(pid):
@@ -792,41 +929,63 @@ class PipeWireEngine:
             return ""
 
     def _identify_sandboxed_app(self, pid):
-        """Resolve a friendly name for Flatpak/Snap/AppImage wrappers."""
+        """Resolve a friendly name for Flatpak/Snap/AppImage wrappers.
+        Honours the curated _KNOWN_APP_IDS table so common apps like
+        Spotify stop being rendered as 'audio-src'."""
         if not pid:
             return None
         env = self._read_proc_env(pid)
 
-        # Flatpak exposes its app id via env and/or /.flatpak-info
+        # 1. Flatpak: FLATPAK_ID env var, or /.flatpak-info's `name=` line.
         flatpak_id = env.get("FLATPAK_ID")
         if not flatpak_id:
             try:
                 with open(f"/proc/{pid}/root/.flatpak-info", "r") as f:
                     for line in f:
-                        if line.startswith("name="):
+                        line = line.strip()
+                        if line.startswith("name=") or line.startswith("application="):
                             flatpak_id = line.split("=", 1)[1].strip()
                             break
             except OSError:
                 pass
         if flatpak_id:
-            # com.discordapp.Discord → Discord
-            tail = flatpak_id.rsplit('.', 1)[-1]
-            return tail.replace('-', ' ').replace('_', ' ').strip() or flatpak_id
+            return self._canonicalize_app_id(flatpak_id)
 
-        # Snap exposes SNAP_NAME / SNAP_INSTANCE_NAME
+        # 2. Snap: SNAP_INSTANCE_NAME / SNAP_NAME env vars.
         snap_name = env.get("SNAP_INSTANCE_NAME") or env.get("SNAP_NAME")
         if snap_name:
             return snap_name.replace('-', ' ').replace('_', ' ').title()
 
+        # 3. cgroup scopes for flatpak + snap + systemd-run bundles.
         cgroup = self._read_proc_cgroup(pid)
+        m = re.search(r'app-flatpak-([A-Za-z0-9_.+-]+?)-\d+\.scope', cgroup)
+        if m:
+            return self._canonicalize_app_id(m.group(1))
         m = re.search(r'snap\.([A-Za-z0-9_-]+)', cgroup)
         if m:
             return m.group(1).replace('-', ' ').replace('_', ' ').title()
-        m = re.search(r'app-flatpak-([A-Za-z0-9_.+-]+?)-\d+\.scope', cgroup)
+        m = re.search(r'app-([A-Za-z0-9_.+-]+?)\.slice', cgroup)
         if m:
-            return m.group(1).rsplit('.', 1)[-1].replace('-', ' ').strip()
+            return self._canonicalize_app_id(m.group(1))
 
-        # AppImage mounts under /tmp/.mount_* — fall through to comm lookup
+        # 4. Desktop-file id from GTK_APPLICATION_ID / etc.
+        for env_key in ("GTK_APPLICATION_ID", "APP_ID", "XDG_CURRENT_DESKTOP_APP"):
+            val = env.get(env_key)
+            if val:
+                return self._canonicalize_app_id(val)
+
+        # 5. AppImage mounts show up under /tmp/.mount_… — use the basename
+        # of the first cmdline arg (which is usually the mount path).
+        cmdline = self._read_proc_cmdline(pid)
+        if cmdline:
+            first = cmdline[0]
+            m = re.search(r'/tmp/\.mount_([^/]+)', first)
+            if m:
+                # .mount_SpotifyXXXX → Spotify
+                stripped = re.sub(r'[A-Za-z0-9]{4,8}$', '', m.group(1)).rstrip('_-.')
+                if stripped:
+                    return stripped.replace('_', ' ').replace('-', ' ').title()
+
         return None
 
     def _app_name_from_pid(self, pid):
@@ -886,27 +1045,38 @@ class PipeWireEngine:
         if is_internal:
             return
 
-        # Stable-first name resolution. We deliberately try the sandbox id
-        # BEFORE application.name, because a Flatpak'd app often sets
-        # application.name to a generic "audio-src" while the real identity
-        # lives in FLATPAK_ID / cgroup.
+        # Stable-first name resolution. Flatpak'd apps (Spotify, Discord…)
+        # often set `application.name` to "audio-src" while their real
+        # identity lives in FLATPAK_ID / cgroup / env, so we ALWAYS run
+        # the sandbox probe first and let its result win over a generic
+        # `application.name`.
         pid = current.get('pid') or current.get('application.process.id')
+        sandbox_name = self._identify_sandboxed_app(pid)
 
-        sandbox_name = None
+        # Any of these reverse-DNS-style ids gets run through the curated
+        # _KNOWN_APP_IDS table too.
+        for key in ('flatpak.app_id', 'pipewire.access.portal.app_id',
+                    'application.process.host', 'application.id',
+                    'application.icon_name'):
+            mapped = self._canonicalize_app_id(current.get(key))
+            if mapped and mapped.lower() not in self._GENERIC_APP_NAMES:
+                sandbox_name = sandbox_name or mapped
+                break
+
         raw_app_name = current.get('application.name', '').strip()
-        if not raw_app_name or raw_app_name.lower() in self._GENERIC_APP_NAMES:
-            sandbox_name = self._identify_sandboxed_app(pid)
+        if raw_app_name.lower() in self._GENERIC_APP_NAMES:
+            raw_app_name = ''
 
         candidates = [
             sandbox_name,
-            current.get('flatpak.app_id'),
-            current.get('pipewire.access.portal.app_id'),
+            raw_app_name,
             current.get('snap.name'),
-            raw_app_name if raw_app_name.lower() not in self._GENERIC_APP_NAMES else None,
+            current.get('application.display_name'),
             current.get('application.process.binary'),
             current.get('binary'),
         ]
-        name = next((c for c in candidates if c and c.strip()), None)
+        name = next((c for c in candidates if c and c.strip()
+                     and c.lower() not in self._GENERIC_APP_NAMES), None)
 
         if not name or name.lower() in self._GENERIC_APP_NAMES:
             proc_name = self._app_name_from_pid(pid)
@@ -926,33 +1096,87 @@ class PipeWireEngine:
         current['app_name'] = name or "Unknown App"
         entries.append(current)
 
+    # Single source of truth for "0..1.0 is unity". Everything that writes
+    # a volume into PipeWire clamps to 100% so audio can't silently clip
+    # past unity.
+    MAX_VOLUME = 1.0
+
+    def _clamp(self, volume):
+        try:
+            return max(0.0, min(float(volume), self.MAX_VOLUME))
+        except (TypeError, ValueError):
+            return 1.0
+
     def move_app_to_sink(self, sink_input_index, sink_name):
+        """Move a running app's sink-input to `sink_name`. `sink_name=None`
+        means "System Default" — route back to whatever PipeWire calls the
+        default sink right now."""
+        if sink_name is None:
+            sink_name = self.get_default_sink()
+        if not sink_name:
+            # If we still don't know where to send it, just leave it alone
+            # rather than raising.
+            return
         self._run(['pactl', 'move-sink-input', str(sink_input_index), sink_name])
 
     def set_sink_input_volume(self, sink_input_index, volume):
-        # volume is 0.0 to 1.0
-        self._run(['wpctl', 'set-volume', str(sink_input_index), str(volume)])
+        """App-stream volume. pactl works on sink-input indices; wpctl
+        wants numeric PipeWire node IDs which don't match, which is why
+        the previous wpctl path silently no-opped."""
+        pct = max(0, min(int(round(self._clamp(volume) * 100)), 100))
+        self._run(['pactl', 'set-sink-input-volume', str(sink_input_index), f'{pct}%'])
 
     def get_sink_input_volume(self, sink_input_index):
-        # wpctl get-volume returns "Volume: 0.50"
-        out = self._run(['wpctl', 'get-volume', str(sink_input_index)])
-        if out and 'Volume:' in out:
-            try:
-                return float(out.split(':', 1)[1].strip().split()[0])
-            except:
-                pass
+        """Return 0..1.0 for the given sink-input."""
+        out = self._run(['pactl', 'list', 'sink-inputs'])
+        if not out:
+            return 1.0
+        target = f'Sink Input #{sink_input_index}'
+        seen = False
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('Sink Input #'):
+                seen = stripped == target
+            elif seen and stripped.startswith('Volume:'):
+                m = re.search(r'/\s*(\d+)%', stripped)
+                if m:
+                    try:
+                        return int(m.group(1)) / 100.0
+                    except ValueError:
+                        pass
+                return 1.0
         return 1.0
 
     def get_all_sinks(self, snap=None):
         return snap.sinks if snap else self._parse_short_sinks()
 
+    def get_sink_description(self, sink_name, snap=None):
+        """The user-facing Description field from `pactl list sinks`
+        ('Sony WH-1000XM4' for a paired BT headset, for example).
+        Returns None when we have to fall back to name-based naming."""
+        if snap is None:
+            text = self._run(['pactl', 'list', 'sinks']) or ''
+            return self._parse_sink_descriptions(text).get(sink_name)
+        if snap._sink_descriptions is None:
+            snap._sink_descriptions = self._parse_sink_descriptions(snap.sinks_text)
+        return snap._sink_descriptions.get(sink_name)
+
+    def display_name_for_sink(self, sink_name, snap=None):
+        """Best human-readable label for a sink: prefer the PipeWire
+        Description field (has model names like 'Sony WH-1000XM4'); fall
+        back to the cleaned-up node.name when there's no description."""
+        desc = self.get_sink_description(sink_name, snap=snap)
+        if desc:
+            cleaned = self.friendly_name(desc)
+            if cleaned and cleaned != "Unknown":
+                return cleaned
+        return self.friendly_name(sink_name)
+
     # ── Wave Link-parity helpers ───────────────────────────────────
 
     def set_input_gain(self, node_id, volume):
-        """Pre-fader channel gain for mics / virtual sinks (0.0..1.5).
-        Mic volumes go through wpctl by numeric ID; null-sinks go through
-        pactl by name."""
-        self._run(['wpctl', 'set-volume', str(node_id), f'{max(0.0, min(volume, 1.5)):.2f}'])
+        """Pre-fader channel gain for mics / virtual sinks (0.0..1.0)."""
+        self._run(['wpctl', 'set-volume', str(node_id), f'{self._clamp(volume):.2f}'])
 
     def unroute_mix_from_hardware(self, mix_name):
         """Remove any hardware loopback for the named mix, so 'None' in the
@@ -1164,6 +1388,8 @@ context.modules = [
              'desc': 'AI-powered background noise removal'},
             {'id': 'highpass', 'name': 'High-Pass Filter', 'icon': '🎵',
              'desc': 'Roll off low rumble (fans, handling noise)'},
+            {'id': 'eq', 'name': '3-Band EQ', 'icon': '🎚️',
+             'desc': 'Shape tone with low shelf / mid peak / high shelf'},
             {'id': 'compressor', 'name': 'Compressor', 'icon': '📉',
              'desc': 'Smooth out loud/quiet differences'},
             {'id': 'gate', 'name': 'Noise Gate', 'icon': '🚪',
@@ -1180,6 +1406,14 @@ context.modules = [
         ],
         'highpass': [
             ('Freq', 'Cutoff', 20.0, 500.0, 80.0, ' Hz'),
+        ],
+        'eq': [
+            ('Low Freq', 'Low Freq', 40.0, 400.0, 120.0, ' Hz'),
+            ('Low Gain', 'Low Gain', -12.0, 12.0, 0.0, ' dB'),
+            ('Mid Freq', 'Mid Freq', 300.0, 4000.0, 1000.0, ' Hz'),
+            ('Mid Gain', 'Mid Gain', -12.0, 12.0, 0.0, ' dB'),
+            ('High Freq', 'High Freq', 2000.0, 12000.0, 6000.0, ' Hz'),
+            ('High Gain', 'High Gain', -12.0, 12.0, 0.0, ' dB'),
         ],
         'compressor': [
             ('threshold_db', 'Threshold', -60.0, 0.0, -20.0, ' dB'),
@@ -1205,6 +1439,102 @@ context.modules = [
     @classmethod
     def get_effect_params(cls, effect_id):
         return list(cls._EFFECT_PARAMS.get(effect_id, []))
+
+    # Plain-English description of what each effect does, shown in the
+    # FX dialog so the user isn't guessing what 'VAD' or 'Makeup' means.
+    _EFFECT_HELP = {
+        'rnnoise':
+            "AI-powered noise suppression. Removes steady background noise "
+            "(fans, keyboard, street). VAD threshold controls how aggressive "
+            "it is — higher numbers cut more but risk chopping quiet speech.",
+        'highpass':
+            "Rolls off low-frequency rumble below the cutoff. 80 Hz is a "
+            "safe default for voice; push to 100–120 Hz for very rumbly "
+            "rooms, drop to 40–60 Hz for music or deep voices.",
+        'eq':
+            "Three-band tone shaping. Low shelf warms or thins the bass, "
+            "mid peak carves out muddiness or adds presence around 1–3 kHz, "
+            "high shelf brightens or tames sibilance.",
+        'compressor':
+            "Evens out loud vs. quiet moments. Threshold is where it starts "
+            "working, ratio is how hard it clamps (4:1 is a solid broadcast "
+            "setting), makeup brings the level back up afterwards.",
+        'gate':
+            "Silences the channel when it's below the threshold. Useful on "
+            "mics to kill room tone between words. Range is how much to "
+            "attenuate when closed; too strong makes breaths choppy.",
+        'limiter':
+            "A brick-wall ceiling on the signal so nothing clips. Leave "
+            "'Ceiling' at -1 dB for broadcast. Release sets how quickly it "
+            "recovers — too fast sounds pumpy, too slow ducks audio.",
+    }
+
+    # Short, labeled preset bundles for each effect. These are all safe
+    # starting points, not magic values — users are expected to tweak.
+    _EFFECT_PRESETS = {
+        'rnnoise': [
+            ("Gentle",     {"VAD Threshold (%)": 25.0}),
+            ("Broadcast",  {"VAD Threshold (%)": 50.0}),
+            ("Aggressive", {"VAD Threshold (%)": 75.0}),
+        ],
+        'highpass': [
+            ("Voice 80 Hz",  {"Freq":  80.0}),
+            ("Rumble 120 Hz", {"Freq": 120.0}),
+            ("Music 40 Hz",  {"Freq":  40.0}),
+        ],
+        'eq': [
+            ("Flat",
+             {"Low Freq": 120.0, "Low Gain": 0.0,
+              "Mid Freq": 1000.0, "Mid Gain": 0.0,
+              "High Freq": 6000.0, "High Gain": 0.0}),
+            ("Broadcast Voice",
+             {"Low Freq": 120.0, "Low Gain": -2.0,
+              "Mid Freq": 2500.0, "Mid Gain": 2.0,
+              "High Freq": 8000.0, "High Gain": 1.5}),
+            ("Warm Music",
+             {"Low Freq": 100.0, "Low Gain": 2.0,
+              "Mid Freq": 800.0, "Mid Gain": -1.0,
+              "High Freq": 10000.0, "High Gain": 2.0}),
+        ],
+        'compressor': [
+            ("Gentle 2:1",
+             {"threshold_db": -20.0, "ratio": 2.0,
+              "attack_ms": 10.0, "release_ms": 120.0, "makeup_gain_db": 2.0}),
+            ("Broadcast 4:1",
+             {"threshold_db": -18.0, "ratio": 4.0,
+              "attack_ms": 5.0, "release_ms": 100.0, "makeup_gain_db": 3.0}),
+            ("Streaming 6:1",
+             {"threshold_db": -16.0, "ratio": 6.0,
+              "attack_ms": 3.0, "release_ms": 80.0, "makeup_gain_db": 4.0}),
+        ],
+        'gate': [
+            ("Soft -60 dB",
+             {"Threshold (dB)": -60.0, "Range (dB)": -20.0,
+              "Attack (ms)": 5.0, "Hold (ms)": 20.0, "Decay (ms)": 200.0}),
+            ("Room mic -40 dB",
+             {"Threshold (dB)": -40.0, "Range (dB)": -40.0,
+              "Attack (ms)": 2.5, "Hold (ms)": 10.0, "Decay (ms)": 120.0}),
+            ("Noisy mic -30 dB",
+             {"Threshold (dB)": -30.0, "Range (dB)": -50.0,
+              "Attack (ms)": 1.0, "Hold (ms)": 10.0, "Decay (ms)": 80.0}),
+        ],
+        'limiter': [
+            ("Gentle -3 dB",
+             {"Input gain (dB)": 0.0, "Limit (dB)": -3.0, "Release time (s)": 0.2}),
+            ("Broadcast -1 dB",
+             {"Input gain (dB)": 0.0, "Limit (dB)": -1.0, "Release time (s)": 0.1}),
+            ("Loud -0.5 dB",
+             {"Input gain (dB)": 3.0, "Limit (dB)": -0.5, "Release time (s)": 0.05}),
+        ],
+    }
+
+    @classmethod
+    def get_effect_help(cls, effect_id):
+        return cls._EFFECT_HELP.get(effect_id, "")
+
+    @classmethod
+    def get_effect_presets(cls, effect_id):
+        return list(cls._EFFECT_PRESETS.get(effect_id, []))
 
     def _resolved_params(self, effect_id, overrides):
         """Merge user overrides on top of defaults from _EFFECT_PARAMS."""
@@ -1247,6 +1577,48 @@ context.modules = [
                         label = bq_highpass
 {self._render_control_block(values)}
                     }}
+                ]
+"""
+        elif effect_id == 'eq':
+            # Three-stage biquad chain: low shelf → mid peaking → high shelf.
+            # Built into PipeWire so works on any system with pipewire
+            # installed — no LADSPA plugins required.
+            filter_graph = f"""
+                nodes = [
+                    {{
+                        type  = builtin
+                        name  = eq_low
+                        label = bq_lowshelf
+                        control = {{
+                            "Freq" = {float(values.get('Low Freq', 120.0)):.2f}
+                            "Q"    = 0.707
+                            "Gain" = {float(values.get('Low Gain', 0.0)):.2f}
+                        }}
+                    }}
+                    {{
+                        type  = builtin
+                        name  = eq_mid
+                        label = bq_peaking
+                        control = {{
+                            "Freq" = {float(values.get('Mid Freq', 1000.0)):.2f}
+                            "Q"    = 1.0
+                            "Gain" = {float(values.get('Mid Gain', 0.0)):.2f}
+                        }}
+                    }}
+                    {{
+                        type  = builtin
+                        name  = eq_high
+                        label = bq_highshelf
+                        control = {{
+                            "Freq" = {float(values.get('High Freq', 6000.0)):.2f}
+                            "Q"    = 0.707
+                            "Gain" = {float(values.get('High Gain', 0.0)):.2f}
+                        }}
+                    }}
+                ]
+                links = [
+                    {{ output = "eq_low:Out"  input = "eq_mid:In"  }}
+                    {{ output = "eq_mid:Out"  input = "eq_high:In" }}
                 ]
 """
         elif effect_id == 'gate':
