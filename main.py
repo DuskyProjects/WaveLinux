@@ -180,10 +180,15 @@ class CardProfileDialog(QDialog):
 
 # ── FX Selection Dialog ───────────────────────────────────────────
 class FXSelectionDialog(QDialog):
-    def __init__(self, node_id, node_name, engine, parent=None):
+    def __init__(self, node_id, node_name, capture_target, engine, parent=None):
         super().__init__(parent)
         self.node_id = str(node_id)
         self.node_name = node_name
+        # The PipeWire source name the FX chain's first stage should pull
+        # from. For mics that's the mic's own node.name; for virtual sinks
+        # it's `<sink>.monitor`. Determined by the channel strip and passed
+        # in so the engine doesn't need to guess about media class.
+        self.capture_target = capture_target
         self.engine = engine
         self.setWindowTitle("Channel Effects")
         self.setMinimumWidth(400)
@@ -256,7 +261,7 @@ class FXSelectionDialog(QDialog):
 
         toggle_btn = QPushButton()
         toggle_btn.setCheckable(True)
-        active = self.engine.is_effect_active(self.node_id, fid)
+        active = self.engine.is_channel_effect_active(self.node_name, fid)
         toggle_btn.setChecked(active)
         toggle_btn.setFixedWidth(60)
 
@@ -386,34 +391,6 @@ class FXSelectionDialog(QDialog):
             p = p.parent()
         return p
 
-    def _save_params(self, effect_id, params):
-        p = self._main_window()
-        if p is None:
-            return
-        p.effect_params.setdefault(self.node_name, {})[effect_id] = dict(params)
-        if hasattr(p, 'schedule_save'):
-            p.schedule_save()
-        elif hasattr(p, 'save_config'):
-            p.save_config()
-
-    def _set_active(self, effect_id, enabled):
-        """Remember which effects the user has turned on for this channel,
-        keyed by the stable PipeWire node.name so they survive restarts."""
-        p = self._main_window()
-        if p is None:
-            return
-        lst = p.active_effects.setdefault(self.node_name, [])
-        if enabled:
-            if effect_id not in lst:
-                lst.append(effect_id)
-        else:
-            if effect_id in lst:
-                lst.remove(effect_id)
-            if not lst:
-                p.active_effects.pop(self.node_name, None)
-        if hasattr(p, 'schedule_save'):
-            p.schedule_save()
-
     def _collect_params(self, effect_id):
         out = {}
         for key, (slider, _lbl) in self._param_sliders.get(effect_id, {}).items():
@@ -423,29 +400,88 @@ class FXSelectionDialog(QDialog):
             out[key] = val
         return out
 
+    # ── Chain rebuild (one path, three triggers) ───────────────────
+    #
+    # Toggling an effect, picking a preset, or dragging a slider all end
+    # up calling `_rebuild_chain` so the channel's filter-chain is exactly
+    # the set of "ON" effects with their current parameter values. That
+    # also triggers a refresh on the main window so the submix loopbacks
+    # get re-routed through (or around) the new bus immediately.
+
+    def _active_effect_ids(self):
+        """Return the effect ids whose toggle buttons are currently ON,
+        in the order they appear in the engine's available list."""
+        wanted = []
+        for fx in self.engine.get_available_effects():
+            fid = fx['id']
+            btn = self._toggle_btns.get(fid)
+            if btn is not None and btn.isChecked() and btn.isEnabled():
+                wanted.append(fid)
+        return wanted
+
+    def _all_params_map(self):
+        """Snapshot every effect's current slider values, even effects that
+        aren't ON right now. Persisting all of them means flipping an effect
+        back ON later resumes from the user's last-tweaked values rather
+        than the canned defaults."""
+        out = {}
+        for fid in self._param_sliders.keys():
+            out[fid] = self._collect_params(fid)
+        return out
+
+    def _rebuild_chain(self):
+        """Spawn / replace the channel's FX chain to match the dialog's
+        current toggle + slider state, then ask the main window to re-route
+        submix loopbacks through the new bus."""
+        wanted = self._active_effect_ids()
+        params_map = self._all_params_map()
+        self.engine.set_channel_fx(
+            self.node_name, self.capture_target, wanted, params_map,
+        )
+        # Persist on the main-window state objects so a restart re-applies.
+        self._save_chain_state(wanted, params_map)
+        # Force a routing pass so the loopbacks pick up the new source.
+        win = self._main_window()
+        if win is not None and hasattr(win, '_request_reroute'):
+            win._request_reroute(self.node_name)
+
+    def _save_chain_state(self, effects, params_map):
+        """Mirror the new chain into the main window's persistence buckets:
+        active_effects keeps the ordered list, effect_params keeps every
+        slider position so it survives a session restart."""
+        win = self._main_window()
+        if win is None:
+            return
+        if effects:
+            win.active_effects[self.node_name] = list(effects)
+        else:
+            win.active_effects.pop(self.node_name, None)
+        # Always save params even for OFF effects so toggling back ON
+        # resumes from the user's last tweak.
+        if params_map:
+            stash = win.effect_params.setdefault(self.node_name, {})
+            for fid, vals in params_map.items():
+                stash[fid] = dict(vals)
+            if not stash:
+                win.effect_params.pop(self.node_name, None)
+        if hasattr(win, 'schedule_save'):
+            win.schedule_save()
+        elif hasattr(win, 'save_config'):
+            win.save_config()
+
     # ── Handlers ───────────────────────────────────────────────────
 
     def _on_toggle(self, effect_id):
         btn = self._toggle_btns[effect_id]
         frame = self._param_frames.get(effect_id)
-        if btn.isChecked():
-            btn.setText("ON")
-            params = self._collect_params(effect_id)
-            self.engine.apply_effect(self.node_id, effect_id, params=params or None)
-            self._save_params(effect_id, params)
-            self._set_active(effect_id, True)
-            if frame:
-                frame.setVisible(True)
-        else:
-            btn.setText("OFF")
-            self.engine.remove_effect(self.node_id, effect_id)
-            self._set_active(effect_id, False)
-            if frame:
-                frame.setVisible(False)
+        btn.setText("ON" if btn.isChecked() else "OFF")
+        if frame:
+            frame.setVisible(btn.isChecked())
+        self._rebuild_chain()
 
     def _apply_preset(self, effect_id, values):
-        """A preset sets every slider in the effect panel and re-applies
-        the effect live if it's already on."""
+        """A preset slams every slider in the effect panel to a known good
+        starting point, then rebuilds the chain so the change is audible."""
         sliders = self._param_sliders.get(effect_id, {})
         for key, (slider, value_lbl) in sliders.items():
             if key not in values:
@@ -459,11 +495,7 @@ class FXSelectionDialog(QDialog):
             slider.blockSignals(False)
             suffix = slider.property("psuffix") or ""
             value_lbl.setText(self._fmt_value(target, suffix))
-        params = self._collect_params(effect_id)
-        self._save_params(effect_id, params)
-        if self.engine.is_effect_active(self.node_id, effect_id):
-            self.engine.remove_effect(self.node_id, effect_id)
-            self.engine.apply_effect(self.node_id, effect_id, params=params)
+        self._rebuild_chain()
 
     def _on_param_changed(self, effect_id, slider, value_lbl):
         pmin = float(slider.property("pmin"))
@@ -471,15 +503,11 @@ class FXSelectionDialog(QDialog):
         suffix = slider.property("psuffix") or ""
         val = pmin + (pmax - pmin) * (slider.value() / 1000.0)
         value_lbl.setText(self._fmt_value(val, suffix))
-
-        params = self._collect_params(effect_id)
-        self._save_params(effect_id, params)
-
-        # If the effect is currently running, restart it with new params so
-        # the change is audible immediately. Otherwise we just persist.
-        if self.engine.is_effect_active(self.node_id, effect_id):
-            self.engine.remove_effect(self.node_id, effect_id)
-            self.engine.apply_effect(self.node_id, effect_id, params=params)
+        # Rebuild on every drag tick — set_channel_fx is idempotent: it
+        # tears down the existing stages and respawns with new control
+        # values. Heavy, but the simplest model and fast enough at the
+        # rate Qt sliders fire valueChanged.
+        self._rebuild_chain()
 
 
 # ── Channel Strip Widget ───────────────────────────────────────────
@@ -685,21 +713,28 @@ class ChannelStrip(QFrame):
             self._stash_submix("Stream", self.str_slider.value() / 100.0, self._str_muted)
         self._apply_mute_style(self.str_mute, self._str_muted)
 
+    def fx_capture_target(self):
+        """The PipeWire source name the FX chain's first stage should
+        pull audio from. For mics that's the mic itself; for virtual
+        sinks (Audio/Sink), it's the sink's monitor node."""
+        if self.is_mic:
+            return self.node_name
+        return f"{self.node_name}.monitor"
+
     def _on_fx_toggle(self):
         """Open the effects dialog and refresh the ✨ indicator."""
-        dlg = FXSelectionDialog(self.node_id, self.node_name, self.engine, self)
+        dlg = FXSelectionDialog(
+            self.node_id, self.node_name, self.fx_capture_target(),
+            self.engine, self,
+        )
         dlg.exec()
         self._refresh_fx_indicator()
 
     def _refresh_fx_indicator(self):
-        if not self.node_id:
+        if not self.node_name:
             self.fx_indicator.setVisible(False)
             return
-        for fx in self.engine.get_available_effects():
-            if self.engine.is_effect_active(str(self.node_id), fx['id']):
-                self.fx_indicator.setVisible(True)
-                return
-        self.fx_indicator.setVisible(False)
+        self.fx_indicator.setVisible(self.engine.is_channel_fx_running(self.node_name))
 
     def _show_context_menu(self, pos):
         """Right-click context menu for channel-strip actions.
@@ -1038,7 +1073,7 @@ class WaveLinuxWindow(QMainWindow):
             layout.addWidget(lbl)
 
         # App prune cutoff
-        _heading("APP ROUTING")
+        _heading("APP CLEANUP")
         prune_row = QHBoxLayout()
         prune_row.addWidget(QLabel("Forget offline apps after (days):"))
         self.prune_spin = QSpinBox()
@@ -1182,6 +1217,16 @@ class WaveLinuxWindow(QMainWindow):
 
     def schedule_save(self):
         self._save_timer.start(500)
+
+    def _request_reroute(self, node_name):
+        """The FX dialog calls this after rebuilding a channel's chain.
+        Drop the channel out of the synced-set so the next refresh tick
+        re-pushes saved volume/mute, and trigger the debounced refresh so
+        submix loopbacks pick up the new (or removed) FX virtual-source
+        without waiting up to two seconds for the poll timer."""
+        if hasattr(self, '_synced_nodes'):
+            self._synced_nodes.discard(node_name)
+        self._event_refresh_timer.start()
 
     def _start_event_subscriber(self):
         """Run `pactl subscribe` under a QProcess so an external mute/volume
@@ -1506,8 +1551,28 @@ class WaveLinuxWindow(QMainWindow):
                 self.engine.route_input_to_submix(pw_id, nname, node.media_class, "Monitor", snap=snap)
                 self.engine.route_input_to_submix(pw_id, nname, node.media_class, "Stream", snap=snap)
 
-                mon_state = dict(self.submix_state.get(f"{nname}_Monitor", {'vol': 1.0, 'mute': False}))
-                str_state = dict(self.submix_state.get(f"{nname}_Stream", {'vol': 1.0, 'mute': False}))
+                # First time we've ever seen this node: pick safe defaults.
+                # Mics default to MUTED in Monitor so a fresh install does NOT
+                # immediately scream the user's voice back at them through their
+                # headphones / speakers (which on a 4-monitor setup turns into a
+                # screaming feedback loop). Stream stays unmuted because that
+                # mix exists for a recording target (OBS) where 'no audio'
+                # would be more confusing than 'audio'.
+                mon_key = f"{nname}_Monitor"
+                str_key = f"{nname}_Stream"
+                fresh_mon = mon_key not in self.submix_state
+                fresh_str = str_key not in self.submix_state
+                is_mic_node = node in mics
+                mon_default = {'vol': 1.0, 'mute': True} if is_mic_node else {'vol': 1.0, 'mute': False}
+                str_default = {'vol': 1.0, 'mute': False}
+                mon_state = dict(self.submix_state.get(mon_key, mon_default))
+                str_state = dict(self.submix_state.get(str_key, str_default))
+                if fresh_mon:
+                    self.submix_state[mon_key] = dict(mon_state)
+                if fresh_str:
+                    self.submix_state[str_key] = dict(str_state)
+                if fresh_mon or fresh_str:
+                    self.schedule_save()
 
                 # State sync: on first tick after startup (or after a PipeWire
                 # restart), push our saved config into PipeWire so mutes/volumes
@@ -1529,14 +1594,32 @@ class WaveLinuxWindow(QMainWindow):
                         self.engine.set_submix_mute(pw_id, "Stream", str_state.get('mute', False))
                         self._synced_nodes.add(sync_key)
                 else:
-                    # After initial push, overlay live PipeWire state into the UI
-                    for mix_name, state in (("Monitor", mon_state), ("Stream", str_state)):
+                    # After initial push, overlay live PipeWire state into the
+                    # UI *and* persist it. Without writing back, an external
+                    # mute (pavucontrol, media keys, our own button) showed in
+                    # the UI but was never saved, so a restart re-pushed the
+                    # stale un-muted state — which is exactly what made fresh
+                    # installs blast the mic back at the user.
+                    overlay_changed = False
+                    for mix_name, state, mix_key in (
+                        ("Monitor", mon_state, mon_key),
+                        ("Stream",  str_state, str_key),
+                    ):
                         owner = self.engine.submix_loopbacks.get(f"{pw_id}->{mix_name}")
                         if owner is None:
                             continue
                         live = live_by_owner.get(str(owner))
-                        if live is not None:
-                            state['vol'], state['mute'] = live
+                        if live is None:
+                            continue
+                        live_vol, live_mute = live
+                        state['vol'], state['mute'] = live_vol, live_mute
+                        saved = self.submix_state.get(mix_key) or {}
+                        if (saved.get('vol') != live_vol
+                                or bool(saved.get('mute', False)) != bool(live_mute)):
+                            self.submix_state[mix_key] = {'vol': live_vol, 'mute': live_mute}
+                            overlay_changed = True
+                    if overlay_changed:
+                        self.schedule_save()
 
                 if pw_id not in self.channel_widgets:
                     if node in mics:
@@ -1586,16 +1669,18 @@ class WaveLinuxWindow(QMainWindow):
                 # Re-apply any saved effects the first time this node shows
                 # up in the session. `active_effects` is keyed by node.name
                 # (stable across PipeWire restarts); filter-chain processes
-                # live on the ephemeral pw_id, so we have to re-spawn them.
+                # live in-memory on the engine, so we re-spawn the chain
+                # via set_channel_fx. The next routing pass below will
+                # then thread the loopbacks through the chain's output.
                 if nname and nname not in self._effects_applied:
                     self._effects_applied.add(nname)
-                    for fid in list(self.active_effects.get(nname, [])):
-                        if not self.engine.effect_available(fid):
-                            continue
-                        if self.engine.is_effect_active(str(pw_id), fid):
-                            continue
-                        params = self.effect_params.get(nname, {}).get(fid) or None
-                        self.engine.apply_effect(str(pw_id), fid, params=params)
+                    saved_chain = list(self.active_effects.get(nname, []))
+                    if saved_chain and not self.engine.is_channel_fx_running(nname):
+                        capture_target = nname if (node in mics) else f"{nname}.monitor"
+                        params_map = dict(self.effect_params.get(nname, {}) or {})
+                        self.engine.set_channel_fx(
+                            nname, capture_target, saved_chain, params_map,
+                        )
 
                 # Surface "an effect is on" as a tiny ✨ next to the icon
                 # instead of repainting a big FX button.
@@ -1605,9 +1690,17 @@ class WaveLinuxWindow(QMainWindow):
             # mic, removed sink, PipeWire restart).
             for stale in [pid for pid in self.channel_widgets if pid not in current_node_ids]:
                 widget = self.channel_widgets.pop(stale)
+                stale_nname = getattr(widget, 'node_name', None)
                 widget.setParent(None)
                 widget.deleteLater()
                 self.engine.remove_node_routing(stale)
+                # The mic is gone, so its FX chain is now processing nothing
+                # — kill the stage processes too so they don't sit idle.
+                # The dropped node will be re-discovered (and its chain
+                # re-applied via _effects_applied) if it comes back.
+                if stale_nname:
+                    self.engine.clear_channel_fx(stale_nname)
+                    self._effects_applied.discard(stale_nname)
                 meter = self.meters.pop(stale, None)
                 if meter is not None:
                     meter.stop()
@@ -1635,8 +1728,21 @@ class WaveLinuxWindow(QMainWindow):
                     if preferred_sink and app.get('sink') != preferred_sink:
                         self.engine.move_app_to_sink(idx, preferred_sink)
 
-            # Show ALL known apps (including offline ones from config)
-            all_display_apps = set(apps_by_name.keys()) | set(self.app_routing.keys())
+            # Show every app we still 'remember' — currently making sound,
+            # has a saved routing, OR was seen within the prune window. The
+            # last category is what makes Discord stay in the panel after you
+            # close it: without it, an app that was never explicitly routed
+            # vanishes the moment its last sink-input goes away.
+            cutoff = int(time.time()) - max(1, self.app_prune_days) * 24 * 3600
+            recently_seen = {
+                name for name, ts in self.app_last_seen.items()
+                if ts >= cutoff
+            }
+            all_display_apps = (
+                set(apps_by_name.keys())
+                | set(self.app_routing.keys())
+                | recently_seen
+            )
             
             for app_name in all_display_apps:
                 active_indices = apps_by_name.get(app_name, [])
@@ -1757,9 +1863,12 @@ class WaveLinuxWindow(QMainWindow):
                 self.clipguard_btn.setChecked(False)
                 QMessageBox.warning(
                     self, "Clipguard",
-                    "Could not start the Stream limiter — check "
-                    "~/.config/wavelinux/fx-logs/limiter-mix_stream.log. "
-                    "swh-plugins (fast_lookahead_limiter_1913) is required."
+                    "Could not start the Stream limiter. Check "
+                    "~/.config/wavelinux/fx-logs/limiter-mix_stream.log "
+                    "for the spawn error. WaveLinux ships a builtin "
+                    "clamp-based fallback for systems without swh-plugins, "
+                    "so this typically only happens if PipeWire itself "
+                    "failed to launch the filter-chain."
                 )
         else:
             self.engine.apply_clipguard("Stream", False)
@@ -1799,14 +1908,10 @@ class WaveLinuxWindow(QMainWindow):
                     if isinstance(v, list)
                 }
 
-                # Re-apply saved effects for each node as they come back
-                # online. We can only act on user virtual sinks here because
-                # mic pw_ids aren't known yet; _refresh will pick up the
-                # effects for those on first tick via is_effect_active.
-                for node_name, effects in self.effect_params.items():
-                    # Don't auto-enable — parameters are just remembered.
-                    # Enabling happens the next time the user toggles ON.
-                    pass
+                # Saved effect parameters are loaded into self.effect_params
+                # / self.active_effects above. The actual chain spawn happens
+                # in _refresh once each node's pw_id is known, via
+                # set_channel_fx — see the "_effects_applied" gate there.
 
                 # Create standard mixes (always needed)
                 self.engine.create_output_mix("Monitor")
@@ -1924,15 +2029,28 @@ class WaveLinuxWindow(QMainWindow):
         if self.app_prune_days <= 0:
             return
         cutoff = int(time.time()) - self.app_prune_days * 24 * 3600
-        stale = [
+        stale_routed = [
             name for name in list(self.app_routing.keys())
             if self.app_last_seen.get(name, 0) < cutoff
         ]
-        for name in stale:
+        for name in stale_routed:
             self.app_routing.pop(name, None)
             self.app_last_seen.pop(name, None)
-        if stale:
-            logging.info(f"Pruned {len(stale)} stale app routing entries: {', '.join(stale[:5])}")
+        # Apps whose last_seen is older than the cutoff but which never had a
+        # saved routing also get reaped — without this, the panel would grow
+        # forever with apps the user opened once two years ago.
+        stale_seen = [
+            name for name, ts in list(self.app_last_seen.items())
+            if ts < cutoff
+        ]
+        for name in stale_seen:
+            self.app_last_seen.pop(name, None)
+        total = len(stale_routed) + len(stale_seen)
+        if total:
+            logging.info(
+                f"Pruned {total} stale app entries "
+                f"({len(stale_routed)} routed, {len(stale_seen)} seen-only)"
+            )
 
     # ── Channel reorder / rename ──────────────────────────────────
 
