@@ -199,6 +199,37 @@ class FXSelectionDialog(QDialog):
         self._param_frames  = {}   # effect_id -> QFrame holding the param rows
         self._toggle_btns   = {}   # effect_id -> QPushButton
 
+        # The user's *intent*: which effects they last had ON. We surface
+        # this in the dialog (tick the toggles) regardless of whether the
+        # filter-chain is actually running right now, because the chain
+        # might have died (PipeWire restart, stage crash) without the user
+        # touching anything. This is what makes "turn ON, click Done,
+        # reopen" show ON instead of OFF.
+        win = self._main_window_static(parent)
+        self._saved_effects = set(
+            (win.active_effects.get(self.node_name, []) if win else [])
+        )
+
+        # If we have saved chain state but it isn't currently running on
+        # the engine, try to spawn it now so what the dialog displays
+        # matches what's audible.
+        if self._saved_effects and not self.engine.is_channel_fx_running(self.node_name):
+            params = (win.effect_params.get(self.node_name, {})
+                      if win else {})
+            self.engine.set_channel_fx(
+                self.node_name, self.capture_target,
+                list(self._saved_effects), params,
+            )
+
+        # Slider drags fire valueChanged on every pixel; tearing down and
+        # respawning the whole chain at that rate would be unusable. Instead
+        # debounce param-driven rebuilds to ~150 ms, which feels live but
+        # only spawns once the user pauses.
+        self._param_timer = QTimer(self)
+        self._param_timer.setSingleShot(True)
+        self._param_timer.setInterval(150)
+        self._param_timer.timeout.connect(self._rebuild_chain)
+
         root = QVBoxLayout(self)
         root.setSpacing(12)
         root.setContentsMargins(20, 20, 20, 20)
@@ -228,8 +259,25 @@ class FXSelectionDialog(QDialog):
 
         close_btn = QPushButton("Done")
         close_btn.setObjectName("addBtn")
-        close_btn.clicked.connect(self.accept)
+        close_btn.clicked.connect(self._on_done)
         root.addWidget(close_btn)
+
+    @staticmethod
+    def _main_window_static(parent):
+        """Walk up to find the WaveLinuxWindow. Static because we need it
+        before instance state is fully wired."""
+        p = parent
+        while p is not None and not hasattr(p, 'effect_params'):
+            p = p.parent()
+        return p
+
+    def _on_done(self):
+        # Flush any pending debounced rebuild so a slider tweak that
+        # finished within the last 150 ms isn't lost on close.
+        if self._param_timer.isActive():
+            self._param_timer.stop()
+            self._rebuild_chain()
+        self.accept()
 
     # ── Card construction ──────────────────────────────────────────
 
@@ -261,7 +309,15 @@ class FXSelectionDialog(QDialog):
 
         toggle_btn = QPushButton()
         toggle_btn.setCheckable(True)
-        active = self.engine.is_channel_effect_active(self.node_name, fid)
+        # Saved intent wins over live state: if the user previously turned
+        # this ON and the chain isn't running (because a stage crashed
+        # / PipeWire restarted / the spawn failed quietly), the toggle
+        # still shows ON so the user can see their saved settings and
+        # we can attempt a respawn.
+        active = (
+            fid in self._saved_effects
+            or self.engine.is_channel_effect_active(self.node_name, fid)
+        )
         toggle_btn.setChecked(active)
         toggle_btn.setFixedWidth(60)
 
@@ -503,11 +559,13 @@ class FXSelectionDialog(QDialog):
         suffix = slider.property("psuffix") or ""
         val = pmin + (pmax - pmin) * (slider.value() / 1000.0)
         value_lbl.setText(self._fmt_value(val, suffix))
-        # Rebuild on every drag tick — set_channel_fx is idempotent: it
-        # tears down the existing stages and respawns with new control
-        # values. Heavy, but the simplest model and fast enough at the
-        # rate Qt sliders fire valueChanged.
-        self._rebuild_chain()
+        # Debounce: a slider drag fires valueChanged for every pixel, and
+        # set_channel_fx tears down + respawns the whole chain. Without
+        # debouncing the chain would be in a restart loop the entire time
+        # the user is dragging. 150 ms feels live but only commits the
+        # change once the slider settles. The "Done" button flushes any
+        # pending rebuild on close.
+        self._param_timer.start()
 
 
 # ── Channel Strip Widget ───────────────────────────────────────────
@@ -955,11 +1013,24 @@ class AppRoutingRow(QWidget):
             self.vol_slider.setValue(int(vol * 100))
             self.vol_slider.blockSignals(False)
 
-        # Forget is only useful for offline apps with a remembered routing;
-        # for a running app, it would be hidden and come right back.
-        win = self.window()
-        saved = hasattr(win, 'app_routing') and self.app_name in win.app_routing
-        self.forget_btn.setEnabled((not is_active) and saved)
+        # Forget is always available. For an offline row it deletes the
+        # row outright; for an online app it nukes the saved routing /
+        # last-seen entries so the next refresh re-discovers the app
+        # under whatever (potentially better) name resolution gives us.
+        # That second case is the escape hatch when an app is stuck under
+        # an old, generic identification like "audio-src" because the
+        # name was first cached before .desktop discovery improved.
+        self.forget_btn.setEnabled(True)
+        if is_active:
+            self.forget_btn.setToolTip(
+                "Forget this app and everything we've saved about it. "
+                "If it's still playing audio it will reappear under its "
+                "freshly-resolved name."
+            )
+        else:
+            self.forget_btn.setToolTip(
+                "Forget this app so it stops showing up in the list."
+            )
 
         # Update combo box. Users can send an app to:
         #   • any hardware output (ALSA / Bluetooth / JACK)

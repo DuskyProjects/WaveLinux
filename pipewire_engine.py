@@ -2048,13 +2048,15 @@ context.modules = [
     #
     # The legacy apply_effect / remove_effect / is_effect_active functions
     # spawn a free-floating filter-chain that processes audio it never
-    # actually sees (it captures from PipeWire's default source, not the
-    # user's chosen channel). The chain API below replaces that with a
-    # real bus: each enabled effect is its own pipewire filter-chain stage
-    # whose `capture.props.target.object` is bound to the previous stage's
-    # output (or the channel's mic for the first stage). The final stage
-    # exposes a virtual Audio/Source that the submix loopbacks pull from
-    # — which is what makes the effects audible.
+    # actually sees. The chain API below replaces that with a real bus:
+    # each enabled effect is its own filter-chain process exposing both
+    # an Audio/Sink (its input) and an Audio/Source (its output). We wire
+    # the chain together with explicit `module-loopback` modules — same
+    # mechanism we use for submix routing — so the mic feeds stage 0's
+    # sink, stage N's source feeds stage N+1's sink, and the final
+    # stage's source is what the submix loopbacks pull from. That last
+    # link is what makes the effects audible: without it the chain runs
+    # but processes nothing.
 
     # Order to apply effects in the chain. Anything not in this list
     # appears at the end in user-specified order.
@@ -2074,25 +2076,33 @@ context.modules = [
         cleaned = re.sub(r'[^A-Za-z0-9]+', '_', (node_name or '').lower()).strip('_')
         return cleaned or 'chan'
 
-    def _stage_source_name(self, safe_key, idx, effect_id):
-        """The Audio/Source node.name a chain stage exposes. Stable enough
-        to use as the next stage's `target.object`."""
-        return f'wavelinux.fx.{safe_key}.{idx}.{effect_id}.source'
-
-    def _build_fx_stage_config(self, safe_key, idx, effect_id, params, capture_target):
+    def _build_fx_stage_config(self, safe_key, idx, effect_id, params):
         """Write a per-stage filter-chain config to disk and return its
-        path, plus the source node.name the stage will expose. Returns
-        (None, None) on unknown effect."""
+        path along with the stage's input-sink and output-source node
+        names. Each stage exposes BOTH:
+
+          - a `media.class = Audio/Sink`   on capture.props (the stage
+            sink — anything routed here gets processed),
+          - a `media.class = Audio/Source` on playback.props (the stage
+            source — what the next stage / submix loopback consumes).
+
+        Connecting them is then a normal `module-loopback` from the
+        upstream source into this stage's sink — the same machinery
+        we already use for submix routing. Robust across pipewire
+        versions; doesn't depend on `target.object` binding.
+
+        Returns (config_path, sink_name, source_name) or (None, None, None)
+        for an unknown effect."""
         config_dir = os.path.expanduser('~/.config/pipewire')
         os.makedirs(config_dir, exist_ok=True)
 
         values = self._resolved_params(effect_id, params)
         filter_graph = self._build_filter_graph(effect_id, values)
         if filter_graph is None:
-            return None, None
+            return None, None, None
 
-        source_name = self._stage_source_name(safe_key, idx, effect_id)
-        capture_name = f'wavelinux.fx.{safe_key}.{idx}.{effect_id}.capture'
+        sink_name   = f'wavelinux.fx.{safe_key}.{idx}.{effect_id}.input'
+        source_name = f'wavelinux.fx.{safe_key}.{idx}.{effect_id}.source'
 
         config = self._FX_PREAMBLE + f"""
 context.modules = [
@@ -2103,9 +2113,9 @@ context.modules = [
             filter.graph = {{{filter_graph}
             }}
             capture.props = {{
-                node.name     = "{capture_name}"
-                target.object = "{capture_target}"
-                audio.rate    = 48000
+                node.name    = "{sink_name}"
+                media.class  = Audio/Sink
+                audio.rate   = 48000
             }}
             playback.props = {{
                 node.name    = "{source_name}"
@@ -2121,20 +2131,47 @@ context.modules = [
         )
         with open(config_path, 'w') as f:
             f.write(config)
-        return config_path, source_name
+        return config_path, sink_name, source_name
+
+    def _wait_load_loopback(self, source, sink, latency_msec=5, attempts=8, delay=0.05):
+        """Load a `module-loopback` from `source` to `sink`, retrying for
+        ~400 ms while pipewire-pulse registers a freshly-spawned node.
+        Inter-stage FX wiring would race the spawn otherwise: pipewire-pulse
+        catalogues the new sink a beat after the filter-chain process comes
+        up, and a one-shot `pactl load-module` sees an unknown sink and
+        fails. Returns the loopback module id (str) or None."""
+        import time as _time
+        for _ in range(attempts):
+            out = self._run([
+                'pactl', 'load-module', 'module-loopback',
+                f'source={source}',
+                f'sink={sink}',
+                f'latency_msec={int(latency_msec)}',
+                'adjust_time=0',
+            ])
+            if out:
+                stripped = out.strip().splitlines()[-1].strip()
+                if stripped.isdigit():
+                    return stripped
+            _time.sleep(delay)
+        return None
 
     def set_channel_fx(self, node_name, capture_target, effects, params_map=None):
         """Replace this channel's effect chain. Tears down whatever was
-        running, then spawns one filter-chain process per enabled effect,
-        each capturing from the previous stage's output (or `capture_target`
-        for the first stage). Returns the final source node.name when at
-        least one stage came up, else None.
+        running, then spawns one filter-chain process per enabled effect.
+        Each stage exposes a sink (input) and a source (output); we
+        wire the chain explicitly with `module-loopback` modules — same
+        pattern we use for submix routing, so it doesn't rely on
+        `target.object` semantics that vary by pipewire version.
 
-        - `node_name`: stable PipeWire node.name of the channel (mic or
-          virtual sink). State is keyed by this so it survives restarts.
-        - `capture_target`: the source the FIRST stage captures from.
-          For mics this is the mic's node.name; for virtual sinks pass
-          `f"{sink_name}.monitor"`.
+        Returns the final source node.name on success (at least one stage
+        spawned and was loopback-ed in), else None.
+
+        - `node_name`: stable PipeWire node.name. State is keyed by this so
+          chains survive PipeWire restarts.
+        - `capture_target`: the source the FIRST stage should receive
+          audio from. For mics this is the mic's node.name; for virtual
+          sinks pass `f"{sink_name}.monitor"`.
         - `effects`: effect_id list; reordered to canonical signal flow.
         - `params_map`: {effect_id: {param_key: value}}.
         """
@@ -2142,66 +2179,106 @@ context.modules = [
             return None
         params_map = params_map or {}
 
-        # Always reset first — this both makes the call idempotent and
-        # gives us a clean baseline when the user changes a parameter and
-        # we re-spawn with new control values.
+        # Always reset first — makes the call idempotent and gives a clean
+        # baseline when respawning after a parameter change.
         self.clear_channel_fx(node_name)
 
-        # Filter to effects whose backend plugin is actually installed.
-        # Skipping unavailable effects silently is intentional: the FX UI
-        # already greys out unavailable rows; if a saved chain references
-        # one anyway, we'd rather light up the rest of the chain than
-        # leave the channel completely processed-bypass-style.
         ordered = [fid for fid in self._ordered_chain(effects)
                    if self.effect_available(fid)]
         if not ordered:
             return None
 
         safe_key = self._safe_channel_key(node_name)
-        spawned = []          # list of (proc_key, effect_id, source_name)
-        current_target = capture_target
+        proc_keys     = []   # filter-chain stage process keys
+        loopback_ids  = []   # module-loopback ids wiring stages together
+        upstream_src  = capture_target
 
         for i, effect_id in enumerate(ordered):
             params = params_map.get(effect_id) or None
-            config_path, source_name = self._build_fx_stage_config(
-                safe_key, i, effect_id, params, current_target,
+            config_path, sink_name, source_name = self._build_fx_stage_config(
+                safe_key, i, effect_id, params,
             )
             if config_path is None:
                 continue
+
             log_path = self._fx_log_path(safe_key, f'{i}_{effect_id}')
             proc_key = f'chain_{safe_key}_{i}_{effect_id}'
-            if self._spawn_fx(config_path, log_path, proc_key):
-                spawned.append((proc_key, effect_id, source_name))
-                current_target = source_name
-            else:
+
+            if not self._spawn_fx(config_path, log_path, proc_key):
                 logging.warning(
                     f"FX chain stage {i} ({effect_id}) failed to spawn for "
-                    f"{node_name}; subsequent stages may not work."
+                    f"{node_name}; remaining stages will be skipped."
                 )
+                # Stop here — chaining over a missing stage produces silence.
+                break
 
-        if not spawned:
+            # Wire upstream → this stage's input sink. Without this loopback
+            # the stage processes silence and the user hears nothing.
+            lb = self._wait_load_loopback(upstream_src, sink_name)
+            if lb is None:
+                logging.warning(
+                    f"FX loopback {upstream_src} → {sink_name} failed; "
+                    f"chain stage {i} ({effect_id}) is dangling."
+                )
+                # Kill the orphan stage and stop building the chain.
+                self.stop_rnnoise(proc_key)
+                break
+
+            proc_keys.append(proc_key)
+            loopback_ids.append(lb)
+            upstream_src = source_name
+
+        if not proc_keys:
             return None
 
-        final_source = spawned[-1][2]
+        final_source = upstream_src
+        applied_effects = list(ordered[:len(proc_keys)])
         self.channel_fx[node_name] = {
-            'effects': [eid for (_pk, eid, _src) in spawned],
-            'params':  {eid: dict(params_map.get(eid, {}))
-                        for (_pk, eid, _src) in spawned},
-            'procs':   [pk for (pk, _eid, _src) in spawned],
-            'source':  final_source,
+            'effects':   applied_effects,
+            'params':    {fid: dict(params_map.get(fid, {}))
+                          for fid in applied_effects},
+            'procs':     list(proc_keys),
+            'loopbacks': list(loopback_ids),
+            'source':    final_source,
             'capture_target': capture_target,
-            'safe_key': safe_key,
+            'safe_key':  safe_key,
         }
         return final_source
 
     def clear_channel_fx(self, node_name):
-        """Tear down the FX chain on a channel. Idempotent."""
+        """Tear down the FX chain on a channel. Idempotent. Order matters:
+        unload the inter-stage loopbacks AND any submix loopback that was
+        consuming this channel's FX output BEFORE stopping the
+        filter-chain stages, so we don't leave PipeWire briefly routing
+        audio into a sink that's about to disappear (which can wedge
+        pipewire-pulse for a beat)."""
         info = self.channel_fx.pop(node_name, None)
         if not info:
             return False
+
+        # 1. Drop submix loopbacks whose source is part of this channel's
+        # chain — without this, route_input_to_submix would happily keep
+        # using the cached loopback (still alive in `pactl list modules`)
+        # even though its source was just unloaded, and the user gets
+        # silence on the submix until the next chain spawn re-uses the
+        # exact same source name. We can't compare by source identity
+        # cheaply, so we match the well-known FX-source prefix.
+        prefix = f'wavelinux.fx.{info.get("safe_key", "")}.'
+        for skey in list(self.submix_sources.keys()):
+            src = self.submix_sources.get(skey, '')
+            if not src or not src.startswith(prefix):
+                continue
+            mod_id = self.submix_loopbacks.pop(skey, None)
+            self.submix_sources.pop(skey, None)
+            if mod_id is not None:
+                self._run(['pactl', 'unload-module', str(mod_id)])
+
+        # 2. Unload the chain's own inter-stage wiring loopbacks.
+        for mod_id in info.get('loopbacks', []):
+            self._run(['pactl', 'unload-module', str(mod_id)])
+
+        # 3. Kill the filter-chain stage processes.
         for pk in info.get('procs', []):
-            # _spawn_fx parks each stage in self.rnnoise_processes keyed
-            # by proc_key, so we can hand the kill back to stop_rnnoise.
             self.stop_rnnoise(pk)
         return True
 
