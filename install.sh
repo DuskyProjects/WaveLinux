@@ -7,7 +7,18 @@ echo "║        WaveLinux Installer               ║"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 
-# Install dependencies via pacman
+# Install dependencies via pacman.
+# Why each one is here:
+#   python / python-pyqt6 — runtime + GUI
+#   pipewire / pipewire-pulse / wireplumber — the audio server we drive
+#   libpulse — provides `pactl` and `parec` (peak meters use parec)
+#   rnnoise — base library for the noise-suppressor LADSPA plugin
+#   swh-plugins — provides sc4_1882 (compressor), gate_1410 (gate), and
+#                 fast_lookahead_limiter_1913 (limiter / Clipguard).
+#                 NOTE: WaveLinux ships a builtin clamp-based fallback
+#                 for the limiter, so Clipguard works without
+#                 swh-plugins; the LADSPA limiter is just better-sounding
+#                 when present.
 echo "→ Installing dependencies..."
 sudo pacman -S --needed --noconfirm \
     python \
@@ -19,7 +30,10 @@ sudo pacman -S --needed --noconfirm \
     rnnoise \
     swh-plugins
 
-# Install RNNoise LADSPA plugin (required for Denoise to work)
+# Install the RNNoise LADSPA plugin from the AUR. Required for the
+# Noise-Suppression effect; without it, the FX dialog grey-outs that row.
+# Skipped if WaveLinux's installer is being run inside an environment
+# without an AUR helper (CI, docker, fresh chroot).
 echo "→ Installing RNNoise plugin (noise-suppression-for-voice)..."
 if ! pacman -Qi noise-suppression-for-voice > /dev/null 2>&1; then
     if command -v paru >/dev/null 2>&1; then
@@ -67,4 +81,8 @@ echo ""
 echo "You can now:"
 echo "  1. Find 'WaveLinux' in your KDE application menu"
 echo "  2. Or run it directly:  python3 ${SCRIPT_DIR}/main.py"
+echo ""
+echo "To uninstall and wipe state (useful if app names look stuck on"
+echo "old values like 'audio-src'):"
+echo "  ${SCRIPT_DIR}/uninstall.sh"
 echo ""
