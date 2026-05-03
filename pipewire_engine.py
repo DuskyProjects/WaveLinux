@@ -1631,14 +1631,23 @@ class PipeWireEngine:
         """Build a complete `pipewire -c` config that runs as a CLIENT
         of the user's running daemon (not as a standalone audio system)
         and loads exactly one `libpipewire-module-filter-chain` whose
-        args are the SPA-JSON object passed in. The client_id is folded
-        into `core.name` to keep `pw-top` and `pw-cli ls Module` legible."""
+        args are the SPA-JSON object passed in.
+
+        The module list and SPA libs match — exactly — PipeWire's own
+        canonical `filter-chain.conf` (the file pipewire(1) loads when
+        you run `pipewire -c filter-chain.conf`). That config is the
+        upstream reference for "run a filter chain as a client of the
+        running daemon", so anything more or less is a guess. In
+        particular: do NOT add `libpipewire-module-metadata` here —
+        canonical omits it, and on some setups loading metadata as a
+        client of an existing daemon throws an ENOENT and aborts the
+        entire client. We want filter-chain spawns to come up reliably,
+        not depend on every distro's metadata-interface init."""
         return f"""\
 context.properties = {{
-    core.daemon       = false
-    core.name         = wavelinux-fx-{client_id}
-    log.level         = 2
-    mem.warn-mlock    = false
+    core.daemon = false
+    core.name   = wavelinux-fx-{client_id}
+    log.level   = 2
 }}
 
 context.spa-libs = {{
@@ -1654,8 +1663,8 @@ context.modules = [
     {{ name = libpipewire-module-protocol-native }}
     {{ name = libpipewire-module-client-node }}
     {{ name = libpipewire-module-adapter }}
-    {{ name = libpipewire-module-metadata }}
     {{ name = libpipewire-module-filter-chain
+        flags = [ nofail ]
         args = {filter_chain_args}
     }}
 ]
@@ -1684,9 +1693,42 @@ context.modules = [
         gives us a reliable pass/fail. 1.5 s is empirical: filter-chain
         spawn on a typical Linux system completes in ~250 ms; the headroom
         catches slower setups (Bluetooth audio waking up, NUMA-pinned
-        rt scheduling, etc.) without leaving the UI feeling sluggish."""
+        rt scheduling, etc.) without leaving the UI feeling sluggish.
+
+        We also dump a debug header into the log file (the config we ran,
+        the env, the pipewire version) so post-mortem on a failed spawn
+        doesn't require re-running anything — `cat <log>` shows what we
+        tried and why it didn't fly. Without this header it's impossible
+        to tell from outside whether a config-syntax error or a missing
+        plugin or a daemon-connection failure is the culprit."""
         try:
+            # Read config back so the debug header is the FILE we ran
+            # (not whatever the caller intended). Avoids mismatch when
+            # someone races us with a hand-edit.
+            try:
+                with open(config_path, 'r') as cf:
+                    rendered_config = cf.read()
+            except OSError:
+                rendered_config = '<read failed>'
+            try:
+                pw_ver = subprocess.run(
+                    ['pipewire', '--version'], capture_output=True,
+                    text=True, timeout=2,
+                ).stdout.strip() or 'unknown'
+            except Exception:
+                pw_ver = 'unknown'
             log_file = open(log_path, 'wb')
+            header = (
+                f"# WaveLinux FX spawn {key}\n"
+                f"# pipewire --version: {pw_ver}\n"
+                f"# config path:        {config_path}\n"
+                f"# LADSPA_PATH env:    {os.environ.get('LADSPA_PATH', '')}\n"
+                f"# ──────── config ─────────\n"
+                f"{rendered_config}"
+                f"\n# ──────── pipewire stderr/stdout ────────\n"
+            )
+            log_file.write(header.encode('utf-8'))
+            log_file.flush()
             proc = subprocess.Popen(
                 ['pipewire', '-c', config_path],
                 stdout=log_file, stderr=log_file,
@@ -2167,20 +2209,34 @@ context.modules = [
         source_name = f'wavelinux.fx.{safe_key}.{idx}.{effect_id}.source'
 
         client_id = f'{safe_key}-{idx}-{effect_id}'
+        # `node.always-process = true` forces the filter chain to run even
+        # when nothing is currently pulling on the playback side or pushing
+        # on the capture side. Without it, pipewire is free to suspend the
+        # chain until both sides have an active link — which during chain
+        # construction is briefly true and creates a chicken-and-egg with
+        # the loopback wiring (the loopback is what creates the link, but
+        # the link is what activates the chain).
+        # `audio.position = [ MONO ]` pins the channel layout to a single
+        # channel so a stereo LADSPA plugin doesn't get spliced onto a
+        # mono mic with one half of its inputs floating.
         filter_chain_args = f"""{{
             node.description = "WaveLinux-{effect_id} ({safe_key}#{idx})"
             media.name       = "WaveLinux-{effect_id} ({safe_key}#{idx})"
             filter.graph = {{{filter_graph}
             }}
             capture.props = {{
-                node.name    = "{sink_name}"
-                media.class  = Audio/Sink
-                audio.rate   = 48000
+                node.name           = "{sink_name}"
+                media.class         = Audio/Sink
+                audio.rate          = 48000
+                audio.position      = [ MONO ]
+                node.always-process = true
             }}
             playback.props = {{
-                node.name    = "{source_name}"
-                media.class  = Audio/Source
-                audio.rate   = 48000
+                node.name           = "{source_name}"
+                media.class         = Audio/Source
+                audio.rate          = 48000
+                audio.position      = [ MONO ]
+                node.always-process = true
             }}
         }}"""
         config = self._fx_client_config(client_id, filter_chain_args)
@@ -2191,13 +2247,21 @@ context.modules = [
             f.write(config)
         return config_path, sink_name, source_name
 
-    def _wait_load_loopback(self, source, sink, latency_msec=5, attempts=8, delay=0.05):
+    def _wait_load_loopback(self, source, sink, latency_msec=20, attempts=20, delay=0.1):
         """Load a `module-loopback` from `source` to `sink`, retrying for
-        ~400 ms while pipewire-pulse registers a freshly-spawned node.
+        up to ~2 s while pipewire-pulse registers a freshly-spawned node.
         Inter-stage FX wiring would race the spawn otherwise: pipewire-pulse
         catalogues the new sink a beat after the filter-chain process comes
         up, and a one-shot `pactl load-module` sees an unknown sink and
-        fails. Returns the loopback module id (str) or None."""
+        fails. Returns the loopback module id (str) or None.
+
+        `latency_msec=20` matches the default the rest of the codebase
+        uses for submix loopbacks. Lower values (we briefly used 5) were
+        unstable on a couple of test rigs — pulse-bridge would create the
+        module successfully but the chain wouldn't actually flow audio,
+        because filter-chain's internal scheduler couldn't keep up at
+        a 5ms quantum. 20 ms is quiet enough for live monitoring (well
+        under the perception threshold for self-monitoring) and reliable."""
         import time as _time
         for _ in range(attempts):
             out = self._run([
