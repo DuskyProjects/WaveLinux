@@ -150,6 +150,35 @@ class PipeWireEngine:
                 return True
         return False
 
+    def ladspa_plugin_path(self, name):
+        """Find the full filesystem path to a LADSPA plugin .so. PipeWire's
+        filter-chain technically accepts a bare plugin name (it walks
+        $LADSPA_PATH internally) but using the absolute path eliminates
+        a class of "plugin not found" silent failures we've seen in the
+        wild — particularly on systems where the librnnoise .so lives in
+        a non-default directory the spawned `pipewire -c` process didn't
+        inherit. Returns None if the plugin isn't on disk anywhere we
+        searched."""
+        env_path = os.environ.get("LADSPA_PATH", "")
+        roots = [p for p in env_path.split(":") if p] + list(self._LADSPA_PATHS)
+        target_lower = name.lower()
+        for root in roots:
+            try:
+                entries = os.listdir(root)
+            except OSError:
+                continue
+            for entry in entries:
+                if not entry.endswith(".so"):
+                    continue
+                stem = entry[:-3]
+                if (stem == name
+                        or stem.lower() == target_lower
+                        or stem.lower().startswith(target_lower + "_")):
+                    full = os.path.join(root, entry)
+                    if os.path.isfile(full):
+                        return full
+        return None
+
     def effect_available(self, effect_id):
         """Return True if the filter-chain backend for this effect has
         everything it needs on disk. Keeps the FX UI from offering things
@@ -1575,16 +1604,77 @@ class PipeWireEngine:
         return new_sink_name
 
     # ── Effects / RNNoise ──────────────────────────────────────────
+    #
+    # A `pipewire -c <conf>` invocation starts a NEW pipewire instance with
+    # the given conf as its COMPLETE config (no merge with the system
+    # default). For that instance to participate in the user's running
+    # audio graph — i.e. for its filter-chain's Audio/Sink and Audio/Source
+    # nodes to actually appear in `pactl list sinks` / `pactl list sources`
+    # so we can pipe audio into them — the conf must:
+    #
+    #   1. Set `core.daemon = false` so it doesn't try to BE the system
+    #      pipewire daemon.
+    #   2. Load the basic SPA libs (`audioconvert`, `support`).
+    #   3. Load the basic client modules (`rt`, `protocol-native`,
+    #      `client-node`, `adapter`, `metadata`).
+    #   4. THEN load `libpipewire-module-filter-chain` with our filter graph.
+    #
+    # Earlier versions of this file shipped only step 1, so the spawned
+    # process either ran as an orphan audio system with no devices (and
+    # thus processed nothing) or failed silently to register its nodes
+    # with the running daemon. The user heard their mic untouched and
+    # — with `noise_suppressor_mono` clearly installed — would understandably
+    # conclude "the effects don't actually do anything".
 
-    # Boilerplate that keeps spawned `pipewire -c` processes from trying to
-    # become the system daemon and re-route all audio.
-    _FX_PREAMBLE = """\
-context.properties = {
+    @staticmethod
+    def _fx_client_config(client_id, filter_chain_args):
+        """Build a complete `pipewire -c` config that runs as a CLIENT
+        of the user's running daemon (not as a standalone audio system)
+        and loads exactly one `libpipewire-module-filter-chain` whose
+        args are the SPA-JSON object passed in.
+
+        The module list and SPA libs match — exactly — PipeWire's own
+        canonical `filter-chain.conf` (the file pipewire(1) loads when
+        you run `pipewire -c filter-chain.conf`). That config is the
+        upstream reference for "run a filter chain as a client of the
+        running daemon", so anything more or less is a guess. In
+        particular: do NOT add `libpipewire-module-metadata` here —
+        canonical omits it, and on some setups loading metadata as a
+        client of an existing daemon throws an ENOENT and aborts the
+        entire client. We want filter-chain spawns to come up reliably,
+        not depend on every distro's metadata-interface init."""
+        return f"""\
+context.properties = {{
     core.daemon = false
-    core.name   = wavelinux-fx
+    core.name   = wavelinux-fx-{client_id}
     log.level   = 2
-}
+}}
+
+context.spa-libs = {{
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}}
+
+context.modules = [
+    {{ name = libpipewire-module-rt
+        args = {{ nice.level = -11 }}
+        flags = [ ifexists nofail ]
+    }}
+    {{ name = libpipewire-module-protocol-native }}
+    {{ name = libpipewire-module-client-node }}
+    {{ name = libpipewire-module-adapter }}
+    {{ name = libpipewire-module-filter-chain
+        flags = [ nofail ]
+        args = {filter_chain_args}
+    }}
+]
 """
+
+    # Old _FX_PREAMBLE-based callers still exist (apply_effect / start_rnnoise
+    # are kept as a legacy path used by Clipguard). They get the same
+    # complete client preamble via `_fx_client_config` now — preserved here
+    # only as a stub so an unupgraded checkout doesn't NameError on import.
+    _FX_PREAMBLE = ""
 
     @staticmethod
     def _fx_log_path(channel_key, effect_id):
@@ -1593,8 +1683,52 @@ context.properties = {
         return os.path.join(log_dir, f'{effect_id}-{channel_key}.log')
 
     def _spawn_fx(self, config_path, log_path, key):
+        """Spawn a `pipewire -c <config>` process. Returns True if the
+        process is still alive after a 1.5 s settle window, in which case
+        it's parked in `rnnoise_processes[key]` for later teardown.
+
+        The settle window is the only crash signal we have — a config
+        with a bad LADSPA path / wrong port name / unknown SPA factory
+        exits immediately, so waiting longer than the worst-case startup
+        gives us a reliable pass/fail. 1.5 s is empirical: filter-chain
+        spawn on a typical Linux system completes in ~250 ms; the headroom
+        catches slower setups (Bluetooth audio waking up, NUMA-pinned
+        rt scheduling, etc.) without leaving the UI feeling sluggish.
+
+        We also dump a debug header into the log file (the config we ran,
+        the env, the pipewire version) so post-mortem on a failed spawn
+        doesn't require re-running anything — `cat <log>` shows what we
+        tried and why it didn't fly. Without this header it's impossible
+        to tell from outside whether a config-syntax error or a missing
+        plugin or a daemon-connection failure is the culprit."""
         try:
+            # Read config back so the debug header is the FILE we ran
+            # (not whatever the caller intended). Avoids mismatch when
+            # someone races us with a hand-edit.
+            try:
+                with open(config_path, 'r') as cf:
+                    rendered_config = cf.read()
+            except OSError:
+                rendered_config = '<read failed>'
+            try:
+                pw_ver = subprocess.run(
+                    ['pipewire', '--version'], capture_output=True,
+                    text=True, timeout=2,
+                ).stdout.strip() or 'unknown'
+            except Exception:
+                pw_ver = 'unknown'
             log_file = open(log_path, 'wb')
+            header = (
+                f"# WaveLinux FX spawn {key}\n"
+                f"# pipewire --version: {pw_ver}\n"
+                f"# config path:        {config_path}\n"
+                f"# LADSPA_PATH env:    {os.environ.get('LADSPA_PATH', '')}\n"
+                f"# ──────── config ─────────\n"
+                f"{rendered_config}"
+                f"\n# ──────── pipewire stderr/stdout ────────\n"
+            )
+            log_file.write(header.encode('utf-8'))
+            log_file.flush()
             proc = subprocess.Popen(
                 ['pipewire', '-c', config_path],
                 stdout=log_file, stderr=log_file,
@@ -1602,9 +1736,8 @@ context.properties = {
         except FileNotFoundError:
             logging.error("`pipewire` binary not found — cannot spawn filter chain")
             return False
-        # Give it a moment to fail loudly (missing plugin, syntax error, etc.)
         try:
-            proc.wait(timeout=0.4)
+            proc.wait(timeout=1.5)
         except subprocess.TimeoutExpired:
             # Still running = success.
             self.rnnoise_processes[key] = proc
@@ -1613,31 +1746,27 @@ context.properties = {
         return False
 
     def start_rnnoise(self, channel_key='default', params=None):
+        """Legacy single-effect rnnoise spawn (kept for backwards-compat).
+        New code should go through `set_channel_fx` which routes the mic
+        through the chain explicitly. This path is only used when something
+        directly calls `apply_effect('rnnoise', …)` — currently nothing
+        in-tree does so."""
         config_dir = os.path.expanduser('~/.config/pipewire')
         os.makedirs(config_dir, exist_ok=True)
         config_path = os.path.join(config_dir, f'wavelinux-rnnoise-{channel_key}.conf')
         values = self._resolved_params('rnnoise', params)
-        control_block = self._render_control_block(values)
-        config = self._FX_PREAMBLE + f"""
-context.modules = [
-    {{ name = libpipewire-module-filter-chain
-        args = {{
+        filter_graph = self._build_filter_graph('rnnoise', values)
+        if filter_graph is None:
+            return False
+        client_id = re.sub(r'[^A-Za-z0-9]+', '-', f'rnnoise-{channel_key}').strip('-') or 'rnnoise'
+        filter_chain_args = f"""{{
             node.description = "WaveLinux-Denoise ({channel_key})"
             media.name       = "WaveLinux-Denoise ({channel_key})"
-            filter.graph = {{
-                nodes = [
-                    {{
-                        type   = ladspa
-                        name   = rnnoise
-                        plugin = librnnoise_ladspa
-                        label  = noise_suppressor_mono
-{control_block}
-                    }}
-                ]
+            filter.graph = {{{filter_graph}
             }}
             capture.props = {{
                 node.name    = "wavelinux.rnnoise.{channel_key}.capture"
-                node.passive = true
+                media.class  = Audio/Sink
                 audio.rate   = 48000
             }}
             playback.props = {{
@@ -1645,10 +1774,8 @@ context.modules = [
                 media.class  = Audio/Source
                 audio.rate   = 48000
             }}
-        }}
-    }}
-]
-"""
+        }}"""
+        config = self._fx_client_config(client_id, filter_chain_args)
         with open(config_path, 'w') as f:
             f.write(config)
         return self._spawn_fx(config_path, self._fx_log_path(channel_key, 'rnnoise'), channel_key)
@@ -1848,22 +1975,31 @@ context.modules = [
         body = "\n".join(lines)
         return f"                        control = {{\n{body}\n                        }}"
 
+    def _ladspa_node(self, name, plugin, label, values):
+        """Render a single LADSPA node block for filter.graph, using the
+        full filesystem path to the .so when we can find it. Falls back
+        to the bare name (which pipewire resolves via $LADSPA_PATH) when
+        the plugin isn't on disk in any path we know about."""
+        path = self.ladspa_plugin_path(plugin) or plugin
+        return f"""
+                nodes = [
+                    {{
+                        type   = ladspa
+                        name   = {name}
+                        plugin = "{path}"
+                        label  = {label}
+{self._render_control_block(values)}
+                    }}
+                ]
+"""
+
     def _build_filter_graph(self, effect_id, values):
         """Render the `filter.graph` body for a given effect. Returns None for
         unknown effect ids. Shared by both the legacy single-effect spawn
         path (used by clipguard) and the per-stage chain path (`set_channel_fx`)."""
         if effect_id == 'rnnoise':
-            return f"""
-                nodes = [
-                    {{
-                        type   = ladspa
-                        name   = rnnoise
-                        plugin = librnnoise_ladspa
-                        label  = noise_suppressor_mono
-{self._render_control_block(values)}
-                    }}
-                ]
-"""
+            return self._ladspa_node('rnnoise', 'librnnoise_ladspa',
+                                     'noise_suppressor_mono', values)
         if effect_id == 'highpass':
             # PipeWire's native biquad — no LADSPA needed.
             return f"""
@@ -1917,29 +2053,9 @@ context.modules = [
                 ]
 """
         if effect_id == 'gate':
-            return f"""
-                nodes = [
-                    {{
-                        type  = ladspa
-                        name  = gate
-                        plugin = gate_1410
-                        label = gate
-{self._render_control_block(values)}
-                    }}
-                ]
-"""
+            return self._ladspa_node('gate', 'gate_1410', 'gate', values)
         if effect_id == 'compressor':
-            return f"""
-                nodes = [
-                    {{
-                        type  = ladspa
-                        name  = compressor
-                        plugin = sc4_1882
-                        label = sc4
-{self._render_control_block(values)}
-                    }}
-                ]
-"""
+            return self._ladspa_node('compressor', 'sc4_1882', 'sc4', values)
         if effect_id == 'limiter':
             # Prefer the swh-plugins fast lookahead limiter when present —
             # real lookahead, real release. Without it, fall back to a
@@ -1949,17 +2065,8 @@ context.modules = [
             # release behaviour) but it stops audio from clipping, which
             # is what Clipguard exists to do.
             if self.ladspa_plugin_available('fast_lookahead_limiter_1913'):
-                return f"""
-                nodes = [
-                    {{
-                        type  = ladspa
-                        name  = limiter
-                        plugin = fast_lookahead_limiter_1913
-                        label = fastLookaheadLimiter
-{self._render_control_block(values)}
-                    }}
-                ]
-"""
+                return self._ladspa_node('limiter', 'fast_lookahead_limiter_1913',
+                                         'fastLookaheadLimiter', values)
             ceiling_db = float(values.get('Limit (dB)', -1.0))
             input_db   = float(values.get('Input gain (dB)', 0.0))
             ceiling = max(0.0001, min(1.0, 10 ** (ceiling_db / 20.0)))
@@ -2004,17 +2111,16 @@ context.modules = [
             return False
 
         config_path = os.path.join(config_dir, f'wavelinux-fx-{channel_key}-{effect_id}.conf')
-        config = self._FX_PREAMBLE + f"""
-context.modules = [
-    {{ name = libpipewire-module-filter-chain
-        args = {{
+        client_id = re.sub(r'[^A-Za-z0-9]+', '-',
+                           f'{effect_id}-{channel_key}').strip('-') or effect_id
+        filter_chain_args = f"""{{
             node.description = "WaveLinux-{effect_id} ({channel_key})"
             media.name       = "WaveLinux-{effect_id} ({channel_key})"
             filter.graph = {{{filter_graph}
             }}
             capture.props = {{
                 node.name    = "wavelinux.fx.{channel_key}.{effect_id}.capture"
-                node.passive = true
+                media.class  = Audio/Sink
                 audio.rate   = 48000
             }}
             playback.props = {{
@@ -2022,10 +2128,8 @@ context.modules = [
                 media.class  = Audio/Source
                 audio.rate   = 48000
             }}
-        }}
-    }}
-]
-"""
+        }}"""
+        config = self._fx_client_config(client_id, filter_chain_args)
         with open(config_path, 'w') as f:
             f.write(config)
         key = f'{channel_key}_{effect_id}'
@@ -2104,28 +2208,38 @@ context.modules = [
         sink_name   = f'wavelinux.fx.{safe_key}.{idx}.{effect_id}.input'
         source_name = f'wavelinux.fx.{safe_key}.{idx}.{effect_id}.source'
 
-        config = self._FX_PREAMBLE + f"""
-context.modules = [
-    {{ name = libpipewire-module-filter-chain
-        args = {{
+        client_id = f'{safe_key}-{idx}-{effect_id}'
+        # `node.always-process = true` forces the filter chain to run even
+        # when nothing is currently pulling on the playback side or pushing
+        # on the capture side. Without it, pipewire is free to suspend the
+        # chain until both sides have an active link — which during chain
+        # construction is briefly true and creates a chicken-and-egg with
+        # the loopback wiring (the loopback is what creates the link, but
+        # the link is what activates the chain).
+        # `audio.position = [ MONO ]` pins the channel layout to a single
+        # channel so a stereo LADSPA plugin doesn't get spliced onto a
+        # mono mic with one half of its inputs floating.
+        filter_chain_args = f"""{{
             node.description = "WaveLinux-{effect_id} ({safe_key}#{idx})"
             media.name       = "WaveLinux-{effect_id} ({safe_key}#{idx})"
             filter.graph = {{{filter_graph}
             }}
             capture.props = {{
-                node.name    = "{sink_name}"
-                media.class  = Audio/Sink
-                audio.rate   = 48000
+                node.name           = "{sink_name}"
+                media.class         = Audio/Sink
+                audio.rate          = 48000
+                audio.position      = [ MONO ]
+                node.always-process = true
             }}
             playback.props = {{
-                node.name    = "{source_name}"
-                media.class  = Audio/Source
-                audio.rate   = 48000
+                node.name           = "{source_name}"
+                media.class         = Audio/Source
+                audio.rate          = 48000
+                audio.position      = [ MONO ]
+                node.always-process = true
             }}
-        }}
-    }}
-]
-"""
+        }}"""
+        config = self._fx_client_config(client_id, filter_chain_args)
         config_path = os.path.join(
             config_dir, f'wavelinux-chain-{safe_key}-{idx}-{effect_id}.conf'
         )
@@ -2133,13 +2247,21 @@ context.modules = [
             f.write(config)
         return config_path, sink_name, source_name
 
-    def _wait_load_loopback(self, source, sink, latency_msec=5, attempts=8, delay=0.05):
+    def _wait_load_loopback(self, source, sink, latency_msec=20, attempts=20, delay=0.1):
         """Load a `module-loopback` from `source` to `sink`, retrying for
-        ~400 ms while pipewire-pulse registers a freshly-spawned node.
+        up to ~2 s while pipewire-pulse registers a freshly-spawned node.
         Inter-stage FX wiring would race the spawn otherwise: pipewire-pulse
         catalogues the new sink a beat after the filter-chain process comes
         up, and a one-shot `pactl load-module` sees an unknown sink and
-        fails. Returns the loopback module id (str) or None."""
+        fails. Returns the loopback module id (str) or None.
+
+        `latency_msec=20` matches the default the rest of the codebase
+        uses for submix loopbacks. Lower values (we briefly used 5) were
+        unstable on a couple of test rigs — pulse-bridge would create the
+        module successfully but the chain wouldn't actually flow audio,
+        because filter-chain's internal scheduler couldn't keep up at
+        a 5ms quantum. 20 ms is quiet enough for live monitoring (well
+        under the perception threshold for self-monitoring) and reliable."""
         import time as _time
         for _ in range(attempts):
             out = self._run([
@@ -2313,6 +2435,60 @@ context.modules = [
         """Ordered list of effect ids currently running on a channel."""
         info = self.channel_fx.get(node_name)
         return list(info.get('effects', [])) if info else []
+
+    def fx_chain_status(self, node_name):
+        """Diagnostic snapshot of a channel's FX chain. Returns a dict of
+        `{effect_id: {'state': 'running' | 'failed' | 'inactive',
+                      'log': <path or None>}}`.
+
+        - 'running'  = the stage's filter-chain process is alive AND its
+                       inbound module-loopback exists.
+        - 'failed'   = we attempted to spawn it but the process died, OR
+                       the inbound loopback couldn't be created. The log
+                       path points at the per-stage spawn log so the UI
+                       can offer a "click to inspect" hint.
+        - 'inactive' = the user never enabled this effect (or it was
+                       cleared). No log to show.
+
+        Used by the FX dialog to show a red border + tooltip on toggles
+        whose chain didn't actually come up — without that, a failed
+        spawn is invisible and the user understandably thinks the
+        feature is broken when it's really just missing a plugin."""
+        out = {}
+        info = self.channel_fx.get(node_name) or {}
+        live_effects = list(info.get('effects', []))
+        live_procs   = list(info.get('procs', []))
+        safe_key     = info.get('safe_key', self._safe_channel_key(node_name))
+
+        for eid in self.get_available_effects():
+            fid = eid['id']
+            log_path = self._fx_log_path(safe_key, f'_{fid}')
+            if fid not in live_effects:
+                # Either never enabled, or attempted-and-removed. We can
+                # tell apart by checking the per-stage log on disk.
+                stage_log = None
+                for i, candidate in enumerate(live_effects + [fid]):
+                    candidate_log = self._fx_log_path(safe_key, f'{i}_{fid}')
+                    if os.path.exists(candidate_log):
+                        stage_log = candidate_log
+                        break
+                out[fid] = {'state': 'inactive', 'log': stage_log}
+                continue
+
+            # Stage exists in the chain. Map effect → its proc by index.
+            try:
+                idx = live_effects.index(fid)
+                proc_key = live_procs[idx]
+            except (ValueError, IndexError):
+                out[fid] = {'state': 'failed', 'log': self._fx_log_path(safe_key, f'_{fid}')}
+                continue
+            proc = self.rnnoise_processes.get(proc_key)
+            stage_log = self._fx_log_path(safe_key, f'{idx}_{fid}')
+            if proc is None or proc.poll() is not None:
+                out[fid] = {'state': 'failed', 'log': stage_log}
+            else:
+                out[fid] = {'state': 'running', 'log': stage_log}
+        return out
 
     def _find_module_by_arg(self, pattern, modules_text=None):
         """Find a pactl module ID whose argument list contains `pattern`

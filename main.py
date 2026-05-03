@@ -257,10 +257,16 @@ class FXSelectionDialog(QDialog):
         scroll.setWidget(inner)
         root.addWidget(scroll, 1)
 
-        close_btn = QPushButton("Done")
+        close_btn = QPushButton("Apply")
         close_btn.setObjectName("addBtn")
         close_btn.clicked.connect(self._on_done)
         root.addWidget(close_btn)
+
+        # Surface "this stage failed to start" state once the dialog
+        # has finished constructing every toggle. Done after the layout
+        # so toggles that were ticked by saved-intent but aren't actually
+        # running get the red border + log-path tooltip immediately.
+        self._refresh_toggle_status()
 
     @staticmethod
     def _main_window_static(parent):
@@ -309,6 +315,24 @@ class FXSelectionDialog(QDialog):
 
         toggle_btn = QPushButton()
         toggle_btn.setCheckable(True)
+        toggle_btn.setProperty("role", "fxToggle")
+        # Brand-colour the toggle when ON so the dialog reads at a glance.
+        # `:checked` is the standard Qt pseudo-state for QPushButton
+        # toggles, paired with `setCheckable(True)` above.
+        toggle_btn.setStyleSheet(
+            "QPushButton[role=\"fxToggle\"] {"
+            " background: #1a1a28; color: #8b8b9e;"
+            " border: 1px solid rgba(255,255,255,0.12);"
+            " border-radius: 6px; font-weight: bold; padding: 4px 0; }"
+            "QPushButton[role=\"fxToggle\"]:hover {"
+            " border-color: rgba(0,229,255,0.4); }"
+            "QPushButton[role=\"fxToggle\"]:checked {"
+            " background: #00e5ff; color: #0d0d14;"
+            " border-color: #00e5ff; }"
+            "QPushButton[role=\"fxToggle\"]:disabled {"
+            " background: #14141e; color: #555568;"
+            " border-color: rgba(255,255,255,0.06); }"
+        )
         # Saved intent wins over live state: if the user previously turned
         # this ON and the chain isn't running (because a stage crashed
         # / PipeWire restarted / the spawn failed quietly), the toggle
@@ -500,6 +524,51 @@ class FXSelectionDialog(QDialog):
         win = self._main_window()
         if win is not None and hasattr(win, '_request_reroute'):
             win._request_reroute(self.node_name)
+        # Update each toggle's diagnostic state — failed stages get a
+        # red border + tooltip pointing at the per-stage log so the user
+        # can tell apart "feature off" from "feature broken".
+        self._refresh_toggle_status()
+
+    def _refresh_toggle_status(self):
+        """Annotate each toggle with the current chain state. A 'failed'
+        stage means we tried to spawn it but it died — usually a missing
+        plugin or a malformed config — and the tooltip points at the log.
+        Running stages get the brand-blue checked style; inactive ones
+        get the default. Done as a styleSheet override so it composes
+        with the base toggle stylesheet."""
+        if not hasattr(self, 'engine'):
+            return
+        status = self.engine.fx_chain_status(self.node_name)
+        for fid, btn in self._toggle_btns.items():
+            if not btn.isEnabled():
+                continue  # N/A toggles already have their own treatment.
+            info = status.get(fid, {'state': 'inactive', 'log': None})
+            state = info.get('state')
+            log_path = info.get('log')
+            if state == 'failed':
+                btn.setStyleSheet(
+                    "QPushButton[role=\"fxToggle\"] {"
+                    " background: #2a1a22; color: #ff6a8a;"
+                    " border: 1px solid #ff6a8a;"
+                    " border-radius: 6px; font-weight: bold; padding: 4px 0; }"
+                )
+                tip = "FX stage failed to start."
+                if log_path:
+                    tip += f"\nSee {log_path}"
+                btn.setToolTip(tip)
+            else:
+                btn.setStyleSheet(
+                    "QPushButton[role=\"fxToggle\"] {"
+                    " background: #1a1a28; color: #8b8b9e;"
+                    " border: 1px solid rgba(255,255,255,0.12);"
+                    " border-radius: 6px; font-weight: bold; padding: 4px 0; }"
+                    "QPushButton[role=\"fxToggle\"]:hover {"
+                    " border-color: rgba(0,229,255,0.4); }"
+                    "QPushButton[role=\"fxToggle\"]:checked {"
+                    " background: #00e5ff; color: #0d0d14;"
+                    " border-color: #00e5ff; }"
+                )
+                btn.setToolTip("")
 
     def _save_chain_state(self, effects, params_map):
         """Mirror the new chain into the main window's persistence buckets:
