@@ -228,11 +228,39 @@ class PipeWireEngine:
 
     # ── Per-refresh snapshot ───────────────────────────────────────
 
-    def create_snapshot(self):
+    # Minimum age (seconds) below which a fresh snapshot request just hands
+    # back the cached one. Prevents pactl-subscribe storms (every internal
+    # action we take generates a subscribe event we then react to) from
+    # triggering 5-10 full snapshots per second.
+    _SNAPSHOT_TTL = 0.25
+
+    def reap_dead_processes(self):
+        """Drop entries from `rnnoise_processes` whose subprocess has exited.
+        Without this, every spawn-and-die FX stage stays parked in the dict
+        forever, and `is_channel_fx_running` walks a growing list of dead
+        Popen handles every time it's called. Cheap to run periodically."""
+        for key in list(self.rnnoise_processes.keys()):
+            proc = self.rnnoise_processes.get(key)
+            if proc is None or proc.poll() is not None:
+                self.rnnoise_processes.pop(key, None)
+
+    def create_snapshot(self, force=False):
         """Fetch every expensive state dump once so a whole refresh tick can
         share them. Safe to call with PipeWire misbehaving — missing outputs
-        degrade to empty strings/lists."""
-        return EngineSnapshot(
+        degrade to empty strings/lists.
+
+        Cached for `_SNAPSHOT_TTL` seconds so back-to-back refresh requests
+        (e.g. one from `pactl subscribe`, one from a slider release, one
+        from the poll timer all within 100 ms) don't each spawn six
+        subprocesses. Pass `force=True` after a known structural change
+        (sink added/removed) to bypass the cache."""
+        now = time.monotonic()
+        cached = getattr(self, '_snapshot_cache', None)
+        cached_at = getattr(self, '_snapshot_cache_at', 0.0)
+        if cached is not None and not force and (now - cached_at) < self._SNAPSHOT_TTL:
+            return cached
+
+        snap = EngineSnapshot(
             modules_text=self._run(['pactl', 'list', 'modules']) or "",
             short_modules_text=self._run(['pactl', 'list', 'short', 'modules']) or "",
             sink_inputs_text=self._run(['pactl', 'list', 'sink-inputs']) or "",
@@ -240,6 +268,20 @@ class PipeWireEngine:
             nodes=self._parse_nodes(),
             sinks=self._parse_short_sinks(),
         )
+        self._snapshot_cache = snap
+        self._snapshot_cache_at = now
+        # Piggyback periodic GC on the snapshot rebuild. Only runs when we
+        # actually fetch new data (i.e. at most once per _SNAPSHOT_TTL).
+        self.reap_dead_processes()
+        return snap
+
+    def invalidate_snapshot(self):
+        """Drop the cached snapshot so the next `create_snapshot` re-fetches.
+        Call after a structural change we made ourselves (sink/loopback
+        load/unload, FX chain rebuild) so the next refresh sees the new
+        state immediately rather than waiting for the cache to expire."""
+        self._snapshot_cache = None
+        self._snapshot_cache_at = 0.0
 
     @staticmethod
     def _parse_sink_descriptions(text):
@@ -2365,6 +2407,10 @@ context.modules = [
             'capture_target': capture_target,
             'safe_key':  safe_key,
         }
+        # We just changed pactl's view of the world — drop the cache so the
+        # next refresh tick observes the new chain without waiting up to
+        # 250 ms for the snapshot TTL.
+        self.invalidate_snapshot()
         return final_source
 
     def clear_channel_fx(self, node_name):
@@ -2402,6 +2448,7 @@ context.modules = [
         # 3. Kill the filter-chain stage processes.
         for pk in info.get('procs', []):
             self.stop_rnnoise(pk)
+        self.invalidate_snapshot()
         return True
 
     def get_channel_fx_source(self, node_name):

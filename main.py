@@ -656,6 +656,25 @@ class ChannelStrip(QFrame):
         self._mon_muted = False
         self._str_muted = False
 
+        # Slider commit debouncers. Slider drags fire `valueChanged` for every
+        # pixel; before this each pixel triggered an independent
+        # `pactl set-sink-input-volume` subprocess (~50 ms), so a fast drag
+        # queued up several seconds of pactl work and the audio dragged
+        # behind the user's finger. The debouncer lets the slider visually
+        # move at full Qt rate but only commits the LAST value to the engine
+        # after the slider's been still for ~40 ms.
+        self._mon_commit_timer = QTimer(self)
+        self._mon_commit_timer.setSingleShot(True)
+        self._mon_commit_timer.setInterval(40)
+        self._mon_commit_timer.timeout.connect(self._commit_mon_vol)
+        self._str_commit_timer = QTimer(self)
+        self._str_commit_timer.setSingleShot(True)
+        self._str_commit_timer.setInterval(40)
+        self._str_commit_timer.timeout.connect(self._commit_str_vol)
+        # Pending values held until the timer fires.
+        self._pending_mon_vol = None
+        self._pending_str_vol = None
+
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -799,22 +818,39 @@ class ChannelStrip(QFrame):
                 win.schedule_save()
 
     def _on_mon_vol(self, value):
+        # Visual update is immediate (label + linked slider) so the UI feels
+        # snappy. The actual engine write is deferred through a 40 ms timer
+        # so a fast drag doesn't queue up a backlog of pactl spawns.
         self.mon_vol_lbl.setText(f"{value}%")
-        if self.node_id:
-            self.engine.set_submix_volume(self.node_id, "Monitor", value / 100.0)
-            self._stash_submix("Monitor", value / 100.0, self._mon_muted)
-        
+        self._pending_mon_vol = value
+        self._mon_commit_timer.start()
         if self.link_btn.isChecked() and self.str_slider.value() != value:
             self.str_slider.setValue(value)
 
     def _on_str_vol(self, value):
         self.str_vol_lbl.setText(f"{value}%")
-        if self.node_id:
-            self.engine.set_submix_volume(self.node_id, "Stream", value / 100.0)
-            self._stash_submix("Stream", value / 100.0, self._str_muted)
-            
+        self._pending_str_vol = value
+        self._str_commit_timer.start()
         if self.link_btn.isChecked() and self.mon_slider.value() != value:
             self.mon_slider.setValue(value)
+
+    def _commit_mon_vol(self):
+        """Fire the deferred Monitor-fader write. Called by the debounce
+        timer once the user has stopped dragging for ~40 ms."""
+        v = self._pending_mon_vol
+        self._pending_mon_vol = None
+        if v is None or not self.node_id:
+            return
+        self.engine.set_submix_volume(self.node_id, "Monitor", v / 100.0)
+        self._stash_submix("Monitor", v / 100.0, self._mon_muted)
+
+    def _commit_str_vol(self):
+        v = self._pending_str_vol
+        self._pending_str_vol = None
+        if v is None or not self.node_id:
+            return
+        self.engine.set_submix_volume(self.node_id, "Stream", v / 100.0)
+        self._stash_submix("Stream", v / 100.0, self._str_muted)
 
     def _apply_mute_style(self, btn, muted):
         if btn == self.mon_mute:
@@ -1035,11 +1071,29 @@ class AppRoutingRow(QWidget):
         self.forget_btn.clicked.connect(self._on_forget)
         layout.addWidget(self.forget_btn)
 
+        # Per-row volume debouncer — same reasoning as the channel-strip
+        # faders: every pixel of slider drag fires `valueChanged` and used
+        # to spawn one `pactl set-sink-input-volume` per pixel. Now the
+        # latest value is held for ~40 ms and committed once the user pauses.
+        self._pending_app_vol = None
+        self._app_commit_timer = QTimer(self)
+        self._app_commit_timer.setSingleShot(True)
+        self._app_commit_timer.setInterval(40)
+        self._app_commit_timer.timeout.connect(self._commit_app_vol)
+
         self.update_state([], sinks, None)
 
     def _on_vol_change(self, value):
+        self._pending_app_vol = value
+        self._app_commit_timer.start()
+
+    def _commit_app_vol(self):
+        v = self._pending_app_vol
+        self._pending_app_vol = None
+        if v is None:
+            return
         for idx in self._active_indices:
-            self.engine.set_sink_input_volume(idx, value / 100.0)
+            self.engine.set_sink_input_volume(idx, v / 100.0)
 
     def _on_route_change(self, idx):
         sink_name = self.combo.itemData(idx)
@@ -1105,28 +1159,45 @@ class AppRoutingRow(QWidget):
         #   • any hardware output (ALSA / Bluetooth / JACK)
         #   • any user-created WaveLinux channel (starred)
         # Internal mix/source devices stay hidden.
+        #
+        # Combo rebuild used to happen on every refresh tick — even when
+        # the sink list hadn't changed. With ~5 apps and a poll every
+        # second, that was 25 unnecessary `display_name_for_sink` lookups
+        # per second (each of which walks the snapshot). Cache a fingerprint
+        # of the sink list and only rebuild when it actually changes.
         if not self.combo.view().isVisible():
-            self.combo.blockSignals(True)
-            curr_data = self.combo.currentData()
-            self.combo.clear()
-            self.combo.addItem("System Default", None)
-            for s in sinks:
-                name = s['name']
-                if name.startswith('wavelinux_mix_') or name.startswith('wavelinux_src_'):
-                    continue
-                if name.endswith('.monitor'):
-                    continue
-                if name.startswith('wavelinux_'):
-                    pretty = name.replace('wavelinux_', '').replace('_', ' ').title()
-                    display = f"{pretty} ⭐"
-                else:
-                    display = self.engine.display_name_for_sink(name)
-                self.combo.addItem(display, name)
+            sink_fp = tuple(s['name'] for s in sinks)
+            if getattr(self, '_combo_sink_fp', None) != sink_fp:
+                self._combo_sink_fp = sink_fp
+                self.combo.blockSignals(True)
+                curr_data = self.combo.currentData()
+                self.combo.clear()
+                self.combo.addItem("System Default", None)
+                for s in sinks:
+                    name = s['name']
+                    if name.startswith('wavelinux_mix_') or name.startswith('wavelinux_src_'):
+                        continue
+                    if name.endswith('.monitor'):
+                        continue
+                    if name.startswith('wavelinux_'):
+                        pretty = name.replace('wavelinux_', '').replace('_', ' ').title()
+                        display = f"{pretty} ⭐"
+                    else:
+                        display = self.engine.display_name_for_sink(name)
+                    self.combo.addItem(display, name)
 
-            idx = self.combo.findData(current_sink or curr_data)
-            if idx >= 0:
-                self.combo.setCurrentIndex(idx)
-            self.combo.blockSignals(False)
+                idx = self.combo.findData(current_sink or curr_data)
+                if idx >= 0:
+                    self.combo.setCurrentIndex(idx)
+                self.combo.blockSignals(False)
+            elif current_sink is not None:
+                # Sink list unchanged but the current selection may have
+                # — sync the combobox cheaply.
+                idx = self.combo.findData(current_sink)
+                if idx >= 0 and idx != self.combo.currentIndex():
+                    self.combo.blockSignals(True)
+                    self.combo.setCurrentIndex(idx)
+                    self.combo.blockSignals(False)
 
 
 # ── Main Window ────────────────────────────────────────────────────
@@ -1190,7 +1261,13 @@ class WaveLinuxWindow(QMainWindow):
         self._setup_ui()
         self.load_config()
         self._refresh()
-        self.refresh_timer.start(2000)
+        # 5 s, not 2 s. `pactl subscribe` already drives most refreshes
+        # (debounced to 150 ms), so the poll timer is purely a backstop
+        # for environments where subscribe events miss something. At 2 s
+        # the poll was firing roughly as often as the user could think,
+        # spawning six pactl subprocesses each time and making the UI
+        # feel sluggish. 5 s is plenty of backstop without being noisy.
+        self.refresh_timer.start(5000)
         self._start_event_subscriber()
 
     def _open_settings(self):
@@ -1357,6 +1434,26 @@ class WaveLinuxWindow(QMainWindow):
 
     def schedule_save(self):
         self._save_timer.start(500)
+
+    def _any_slider_dragging(self):
+        """True if the user is currently holding down ANY slider thumb.
+        We use this to defer the heavy `_refresh` snapshot work — refreshing
+        mid-drag interleaves subprocess calls with valueChanged events and
+        produces visible stutter."""
+        for s in (getattr(self, 'mon_master_slider', None),
+                  getattr(self, 'str_master_slider', None)):
+            if s is not None and s.isSliderDown():
+                return True
+        for strip in self.channel_widgets.values():
+            for s in (getattr(strip, 'mon_slider', None),
+                      getattr(strip, 'str_slider', None)):
+                if s is not None and s.isSliderDown():
+                    return True
+        for row in self.app_widgets.values():
+            s = getattr(row, 'vol_slider', None)
+            if s is not None and s.isSliderDown():
+                return True
+        return False
 
     def _request_reroute(self, node_name):
         """The FX dialog calls this after rebuilding a channel's chain.
@@ -1634,6 +1731,16 @@ class WaveLinuxWindow(QMainWindow):
         the UI isn't visible, and we don't need to poll PipeWire 30×/min
         to keep a hidden window in sync."""
         if self.tray is not None and not self.isVisible():
+            return
+
+        # Skip refresh while the user is actively dragging a slider — a
+        # full snapshot is hundreds of ms of subprocess work, and during
+        # a drag we'd interleave it with the slider's own updates and
+        # produce visible stutter. The next pactl-subscribe event or the
+        # 5-second backstop timer will pick up any state we missed
+        # within milliseconds of the drag finishing.
+        if self._any_slider_dragging():
+            self._event_refresh_timer.start()  # try again shortly
             return
 
         try:
@@ -1957,11 +2064,28 @@ class WaveLinuxWindow(QMainWindow):
 
 
     def _on_master_vol_change(self, mix_name, value):
-        # value is 0-100
-        vol = value / 100.0
-        mix = self.engine.output_mixes.get(mix_name)
-        if mix:
-            self.engine.set_sink_volume_by_name(mix.sink_name, vol)
+        # Debounce master-fader writes too — same reasoning as the per-strip
+        # MON/STR sliders. Stash the latest value and let the timer commit
+        # the trailing-edge value once the user pauses for ~40 ms.
+        if not hasattr(self, '_pending_master_vol'):
+            self._pending_master_vol = {}
+            self._master_commit_timer = QTimer(self)
+            self._master_commit_timer.setSingleShot(True)
+            self._master_commit_timer.setInterval(40)
+            self._master_commit_timer.timeout.connect(self._commit_master_vols)
+        self._pending_master_vol[mix_name] = value / 100.0
+        self._master_commit_timer.start()
+
+    def _commit_master_vols(self):
+        """Fire all pending master-fader writes in one pass."""
+        if not hasattr(self, '_pending_master_vol'):
+            return
+        pending = self._pending_master_vol
+        self._pending_master_vol = {}
+        for mix_name, vol in pending.items():
+            mix = self.engine.output_mixes.get(mix_name)
+            if mix:
+                self.engine.set_sink_volume_by_name(mix.sink_name, vol)
 
     def _on_mix_out_change(self, mix_name, hw_sink_name):
         if hw_sink_name:
