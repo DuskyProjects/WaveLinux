@@ -656,6 +656,25 @@ class ChannelStrip(QFrame):
         self._mon_muted = False
         self._str_muted = False
 
+        # Slider commit debouncers. Slider drags fire `valueChanged` for every
+        # pixel; before this each pixel triggered an independent
+        # `pactl set-sink-input-volume` subprocess (~50 ms), so a fast drag
+        # queued up several seconds of pactl work and the audio dragged
+        # behind the user's finger. The debouncer lets the slider visually
+        # move at full Qt rate but only commits the LAST value to the engine
+        # after the slider's been still for ~40 ms.
+        self._mon_commit_timer = QTimer(self)
+        self._mon_commit_timer.setSingleShot(True)
+        self._mon_commit_timer.setInterval(40)
+        self._mon_commit_timer.timeout.connect(self._commit_mon_vol)
+        self._str_commit_timer = QTimer(self)
+        self._str_commit_timer.setSingleShot(True)
+        self._str_commit_timer.setInterval(40)
+        self._str_commit_timer.timeout.connect(self._commit_str_vol)
+        # Pending values held until the timer fires.
+        self._pending_mon_vol = None
+        self._pending_str_vol = None
+
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -708,7 +727,7 @@ class ChannelStrip(QFrame):
         self.link_btn.setObjectName("linkBtn")
         self.link_btn.setCheckable(True)
         self.link_btn.setFixedSize(24, 24)
-        self.link_btn.setToolTip("Link the Headphones and Stream faders")
+        self.link_btn.setToolTip("Link the Monitor and Stream faders")
         self.link_btn.clicked.connect(self._on_link_toggle)
         link_row.addWidget(self.link_btn)
         link_row.addStretch()
@@ -737,7 +756,7 @@ class ChannelStrip(QFrame):
         self.mon_mute = QPushButton("🎧")
         self.mon_mute.setObjectName("muteBtn")
         self.mon_mute.setFixedSize(28, 28)
-        self.mon_mute.setToolTip("Mute in Headphones mix")
+        self.mon_mute.setToolTip("Mute in Monitor mix")
         self.mon_mute.clicked.connect(self._on_mon_mute)
         mon_col.addWidget(self.mon_mute)
         faders_row.addLayout(mon_col)
@@ -799,22 +818,39 @@ class ChannelStrip(QFrame):
                 win.schedule_save()
 
     def _on_mon_vol(self, value):
+        # Visual update is immediate (label + linked slider) so the UI feels
+        # snappy. The actual engine write is deferred through a 40 ms timer
+        # so a fast drag doesn't queue up a backlog of pactl spawns.
         self.mon_vol_lbl.setText(f"{value}%")
-        if self.node_id:
-            self.engine.set_submix_volume(self.node_id, "Monitor", value / 100.0)
-            self._stash_submix("Monitor", value / 100.0, self._mon_muted)
-        
+        self._pending_mon_vol = value
+        self._mon_commit_timer.start()
         if self.link_btn.isChecked() and self.str_slider.value() != value:
             self.str_slider.setValue(value)
 
     def _on_str_vol(self, value):
         self.str_vol_lbl.setText(f"{value}%")
-        if self.node_id:
-            self.engine.set_submix_volume(self.node_id, "Stream", value / 100.0)
-            self._stash_submix("Stream", value / 100.0, self._str_muted)
-            
+        self._pending_str_vol = value
+        self._str_commit_timer.start()
         if self.link_btn.isChecked() and self.mon_slider.value() != value:
             self.mon_slider.setValue(value)
+
+    def _commit_mon_vol(self):
+        """Fire the deferred Monitor-fader write. Called by the debounce
+        timer once the user has stopped dragging for ~40 ms."""
+        v = self._pending_mon_vol
+        self._pending_mon_vol = None
+        if v is None or not self.node_id:
+            return
+        self.engine.set_submix_volume(self.node_id, "Monitor", v / 100.0)
+        self._stash_submix("Monitor", v / 100.0, self._mon_muted)
+
+    def _commit_str_vol(self):
+        v = self._pending_str_vol
+        self._pending_str_vol = None
+        if v is None or not self.node_id:
+            return
+        self.engine.set_submix_volume(self.node_id, "Stream", v / 100.0)
+        self._stash_submix("Stream", v / 100.0, self._str_muted)
 
     def _apply_mute_style(self, btn, muted):
         if btn == self.mon_mute:
@@ -1035,11 +1071,29 @@ class AppRoutingRow(QWidget):
         self.forget_btn.clicked.connect(self._on_forget)
         layout.addWidget(self.forget_btn)
 
+        # Per-row volume debouncer — same reasoning as the channel-strip
+        # faders: every pixel of slider drag fires `valueChanged` and used
+        # to spawn one `pactl set-sink-input-volume` per pixel. Now the
+        # latest value is held for ~40 ms and committed once the user pauses.
+        self._pending_app_vol = None
+        self._app_commit_timer = QTimer(self)
+        self._app_commit_timer.setSingleShot(True)
+        self._app_commit_timer.setInterval(40)
+        self._app_commit_timer.timeout.connect(self._commit_app_vol)
+
         self.update_state([], sinks, None)
 
     def _on_vol_change(self, value):
+        self._pending_app_vol = value
+        self._app_commit_timer.start()
+
+    def _commit_app_vol(self):
+        v = self._pending_app_vol
+        self._pending_app_vol = None
+        if v is None:
+            return
         for idx in self._active_indices:
-            self.engine.set_sink_input_volume(idx, value / 100.0)
+            self.engine.set_sink_input_volume(idx, v / 100.0)
 
     def _on_route_change(self, idx):
         sink_name = self.combo.itemData(idx)
@@ -1105,28 +1159,45 @@ class AppRoutingRow(QWidget):
         #   • any hardware output (ALSA / Bluetooth / JACK)
         #   • any user-created WaveLinux channel (starred)
         # Internal mix/source devices stay hidden.
+        #
+        # Combo rebuild used to happen on every refresh tick — even when
+        # the sink list hadn't changed. With ~5 apps and a poll every
+        # second, that was 25 unnecessary `display_name_for_sink` lookups
+        # per second (each of which walks the snapshot). Cache a fingerprint
+        # of the sink list and only rebuild when it actually changes.
         if not self.combo.view().isVisible():
-            self.combo.blockSignals(True)
-            curr_data = self.combo.currentData()
-            self.combo.clear()
-            self.combo.addItem("System Default", None)
-            for s in sinks:
-                name = s['name']
-                if name.startswith('wavelinux_mix_') or name.startswith('wavelinux_src_'):
-                    continue
-                if name.endswith('.monitor'):
-                    continue
-                if name.startswith('wavelinux_'):
-                    pretty = name.replace('wavelinux_', '').replace('_', ' ').title()
-                    display = f"{pretty} ⭐"
-                else:
-                    display = self.engine.display_name_for_sink(name)
-                self.combo.addItem(display, name)
+            sink_fp = tuple(s['name'] for s in sinks)
+            if getattr(self, '_combo_sink_fp', None) != sink_fp:
+                self._combo_sink_fp = sink_fp
+                self.combo.blockSignals(True)
+                curr_data = self.combo.currentData()
+                self.combo.clear()
+                self.combo.addItem("System Default", None)
+                for s in sinks:
+                    name = s['name']
+                    if name.startswith('wavelinux_mix_') or name.startswith('wavelinux_src_'):
+                        continue
+                    if name.endswith('.monitor'):
+                        continue
+                    if name.startswith('wavelinux_'):
+                        pretty = name.replace('wavelinux_', '').replace('_', ' ').title()
+                        display = f"{pretty} ⭐"
+                    else:
+                        display = self.engine.display_name_for_sink(name)
+                    self.combo.addItem(display, name)
 
-            idx = self.combo.findData(current_sink or curr_data)
-            if idx >= 0:
-                self.combo.setCurrentIndex(idx)
-            self.combo.blockSignals(False)
+                idx = self.combo.findData(current_sink or curr_data)
+                if idx >= 0:
+                    self.combo.setCurrentIndex(idx)
+                self.combo.blockSignals(False)
+            elif current_sink is not None:
+                # Sink list unchanged but the current selection may have
+                # — sync the combobox cheaply.
+                idx = self.combo.findData(current_sink)
+                if idx >= 0 and idx != self.combo.currentIndex():
+                    self.combo.blockSignals(True)
+                    self.combo.setCurrentIndex(idx)
+                    self.combo.blockSignals(False)
 
 
 # ── Main Window ────────────────────────────────────────────────────
@@ -1156,6 +1227,12 @@ class WaveLinuxWindow(QMainWindow):
         self.app_last_seen = {}     # app_name -> epoch seconds (for stale prune)
         self.app_prune_days = 14    # forget routing entries not seen in this many days
         self.virtual_channels = []  # list of names
+        # Single-mic mode: only ONE microphone shows up as a strip in the top
+        # section at any time. This is the node.name of the mic the user has
+        # picked in the master "Microphone Input" combo. None on first
+        # launch (we'll fall back to `pactl get-default-source` when refresh
+        # runs and persist the choice).
+        self.selected_mic = None
         # All user-facing state is keyed by PipeWire node.name (stable across
         # PipeWire restarts); pw_id is only used when talking to the engine.
         self.hidden_nodes = set()      # {node.name}
@@ -1190,7 +1267,13 @@ class WaveLinuxWindow(QMainWindow):
         self._setup_ui()
         self.load_config()
         self._refresh()
-        self.refresh_timer.start(2000)
+        # 5 s, not 2 s. `pactl subscribe` already drives most refreshes
+        # (debounced to 150 ms), so the poll timer is purely a backstop
+        # for environments where subscribe events miss something. At 2 s
+        # the poll was firing roughly as often as the user could think,
+        # spawning six pactl subprocesses each time and making the UI
+        # feel sluggish. 5 s is plenty of backstop without being noisy.
+        self.refresh_timer.start(5000)
         self._start_event_subscriber()
 
     def _open_settings(self):
@@ -1358,6 +1441,26 @@ class WaveLinuxWindow(QMainWindow):
     def schedule_save(self):
         self._save_timer.start(500)
 
+    def _any_slider_dragging(self):
+        """True if the user is currently holding down ANY slider thumb.
+        We use this to defer the heavy `_refresh` snapshot work — refreshing
+        mid-drag interleaves subprocess calls with valueChanged events and
+        produces visible stutter."""
+        for s in (getattr(self, 'mon_master_slider', None),
+                  getattr(self, 'str_master_slider', None)):
+            if s is not None and s.isSliderDown():
+                return True
+        for strip in self.channel_widgets.values():
+            for s in (getattr(strip, 'mon_slider', None),
+                      getattr(strip, 'str_slider', None)):
+                if s is not None and s.isSliderDown():
+                    return True
+        for row in self.app_widgets.values():
+            s = getattr(row, 'vol_slider', None)
+            if s is not None and s.isSliderDown():
+                return True
+        return False
+
     def _request_reroute(self, node_name):
         """The FX dialog calls this after rebuilding a channel's chain.
         Drop the channel out of the synced-set so the next refresh tick
@@ -1495,12 +1598,31 @@ class WaveLinuxWindow(QMainWindow):
         o_layout.addWidget(o_title)
         o_layout.addSpacing(10)
 
-        # Headphones row (what you hear).
+        # Microphone Input row (which physical mic feeds the mixer).
+        # Single-mic mode: only the selected mic gets a strip in the top
+        # section. Switching the picker swaps the mic that's mixed; per-mic
+        # MON/STR/effect state is keyed by node.name so it survives a swap.
+        # We picked this name (not "Microphone Source") because users with
+        # speakers as their listening output otherwise read "Headphones" as
+        # "I don't have those, this app isn't for me".
+        mic_row = QHBoxLayout()
+        mic_lbl = QLabel("🎤 Microphone Input")
+        mic_lbl.setObjectName("masterMixLabel")
+        self.mic_in_combo = QComboBox()
+        self.mic_in_combo.setToolTip("Pick which physical mic the mixer uses")
+        self.mic_in_combo.currentIndexChanged.connect(self._on_mic_input_change)
+        mic_row.addWidget(mic_lbl)
+        mic_row.addWidget(self.mic_in_combo, 1)
+        o_layout.addLayout(mic_row)
+        o_layout.addSpacing(8)
+
+        # Monitor Output row (was "Headphones" — renamed because lots of
+        # users monitor through speakers and "Headphones" implies otherwise).
         mon_row = QHBoxLayout()
-        mon_lbl = QLabel("🎧 Headphones")
+        mon_lbl = QLabel("🎧 Monitor Output")
         mon_lbl.setObjectName("masterMixLabel")
         self.mon_out_combo = QComboBox()
-        self.mon_out_combo.setToolTip("Pick the physical output you listen on")
+        self.mon_out_combo.setToolTip("Pick the physical output you listen on (headphones / speakers)")
         self.mon_out_combo.currentIndexChanged.connect(
             lambda idx: self._on_mix_out_change("Monitor", self.mon_out_combo.itemData(idx))
         )
@@ -1636,6 +1758,16 @@ class WaveLinuxWindow(QMainWindow):
         if self.tray is not None and not self.isVisible():
             return
 
+        # Skip refresh while the user is actively dragging a slider — a
+        # full snapshot is hundreds of ms of subprocess work, and during
+        # a drag we'd interleave it with the slider's own updates and
+        # produce visible stutter. The next pactl-subscribe event or the
+        # 5-second backstop timer will pick up any state we missed
+        # within milliseconds of the drag finishing.
+        if self._any_slider_dragging():
+            self._event_refresh_timer.start()  # try again shortly
+            return
+
         try:
             snap = self.engine.create_snapshot()
             mics = self.engine.get_hardware_inputs(snap=snap)
@@ -1668,13 +1800,34 @@ class WaveLinuxWindow(QMainWindow):
             # 1. Update Input Channels (Mics & Virtual Sinks)
             current_node_ids = set()
 
+            # Single-mic mode: of the N hardware mics PipeWire is showing us,
+            # only ONE gets a strip in the top section — whichever the user
+            # has picked in the master "Microphone Input" combo. The rest
+            # are still listed in that combo so the user can switch, but
+            # they don't clutter the channel row. On first run we resolve
+            # `selected_mic = None` to the system default source so the
+            # mixer comes up usable immediately.
+            self._sync_mic_picker(mics)
+            selected_mic_node = next(
+                (m for m in mics if m.name == self.selected_mic), None
+            )
+            shown_inputs = []
+            if selected_mic_node is not None:
+                shown_inputs.append(selected_mic_node)
+            shown_inputs.extend(vsinks)
+
             # Sort by the persistent channel order so reorder arrows stick.
             # Unseen nodes go to the end (keeps hot-plugged devices visible).
             order_index = {nm: i for i, nm in enumerate(self.channel_order)}
             sorted_nodes = sorted(
-                (mics + vsinks),
+                shown_inputs,
                 key=lambda n: order_index.get(n.name, len(order_index) + 1),
             )
+
+            # Hide widget rows for any hardware mic that's NOT the selected
+            # one. The reaper at the bottom of this loop drops widgets
+            # whose pw_id isn't in `current_node_ids`, so all we have to do
+            # is exclude unselected mics from `current_node_ids` below.
             for node in sorted_nodes:
                 pw_id = node.pw_id
                 current_node_ids.add(pw_id)
@@ -1735,11 +1888,15 @@ class WaveLinuxWindow(QMainWindow):
                         self._synced_nodes.add(sync_key)
                 else:
                     # After initial push, overlay live PipeWire state into the
-                    # UI *and* persist it. Without writing back, an external
-                    # mute (pavucontrol, media keys, our own button) showed in
-                    # the UI but was never saved, so a restart re-pushed the
-                    # stale un-muted state — which is exactly what made fresh
-                    # installs blast the mic back at the user.
+                    # UI. We only PERSIST the live state for real microphones
+                    # — for those, an external mute (pavucontrol, media keys)
+                    # is a legitimate user intent we want to remember across
+                    # restarts. For our OWN virtual sinks (Music, Game, etc.),
+                    # WE are the only writer; treating PipeWire's transient
+                    # state as user intent caused the "audio randomly stops
+                    # working after Bluetooth profile changes" bug — a brief
+                    # mute during BT switching got captured and persisted.
+                    is_real_mic = node in mics
                     overlay_changed = False
                     for mix_name, state, mix_key in (
                         ("Monitor", mon_state, mon_key),
@@ -1752,7 +1909,13 @@ class WaveLinuxWindow(QMainWindow):
                         if live is None:
                             continue
                         live_vol, live_mute = live
+                        # Always reflect live state in the UI so external
+                        # changes are visible.
                         state['vol'], state['mute'] = live_vol, live_mute
+                        # Only persist live state for real mics — virtual
+                        # sinks own their own state.
+                        if not is_real_mic:
+                            continue
                         saved = self.submix_state.get(mix_key) or {}
                         if (saved.get('vol') != live_vol
                                 or bool(saved.get('mute', False)) != bool(live_mute)):
@@ -1957,11 +2120,28 @@ class WaveLinuxWindow(QMainWindow):
 
 
     def _on_master_vol_change(self, mix_name, value):
-        # value is 0-100
-        vol = value / 100.0
-        mix = self.engine.output_mixes.get(mix_name)
-        if mix:
-            self.engine.set_sink_volume_by_name(mix.sink_name, vol)
+        # Debounce master-fader writes too — same reasoning as the per-strip
+        # MON/STR sliders. Stash the latest value and let the timer commit
+        # the trailing-edge value once the user pauses for ~40 ms.
+        if not hasattr(self, '_pending_master_vol'):
+            self._pending_master_vol = {}
+            self._master_commit_timer = QTimer(self)
+            self._master_commit_timer.setSingleShot(True)
+            self._master_commit_timer.setInterval(40)
+            self._master_commit_timer.timeout.connect(self._commit_master_vols)
+        self._pending_master_vol[mix_name] = value / 100.0
+        self._master_commit_timer.start()
+
+    def _commit_master_vols(self):
+        """Fire all pending master-fader writes in one pass."""
+        if not hasattr(self, '_pending_master_vol'):
+            return
+        pending = self._pending_master_vol
+        self._pending_master_vol = {}
+        for mix_name, vol in pending.items():
+            mix = self.engine.output_mixes.get(mix_name)
+            if mix:
+                self.engine.set_sink_volume_by_name(mix.sink_name, vol)
 
     def _on_mix_out_change(self, mix_name, hw_sink_name):
         if hw_sink_name:
@@ -1970,6 +2150,69 @@ class WaveLinuxWindow(QMainWindow):
             # 'None (Disconnected)' — actually unload the loopback so the bus
             # stops sending to the previous hardware output.
             self.engine.unroute_mix_from_hardware(mix_name)
+
+    def _sync_mic_picker(self, mics):
+        """Refresh the master "Microphone Input" combo to show every mic
+        PipeWire knows about. Called on every refresh tick. Cheap: only
+        rebuilds the items when the mic list (by node.name) actually
+        changes — otherwise just keeps the combo's current selection
+        in sync with `self.selected_mic`.
+
+        Falls back to `pactl get-default-source` when nothing's saved
+        and at least one mic exists, so first launch picks something
+        sensible and the user isn't stuck staring at an empty mixer."""
+        combo = self.mic_in_combo
+        mic_names = {m.name for m in mics}
+        # Resolve "None" — or a stale/disappeared selection — to a present
+        # mic. `selected_mic` can go stale if the user unplugs the device
+        # they previously picked; without this fallback the master combo
+        # ends up showing nothing selected and the top section has no
+        # mic strip even though other mics are available.
+        if mics and (not self.selected_mic or self.selected_mic not in mic_names):
+            default_src = (
+                self.engine.get_default_source()
+                if hasattr(self.engine, 'get_default_source') else None
+            )
+            if default_src and default_src in mic_names:
+                self.selected_mic = default_src
+            else:
+                self.selected_mic = mics[0].name
+            self.schedule_save()
+
+        mic_fp = tuple((m.name, m.description or '') for m in mics)
+        if getattr(self, '_mic_combo_fp', None) != mic_fp:
+            self._mic_combo_fp = mic_fp
+            combo.blockSignals(True)
+            combo.clear()
+            for m in mics:
+                label = PipeWireEngine.friendly_name(m.description) or m.name
+                combo.addItem(label, m.name)
+            if not mics:
+                combo.addItem("(no microphone detected)", None)
+            combo.blockSignals(False)
+
+        # Sync selection to the saved mic, if it's in the combo.
+        idx = combo.findData(self.selected_mic)
+        if idx >= 0 and combo.currentIndex() != idx:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+
+    def _on_mic_input_change(self, idx):
+        """User picked a different mic in the master combo. Persist the
+        choice and force an immediate refresh so the channel strip swaps
+        to the new mic on the same tick."""
+        new_mic = self.mic_in_combo.itemData(idx)
+        if new_mic == self.selected_mic:
+            return
+        # Drop sync state + meter so the new mic gets a fresh push of its
+        # saved volume / mute. Without this the new strip would briefly
+        # show the previous mic's last live state.
+        if hasattr(self, '_synced_nodes'):
+            self._synced_nodes.discard(new_mic or '')
+        self.selected_mic = new_mic
+        self.schedule_save()
+        self._refresh()
 
     def _on_add_channel(self):
         text, ok = QInputDialog.getText(self, "Add Virtual Channel", "Channel Name:")
@@ -2016,16 +2259,35 @@ class WaveLinuxWindow(QMainWindow):
 
 
 
+    # The Wave Link-style "starter" channels we seed on a fresh install so
+    # the user opens the app and sees a working mixer instead of an empty
+    # page. Picked to match Elgato's reference layout. These are FIRST-RUN
+    # ONLY — once the user deletes one we don't bring it back, so config
+    # presence (not channel-list presence) is the seeding gate.
+    _DEFAULT_CHANNELS = ("Music", "Game", "Browser", "Voice Chat", "System")
+
+    def _seed_default_channels(self):
+        """Create the starter virtual channels and persist the resulting
+        list. Called only when no config file exists yet."""
+        for name in self._DEFAULT_CHANNELS:
+            if self.engine.create_virtual_sink(name) is not None:
+                if name not in self.virtual_channels:
+                    self.virtual_channels.append(name)
+
     def load_config(self):
         if not os.path.exists(self.config_path):
-            # Create standard mixes
+            # First launch — set up the standard mixes, route Monitor to
+            # the system default output, and seed the Wave Link-style
+            # starter channels so the user has something usable from the
+            # first open. Persist immediately so subsequent launches load
+            # the seeded list (and respect any deletions the user makes).
             self.engine.create_output_mix("Monitor")
             self.engine.create_output_mix("Stream")
-            
-            # Default Monitor to system default
             def_sink = self.engine.get_default_sink()
             if def_sink:
                 self.engine.route_mix_to_hardware("Monitor", def_sink)
+            self._seed_default_channels()
+            self.save_config()
             return
 
         try:
@@ -2042,6 +2304,11 @@ class WaveLinuxWindow(QMainWindow):
                 self._prune_stale_apps()
                 self.virtual_channels = conf.get('channels', [])
                 self.channel_order = conf.get('channel_order', []) or []
+                # Single-mic mode: which mic the user picked in the master
+                # "Microphone Input" combo. None means "use system default";
+                # the refresh path resolves None to `pactl get-default-source`
+                # the first time it runs.
+                self.selected_mic = conf.get('selected_mic') or None
                 self.effect_params = conf.get('effect_params', {}) or {}
                 self.active_effects = {
                     k: list(v) for k, v in (conf.get('active_effects', {}) or {}).items()
@@ -2125,6 +2392,7 @@ class WaveLinuxWindow(QMainWindow):
             'monitor_hw': self.mon_out_combo.currentData(),
             'stream_hw': self.str_out_combo.currentData(),
             'channels': self.virtual_channels,
+            'selected_mic': self.selected_mic,
             'submixes': self.submix_state,
             'hidden': list(self.hidden_nodes),
             'app_routing': self.app_routing,

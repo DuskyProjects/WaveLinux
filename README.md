@@ -10,7 +10,7 @@ PyQt6 app. Talks to PipeWire through `pactl`, `pw-dump`, `wpctl`, and
 
 ## What it does
 
-- **🎧 Headphones / 📡 Stream** — two master buses, two knobs. The
+- **🎧 Monitor Output / 📡 Stream** — two master buses, two knobs. The
   Stream bus is a named virtual recording device (`WaveLinux-Stream`)
   that shows up directly in OBS's audio input picker.
 - **Per-channel dual faders** — every channel has one fader for what

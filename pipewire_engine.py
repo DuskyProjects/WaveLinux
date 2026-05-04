@@ -118,8 +118,32 @@ class PipeWireEngine:
         # isn't installed, so we probe once at startup.
         self.ladspa_plugins = self._probe_ladspa_plugins()
 
-        # Ensure clean state from any previous crashes
+        # Reap any orphan `pipewire -c` filter-chain processes left behind
+        # by previous WaveLinux crashes. Without this they keep their
+        # virtual sinks/sources alive in the system audio graph forever,
+        # which is one of the things the user complained about ("names
+        # showing up in system settings sound menu that shouldn't").
+        self._reap_orphan_fx_processes()
+
+        # Ensure clean state from any previous crashes (pactl-loaded modules).
         self.cleanup()
+
+    @staticmethod
+    def _reap_orphan_fx_processes():
+        """Kill any `pipewire -c` processes whose config path mentions
+        `wavelinux` — they're filter-chain stages from a previous
+        WaveLinux session that didn't shut down cleanly. Idempotent and
+        safe to run on every start. Uses `pkill -f` so we don't have to
+        parse `ps` output ourselves."""
+        try:
+            subprocess.run(
+                ['pkill', '-f', r'pipewire -c .*wavelinux'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+        except Exception:
+            # `pkill` returns non-zero if no matches — that's fine, ignore.
+            pass
 
     @classmethod
     def _probe_ladspa_plugins(cls):
@@ -226,13 +250,47 @@ class PipeWireEngine:
         """Find the system's default audio output sink name."""
         return self._run(['pactl', 'get-default-sink'])
 
+    def get_default_source(self):
+        """Find the system's default audio input source (mic) name. Used
+        on first launch to pre-populate the master "Microphone Input"
+        combo with the same mic the rest of the user's apps default to."""
+        return self._run(['pactl', 'get-default-source'])
+
     # ── Per-refresh snapshot ───────────────────────────────────────
 
-    def create_snapshot(self):
+    # Minimum age (seconds) below which a fresh snapshot request just hands
+    # back the cached one. Prevents pactl-subscribe storms (every internal
+    # action we take generates a subscribe event we then react to) from
+    # triggering 5-10 full snapshots per second.
+    _SNAPSHOT_TTL = 0.25
+
+    def reap_dead_processes(self):
+        """Drop entries from `rnnoise_processes` whose subprocess has exited.
+        Without this, every spawn-and-die FX stage stays parked in the dict
+        forever, and `is_channel_fx_running` walks a growing list of dead
+        Popen handles every time it's called. Cheap to run periodically."""
+        for key in list(self.rnnoise_processes.keys()):
+            proc = self.rnnoise_processes.get(key)
+            if proc is None or proc.poll() is not None:
+                self.rnnoise_processes.pop(key, None)
+
+    def create_snapshot(self, force=False):
         """Fetch every expensive state dump once so a whole refresh tick can
         share them. Safe to call with PipeWire misbehaving — missing outputs
-        degrade to empty strings/lists."""
-        return EngineSnapshot(
+        degrade to empty strings/lists.
+
+        Cached for `_SNAPSHOT_TTL` seconds so back-to-back refresh requests
+        (e.g. one from `pactl subscribe`, one from a slider release, one
+        from the poll timer all within 100 ms) don't each spawn six
+        subprocesses. Pass `force=True` after a known structural change
+        (sink added/removed) to bypass the cache."""
+        now = time.monotonic()
+        cached = getattr(self, '_snapshot_cache', None)
+        cached_at = getattr(self, '_snapshot_cache_at', 0.0)
+        if cached is not None and not force and (now - cached_at) < self._SNAPSHOT_TTL:
+            return cached
+
+        snap = EngineSnapshot(
             modules_text=self._run(['pactl', 'list', 'modules']) or "",
             short_modules_text=self._run(['pactl', 'list', 'short', 'modules']) or "",
             sink_inputs_text=self._run(['pactl', 'list', 'sink-inputs']) or "",
@@ -240,6 +298,20 @@ class PipeWireEngine:
             nodes=self._parse_nodes(),
             sinks=self._parse_short_sinks(),
         )
+        self._snapshot_cache = snap
+        self._snapshot_cache_at = now
+        # Piggyback periodic GC on the snapshot rebuild. Only runs when we
+        # actually fetch new data (i.e. at most once per _SNAPSHOT_TTL).
+        self.reap_dead_processes()
+        return snap
+
+    def invalidate_snapshot(self):
+        """Drop the cached snapshot so the next `create_snapshot` re-fetches.
+        Call after a structural change we made ourselves (sink/loopback
+        load/unload, FX chain rebuild) so the next refresh sees the new
+        state immediately rather than waiting for the cache to expire."""
+        self._snapshot_cache = None
+        self._snapshot_cache_at = 0.0
 
     @staticmethod
     def _parse_sink_descriptions(text):
@@ -830,7 +902,18 @@ class PipeWireEngine:
         return True
 
     def route_mix_to_hardware(self, mix_name, hw_sink_name):
-        """Route an output mix to a hardware output using a loopback."""
+        """Route an output mix to a hardware output using a loopback.
+
+        Bluetooth-aware: the previous version locked the loopback to its
+        initial sink with `sink_dont_move=true`, but Bluetooth devices
+        rotate their PipeWire sink name when the profile changes
+        (`bluez_output.MAC.1` for A2DP, `.2` for HSP/HFP, etc.). Holding
+        the loopback to a stale sink name was the "audio randomly stops
+        working after I reconnect / change BT profile" bug. We now allow
+        the session manager to follow the hardware, AND after the loopback
+        comes up we explicitly find its sink-input and force volume=100%
+        + unmute (instead of trusting pactl's defaults), so a freshly-
+        routed BT device isn't silently created at 0%."""
         mix = self.output_mixes.get(mix_name)
         if not mix:
             return False
@@ -840,22 +923,77 @@ class PipeWireEngine:
                 self._run(['pactl', 'unload-module', self.loopback_modules[key]])
                 del self.loopback_modules[key]
 
-        # Create loopback from mix sink monitor to hardware sink
-        out = self._run([
-            'pactl', 'load-module', 'module-loopback',
-            f'source={mix.sink_name}.monitor',
-            f'sink={hw_sink_name}',
-            'latency_msec=20',
-            'adjust_time=0',
-            'source_dont_move=true',
-            'sink_dont_move=true'
-        ])
-        if out:
-            key = f'{mix_name}->{hw_sink_name}'
-            self.loopback_modules[key] = out
-            mix.hardware_output = hw_sink_name
-            return True
+        # If the user just picked a sink that pipewire-pulse hasn't
+        # surfaced yet (Bluetooth in the middle of profile negotiation,
+        # USB device still enumerating), retry briefly so the load doesn't
+        # fail just because we got there a tick early.
+        out = None
+        for attempt in range(8):
+            if self._sink_visible(hw_sink_name):
+                out = self._run([
+                    'pactl', 'load-module', 'module-loopback',
+                    f'source={mix.sink_name}.monitor',
+                    f'sink={hw_sink_name}',
+                    'latency_msec=20',
+                    'adjust_time=0',
+                ])
+                if out:
+                    break
+            import time as _t; _t.sleep(0.1)
+
+        if not out:
+            logging.warning(
+                f"route_mix_to_hardware: could not load loopback "
+                f"{mix.sink_name}.monitor → {hw_sink_name}"
+            )
+            return False
+
+        key = f'{mix_name}->{hw_sink_name}'
+        self.loopback_modules[key] = out
+        mix.hardware_output = hw_sink_name
+        # Force the new loopback's playback-side sink-input to 100% / unmuted.
+        # Pactl loopbacks can come up at the wrong volume if pulse-bridge
+        # carried a stale per-app-per-sink rule from a previous session,
+        # which manifests as "audio reaches the mix but I hear nothing".
+        si = self._sink_input_for_module(out)
+        if si is not None:
+            self._run(['pactl', 'set-sink-input-volume', si, '100%'])
+            self._run(['pactl', 'set-sink-input-mute',   si, '0'])
+        self.invalidate_snapshot()
+        return True
+
+    def _sink_visible(self, sink_name):
+        """Cheap check: is `sink_name` in `pactl list short sinks` right now?"""
+        if not sink_name:
+            return False
+        out = self._run(['pactl', 'list', 'short', 'sinks'])
+        if not out:
+            return False
+        for line in out.splitlines():
+            parts = line.split('\t')
+            if len(parts) >= 2 and parts[1].strip() == sink_name:
+                return True
         return False
+
+    def _sink_input_for_module(self, module_id):
+        """Find the sink-input index owned by `module_id` (a pactl module
+        we just loaded). Returns the sink-input index as a string, or None."""
+        if not module_id:
+            return None
+        text = self._run(['pactl', 'list', 'sink-inputs'])
+        if not text:
+            return None
+        mid = str(module_id)
+        current_si = None
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('Sink Input #'):
+                current_si = stripped.split('#', 1)[1].strip()
+            elif stripped.startswith('Owner Module:') and stripped.split(':', 1)[1].strip() == mid:
+                return current_si
+            elif 'module.id =' in stripped and f'"{mid}"' in stripped:
+                return current_si
+        return None
 
     def full_audio_reset(self):
         """Emergency cleanup of ALL wavelinux modules."""
@@ -2219,21 +2357,44 @@ context.modules = [
         # `audio.position = [ MONO ]` pins the channel layout to a single
         # channel so a stereo LADSPA plugin doesn't get spliced onto a
         # mono mic with one half of its inputs floating.
+        # `node.virtual = true` + `priority.session = -1000` together demote
+        # these nodes in user-facing audio menus (KDE Plasma's audio panel,
+        # GNOME's sound prefs, pavucontrol's "default device" picker) so
+        # they don't clutter the user's view of "real" inputs and outputs.
+        # The description prefixed with `_WaveLinux internal` makes it
+        # obvious what they are if they DO show up — KDE/GNOME don't have a
+        # strict "hide virtual nodes" toggle, so the demotion isn't 100 %
+        # invisibility, but it pushes them to the bottom of every list and
+        # labels them clearly as plumbing.
         filter_chain_args = f"""{{
-            node.description = "WaveLinux-{effect_id} ({safe_key}#{idx})"
-            media.name       = "WaveLinux-{effect_id} ({safe_key}#{idx})"
+            node.description = "_WaveLinux internal: {effect_id} ({safe_key}#{idx})"
+            node.nick        = "_WaveLinux-{effect_id}"
+            media.name       = "_WaveLinux-{effect_id} ({safe_key}#{idx})"
+            node.virtual     = true
+            priority.session = -1000
+            priority.driver  = -1000
             filter.graph = {{{filter_graph}
             }}
             capture.props = {{
                 node.name           = "{sink_name}"
+                node.description    = "_WaveLinux internal: {effect_id} input"
+                node.nick           = "_WaveLinux-{effect_id}-in"
                 media.class         = Audio/Sink
+                node.virtual        = true
+                priority.session    = -1000
+                priority.driver     = -1000
                 audio.rate          = 48000
                 audio.position      = [ MONO ]
                 node.always-process = true
             }}
             playback.props = {{
                 node.name           = "{source_name}"
+                node.description    = "_WaveLinux internal: {effect_id} output"
+                node.nick           = "_WaveLinux-{effect_id}-out"
                 media.class         = Audio/Source
+                node.virtual        = true
+                priority.session    = -1000
+                priority.driver     = -1000
                 audio.rate          = 48000
                 audio.position      = [ MONO ]
                 node.always-process = true
@@ -2365,6 +2526,10 @@ context.modules = [
             'capture_target': capture_target,
             'safe_key':  safe_key,
         }
+        # We just changed pactl's view of the world — drop the cache so the
+        # next refresh tick observes the new chain without waiting up to
+        # 250 ms for the snapshot TTL.
+        self.invalidate_snapshot()
         return final_source
 
     def clear_channel_fx(self, node_name):
@@ -2402,6 +2567,7 @@ context.modules = [
         # 3. Kill the filter-chain stage processes.
         for pk in info.get('procs', []):
             self.stop_rnnoise(pk)
+        self.invalidate_snapshot()
         return True
 
     def get_channel_fx_source(self, node_name):
