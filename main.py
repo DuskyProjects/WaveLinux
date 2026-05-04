@@ -727,7 +727,7 @@ class ChannelStrip(QFrame):
         self.link_btn.setObjectName("linkBtn")
         self.link_btn.setCheckable(True)
         self.link_btn.setFixedSize(24, 24)
-        self.link_btn.setToolTip("Link the Headphones and Stream faders")
+        self.link_btn.setToolTip("Link the Monitor and Stream faders")
         self.link_btn.clicked.connect(self._on_link_toggle)
         link_row.addWidget(self.link_btn)
         link_row.addStretch()
@@ -756,7 +756,7 @@ class ChannelStrip(QFrame):
         self.mon_mute = QPushButton("🎧")
         self.mon_mute.setObjectName("muteBtn")
         self.mon_mute.setFixedSize(28, 28)
-        self.mon_mute.setToolTip("Mute in Headphones mix")
+        self.mon_mute.setToolTip("Mute in Monitor mix")
         self.mon_mute.clicked.connect(self._on_mon_mute)
         mon_col.addWidget(self.mon_mute)
         faders_row.addLayout(mon_col)
@@ -1227,6 +1227,12 @@ class WaveLinuxWindow(QMainWindow):
         self.app_last_seen = {}     # app_name -> epoch seconds (for stale prune)
         self.app_prune_days = 14    # forget routing entries not seen in this many days
         self.virtual_channels = []  # list of names
+        # Single-mic mode: only ONE microphone shows up as a strip in the top
+        # section at any time. This is the node.name of the mic the user has
+        # picked in the master "Microphone Input" combo. None on first
+        # launch (we'll fall back to `pactl get-default-source` when refresh
+        # runs and persist the choice).
+        self.selected_mic = None
         # All user-facing state is keyed by PipeWire node.name (stable across
         # PipeWire restarts); pw_id is only used when talking to the engine.
         self.hidden_nodes = set()      # {node.name}
@@ -1592,12 +1598,31 @@ class WaveLinuxWindow(QMainWindow):
         o_layout.addWidget(o_title)
         o_layout.addSpacing(10)
 
-        # Headphones row (what you hear).
+        # Microphone Input row (which physical mic feeds the mixer).
+        # Single-mic mode: only the selected mic gets a strip in the top
+        # section. Switching the picker swaps the mic that's mixed; per-mic
+        # MON/STR/effect state is keyed by node.name so it survives a swap.
+        # We picked this name (not "Microphone Source") because users with
+        # speakers as their listening output otherwise read "Headphones" as
+        # "I don't have those, this app isn't for me".
+        mic_row = QHBoxLayout()
+        mic_lbl = QLabel("🎤 Microphone Input")
+        mic_lbl.setObjectName("masterMixLabel")
+        self.mic_in_combo = QComboBox()
+        self.mic_in_combo.setToolTip("Pick which physical mic the mixer uses")
+        self.mic_in_combo.currentIndexChanged.connect(self._on_mic_input_change)
+        mic_row.addWidget(mic_lbl)
+        mic_row.addWidget(self.mic_in_combo, 1)
+        o_layout.addLayout(mic_row)
+        o_layout.addSpacing(8)
+
+        # Monitor Output row (was "Headphones" — renamed because lots of
+        # users monitor through speakers and "Headphones" implies otherwise).
         mon_row = QHBoxLayout()
-        mon_lbl = QLabel("🎧 Headphones")
+        mon_lbl = QLabel("🎧 Monitor Output")
         mon_lbl.setObjectName("masterMixLabel")
         self.mon_out_combo = QComboBox()
-        self.mon_out_combo.setToolTip("Pick the physical output you listen on")
+        self.mon_out_combo.setToolTip("Pick the physical output you listen on (headphones / speakers)")
         self.mon_out_combo.currentIndexChanged.connect(
             lambda idx: self._on_mix_out_change("Monitor", self.mon_out_combo.itemData(idx))
         )
@@ -1775,13 +1800,34 @@ class WaveLinuxWindow(QMainWindow):
             # 1. Update Input Channels (Mics & Virtual Sinks)
             current_node_ids = set()
 
+            # Single-mic mode: of the N hardware mics PipeWire is showing us,
+            # only ONE gets a strip in the top section — whichever the user
+            # has picked in the master "Microphone Input" combo. The rest
+            # are still listed in that combo so the user can switch, but
+            # they don't clutter the channel row. On first run we resolve
+            # `selected_mic = None` to the system default source so the
+            # mixer comes up usable immediately.
+            self._sync_mic_picker(mics)
+            selected_mic_node = next(
+                (m for m in mics if m.name == self.selected_mic), None
+            )
+            shown_inputs = []
+            if selected_mic_node is not None:
+                shown_inputs.append(selected_mic_node)
+            shown_inputs.extend(vsinks)
+
             # Sort by the persistent channel order so reorder arrows stick.
             # Unseen nodes go to the end (keeps hot-plugged devices visible).
             order_index = {nm: i for i, nm in enumerate(self.channel_order)}
             sorted_nodes = sorted(
-                (mics + vsinks),
+                shown_inputs,
                 key=lambda n: order_index.get(n.name, len(order_index) + 1),
             )
+
+            # Hide widget rows for any hardware mic that's NOT the selected
+            # one. The reaper at the bottom of this loop drops widgets
+            # whose pw_id isn't in `current_node_ids`, so all we have to do
+            # is exclude unselected mics from `current_node_ids` below.
             for node in sorted_nodes:
                 pw_id = node.pw_id
                 current_node_ids.add(pw_id)
@@ -1842,11 +1888,15 @@ class WaveLinuxWindow(QMainWindow):
                         self._synced_nodes.add(sync_key)
                 else:
                     # After initial push, overlay live PipeWire state into the
-                    # UI *and* persist it. Without writing back, an external
-                    # mute (pavucontrol, media keys, our own button) showed in
-                    # the UI but was never saved, so a restart re-pushed the
-                    # stale un-muted state — which is exactly what made fresh
-                    # installs blast the mic back at the user.
+                    # UI. We only PERSIST the live state for real microphones
+                    # — for those, an external mute (pavucontrol, media keys)
+                    # is a legitimate user intent we want to remember across
+                    # restarts. For our OWN virtual sinks (Music, Game, etc.),
+                    # WE are the only writer; treating PipeWire's transient
+                    # state as user intent caused the "audio randomly stops
+                    # working after Bluetooth profile changes" bug — a brief
+                    # mute during BT switching got captured and persisted.
+                    is_real_mic = node in mics
                     overlay_changed = False
                     for mix_name, state, mix_key in (
                         ("Monitor", mon_state, mon_key),
@@ -1859,7 +1909,13 @@ class WaveLinuxWindow(QMainWindow):
                         if live is None:
                             continue
                         live_vol, live_mute = live
+                        # Always reflect live state in the UI so external
+                        # changes are visible.
                         state['vol'], state['mute'] = live_vol, live_mute
+                        # Only persist live state for real mics — virtual
+                        # sinks own their own state.
+                        if not is_real_mic:
+                            continue
                         saved = self.submix_state.get(mix_key) or {}
                         if (saved.get('vol') != live_vol
                                 or bool(saved.get('mute', False)) != bool(live_mute)):
@@ -2095,6 +2151,69 @@ class WaveLinuxWindow(QMainWindow):
             # stops sending to the previous hardware output.
             self.engine.unroute_mix_from_hardware(mix_name)
 
+    def _sync_mic_picker(self, mics):
+        """Refresh the master "Microphone Input" combo to show every mic
+        PipeWire knows about. Called on every refresh tick. Cheap: only
+        rebuilds the items when the mic list (by node.name) actually
+        changes — otherwise just keeps the combo's current selection
+        in sync with `self.selected_mic`.
+
+        Falls back to `pactl get-default-source` when nothing's saved
+        and at least one mic exists, so first launch picks something
+        sensible and the user isn't stuck staring at an empty mixer."""
+        combo = self.mic_in_combo
+        mic_names = {m.name for m in mics}
+        # Resolve "None" — or a stale/disappeared selection — to a present
+        # mic. `selected_mic` can go stale if the user unplugs the device
+        # they previously picked; without this fallback the master combo
+        # ends up showing nothing selected and the top section has no
+        # mic strip even though other mics are available.
+        if mics and (not self.selected_mic or self.selected_mic not in mic_names):
+            default_src = (
+                self.engine.get_default_source()
+                if hasattr(self.engine, 'get_default_source') else None
+            )
+            if default_src and default_src in mic_names:
+                self.selected_mic = default_src
+            else:
+                self.selected_mic = mics[0].name
+            self.schedule_save()
+
+        mic_fp = tuple((m.name, m.description or '') for m in mics)
+        if getattr(self, '_mic_combo_fp', None) != mic_fp:
+            self._mic_combo_fp = mic_fp
+            combo.blockSignals(True)
+            combo.clear()
+            for m in mics:
+                label = PipeWireEngine.friendly_name(m.description) or m.name
+                combo.addItem(label, m.name)
+            if not mics:
+                combo.addItem("(no microphone detected)", None)
+            combo.blockSignals(False)
+
+        # Sync selection to the saved mic, if it's in the combo.
+        idx = combo.findData(self.selected_mic)
+        if idx >= 0 and combo.currentIndex() != idx:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+
+    def _on_mic_input_change(self, idx):
+        """User picked a different mic in the master combo. Persist the
+        choice and force an immediate refresh so the channel strip swaps
+        to the new mic on the same tick."""
+        new_mic = self.mic_in_combo.itemData(idx)
+        if new_mic == self.selected_mic:
+            return
+        # Drop sync state + meter so the new mic gets a fresh push of its
+        # saved volume / mute. Without this the new strip would briefly
+        # show the previous mic's last live state.
+        if hasattr(self, '_synced_nodes'):
+            self._synced_nodes.discard(new_mic or '')
+        self.selected_mic = new_mic
+        self.schedule_save()
+        self._refresh()
+
     def _on_add_channel(self):
         text, ok = QInputDialog.getText(self, "Add Virtual Channel", "Channel Name:")
         if not (ok and text):
@@ -2140,16 +2259,35 @@ class WaveLinuxWindow(QMainWindow):
 
 
 
+    # The Wave Link-style "starter" channels we seed on a fresh install so
+    # the user opens the app and sees a working mixer instead of an empty
+    # page. Picked to match Elgato's reference layout. These are FIRST-RUN
+    # ONLY — once the user deletes one we don't bring it back, so config
+    # presence (not channel-list presence) is the seeding gate.
+    _DEFAULT_CHANNELS = ("Music", "Game", "Browser", "Voice Chat", "System")
+
+    def _seed_default_channels(self):
+        """Create the starter virtual channels and persist the resulting
+        list. Called only when no config file exists yet."""
+        for name in self._DEFAULT_CHANNELS:
+            if self.engine.create_virtual_sink(name) is not None:
+                if name not in self.virtual_channels:
+                    self.virtual_channels.append(name)
+
     def load_config(self):
         if not os.path.exists(self.config_path):
-            # Create standard mixes
+            # First launch — set up the standard mixes, route Monitor to
+            # the system default output, and seed the Wave Link-style
+            # starter channels so the user has something usable from the
+            # first open. Persist immediately so subsequent launches load
+            # the seeded list (and respect any deletions the user makes).
             self.engine.create_output_mix("Monitor")
             self.engine.create_output_mix("Stream")
-            
-            # Default Monitor to system default
             def_sink = self.engine.get_default_sink()
             if def_sink:
                 self.engine.route_mix_to_hardware("Monitor", def_sink)
+            self._seed_default_channels()
+            self.save_config()
             return
 
         try:
@@ -2166,6 +2304,11 @@ class WaveLinuxWindow(QMainWindow):
                 self._prune_stale_apps()
                 self.virtual_channels = conf.get('channels', [])
                 self.channel_order = conf.get('channel_order', []) or []
+                # Single-mic mode: which mic the user picked in the master
+                # "Microphone Input" combo. None means "use system default";
+                # the refresh path resolves None to `pactl get-default-source`
+                # the first time it runs.
+                self.selected_mic = conf.get('selected_mic') or None
                 self.effect_params = conf.get('effect_params', {}) or {}
                 self.active_effects = {
                     k: list(v) for k, v in (conf.get('active_effects', {}) or {}).items()
@@ -2249,6 +2392,7 @@ class WaveLinuxWindow(QMainWindow):
             'monitor_hw': self.mon_out_combo.currentData(),
             'stream_hw': self.str_out_combo.currentData(),
             'channels': self.virtual_channels,
+            'selected_mic': self.selected_mic,
             'submixes': self.submix_state,
             'hidden': list(self.hidden_nodes),
             'app_routing': self.app_routing,
