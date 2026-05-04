@@ -1106,36 +1106,65 @@ class PipeWireEngine:
         tail = app_id.rsplit('.', 1)[-1]
         return tail.replace('-', ' ').replace('_', ' ').strip() or app_id
 
+    @staticmethod
+    def _normalize_for_host_match(value):
+        """Collapse a string down to a comparable token for hostname matching.
+        PipeWire surfaces the host name through different properties with
+        different casings and punctuation: 'DuskyPC', 'dusky_pc', 'Dusky PC',
+        'dusky-pc.local'. Lower-case and strip every non-alphanumeric so all
+        of those map to the single canonical token 'duskypc' / 'duskypclocal'.
+        Without this normalisation the substring filter at the call site
+        misses anything PipeWire spelled with whitespace, underscores, or
+        hyphens — which is exactly what produced the long-running 'dusky pc
+        offline' ghost row in the App Routing tab."""
+        if not value:
+            return ''
+        return re.sub(r'[^a-z0-9]', '', value.lower())
+
     @classmethod
     def _host_aliases(cls):
-        """Return the set of strings that identify *this machine* — used to
-        filter sink-inputs that PipeWire hangs off the local host instead of
-        a real app. Cached so we don't re-stat /proc on every refresh."""
+        """Return the set of normalised tokens that identify *this machine* —
+        used to filter sink-inputs that PipeWire hangs off the local host
+        instead of a real app. Tokens are lower-cased and stripped of every
+        non-alphanumeric so the comparison at the call site can normalise its
+        candidate the same way and survive ``DuskyPC`` ↔ ``Dusky_PC`` ↔
+        ``dusky pc`` mismatches. Cached so we don't re-stat /proc every tick."""
         cached = getattr(cls, '_host_alias_cache', None)
         if cached is not None:
             return cached
-        names = set()
+        raw = set()
         try:
             h = socket.gethostname()
             if h:
-                names.add(h.lower())
-                # `socket.gethostname()` may return the FQDN — also keep just
-                # the short hostname so 'duskypc.local' still matches 'duskypc'.
+                raw.add(h)
                 short = h.split('.', 1)[0]
                 if short:
-                    names.add(short.lower())
+                    raw.add(short)
         except Exception:
             pass
         try:
             with open('/etc/hostname', 'r') as f:
                 h = f.read().strip()
                 if h:
-                    names.add(h.lower())
-                    names.add(h.split('.', 1)[0].lower())
+                    raw.add(h)
+                    raw.add(h.split('.', 1)[0])
         except OSError:
             pass
+        names = {cls._normalize_for_host_match(h) for h in raw}
+        names.discard('')
         cls._host_alias_cache = names
         return names
+
+    @classmethod
+    def name_matches_host(cls, value):
+        """True if `value` is one of this machine's hostnames after
+        normalisation. Public so the UI can also call this when pruning
+        previously-saved app_routing entries that came from the broken
+        substring filter."""
+        token = cls._normalize_for_host_match(value)
+        if not token:
+            return False
+        return token in cls._host_aliases()
 
     @staticmethod
     def _read_proc_cmdline(pid):
@@ -1484,17 +1513,17 @@ class PipeWireEngine:
         # PipeWire surfaces its own host (e.g. "DuskyPC") as an app whenever a
         # system-level stream — `speech-dispatcher`, the X11 bell, RTP receiver,
         # etc. — has nothing better to report. We are not an app on our own
-        # mixer, so suppress anything whose visible name *is* our hostname.
+        # mixer, so suppress anything whose visible name normalises to our
+        # hostname. Compares NORMALISED tokens (lowercase, alphanumeric only)
+        # so 'Dusky_PC' / 'dusky pc' / 'DuskyPC.local' all collapse to the
+        # same 'duskypc' / 'duskypclocal' and get filtered uniformly.
         host = self._host_aliases()
         if host:
-            check = (
-                current.get('application.name', '').strip().lower(),
-                current.get('node.description', '').strip().lower(),
-                current.get('node.nick', '').strip().lower(),
-                current.get('media.name', '').strip().lower(),
-            )
-            if any(c and c in host for c in check):
-                return
+            for prop in ('application.name', 'node.description',
+                         'node.nick', 'media.name'):
+                token = self._normalize_for_host_match(current.get(prop, ''))
+                if token and token in host:
+                    return
 
         # Stable-first name resolution. Flatpak'd apps (Spotify, Discord…)
         # often set `application.name` to "audio-src" while their real
