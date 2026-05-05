@@ -11,6 +11,7 @@ DESKTOP_FILE="$HOME/.local/share/applications/wavelinux.desktop"
 ICON_FILE="$HOME/.local/share/icons/hicolor/512x512/apps/wavelinux.png"
 LOCK_FILE="$HOME/.wavelinux.lock"
 AUTOSTART_FILE="$HOME/.config/autostart/wavelinux.desktop"
+WRAPPER_FILE="$HOME/.local/bin/wavelinux"
 
 echo "╔══════════════════════════════════════════╗"
 echo "║       WaveLinux Uninstaller              ║"
@@ -33,7 +34,11 @@ if command -v pactl >/dev/null 2>&1; then
             '
     )
     # Also kill any lingering filter-chain pipewire client we spawned.
-    pkill -f 'pipewire -c .*wavelinux' 2>/dev/null || true
+    # The pattern is anchored to OUR canonical config location +
+    # filename prefix so we don't accidentally kill an unrelated user
+    # `pipewire -c` invocation that happens to have the substring
+    # "wavelinux" elsewhere in its command line.
+    pkill -f 'pipewire -c [^ ]*\.config/pipewire/wavelinux-' 2>/dev/null || true
 fi
 
 # Per-user state. This is the bit that fixes "stuck audio-src" caches —
@@ -50,9 +55,10 @@ if [ -d "$PIPEWIRE_FX_DIR" ]; then
         -delete 2>/dev/null || true
 fi
 
-# Desktop integration.
-echo "→ Removing desktop launcher and icon..."
-rm -f "$DESKTOP_FILE" "$ICON_FILE" "$LOCK_FILE" "$AUTOSTART_FILE"
+# Desktop integration. The wrapper at ~/.local/bin/wavelinux is what
+# the .desktop's Exec= line points at; remove both together.
+echo "→ Removing desktop launcher, wrapper and icon..."
+rm -f "$DESKTOP_FILE" "$ICON_FILE" "$LOCK_FILE" "$AUTOSTART_FILE" "$WRAPPER_FILE"
 
 # Refresh the desktop database so KDE / GNOME drop the stale launcher.
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true

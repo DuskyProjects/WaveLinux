@@ -1239,6 +1239,12 @@ class WaveLinuxWindow(QMainWindow):
         self.effect_params = {}        # node.name -> effect_id -> {param_key: value}
         self.active_effects = {}       # node.name -> [effect_id, ...] — restored each run
         self._effects_applied = set()  # node.name keys we've already reconciled this session
+        # Per-channel record of the submix loopback module ids we've
+        # last pushed saved volume/mute against. Used in `_refresh()`
+        # to detect a loopback rebuild (the module id changes) and
+        # re-push state. Lives here so the per-channel hot loop doesn't
+        # have to do a `hasattr` probe on every node every tick.
+        self._synced_submix_owners = {}  # node.name -> {"Monitor": id, "Stream": id}
         self.channel_order = []        # [node.name, ...] — persistent UI order
         self.meters = {}               # pw_id -> MeterWorker
         self._known_node_names = set() # for hot-plug detection
@@ -1311,6 +1317,20 @@ class WaveLinuxWindow(QMainWindow):
         forget_all_btn.clicked.connect(self._forget_all_offline)
         layout.addWidget(forget_all_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
+        # Recovery path for the persistent ✕ blocklist. Without this the
+        # only way to un-forget an app the user clicked ✕ on by mistake
+        # was hand-editing config.json. Button is enabled only when the
+        # blocklist actually has something to clear (set in
+        # `_refresh_advanced_tab`).
+        self.restore_forgotten_btn = QPushButton("Restore forgotten apps")
+        self.restore_forgotten_btn.setObjectName("showHiddenBtn")
+        self.restore_forgotten_btn.setToolTip(
+            "Clear the per-app ✕ blocklist so apps you've previously "
+            "forgotten can show up in the routing tab again."
+        )
+        self.restore_forgotten_btn.clicked.connect(self._restore_forgotten_apps)
+        layout.addWidget(self.restore_forgotten_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
         # Startup / tray
         _heading("STARTUP & TRAY")
         self.autostart_check = QCheckBox("Start WaveLinux at login")
@@ -1354,6 +1374,34 @@ class WaveLinuxWindow(QMainWindow):
             self.autostart_check.blockSignals(True)
             self.autostart_check.setChecked(self.is_autostart_enabled())
             self.autostart_check.blockSignals(False)
+        if hasattr(self, 'restore_forgotten_btn'):
+            n = len(self.forgotten_apps)
+            self.restore_forgotten_btn.setEnabled(n > 0)
+            self.restore_forgotten_btn.setText(
+                f"Restore forgotten apps ({n})" if n
+                else "Restore forgotten apps"
+            )
+
+    def _restore_forgotten_apps(self):
+        """Clear the persistent ✕ blocklist so apps the user has clicked
+        the ✕ on can be re-discovered. Doesn't restore their saved
+        volume / destination — those were dropped by `forget_app` and
+        the user will need to re-pick a sink once the row reappears."""
+        if not self.forgotten_apps:
+            return
+        n = len(self.forgotten_apps)
+        yn = QMessageBox.question(
+            self.settings_dialog, "Restore forgotten apps",
+            f"Clear the blocklist of {n} forgotten app(s)? They will "
+            f"reappear in the routing tab the next time they make sound.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if yn != QMessageBox.StandardButton.Yes:
+            return
+        self.forgotten_apps.clear()
+        self.save_config()
+        self._refresh_advanced_tab()
+        self._refresh()
 
     def _on_prune_days_change(self, value):
         self.app_prune_days = int(value)
@@ -1463,12 +1511,13 @@ class WaveLinuxWindow(QMainWindow):
 
     def _request_reroute(self, node_name):
         """The FX dialog calls this after rebuilding a channel's chain.
-        Drop the channel out of the synced-set so the next refresh tick
-        re-pushes saved volume/mute, and trigger the debounced refresh so
-        submix loopbacks pick up the new (or removed) FX virtual-source
-        without waiting up to two seconds for the poll timer."""
-        if hasattr(self, '_synced_nodes'):
-            self._synced_nodes.discard(node_name)
+        Trigger the debounced refresh so submix loopbacks pick up the new
+        (or removed) FX virtual-source without waiting up to five seconds
+        for the poll timer. The re-sync of saved volume/mute is automatic:
+        `set_channel_fx` → `clear_channel_fx` clears the relevant submix
+        loopback entries; the next `route_input_to_submix` call mints a
+        fresh module id; main's `_synced_submix_owners` sees that id
+        change and re-pushes saved state."""
         self._event_refresh_timer.start()
 
     def _start_event_subscriber(self):
@@ -1801,6 +1850,13 @@ class WaveLinuxWindow(QMainWindow):
             # `selected_mic = None` to the system default source so the
             # mixer comes up usable immediately.
             self._sync_mic_picker(mics)
+            # Now that selected_mic is resolved (either from saved state
+            # or from `_sync_mic_picker`'s default-source fallback),
+            # apply any pending clipguard→limiter migration we couldn't
+            # land at load_config time because the mic was unset.
+            if getattr(self, '_pending_clipguard_migration', False) \
+                    and self.selected_mic:
+                self._apply_pending_clipguard_migration()
             selected_mic_node = next(
                 (m for m in mics if m.name == self.selected_mic), None
             )
@@ -1868,9 +1924,6 @@ class WaveLinuxWindow(QMainWindow):
                 # sink-input that has default-everything-zero state).
                 # Without re-syncing on rebuild, enabling effects on a
                 # muted mic silently un-mutes it.
-                if not hasattr(self, '_synced_submix_owners'):
-                    self._synced_submix_owners = {}  # nname -> {mix: owner_id}
-
                 owner_mon = self.engine.submix_loopbacks.get(f"{pw_id}->Monitor")
                 owner_str = self.engine.submix_loopbacks.get(f"{pw_id}->Stream")
                 last = self._synced_submix_owners.get(nname, {})
@@ -1881,13 +1934,23 @@ class WaveLinuxWindow(QMainWindow):
                 )
 
                 if needs_sync:
-                    self.engine.set_submix_volume(pw_id, "Monitor", mon_state['vol'])
-                    self.engine.set_submix_mute(pw_id, "Monitor", mon_state.get('mute', False))
-                    self.engine.set_submix_volume(pw_id, "Stream", str_state['vol'])
-                    self.engine.set_submix_mute(pw_id, "Stream", str_state.get('mute', False))
-                    self._synced_submix_owners[nname] = {
-                        "Monitor": owner_mon, "Stream": owner_str,
-                    }
+                    # set_submix_volume / set_submix_mute now return
+                    # False if the loopback's sink-input couldn't be
+                    # found (e.g. the module loaded but pulse-bridge
+                    # hasn't catalogued the sink-input yet). Only stamp
+                    # `_synced_submix_owners` once every push landed,
+                    # so the next tick retries on a transient miss
+                    # instead of leaving the saved state un-applied.
+                    pushed = (
+                        self.engine.set_submix_volume(pw_id, "Monitor", mon_state['vol'])
+                        and self.engine.set_submix_mute(pw_id, "Monitor", mon_state.get('mute', False))
+                        and self.engine.set_submix_volume(pw_id, "Stream", str_state['vol'])
+                        and self.engine.set_submix_mute(pw_id, "Stream", str_state.get('mute', False))
+                    )
+                    if pushed:
+                        self._synced_submix_owners[nname] = {
+                            "Monitor": owner_mon, "Stream": owner_str,
+                        }
                 else:
                     # After initial push, overlay live PipeWire state into the
                     # UI. We only PERSIST the live state for real microphones
@@ -2178,6 +2241,27 @@ class WaveLinuxWindow(QMainWindow):
             # stops sending to the previous hardware output.
             self.engine.unroute_mix_from_hardware(mix_name)
 
+    def _apply_pending_clipguard_migration(self):
+        """One-shot rewrite of the legacy `clipguard: true` (master-bus)
+        flag into a per-mic `limiter` entry on `selected_mic`'s
+        active_effects. Idempotent — clears `_pending_clipguard_migration`
+        once it runs so subsequent refresh ticks don't re-add the
+        limiter even if the user has explicitly removed it. The legacy
+        flag itself was already dropped on the next save (save_config
+        no longer writes `clipguard`)."""
+        mic = self.selected_mic
+        if not mic:
+            return
+        chain = list(self.active_effects.get(mic, []))
+        if 'limiter' not in chain:
+            chain.append('limiter')
+            self.active_effects[mic] = chain
+            logging.info(
+                f"Migrated master-bus clipguard=true → per-mic limiter on {mic}"
+            )
+            self.schedule_save()
+        self._pending_clipguard_migration = False
+
     def _sync_mic_picker(self, mics):
         """Refresh the master "Microphone Input" combo to show every mic
         PipeWire knows about. Called on every refresh tick. Cheap: only
@@ -2232,11 +2316,14 @@ class WaveLinuxWindow(QMainWindow):
         new_mic = self.mic_in_combo.itemData(idx)
         if new_mic == self.selected_mic:
             return
-        # Drop sync state + meter so the new mic gets a fresh push of its
-        # saved volume / mute. Without this the new strip would briefly
-        # show the previous mic's last live state.
-        if hasattr(self, '_synced_nodes'):
-            self._synced_nodes.discard(new_mic or '')
+        # Drop the new mic out of `_synced_submix_owners` so its saved
+        # volume / mute gets re-pushed the moment the loopbacks come up.
+        # Without this the new strip would briefly inherit the previous
+        # mic's last live state in the visual. The owner-id-change path
+        # in `_refresh` would also catch it eventually, but only after
+        # one tick where the user might see the wrong values.
+        if new_mic:
+            self._synced_submix_owners.pop(new_mic, None)
         self.selected_mic = new_mic
         self.schedule_save()
         self._refresh()
@@ -2355,20 +2442,17 @@ class WaveLinuxWindow(QMainWindow):
 
                 # Migration: pre-rewrite Clipguard was a master-bus
                 # limiter. Per the user's request it now lives per-mic
-                # inside the unified chain. If the old config flag was
-                # set AND we have a single-mic mode selection, surface
-                # the equivalent by adding `limiter` to that mic's
-                # active_effects list (de-duped). The flag itself is
-                # dropped on next save_config so we only migrate once.
-                if conf.get('clipguard') and self.selected_mic:
-                    chain = list(self.active_effects.get(self.selected_mic, []))
-                    if 'limiter' not in chain:
-                        chain.append('limiter')
-                        self.active_effects[self.selected_mic] = chain
-                        logging.info(
-                            "Migrated master-bus clipguard=true → per-mic "
-                            f"limiter on {self.selected_mic}"
-                        )
+                # inside the unified chain. The migration adds `limiter`
+                # to `active_effects[selected_mic]`, but on a fresh
+                # config `selected_mic` may not be resolved yet at
+                # load_config time (it gets auto-filled from
+                # `pactl get-default-source` later in `_sync_mic_picker`).
+                # So we just stash the intent here; `_refresh` runs
+                # `_apply_pending_clipguard_migration` once the mic
+                # picker has had a chance to land on a real source.
+                self._pending_clipguard_migration = bool(conf.get('clipguard'))
+                if self._pending_clipguard_migration and self.selected_mic:
+                    self._apply_pending_clipguard_migration()
 
                 # Recreate virtual channels
                 for name in self.virtual_channels:
@@ -2399,20 +2483,31 @@ class WaveLinuxWindow(QMainWindow):
     def _migrate_submix_state(raw):
         """Drop legacy entries keyed by the ephemeral pw_id (e.g. '42_Monitor').
         New keys use PipeWire node.name (e.g. 'wavelinux_game_Monitor',
-        'alsa_input.pci-..._Monitor'), which survives a PipeWire restart."""
+        'alsa_input.pci-..._Monitor'), which survives a PipeWire restart.
+
+        Conservative migration: only drop keys whose suffix is exactly
+        `_Monitor` or `_Stream` AND whose prefix int-parses cleanly. That
+        matches the legacy `{pw_id}_{Monitor|Stream}` shape without
+        risking other suffixes (`_linked`, `_gain`, future ones) or
+        node.names that happen to look numeric. The previous version
+        ran the int-prefix test against every key with an underscore,
+        which would have falsely classified e.g. a `1234_Monitor`
+        virtual sink as legacy."""
         if not isinstance(raw, dict):
             return {}
         clean = {}
+        legacy_suffixes = ('_Monitor', '_Stream')
         for key, val in raw.items():
             if not isinstance(key, str) or '_' not in key:
                 continue
-            prefix = key.rsplit('_', 1)[0]
-            try:
-                int(prefix)
-                # Legacy pw_id key — drop it rather than carry junk forward.
-                continue
-            except ValueError:
-                pass
+            if key.endswith(legacy_suffixes):
+                prefix = key.rsplit('_', 1)[0]
+                try:
+                    int(prefix)
+                    # Legacy {pw_id}_{Monitor|Stream} key — drop.
+                    continue
+                except ValueError:
+                    pass
             clean[key] = val
         return clean
 
@@ -2459,9 +2554,9 @@ class WaveLinuxWindow(QMainWindow):
         `forgotten_apps` blocklist so the row stays gone for good. Running
         apps used to "come back" on the next refresh because the row was
         re-synthesised from `apps_by_name`; the blocklist short-circuits
-        that path. The user can still get the row back by Settings →
-        Advanced → "Forget all offline apps now" (which clears the
-        blocklist) or by editing config.json by hand."""
+        that path. To recover a forgotten app, use Settings → Advanced →
+        "Restore forgotten apps" (clears the blocklist) or hand-edit
+        `forgotten_apps` in `~/.config/wavelinux/config.json`."""
         self.app_routing.pop(app_name, None)
         self.app_last_seen.pop(app_name, None)
         self.forgotten_apps.add(app_name)

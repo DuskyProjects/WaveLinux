@@ -41,10 +41,18 @@ direct libpipewire binding — talks to PipeWire over `pactl`, `pw-dump`,
   Gate, Limiter; Clipguard on Stream master. Built-ins use PipeWire's
   `bq_*` filters; the others are LADSPA (`swh-plugins`,
   `noise-suppression-for-voice`).
-- **Current FX implementation (TO BE REWRITTEN)**: `set_channel_fx`
-  spawns ONE `pipewire -c <conf>` process PER enabled effect, wired
-  together with `module-loopback`. Target architecture is one config
-  with N nodes in a single `filter.graph` and one process per channel.
+- **FX implementation**: `set_channel_fx` builds ONE unified config
+  per channel via `_build_unified_chain_config` and spawns ONE
+  `pipewire -c <conf>` client. The config's `filter.graph` lists every
+  enabled effect as a node (namespaced `s<idx>_<id>`) with explicit
+  `links` chaining them together. Result: one virtual sink (`*.input`)
+  + one virtual source (`*.source`) per channel regardless of effect
+  count. EasyEffects-inspired design (architectural credit inline at
+  `_effect_stage_blocks`).
+- **Clipguard** is no longer a master-bus button — it's the per-mic
+  `Limiter` effect inside the unified chain. Old `clipguard: true`
+  configs are migrated to per-mic `limiter` on first load if a
+  `selected_mic` is present.
 - **Branding rule**: every value WaveLinux writes into
   `device.description` / `node.description` / `node.nick` /
   `media.name` / `application.name` is whitespace-free

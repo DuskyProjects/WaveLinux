@@ -18,8 +18,13 @@ PyQt6 app. Talks to PipeWire through `pactl`, `pw-dump`, `wpctl`, and
   🔗 Link button ties them together when you want them to move as one.
 - **Per-channel peak meter** so you can see who's loud, updated at
   ~20 Hz with a release envelope.
-- **Clipguard** 🛡 on the Stream bus — a brickwall limiter so your
-  broadcast can't clip.
+- **Clipguard / Limiter** per microphone — a brickwall limiter that
+  protects the active mic from clipping. Lives as the `Limiter` row in
+  the channel's right-click → Effects dialog. Earlier builds put a
+  Clipguard button on the Stream master bus; that affected the whole
+  broadcast (music, game, voice mixed together) which made gain-staging
+  awkward, so it now sits per-channel where it can actually catch the
+  source that's clipping.
 - **Per-app routing** — every running app shows up as a row with a
   volume slider and a destination picker (system default, a hardware
   output, or any WaveLinux channel). Routing persists per app and
@@ -78,7 +83,10 @@ cd WaveLinux
 makepkg -si
 ```
 
-Run it from source with `python3 main.py`.
+Run it from source with `python3 main.py` (or `./start.sh`, which
+just `cd`s to the source tree and runs `python3 main.py` for you).
+After `install.sh`, you can also launch the wrapper from anywhere
+with `wavelinux` (assuming `~/.local/bin` is on your `$PATH`).
 
 ## Where things live
 

@@ -137,14 +137,20 @@ class PipeWireEngine:
 
     @staticmethod
     def _reap_orphan_fx_processes():
-        """Kill any `pipewire -c` processes whose config path mentions
-        `wavelinux` — they're filter-chain stages from a previous
-        WaveLinux session that didn't shut down cleanly. Idempotent and
-        safe to run on every start. Uses `pkill -f` so we don't have to
-        parse `ps` output ourselves."""
+        """Kill any `pipewire -c` processes whose config path lives in
+        OUR canonical config directory and starts with our filename
+        prefix — they're filter-chain stages from a previous WaveLinux
+        session that didn't shut down cleanly. Idempotent and safe to
+        run on every start. Uses `pkill -f` so we don't have to parse
+        `ps` output ourselves.
+
+        The pattern is anchored to `*.config/pipewire/wavelinux-` so we
+        don't accidentally match a user's own `pipewire -c` client
+        whose command line happens to contain the substring 'wavelinux'
+        somewhere unrelated."""
         try:
             subprocess.run(
-                ['pkill', '-f', r'pipewire -c .*wavelinux'],
+                ['pkill', '-f', r'pipewire -c [^ ]*\.config/pipewire/wavelinux-'],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=2,
             )
@@ -367,7 +373,18 @@ class PipeWireEngine:
         (e.g. one from `pactl subscribe`, one from a slider release, one
         from the poll timer all within 100 ms) don't each spawn six
         subprocesses. Pass `force=True` after a known structural change
-        (sink added/removed) to bypass the cache."""
+        (sink added/removed) to bypass the cache.
+
+        NOTE on atomicity: the six pactl/pw-dump invocations below run
+        sequentially, so PipeWire CAN mutate between them — a sink that
+        existed in the modules dump may not appear in the sinks dump
+        100 ms later. Helpers that look up a sink_id from
+        sink_inputs_text in a sink_id_to_name dict built from sinks
+        dumps tolerate missing keys and fall back to the raw id. This
+        is an unavoidable consequence of driving a daemon over CLI;
+        the next tick reconciles. Don't hold structural decisions for
+        more than one tick on snapshot data alone — re-query when you
+        actually act."""
         now = time.monotonic()
         cached = getattr(self, '_snapshot_cache', None)
         cached_at = getattr(self, '_snapshot_cache_at', 0.0)
@@ -454,10 +471,18 @@ class PipeWireEngine:
     def _parse_nodes(self):
         raw = self._run(['pw-dump'], timeout=4)
         if not raw:
+            # `pw-dump` timed out or returned empty. Returning an empty
+            # list collapses the entire PipeWire node graph for this
+            # tick — every channel disappears for one refresh and then
+            # comes back. Log so a chronically slow `pw-dump` (e.g. a
+            # backed-up daemon, NUMA-pinned RT scheduling thrashing) is
+            # visible in the log instead of a mystery flicker.
+            logging.warning("pw-dump returned no output; node graph empty for this tick")
             return []
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
+            logging.warning("pw-dump output was not valid JSON; node graph empty for this tick")
             return []
         nodes = []
         for obj in data:
@@ -804,19 +829,28 @@ class PipeWireEngine:
         return None
 
     def set_submix_volume(self, node_id, mix_name, volume):
+        """Returns True on success, False if the underlying sink-input
+        couldn't be located (loopback hasn't loaded yet, or the loopback
+        was unloaded mid-tick). The UI uses the boolean to flag a tick
+        where the volume slider's intent wasn't actually applied so the
+        next refresh can re-try."""
         si = self.get_submix_sink_input(node_id, mix_name)
-        if si:
-            pct = max(0, min(int(round(self._clamp(volume) * 100)), 100))
-            self._run(['pactl', 'set-sink-input-volume', si, f'{pct}%'])
-        else:
+        if not si:
             logging.warning(f"Could not find sink-input for {node_id}->{mix_name}")
+            return False
+        pct = max(0, min(int(round(self._clamp(volume) * 100)), 100))
+        self._run(['pactl', 'set-sink-input-volume', si, f'{pct}%'])
+        return True
 
     def set_submix_mute(self, node_id, mix_name, mute):
+        """Returns True on success, False if the underlying sink-input
+        couldn't be located. See `set_submix_volume` for the rationale."""
         si = self.get_submix_sink_input(node_id, mix_name)
-        if si:
-            self._run(['pactl', 'set-sink-input-mute', si, '1' if mute else '0'])
-        else:
+        if not si:
             logging.warning(f"Could not find sink-input to mute for {node_id}->{mix_name}")
+            return False
+        self._run(['pactl', 'set-sink-input-mute', si, '1' if mute else '0'])
+        return True
 
     def snapshot_sink_inputs_by_owner(self, snap=None):
         """Map `owner_module_id -> (volume 0..1.5, muted)` in a single
@@ -1249,6 +1283,15 @@ class PipeWireEngine:
             pass
         names = {cls._normalize_for_host_match(h) for h in raw}
         names.discard('')
+        if not names:
+            # Both gethostname() and /etc/hostname failed — unusual
+            # (sandboxed environment, /proc not mounted, etc.). Log
+            # once so the host filter's silent-pass-through isn't a
+            # mystery if a system stream slips into App Routing.
+            logging.warning(
+                "Could not determine hostname; host-name filter for "
+                "system streams in App Routing will be inactive."
+            )
         cls._host_alias_cache = names
         return names
 
@@ -1969,32 +2012,46 @@ context.modules = [
         tried and why it didn't fly. Without this header it's impossible
         to tell from outside whether a config-syntax error or a missing
         plugin or a daemon-connection failure is the culprit."""
+        # Read config back so the debug header is the FILE we ran (not
+        # whatever the caller intended). Avoids mismatch when someone
+        # races us with a hand-edit.
         try:
-            # Read config back so the debug header is the FILE we ran
-            # (not whatever the caller intended). Avoids mismatch when
-            # someone races us with a hand-edit.
-            try:
-                with open(config_path, 'r') as cf:
-                    rendered_config = cf.read()
-            except OSError:
-                rendered_config = '<read failed>'
-            try:
-                pw_ver = subprocess.run(
-                    ['pipewire', '--version'], capture_output=True,
-                    text=True, timeout=2,
-                ).stdout.strip() or 'unknown'
-            except Exception:
-                pw_ver = 'unknown'
+            with open(config_path, 'r') as cf:
+                rendered_config = cf.read()
+        except OSError:
+            rendered_config = '<read failed>'
+        try:
+            pw_ver = subprocess.run(
+                ['pipewire', '--version'], capture_output=True,
+                text=True, timeout=2,
+            ).stdout.strip() or 'unknown'
+        except Exception:
+            pw_ver = 'unknown'
+        header = (
+            f"# WaveLinux FX spawn {key}\n"
+            f"# pipewire --version: {pw_ver}\n"
+            f"# config path:        {config_path}\n"
+            f"# LADSPA_PATH env:    {os.environ.get('LADSPA_PATH', '')}\n"
+            f"# ──────── config ─────────\n"
+            f"{rendered_config}"
+            f"\n# ──────── pipewire stderr/stdout ────────\n"
+        )
+
+        try:
             log_file = open(log_path, 'wb')
-            header = (
-                f"# WaveLinux FX spawn {key}\n"
-                f"# pipewire --version: {pw_ver}\n"
-                f"# config path:        {config_path}\n"
-                f"# LADSPA_PATH env:    {os.environ.get('LADSPA_PATH', '')}\n"
-                f"# ──────── config ─────────\n"
-                f"{rendered_config}"
-                f"\n# ──────── pipewire stderr/stdout ────────\n"
-            )
+        except OSError as e:
+            logging.error(f"Could not open FX log file {log_path}: {e}")
+            return False
+
+        # CRITICAL: close log_file in the PARENT once Popen has dup'd the
+        # FD into the child. Without this finally we'd leak one file
+        # descriptor for every chain spawn (every effect toggle, every
+        # parameter slider commit), and a long session of FX edits would
+        # eventually hit EMFILE. The child keeps writing to its own dup,
+        # so the log file still receives pipewire's stderr; only the
+        # parent's redundant handle goes away.
+        proc = None
+        try:
             log_file.write(header.encode('utf-8'))
             log_file.flush()
             proc = subprocess.Popen(
@@ -2004,6 +2061,12 @@ context.modules = [
         except FileNotFoundError:
             logging.error("`pipewire` binary not found — cannot spawn filter chain")
             return False
+        finally:
+            try:
+                log_file.close()
+            except Exception:
+                pass
+
         try:
             proc.wait(timeout=1.5)
         except subprocess.TimeoutExpired:
@@ -2225,13 +2288,26 @@ context.modules = [
         return list(cls._EFFECT_PRESETS.get(effect_id, []))
 
     def _resolved_params(self, effect_id, overrides):
-        """Merge user overrides on top of defaults from _EFFECT_PARAMS."""
+        """Merge user overrides on top of defaults from _EFFECT_PARAMS,
+        clamping each value to the declared min/max range. The FX dialog
+        sliders already clamp at the UI layer, but a hand-edited
+        config.json or a future caller that bypasses the dialog could
+        still produce out-of-range values that the LADSPA plugin would
+        either reject or interpret as undefined behaviour. Clamping here
+        means the filter-chain config is always within sane bounds."""
+        ranges = {key: (mn, mx) for (key, _l, mn, mx, _d, _u)
+                  in self._EFFECT_PARAMS.get(effect_id, [])}
         out = {key: default for (key, _l, _mn, _mx, default, _u)
                in self._EFFECT_PARAMS.get(effect_id, [])}
         if overrides:
             for k, v in overrides.items():
                 if k in out:
-                    out[k] = float(v)
+                    try:
+                        v = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    mn, mx = ranges[k]
+                    out[k] = max(mn, min(mx, v))
         return out
 
     @staticmethod
@@ -2711,8 +2787,14 @@ context.modules = [
         }}"""
         config = self._fx_client_config(client_id, filter_chain_args)
         config_path = os.path.join(config_dir, f'wavelinux-chain-{safe_key}.conf')
-        with open(config_path, 'w') as f:
+        # Atomic write: a partial write (disk-full, sigkill mid-write,
+        # NFS hiccup) would leave a syntactically broken config that the
+        # next `pipewire -c` spawn would refuse to load. tmp + rename is
+        # cheap insurance.
+        tmp_path = config_path + '.tmp'
+        with open(tmp_path, 'w') as f:
             f.write(config)
+        os.replace(tmp_path, config_path)
         return config_path, sink_name, source_name, used_effects
 
     # Legacy per-stage builder kept around so any out-of-tree caller
