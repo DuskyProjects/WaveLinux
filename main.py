@@ -1802,6 +1802,13 @@ class WaveLinuxWindow(QMainWindow):
             # `selected_mic = None` to the system default source so the
             # mixer comes up usable immediately.
             self._sync_mic_picker(mics)
+            # Now that selected_mic is resolved (either from saved state
+            # or from `_sync_mic_picker`'s default-source fallback),
+            # apply any pending clipguard→limiter migration we couldn't
+            # land at load_config time because the mic was unset.
+            if getattr(self, '_pending_clipguard_migration', False) \
+                    and self.selected_mic:
+                self._apply_pending_clipguard_migration()
             selected_mic_node = next(
                 (m for m in mics if m.name == self.selected_mic), None
             )
@@ -2179,6 +2186,27 @@ class WaveLinuxWindow(QMainWindow):
             # stops sending to the previous hardware output.
             self.engine.unroute_mix_from_hardware(mix_name)
 
+    def _apply_pending_clipguard_migration(self):
+        """One-shot rewrite of the legacy `clipguard: true` (master-bus)
+        flag into a per-mic `limiter` entry on `selected_mic`'s
+        active_effects. Idempotent — clears `_pending_clipguard_migration`
+        once it runs so subsequent refresh ticks don't re-add the
+        limiter even if the user has explicitly removed it. The legacy
+        flag itself was already dropped on the next save (save_config
+        no longer writes `clipguard`)."""
+        mic = self.selected_mic
+        if not mic:
+            return
+        chain = list(self.active_effects.get(mic, []))
+        if 'limiter' not in chain:
+            chain.append('limiter')
+            self.active_effects[mic] = chain
+            logging.info(
+                f"Migrated master-bus clipguard=true → per-mic limiter on {mic}"
+            )
+            self.schedule_save()
+        self._pending_clipguard_migration = False
+
     def _sync_mic_picker(self, mics):
         """Refresh the master "Microphone Input" combo to show every mic
         PipeWire knows about. Called on every refresh tick. Cheap: only
@@ -2359,20 +2387,17 @@ class WaveLinuxWindow(QMainWindow):
 
                 # Migration: pre-rewrite Clipguard was a master-bus
                 # limiter. Per the user's request it now lives per-mic
-                # inside the unified chain. If the old config flag was
-                # set AND we have a single-mic mode selection, surface
-                # the equivalent by adding `limiter` to that mic's
-                # active_effects list (de-duped). The flag itself is
-                # dropped on next save_config so we only migrate once.
-                if conf.get('clipguard') and self.selected_mic:
-                    chain = list(self.active_effects.get(self.selected_mic, []))
-                    if 'limiter' not in chain:
-                        chain.append('limiter')
-                        self.active_effects[self.selected_mic] = chain
-                        logging.info(
-                            "Migrated master-bus clipguard=true → per-mic "
-                            f"limiter on {self.selected_mic}"
-                        )
+                # inside the unified chain. The migration adds `limiter`
+                # to `active_effects[selected_mic]`, but on a fresh
+                # config `selected_mic` may not be resolved yet at
+                # load_config time (it gets auto-filled from
+                # `pactl get-default-source` later in `_sync_mic_picker`).
+                # So we just stash the intent here; `_refresh` runs
+                # `_apply_pending_clipguard_migration` once the mic
+                # picker has had a chance to land on a real source.
+                self._pending_clipguard_migration = bool(conf.get('clipguard'))
+                if self._pending_clipguard_migration and self.selected_mic:
+                    self._apply_pending_clipguard_migration()
 
                 # Recreate virtual channels
                 for name in self.virtual_channels:
@@ -2463,9 +2488,9 @@ class WaveLinuxWindow(QMainWindow):
         `forgotten_apps` blocklist so the row stays gone for good. Running
         apps used to "come back" on the next refresh because the row was
         re-synthesised from `apps_by_name`; the blocklist short-circuits
-        that path. The user can still get the row back by Settings →
-        Advanced → "Forget all offline apps now" (which clears the
-        blocklist) or by editing config.json by hand."""
+        that path. To recover a forgotten app, use Settings → Advanced →
+        "Restore forgotten apps" (clears the blocklist) or hand-edit
+        `forgotten_apps` in `~/.config/wavelinux/config.json`."""
         self.app_routing.pop(app_name, None)
         self.app_last_seen.pop(app_name, None)
         self.forgotten_apps.add(app_name)

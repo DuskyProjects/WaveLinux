@@ -11,6 +11,7 @@ DESKTOP_FILE="$HOME/.local/share/applications/wavelinux.desktop"
 ICON_FILE="$HOME/.local/share/icons/hicolor/512x512/apps/wavelinux.png"
 LOCK_FILE="$HOME/.wavelinux.lock"
 AUTOSTART_FILE="$HOME/.config/autostart/wavelinux.desktop"
+WRAPPER_FILE="$HOME/.local/bin/wavelinux"
 
 echo "╔══════════════════════════════════════════╗"
 echo "║       WaveLinux Uninstaller              ║"
@@ -54,9 +55,10 @@ if [ -d "$PIPEWIRE_FX_DIR" ]; then
         -delete 2>/dev/null || true
 fi
 
-# Desktop integration.
-echo "→ Removing desktop launcher and icon..."
-rm -f "$DESKTOP_FILE" "$ICON_FILE" "$LOCK_FILE" "$AUTOSTART_FILE"
+# Desktop integration. The wrapper at ~/.local/bin/wavelinux is what
+# the .desktop's Exec= line points at; remove both together.
+echo "→ Removing desktop launcher, wrapper and icon..."
+rm -f "$DESKTOP_FILE" "$ICON_FILE" "$LOCK_FILE" "$AUTOSTART_FILE" "$WRAPPER_FILE"
 
 # Refresh the desktop database so KDE / GNOME drop the stale launcher.
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
