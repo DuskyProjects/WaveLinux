@@ -128,6 +128,13 @@ class PipeWireEngine:
         # Ensure clean state from any previous crashes (pactl-loaded modules).
         self.cleanup()
 
+        # Track whether we've successfully overridden the WirePlumber
+        # bluetooth auto-switch setting so cleanup can flip it back without
+        # a stale call when the override never landed (old wpctl, no BT
+        # stack, etc.).
+        self._bt_autoswitch_overridden = False
+        self.lock_bluetooth_to_a2dp()
+
     @staticmethod
     def _reap_orphan_fx_processes():
         """Kill any `pipewire -c` processes whose config path mentions
@@ -144,6 +151,83 @@ class PipeWireEngine:
         except Exception:
             # `pkill` returns non-zero if no matches — that's fine, ignore.
             pass
+
+    # ── Bluetooth profile lock ─────────────────────────────────────
+    #
+    # WirePlumber 0.5+ ships with `bluetooth.autoswitch-to-headset-profile`
+    # set to `true`. The instant ANY client (Discord, Telegram, even a
+    # browser tab requesting microphone access) opens a stream targeting
+    # the BT mic, WirePlumber auto-flips the device from A2DP (high-fi
+    # stereo) to HSP/HFP (mono headset). The A2DP sink disappears for the
+    # duration — which the user reported as "WaveLinux removed my
+    # Bluetooth headset from the audio stack". WaveLinux never unloads
+    # hardware sinks (the cleanup sweep is scoped to wavelinux_* modules)
+    # so the disappearance is BlueZ destroying the A2DP node during the
+    # profile flip, not us.
+    #
+    # The user picked option (b) when asked: lock the headset to A2DP for
+    # the duration WaveLinux is running, accepting that the BT mic will
+    # be unavailable / very low quality while the lock is in effect.
+    # Volatile (no `--save`) so the user's normal preference comes back
+    # automatically when WaveLinux quits or wireplumber restarts.
+
+    def lock_bluetooth_to_a2dp(self):
+        """Disable WirePlumber's A2DP↔HSP/HFP auto-switch for the duration
+        of this session so a Bluetooth headset stays visible as a high-fi
+        stereo output even when the mic is in use. Volatile — the user's
+        original preference returns when wireplumber restarts or
+        `unlock_bluetooth_autoswitch` is called.
+
+        Returns True if the override was applied, False if the local wpctl
+        is too old to support `settings` (WirePlumber < 0.5) or if the
+        wpctl call otherwise failed. Failure is non-fatal: the headset
+        will still work, the user just gets the system default
+        auto-switch behaviour."""
+        # `wpctl settings` is the WirePlumber 0.5 settings interface; pre-0.5
+        # wpctl does not have a `settings` subcommand and exits non-zero,
+        # which we treat as "this knob doesn't exist on this system."
+        try:
+            res = subprocess.run(
+                ['wpctl', 'settings', 'bluetooth.autoswitch-to-headset-profile', 'false'],
+                capture_output=True, text=True, timeout=3,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            logging.warning(
+                f"Could not lock bluetooth profile (wpctl unavailable): {e}"
+            )
+            return False
+        if res.returncode != 0:
+            logging.warning(
+                f"wpctl rejected bluetooth.autoswitch override "
+                f"(rc={res.returncode}): {res.stderr.strip()}"
+            )
+            return False
+        self._bt_autoswitch_overridden = True
+        logging.info(
+            "Locked BT profile to A2DP for this session "
+            "(bluetooth.autoswitch-to-headset-profile=false)"
+        )
+        return True
+
+    def unlock_bluetooth_autoswitch(self):
+        """Restore WirePlumber's BT auto-switch to its default ON state.
+        Called from cleanup() so the user's other apps regain the normal
+        'flip to HSP when mic opens' behaviour the moment WaveLinux quits.
+        No-op if we never successfully applied the override."""
+        if not self._bt_autoswitch_overridden:
+            return False
+        try:
+            res = subprocess.run(
+                ['wpctl', 'settings', 'bluetooth.autoswitch-to-headset-profile', 'true'],
+                capture_output=True, text=True, timeout=3,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        if res.returncode == 0:
+            self._bt_autoswitch_overridden = False
+            logging.info("Restored bluetooth.autoswitch-to-headset-profile=true")
+            return True
+        return False
 
     @classmethod
     def _probe_ladspa_plugins(cls):
@@ -2723,6 +2807,17 @@ context.modules = [
 
     def cleanup(self):
         """Hard cleanup of all wavelinux PipeWire modules."""
+        # Restore the BT auto-switch knob first. It's volatile state on
+        # WirePlumber so it will reset itself when the user's wireplumber
+        # restarts anyway, but flipping it back here makes the moment
+        # WaveLinux exits the moment any other app's HSP/HFP behaviour
+        # returns to normal — no need to log out and back in.
+        try:
+            self.unlock_bluetooth_autoswitch()
+        except AttributeError:
+            # Older builds or a partially-initialised engine that aborted
+            # before lock_bluetooth_to_a2dp ran — nothing to restore.
+            pass
         # Tear down channel chains first so their stage processes go away
         # cleanly (they're tracked in rnnoise_processes too — clear_channel_fx
         # routes through stop_rnnoise — but doing them via the chain API
