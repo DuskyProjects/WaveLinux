@@ -1463,12 +1463,13 @@ class WaveLinuxWindow(QMainWindow):
 
     def _request_reroute(self, node_name):
         """The FX dialog calls this after rebuilding a channel's chain.
-        Drop the channel out of the synced-set so the next refresh tick
-        re-pushes saved volume/mute, and trigger the debounced refresh so
-        submix loopbacks pick up the new (or removed) FX virtual-source
-        without waiting up to two seconds for the poll timer."""
-        if hasattr(self, '_synced_nodes'):
-            self._synced_nodes.discard(node_name)
+        Trigger the debounced refresh so submix loopbacks pick up the new
+        (or removed) FX virtual-source without waiting up to five seconds
+        for the poll timer. The re-sync of saved volume/mute is automatic:
+        `set_channel_fx` → `clear_channel_fx` clears the relevant submix
+        loopback entries; the next `route_input_to_submix` call mints a
+        fresh module id; main's `_synced_submix_owners` sees that id
+        change and re-pushes saved state."""
         self._event_refresh_timer.start()
 
     def _start_event_subscriber(self):
@@ -2232,11 +2233,14 @@ class WaveLinuxWindow(QMainWindow):
         new_mic = self.mic_in_combo.itemData(idx)
         if new_mic == self.selected_mic:
             return
-        # Drop sync state + meter so the new mic gets a fresh push of its
-        # saved volume / mute. Without this the new strip would briefly
-        # show the previous mic's last live state.
-        if hasattr(self, '_synced_nodes'):
-            self._synced_nodes.discard(new_mic or '')
+        # Drop the new mic out of `_synced_submix_owners` so its saved
+        # volume / mute gets re-pushed the moment the loopbacks come up.
+        # Without this the new strip would briefly inherit the previous
+        # mic's last live state in the visual. The owner-id-change path
+        # in `_refresh` would also catch it eventually, but only after
+        # one tick where the user might see the wrong values.
+        if hasattr(self, '_synced_submix_owners') and new_mic:
+            self._synced_submix_owners.pop(new_mic, None)
         self.selected_mic = new_mic
         self.schedule_save()
         self._refresh()

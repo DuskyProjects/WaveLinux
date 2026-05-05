@@ -3,7 +3,7 @@
 A PyQt6 mixer for PipeWire that mirrors Elgato Wave Link's
 day-to-day UX on Linux: per-channel Headphones (MON) and Stream
 (STR) sends, a master Headphones output, a dedicated Stream virtual
-device for OBS, and Clipguard.
+device for OBS, and a per-mic Limiter (Wave Link's "Clipguard").
 
 ## Done
 
@@ -29,7 +29,9 @@ device for OBS, and Clipguard.
       - **📡 Stream** — permanently routed to the virtual
         `WaveLinux-Stream` recording device (matches Wave Link's
         fixed broadcast device), hint text reads *"OBS input:
-        WaveLinux-Stream"*, master fader + 🛡 Clipguard button.
+        WaveLinux-Stream"*, master fader. (The earlier 🛡 master-bus
+        Clipguard button has been moved to the per-mic Limiter
+        effect.)
 - [x] **Settings dialog** (header ⚙) hosts App Routing and the list
       of hidden channels with a one-click unhide.
 - [x] **Tray integration** with graceful fallback to quit-on-close
@@ -73,19 +75,25 @@ device for OBS, and Clipguard.
       `node.name`, which survives a PipeWire restart. An initial
       sync push runs on the first tick for each node so saved mutes
       aren't clobbered by live PipeWire state.
-- [x] **Clipguard** — Wave Link-style limiter on the Stream bus.
+- [x] **Clipguard / Limiter** per microphone. Wave Link's master-bus
+      Clipguard button is gone; the equivalent now lives as the
+      `Limiter` effect inside the channel's unified FX chain so it only
+      affects the active mic, not every source mixed into Stream.
       Uses the `fast_lookahead_limiter_1913` LADSPA plugin when
       available, otherwise falls back to PipeWire's builtin
-      `linear` + `clamp` chain so the button works even on a
-      stock PipeWire install.
-- [x] **FX bus per channel** — when one or more effects are
-      enabled on a mic / virtual sink, the engine spawns a
-      stage-per-effect filter-chain whose first stage's
-      `target.object` is bound to the original source and whose
-      final stage exposes a virtual `Audio/Source`. The submix
-      loopbacks pull from that source instead of the raw mic, so
-      the effects are actually **audible** (and re-routing happens
-      automatically when effects toggle on or off).
+      `linear` + `clamp` chain so the limiter still works on a stock
+      PipeWire install.
+- [x] **FX bus per channel** — one unified `pipewire -c` filter-chain
+      process per channel. Every enabled effect lives as a node in a
+      single `filter.graph` block with explicit inter-stage `links`,
+      so RNNoise → High-Pass → EQ → Compressor → Gate → Limiter is
+      one process and one virtual sink/source pair, no matter how
+      many effects are stacked. The capture side binds to the
+      mic via a `module-loopback`; the submix loopbacks pull from
+      the chain's virtual `Audio/Source`. Architecture credit:
+      EasyEffects (https://github.com/wwmm/easyeffects, GPL-3.0) for
+      the unified-graph design; PipeWire's `module-filter-chain` for
+      the implementation primitives.
 - [x] **Snapshot-cached refresh**. Each refresh tick runs each heavy
       `pactl` / `pw-dump` invocation exactly once; helpers read from
       the cached text.
@@ -222,11 +230,13 @@ device for OBS, and Clipguard.
 - **GUI**: PyQt6.
 - **Audio**: PipeWire via `pactl`, `pw-dump`, `wpctl`, `parec`. No
   direct libpipewire binding.
-- **Process model**: single desktop process. FX chains (rnnoise,
-  highpass, compressor, gate, limiter, Clipguard) are spawned as
-  separate `pipewire -c <conf>` clients with `core.daemon = false`
-  so they can't take over the session. stderr goes to
-  `~/.config/wavelinux/fx-logs/`.
+- **Process model**: single desktop process. Each channel with at
+  least one effect spawns ONE `pipewire -c <conf>` client running a
+  unified `module-filter-chain` whose `filter.graph` lists every
+  enabled effect (rnnoise / highpass / EQ / compressor / gate /
+  limiter) as a node with explicit `links` between them.
+  `core.daemon = false` so the spawn can't take over the session;
+  stderr goes to `~/.config/wavelinux/fx-logs/`.
 - **Per-refresh snapshot** (`EngineSnapshot`): the UI fetches
   `pactl list modules / short modules / sink-inputs / sinks / short
   sinks` and `pw-dump` once per tick, helpers reuse the cached text.

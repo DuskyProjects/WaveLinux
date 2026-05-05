@@ -33,7 +33,11 @@ if command -v pactl >/dev/null 2>&1; then
             '
     )
     # Also kill any lingering filter-chain pipewire client we spawned.
-    pkill -f 'pipewire -c .*wavelinux' 2>/dev/null || true
+    # The pattern is anchored to OUR canonical config location +
+    # filename prefix so we don't accidentally kill an unrelated user
+    # `pipewire -c` invocation that happens to have the substring
+    # "wavelinux" elsewhere in its command line.
+    pkill -f 'pipewire -c [^ ]*\.config/pipewire/wavelinux-' 2>/dev/null || true
 fi
 
 # Per-user state. This is the bit that fixes "stuck audio-src" caches —

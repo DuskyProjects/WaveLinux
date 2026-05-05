@@ -137,14 +137,20 @@ class PipeWireEngine:
 
     @staticmethod
     def _reap_orphan_fx_processes():
-        """Kill any `pipewire -c` processes whose config path mentions
-        `wavelinux` — they're filter-chain stages from a previous
-        WaveLinux session that didn't shut down cleanly. Idempotent and
-        safe to run on every start. Uses `pkill -f` so we don't have to
-        parse `ps` output ourselves."""
+        """Kill any `pipewire -c` processes whose config path lives in
+        OUR canonical config directory and starts with our filename
+        prefix — they're filter-chain stages from a previous WaveLinux
+        session that didn't shut down cleanly. Idempotent and safe to
+        run on every start. Uses `pkill -f` so we don't have to parse
+        `ps` output ourselves.
+
+        The pattern is anchored to `*.config/pipewire/wavelinux-` so we
+        don't accidentally match a user's own `pipewire -c` client
+        whose command line happens to contain the substring 'wavelinux'
+        somewhere unrelated."""
         try:
             subprocess.run(
-                ['pkill', '-f', r'pipewire -c .*wavelinux'],
+                ['pkill', '-f', r'pipewire -c [^ ]*\.config/pipewire/wavelinux-'],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=2,
             )
@@ -1969,32 +1975,46 @@ context.modules = [
         tried and why it didn't fly. Without this header it's impossible
         to tell from outside whether a config-syntax error or a missing
         plugin or a daemon-connection failure is the culprit."""
+        # Read config back so the debug header is the FILE we ran (not
+        # whatever the caller intended). Avoids mismatch when someone
+        # races us with a hand-edit.
         try:
-            # Read config back so the debug header is the FILE we ran
-            # (not whatever the caller intended). Avoids mismatch when
-            # someone races us with a hand-edit.
-            try:
-                with open(config_path, 'r') as cf:
-                    rendered_config = cf.read()
-            except OSError:
-                rendered_config = '<read failed>'
-            try:
-                pw_ver = subprocess.run(
-                    ['pipewire', '--version'], capture_output=True,
-                    text=True, timeout=2,
-                ).stdout.strip() or 'unknown'
-            except Exception:
-                pw_ver = 'unknown'
+            with open(config_path, 'r') as cf:
+                rendered_config = cf.read()
+        except OSError:
+            rendered_config = '<read failed>'
+        try:
+            pw_ver = subprocess.run(
+                ['pipewire', '--version'], capture_output=True,
+                text=True, timeout=2,
+            ).stdout.strip() or 'unknown'
+        except Exception:
+            pw_ver = 'unknown'
+        header = (
+            f"# WaveLinux FX spawn {key}\n"
+            f"# pipewire --version: {pw_ver}\n"
+            f"# config path:        {config_path}\n"
+            f"# LADSPA_PATH env:    {os.environ.get('LADSPA_PATH', '')}\n"
+            f"# ──────── config ─────────\n"
+            f"{rendered_config}"
+            f"\n# ──────── pipewire stderr/stdout ────────\n"
+        )
+
+        try:
             log_file = open(log_path, 'wb')
-            header = (
-                f"# WaveLinux FX spawn {key}\n"
-                f"# pipewire --version: {pw_ver}\n"
-                f"# config path:        {config_path}\n"
-                f"# LADSPA_PATH env:    {os.environ.get('LADSPA_PATH', '')}\n"
-                f"# ──────── config ─────────\n"
-                f"{rendered_config}"
-                f"\n# ──────── pipewire stderr/stdout ────────\n"
-            )
+        except OSError as e:
+            logging.error(f"Could not open FX log file {log_path}: {e}")
+            return False
+
+        # CRITICAL: close log_file in the PARENT once Popen has dup'd the
+        # FD into the child. Without this finally we'd leak one file
+        # descriptor for every chain spawn (every effect toggle, every
+        # parameter slider commit), and a long session of FX edits would
+        # eventually hit EMFILE. The child keeps writing to its own dup,
+        # so the log file still receives pipewire's stderr; only the
+        # parent's redundant handle goes away.
+        proc = None
+        try:
             log_file.write(header.encode('utf-8'))
             log_file.flush()
             proc = subprocess.Popen(
@@ -2004,6 +2024,12 @@ context.modules = [
         except FileNotFoundError:
             logging.error("`pipewire` binary not found — cannot spawn filter chain")
             return False
+        finally:
+            try:
+                log_file.close()
+            except Exception:
+                pass
+
         try:
             proc.wait(timeout=1.5)
         except subprocess.TimeoutExpired:
