@@ -1860,25 +1860,34 @@ class WaveLinuxWindow(QMainWindow):
                 if fresh_mon or fresh_str:
                     self.schedule_save()
 
-                # State sync: on first tick after startup (or after a PipeWire
-                # restart), push our saved config into PipeWire so mutes/volumes
-                # survive across sessions. After that, let PipeWire's live state
-                # overlay so external tools (pavucontrol, media keys) reflect.
-                if not hasattr(self, '_synced_nodes'):
-                    self._synced_nodes = set()
+                # State sync: push our saved config into PipeWire so mutes
+                # and volumes survive across sessions. We re-sync any time
+                # the underlying submix loopback module id changes — that
+                # happens on first tick after startup AND any time the FX
+                # chain toggles (the loopback gets rebuilt with a fresh
+                # sink-input that has default-everything-zero state).
+                # Without re-syncing on rebuild, enabling effects on a
+                # muted mic silently un-mutes it.
+                if not hasattr(self, '_synced_submix_owners'):
+                    self._synced_submix_owners = {}  # nname -> {mix: owner_id}
 
-                sync_key = nname
                 owner_mon = self.engine.submix_loopbacks.get(f"{pw_id}->Monitor")
                 owner_str = self.engine.submix_loopbacks.get(f"{pw_id}->Stream")
+                last = self._synced_submix_owners.get(nname, {})
+                needs_sync = (
+                    owner_mon is not None and owner_str is not None
+                    and (last.get("Monitor") != owner_mon
+                         or last.get("Stream") != owner_str)
+                )
 
-                if sync_key not in self._synced_nodes:
-                    # Sink-inputs may not exist yet; wait until both loopbacks appear.
-                    if owner_mon is not None and owner_str is not None:
-                        self.engine.set_submix_volume(pw_id, "Monitor", mon_state['vol'])
-                        self.engine.set_submix_mute(pw_id, "Monitor", mon_state.get('mute', False))
-                        self.engine.set_submix_volume(pw_id, "Stream", str_state['vol'])
-                        self.engine.set_submix_mute(pw_id, "Stream", str_state.get('mute', False))
-                        self._synced_nodes.add(sync_key)
+                if needs_sync:
+                    self.engine.set_submix_volume(pw_id, "Monitor", mon_state['vol'])
+                    self.engine.set_submix_mute(pw_id, "Monitor", mon_state.get('mute', False))
+                    self.engine.set_submix_volume(pw_id, "Stream", str_state['vol'])
+                    self.engine.set_submix_mute(pw_id, "Stream", str_state.get('mute', False))
+                    self._synced_submix_owners[nname] = {
+                        "Monitor": owner_mon, "Stream": owner_str,
+                    }
                 else:
                     # After initial push, overlay live PipeWire state into the
                     # UI. We only PERSIST the live state for real microphones
@@ -2045,6 +2054,17 @@ class WaveLinuxWindow(QMainWindow):
             # gets re-synthesised from `apps_by_name` on the next tick and
             # the click looks like a no-op.
             all_display_apps -= self.forgotten_apps
+            # Defence-in-depth host filter: even if a row name slipped past
+            # the engine-level host check (a property we don't sniff yet,
+            # an old saved app_routing entry that bypasses the migration on
+            # this load, etc.), drop anything that normalises to the host
+            # before any UI work happens. Migration in load_config purges
+            # those entries from app_routing and app_last_seen; here we
+            # also cull them from the display set.
+            all_display_apps = {
+                name for name in all_display_apps
+                if not PipeWireEngine.name_matches_host(name)
+            }
 
             for app_name in all_display_apps:
                 active_indices = apps_by_name.get(app_name, [])
