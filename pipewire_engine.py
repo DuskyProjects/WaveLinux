@@ -471,10 +471,18 @@ class PipeWireEngine:
     def _parse_nodes(self):
         raw = self._run(['pw-dump'], timeout=4)
         if not raw:
+            # `pw-dump` timed out or returned empty. Returning an empty
+            # list collapses the entire PipeWire node graph for this
+            # tick — every channel disappears for one refresh and then
+            # comes back. Log so a chronically slow `pw-dump` (e.g. a
+            # backed-up daemon, NUMA-pinned RT scheduling thrashing) is
+            # visible in the log instead of a mystery flicker.
+            logging.warning("pw-dump returned no output; node graph empty for this tick")
             return []
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
+            logging.warning("pw-dump output was not valid JSON; node graph empty for this tick")
             return []
         nodes = []
         for obj in data:
@@ -1275,6 +1283,15 @@ class PipeWireEngine:
             pass
         names = {cls._normalize_for_host_match(h) for h in raw}
         names.discard('')
+        if not names:
+            # Both gethostname() and /etc/hostname failed — unusual
+            # (sandboxed environment, /proc not mounted, etc.). Log
+            # once so the host filter's silent-pass-through isn't a
+            # mystery if a system stream slips into App Routing.
+            logging.warning(
+                "Could not determine hostname; host-name filter for "
+                "system streams in App Routing will be inactive."
+            )
         cls._host_alias_cache = names
         return names
 

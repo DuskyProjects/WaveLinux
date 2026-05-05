@@ -1239,6 +1239,12 @@ class WaveLinuxWindow(QMainWindow):
         self.effect_params = {}        # node.name -> effect_id -> {param_key: value}
         self.active_effects = {}       # node.name -> [effect_id, ...] — restored each run
         self._effects_applied = set()  # node.name keys we've already reconciled this session
+        # Per-channel record of the submix loopback module ids we've
+        # last pushed saved volume/mute against. Used in `_refresh()`
+        # to detect a loopback rebuild (the module id changes) and
+        # re-push state. Lives here so the per-channel hot loop doesn't
+        # have to do a `hasattr` probe on every node every tick.
+        self._synced_submix_owners = {}  # node.name -> {"Monitor": id, "Stream": id}
         self.channel_order = []        # [node.name, ...] — persistent UI order
         self.meters = {}               # pw_id -> MeterWorker
         self._known_node_names = set() # for hot-plug detection
@@ -1918,9 +1924,6 @@ class WaveLinuxWindow(QMainWindow):
                 # sink-input that has default-everything-zero state).
                 # Without re-syncing on rebuild, enabling effects on a
                 # muted mic silently un-mutes it.
-                if not hasattr(self, '_synced_submix_owners'):
-                    self._synced_submix_owners = {}  # nname -> {mix: owner_id}
-
                 owner_mon = self.engine.submix_loopbacks.get(f"{pw_id}->Monitor")
                 owner_str = self.engine.submix_loopbacks.get(f"{pw_id}->Stream")
                 last = self._synced_submix_owners.get(nname, {})
@@ -2319,7 +2322,7 @@ class WaveLinuxWindow(QMainWindow):
         # mic's last live state in the visual. The owner-id-change path
         # in `_refresh` would also catch it eventually, but only after
         # one tick where the user might see the wrong values.
-        if hasattr(self, '_synced_submix_owners') and new_mic:
+        if new_mic:
             self._synced_submix_owners.pop(new_mic, None)
         self.selected_mic = new_mic
         self.schedule_save()

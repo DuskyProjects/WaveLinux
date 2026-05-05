@@ -83,7 +83,10 @@ cd WaveLinux
 makepkg -si
 ```
 
-Run it from source with `python3 main.py`.
+Run it from source with `python3 main.py` (or `./start.sh`, which
+just `cd`s to the source tree and runs `python3 main.py` for you).
+After `install.sh`, you can also launch the wrapper from anywhere
+with `wavelinux` (assuming `~/.local/bin` is on your `$PATH`).
 
 ## Where things live
 
