@@ -664,7 +664,15 @@ class PipeWireEngine:
         source token changes (raw mic ↔ FX virtual-source), in which case we
         unload the stale loopback and re-create it pointing at the new
         source. Without that swap, enabling effects would leave the audio
-        flowing direct from the mic to the mixes, bypassing the chain."""
+        flowing direct from the mic to the mixes, bypassing the chain.
+
+        Returns True if `submix_loopbacks[key]` is up to date after the
+        call, False on failure. The caller should compare
+        `submix_loopbacks[key]` before vs. after to detect a rebuild and
+        re-push the user's saved volume/mute — this function intentionally
+        does NOT reset volume or mute on a fresh loopback (used to, but
+        that quietly clobbered the user's Monitor-mute every time the FX
+        state changed)."""
         key = f'{node_id}->{mix_name}'
 
         mix = self.output_mixes.get(mix_name)
@@ -714,11 +722,16 @@ class PipeWireEngine:
             return False
         self.submix_loopbacks[key] = out
         self.submix_sources[key] = source_id
-        # We just created the module; sink-input table is stale in the snapshot.
-        si = self.get_submix_sink_input(node_id, mix_name)
-        if si:
-            self._run(['pactl', 'set-sink-input-volume', si, '100%'])
-            self._run(['pactl', 'set-sink-input-mute', si, '0'])
+        # NOTE: we do not touch the freshly-created sink-input's volume or
+        # mute. That used to default to 100%/unmuted "to work around a
+        # pulse-bridge initial-state race", but it also stomped on the
+        # user's saved Monitor-mute every time the FX chain rebuilt the
+        # loopback — which the user reported as "I muted myself but I can
+        # still hear myself". The caller (WaveLinuxWindow._refresh) now
+        # detects rebuilds via the submix_loopbacks[key] change and re-
+        # pushes the saved submix_state, so the right values land
+        # deterministically instead of leaning on a default that overrode
+        # user intent.
         return True
 
     def _build_loopback_index(self, modules_text):
@@ -1665,6 +1678,16 @@ class PipeWireEngine:
         name = name.replace('-', ' ').replace('_', ' ').strip()
         if name and name.islower():
             name = name.title()
+
+        # Final-name host check. The header-property filter above only
+        # looks at four PipeWire properties; the resolved name above may
+        # come from PID resolution, .desktop matching, install-path
+        # inference, etc. — any of those can land on the host name when
+        # the underlying stream is a system-level service. Re-check the
+        # final resolved name against `_host_aliases()` so 'DuskyPC'
+        # gets dropped no matter which resolution path produced it.
+        if name and host and self._normalize_for_host_match(name) in host:
+            return
 
         current['app_name'] = name or "Unknown App"
         entries.append(current)
