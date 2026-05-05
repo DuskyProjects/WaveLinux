@@ -1,23 +1,111 @@
-this is what was done on google antigravity while you waited for your claude code tokens to refresh so that it can fully understand when i swap over to the other editor. since now i only have gemini flash left which is terrible
+# WaveLinux — Session Init Summary
 
-### Session Summary: WaveLinux Finalization & Wave Link Parity
+A barebones priming doc for any future session. Loaded first; everything
+else (README, ROADMAP, code) builds on this.
 
-1. **Branding & System Integration**
-   - Renamed all virtual devices from 'WaveLink-*' to 'WaveLinux-*'.
-   - Fixed branding strings in `pipewire_engine.py` to ensure correct display in system sound settings while avoiding PulseAudio name truncation bugs.
+## What it is
 
-2. **UI Scaling & Layout Stability**
-   - Resolved persistent layout clipping where the bottom Master Mixes section was being squashed/hidden.
-   - Implemented a protected bottom container with `minHeight(200)` and optimized stretch factors in the root layout.
-   - Cleaned up redundant UI constraints in `main.py` that were causing overlap.
+A PyQt6 desktop mixer for PipeWire on Linux. It mimics Elgato Wave Link:
+two master buses (Monitor + Stream), per-channel dual faders (one for
+what you hear, one for what gets streamed), per-channel effects, per-app
+output routing, and a dedicated virtual recording device for OBS.
 
-3. **Wave Link Feature Parity**
-   - **Fader Identification:** Added 'MON' (Monitor/🎧) and 'STR' (Stream/📡) labels above fader columns for instant mix identification.
-   - **Header Cleanup:** Moved the Hide (👁) and Rename (✏️) buttons to a right-click context menu on the channel strips to reduce clutter.
-   - **Stream Routing:** Locked the Stream Master Mix to the virtual `wavelinux_mix_stream` sink, matching the professional broadcast behavior of the original software.
+Single user-process app. No daemon, no system service, no root, no
+direct libpipewire binding — talks to PipeWire over `pactl`, `pw-dump`,
+`wpctl`, and `parec` subprocesses.
 
-4. **Engine Stability & Bug Fixes**
-   - **Crash Fix:** Resolved a critical crash on config load caused by a reference to a deleted scene combo widget.
-   - **State Persistence:** Fixed a race condition where PipeWire state could overwrite local saved mute/volume settings during initial sync.
-   - **Dead Code Audit:** Removed ~200 lines of obsolete scene management, solo mode, and emergency reset code.
-   - **Project Cleanup:** Deleted 8 temporary patch scripts and stale test files.
+## Source layout (repo root: WaveLinux/)
+
+- `main.py` (~122 KB) — Qt UI, dialogs, channel strips, app-routing tab,
+  tray, settings, scene wiring. Owns the PipeWireEngine instance.
+- `pipewire_engine.py` (~122 KB) — virtual sink/source creation, loopback
+  routing, FX chain spawning, snapshot caching, event subscriber, LADSPA
+  probe, app-name resolution.
+- `wavelinux_theme.py` — Qt stylesheet (dark, cyan/violet accents).
+- `install.sh`, `uninstall.sh`, `start.sh`, `PKGBUILD` — packaging.
+- `README.md`, `ROADMAP.md` — user docs / status.
+- `icon.png` — 512x512 app icon.
+
+## Architecture facts that matter
+
+- **Two master buses**: 🎧 Monitor (routable to any non-WaveLinux sink)
+  and 📡 Stream (locked to virtual sink `wavelinux_mix_stream`, exposed
+  to OBS as `WaveLinux-Stream`). Each is null-sink + virtual-source on
+  the monitor.
+- **Channels**: user virtual sinks (`wavelinux_<name>`) + every real mic
+  / hardware source surfaced. Each has a MON fader and a STR fader,
+  optional Link to move them together.
+- **Per-app routing**: `app_routing[<app_name>] = sink_name`. Persisted
+  in config. Stale entries pruned after `app_prune_days` (default 14).
+- **Effects per channel**: RNNoise, HighPass, EQ (3-band), Compressor,
+  Gate, Limiter; Clipguard on Stream master. Built-ins use PipeWire's
+  `bq_*` filters; the others are LADSPA (`swh-plugins`,
+  `noise-suppression-for-voice`).
+- **Current FX implementation (TO BE REWRITTEN)**: `set_channel_fx`
+  spawns ONE `pipewire -c <conf>` process PER enabled effect, wired
+  together with `module-loopback`. Target architecture is one config
+  with N nodes in a single `filter.graph` and one process per channel.
+- **Branding rule**: every value WaveLinux writes into
+  `device.description` / `node.description` / `node.nick` /
+  `media.name` / `application.name` is whitespace-free
+  (`WaveLinux-Voice-Chat`, not `WaveLinux Voice Chat`). Internal sink
+  names (`sink_name=`) stay underscore-style (`wavelinux_voice_chat`).
+- **State key**: per-channel saved state is keyed by PipeWire
+  `node.name` so it survives a PipeWire restart.
+- **Volume ceiling**: 100% everywhere (`PipeWireEngine.MAX_VOLUME`),
+  even though PipeWire allows 150%.
+- **Refresh model**: 2 s poll backstop + `pactl subscribe` event stream
+  with 150 ms debounce + per-tick snapshot cache (`EngineSnapshot`)
+  that runs each heavy command exactly once.
+- **Peak meters**: one `parec --raw --format=s16le --channels=1` per
+  visible strip, parsed on the Qt event loop (~40 Hz).
+
+## File system locations
+
+- Settings: `~/.config/wavelinux/config.json` (atomic writes via temp +
+  `os.replace`).
+- App log: `~/.config/wavelinux/wavelinux.log`.
+- Per-effect logs: `~/.config/wavelinux/fx-logs/`.
+- PipeWire client confs we generate:
+  `~/.config/pipewire/wavelinux-fx-*.conf`,
+  `~/.config/pipewire/wavelinux-rnnoise-*.conf`,
+  `~/.config/pipewire/wavelinux-chain-*.conf`.
+- Single-instance lock: `~/.wavelinux.lock`.
+- Autostart: `~/.config/autostart/wavelinux.desktop`.
+
+## Target distro / runtime
+
+Tested on CachyOS / Arch with KDE. Requires PipeWire ≥ 0.3 with
+WirePlumber, `pipewire-pulse`, `libpulse` (for pactl/parec),
+`swh-plugins`, and the AUR `noise-suppression-for-voice` plugin for
+RNNoise. Optional: `carla` for VST/LV2 hosting via right-click menu.
+
+## CachyOS audio stack (relevant defaults)
+
+- **PipeWire + WirePlumber** is the stock audio stack.
+- Stock WirePlumber configs live in `/usr/share/wireplumber`. User
+  overrides go in `/etc/wireplumber/` or `~/.config/wireplumber/` as
+  `.conf` snippets.
+- **Bluetooth profile auto-switching is ON by default**:
+  `bluetooth.autoswitch-to-headset-profile = true`. The moment any
+  client opens an input stream on a Bluetooth device, WirePlumber
+  flips it from A2DP → HSP/HFP. The high-fidelity A2DP **sink
+  disappears** while the headset profile is active. Disable per-user
+  with `wpctl settings --save bluetooth.autoswitch-to-headset-profile
+  false`.
+- Initial profile after pairing: `a2dp-sink` by default.
+- Diagnostic command (CachyOS FAQ):
+  `journalctl --user -u pipewire -u pipewire-pulse -u wireplumber -b 0`.
+
+## Branch / git conventions
+
+- Default branch: `master`.
+- Active dev branch for this phase:
+  `claude/wavelinux-final-bugfix-wOvpm`.
+- Project status: 98 % complete; current phase is final bugfix only.
+
+## What is explicitly NOT planned
+
+Stream Deck integration, drag-and-drop reorder, true Wayland global
+hotkeys, ducking (no usable PipeWire sidechain primitive), Flatpak
+manifest. See ROADMAP.md "Explicitly not planned".

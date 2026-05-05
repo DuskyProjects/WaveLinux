@@ -1136,24 +1136,15 @@ class AppRoutingRow(QWidget):
             self.vol_slider.setValue(int(vol * 100))
             self.vol_slider.blockSignals(False)
 
-        # Forget is always available. For an offline row it deletes the
-        # row outright; for an online app it nukes the saved routing /
-        # last-seen entries so the next refresh re-discovers the app
-        # under whatever (potentially better) name resolution gives us.
-        # That second case is the escape hatch when an app is stuck under
-        # an old, generic identification like "audio-src" because the
-        # name was first cached before .desktop discovery improved.
+        # ✕ is a hard forget. The clicked row goes onto the persistent
+        # blocklist and won't return on refresh, regardless of whether the
+        # app is currently making sound. Recover via Settings → Advanced
+        # → "Forget all offline apps now" or by editing config.json.
         self.forget_btn.setEnabled(True)
-        if is_active:
-            self.forget_btn.setToolTip(
-                "Forget this app and everything we've saved about it. "
-                "If it's still playing audio it will reappear under its "
-                "freshly-resolved name."
-            )
-        else:
-            self.forget_btn.setToolTip(
-                "Forget this app so it stops showing up in the list."
-            )
+        self.forget_btn.setToolTip(
+            "Permanently hide this app from the routing list. "
+            "Drops its saved volume / destination too."
+        )
 
         # Update combo box. Users can send an app to:
         #   • any hardware output (ALSA / Bluetooth / JACK)
@@ -1226,6 +1217,14 @@ class WaveLinuxWindow(QMainWindow):
         self.app_routing = {}       # app_name -> sink_name (persistent)
         self.app_last_seen = {}     # app_name -> epoch seconds (for stale prune)
         self.app_prune_days = 14    # forget routing entries not seen in this many days
+        # Apps the user has explicitly clicked ✕ on. Persisted across
+        # restarts. PipeWire keeps surfacing some streams (host-bound bells,
+        # speech-dispatcher, leftover sandboxed clients) every refresh tick,
+        # so an in-memory delete from `app_routing` isn't enough — the row
+        # would just be re-synthesised from `apps_by_name`. The blocklist
+        # is consulted in `_refresh` *before* the row is built, which makes
+        # the ✕ button stick.
+        self.forgotten_apps = set()  # {app_name} — hard-forget blocklist
         self.virtual_channels = []  # list of names
         # Single-mic mode: only ONE microphone shows up as a strip in the top
         # section at any time. This is the node.name of the mic the user has
@@ -1380,6 +1379,7 @@ class WaveLinuxWindow(QMainWindow):
         for name in to_forget:
             self.app_routing.pop(name, None)
             self.app_last_seen.pop(name, None)
+            self.forgotten_apps.add(name)
             widget = self.app_widgets.pop(name, None)
             if widget is not None:
                 widget.setParent(None)
@@ -1659,19 +1659,12 @@ class WaveLinuxWindow(QMainWindow):
         self.str_master_slider.valueChanged.connect(lambda v: self._on_master_vol_change("Stream", v))
         str_master_row.addWidget(self.str_master_slider, 1)
 
-        self.clipguard_btn = QPushButton("🛡")
-        self.clipguard_btn.setObjectName("clipguardBtn")
-        self.clipguard_btn.setCheckable(True)
-        self.clipguard_btn.setFixedWidth(36)
-        if self.engine.effect_available('limiter'):
-            self.clipguard_btn.setToolTip("Clipguard — limits the Stream mix so your broadcast never clips")
-            self.clipguard_btn.clicked.connect(self._on_clipguard_toggle)
-        else:
-            self.clipguard_btn.setEnabled(False)
-            self.clipguard_btn.setToolTip(
-                "Install swh-plugins (fast_lookahead_limiter_1913) to enable Clipguard."
-            )
-        str_master_row.addWidget(self.clipguard_btn)
+        # Clipguard moved off the master Stream bus and into the per-channel
+        # FX chain (the `limiter` effect in the channel's right-click → FX
+        # dialog). Per the user's request it now affects only the active
+        # microphone, not the whole stream mix. The `🛡` button used to
+        # live here; it's been retired so the master row is just fader +
+        # OBS hint.
         o_layout.addLayout(str_master_row)
 
         bottom_container.addWidget(out_frame, 1)
@@ -2046,24 +2039,38 @@ class WaveLinuxWindow(QMainWindow):
                 | set(self.app_routing.keys())
                 | recently_seen
             )
-            
+            # Hard-forget blocklist: rows the user explicitly clicked ✕ on
+            # never come back, even if PipeWire keeps surfacing the stream.
+            # This is the missing half of the ✕ button — without it the row
+            # gets re-synthesised from `apps_by_name` on the next tick and
+            # the click looks like a no-op.
+            all_display_apps -= self.forgotten_apps
+
             for app_name in all_display_apps:
                 active_indices = apps_by_name.get(app_name, [])
-                current_sink = None
+                # The dropdown reflects USER INTENT, not the raw observation
+                # from PipeWire. When a saved routing exists we show that,
+                # even if the live sink-input is still on the system default
+                # for one tick (the move_app_to_sink call above flips it
+                # asynchronously). Without this preference the dropdown
+                # would visibly reset to "System Default" every time an
+                # app launches and then re-snap to the saved sink a
+                # heartbeat later — which the user reports as "saves don't
+                # persist".
+                preferred_sink = self.app_routing.get(app_name)
+                live_sink = None
                 if active_indices:
-                    # Find sink for first active instance
                     for a in apps:
                         if a.get('index') == active_indices[0]:
-                            current_sink = a.get('sink')
+                            live_sink = a.get('sink')
                             break
-                else:
-                    current_sink = self.app_routing.get(app_name)
+                current_sink = preferred_sink or live_sink
 
                 if app_name not in self.app_widgets:
                     row = AppRoutingRow(app_name, self.engine, all_sinks)
                     self.app_widgets[app_name] = row
                     self.routing_layout.addWidget(row)
-                
+
                 self.app_widgets[app_name].update_state(active_indices, all_sinks, current_sink)
 
             # Cleanup widgets for apps we never want to see again (not in config and not active)
@@ -2238,25 +2245,9 @@ class WaveLinuxWindow(QMainWindow):
         self.save_config()
         self._refresh()
 
-    def _on_clipguard_toggle(self):
-        enable = self.clipguard_btn.isChecked()
-        if enable:
-            ok = self.engine.apply_clipguard("Stream", True)
-            if not ok:
-                self.clipguard_btn.setChecked(False)
-                QMessageBox.warning(
-                    self, "Clipguard",
-                    "Could not start the Stream limiter. Check "
-                    "~/.config/wavelinux/fx-logs/limiter-mix_stream.log "
-                    "for the spawn error. WaveLinux ships a builtin "
-                    "clamp-based fallback for systems without swh-plugins, "
-                    "so this typically only happens if PipeWire itself "
-                    "failed to launch the filter-chain."
-                )
-        else:
-            self.engine.apply_clipguard("Stream", False)
-        self.schedule_save()
-
+    # `_on_clipguard_toggle` was the master-bus Clipguard handler. Removed
+    # along with the button when Clipguard moved to the per-channel chain.
+    # Migration of the saved `clipguard: true` flag happens in load_config.
 
 
     # The Wave Link-style "starter" channels we seed on a fresh install so
@@ -2301,6 +2292,24 @@ class WaveLinuxWindow(QMainWindow):
                     if isinstance(k, str) and isinstance(v, (int, float))
                 }
                 self.app_prune_days = int(conf.get('app_prune_days', self.app_prune_days) or 14)
+                # Persistent ✕ blocklist. Stored as a list in JSON; rehydrate
+                # to a set for O(1) membership checks in _refresh.
+                self.forgotten_apps = {
+                    name for name in (conf.get('forgotten_apps', []) or [])
+                    if isinstance(name, str) and name
+                }
+                # One-shot migration: older configs may have host-named ghosts
+                # ('Dusky Pc', 'dusky_pc', etc.) baked into app_routing /
+                # app_last_seen because the substring filter at the engine
+                # didn't normalise whitespace. Purge them so the user doesn't
+                # have to manually click ✕ on a row that the filter now
+                # suppresses upstream anyway.
+                for name in list(self.app_routing.keys()):
+                    if PipeWireEngine.name_matches_host(name):
+                        self.app_routing.pop(name, None)
+                for name in list(self.app_last_seen.keys()):
+                    if PipeWireEngine.name_matches_host(name):
+                        self.app_last_seen.pop(name, None)
                 self._prune_stale_apps()
                 self.virtual_channels = conf.get('channels', [])
                 self.channel_order = conf.get('channel_order', []) or []
@@ -2324,10 +2333,22 @@ class WaveLinuxWindow(QMainWindow):
                 self.engine.create_output_mix("Monitor")
                 self.engine.create_output_mix("Stream")
 
-                # Restore clipguard if it was on last run.
-                if conf.get('clipguard'):
-                    self.engine.apply_clipguard("Stream", True)
-                    self.clipguard_btn.setChecked(True)
+                # Migration: pre-rewrite Clipguard was a master-bus
+                # limiter. Per the user's request it now lives per-mic
+                # inside the unified chain. If the old config flag was
+                # set AND we have a single-mic mode selection, surface
+                # the equivalent by adding `limiter` to that mic's
+                # active_effects list (de-duped). The flag itself is
+                # dropped on next save_config so we only migrate once.
+                if conf.get('clipguard') and self.selected_mic:
+                    chain = list(self.active_effects.get(self.selected_mic, []))
+                    if 'limiter' not in chain:
+                        chain.append('limiter')
+                        self.active_effects[self.selected_mic] = chain
+                        logging.info(
+                            "Migrated master-bus clipguard=true → per-mic "
+                            f"limiter on {self.selected_mic}"
+                        )
 
                 # Recreate virtual channels
                 for name in self.virtual_channels:
@@ -2384,10 +2405,10 @@ class WaveLinuxWindow(QMainWindow):
         return {entry for entry in raw if isinstance(entry, str) and entry}
 
     def save_config(self):
-        try:
-            clipguard = self.clipguard_btn.isChecked()
-        except AttributeError:
-            clipguard = False
+        # `clipguard` (the legacy master-bus flag) is intentionally not
+        # written here. It now lives as the per-mic `limiter` effect
+        # inside `active_effects`, so the next save quietly drops the
+        # legacy key and load_config has nothing more to migrate.
         conf = {
             'monitor_hw': self.mon_out_combo.currentData(),
             'stream_hw': self.str_out_combo.currentData(),
@@ -2396,12 +2417,12 @@ class WaveLinuxWindow(QMainWindow):
             'submixes': self.submix_state,
             'hidden': list(self.hidden_nodes),
             'app_routing': self.app_routing,
-            'clipguard': clipguard,
             'channel_order': self.channel_order,
             'effect_params': self.effect_params,
             'active_effects': self.active_effects,
             'app_last_seen': self.app_last_seen,
             'app_prune_days': self.app_prune_days,
+            'forgotten_apps': sorted(self.forgotten_apps),
         }
         try:
             tmp = self.config_path + '.tmp'
@@ -2414,12 +2435,16 @@ class WaveLinuxWindow(QMainWindow):
 
 
     def forget_app(self, app_name):
-        """Drop persisted routing for an offline app so it stops cluttering
-        the panel. Running apps are allowed to come back because they'll
-        just reappear on the next refresh."""
-        if app_name in self.app_routing:
-            del self.app_routing[app_name]
+        """Drop ALL state for an app and add it to the persistent
+        `forgotten_apps` blocklist so the row stays gone for good. Running
+        apps used to "come back" on the next refresh because the row was
+        re-synthesised from `apps_by_name`; the blocklist short-circuits
+        that path. The user can still get the row back by Settings →
+        Advanced → "Forget all offline apps now" (which clears the
+        blocklist) or by editing config.json by hand."""
+        self.app_routing.pop(app_name, None)
         self.app_last_seen.pop(app_name, None)
+        self.forgotten_apps.add(app_name)
         widget = self.app_widgets.pop(app_name, None)
         if widget is not None:
             widget.setParent(None)
