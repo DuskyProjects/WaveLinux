@@ -1311,6 +1311,20 @@ class WaveLinuxWindow(QMainWindow):
         forget_all_btn.clicked.connect(self._forget_all_offline)
         layout.addWidget(forget_all_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
+        # Recovery path for the persistent ✕ blocklist. Without this the
+        # only way to un-forget an app the user clicked ✕ on by mistake
+        # was hand-editing config.json. Button is enabled only when the
+        # blocklist actually has something to clear (set in
+        # `_refresh_advanced_tab`).
+        self.restore_forgotten_btn = QPushButton("Restore forgotten apps")
+        self.restore_forgotten_btn.setObjectName("showHiddenBtn")
+        self.restore_forgotten_btn.setToolTip(
+            "Clear the per-app ✕ blocklist so apps you've previously "
+            "forgotten can show up in the routing tab again."
+        )
+        self.restore_forgotten_btn.clicked.connect(self._restore_forgotten_apps)
+        layout.addWidget(self.restore_forgotten_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
         # Startup / tray
         _heading("STARTUP & TRAY")
         self.autostart_check = QCheckBox("Start WaveLinux at login")
@@ -1354,6 +1368,34 @@ class WaveLinuxWindow(QMainWindow):
             self.autostart_check.blockSignals(True)
             self.autostart_check.setChecked(self.is_autostart_enabled())
             self.autostart_check.blockSignals(False)
+        if hasattr(self, 'restore_forgotten_btn'):
+            n = len(self.forgotten_apps)
+            self.restore_forgotten_btn.setEnabled(n > 0)
+            self.restore_forgotten_btn.setText(
+                f"Restore forgotten apps ({n})" if n
+                else "Restore forgotten apps"
+            )
+
+    def _restore_forgotten_apps(self):
+        """Clear the persistent ✕ blocklist so apps the user has clicked
+        the ✕ on can be re-discovered. Doesn't restore their saved
+        volume / destination — those were dropped by `forget_app` and
+        the user will need to re-pick a sink once the row reappears."""
+        if not self.forgotten_apps:
+            return
+        n = len(self.forgotten_apps)
+        yn = QMessageBox.question(
+            self.settings_dialog, "Restore forgotten apps",
+            f"Clear the blocklist of {n} forgotten app(s)? They will "
+            f"reappear in the routing tab the next time they make sound.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if yn != QMessageBox.StandardButton.Yes:
+            return
+        self.forgotten_apps.clear()
+        self.save_config()
+        self._refresh_advanced_tab()
+        self._refresh()
 
     def _on_prune_days_change(self, value):
         self.app_prune_days = int(value)
@@ -1889,13 +1931,23 @@ class WaveLinuxWindow(QMainWindow):
                 )
 
                 if needs_sync:
-                    self.engine.set_submix_volume(pw_id, "Monitor", mon_state['vol'])
-                    self.engine.set_submix_mute(pw_id, "Monitor", mon_state.get('mute', False))
-                    self.engine.set_submix_volume(pw_id, "Stream", str_state['vol'])
-                    self.engine.set_submix_mute(pw_id, "Stream", str_state.get('mute', False))
-                    self._synced_submix_owners[nname] = {
-                        "Monitor": owner_mon, "Stream": owner_str,
-                    }
+                    # set_submix_volume / set_submix_mute now return
+                    # False if the loopback's sink-input couldn't be
+                    # found (e.g. the module loaded but pulse-bridge
+                    # hasn't catalogued the sink-input yet). Only stamp
+                    # `_synced_submix_owners` once every push landed,
+                    # so the next tick retries on a transient miss
+                    # instead of leaving the saved state un-applied.
+                    pushed = (
+                        self.engine.set_submix_volume(pw_id, "Monitor", mon_state['vol'])
+                        and self.engine.set_submix_mute(pw_id, "Monitor", mon_state.get('mute', False))
+                        and self.engine.set_submix_volume(pw_id, "Stream", str_state['vol'])
+                        and self.engine.set_submix_mute(pw_id, "Stream", str_state.get('mute', False))
+                    )
+                    if pushed:
+                        self._synced_submix_owners[nname] = {
+                            "Monitor": owner_mon, "Stream": owner_str,
+                        }
                 else:
                     # After initial push, overlay live PipeWire state into the
                     # UI. We only PERSIST the live state for real microphones
@@ -2428,20 +2480,31 @@ class WaveLinuxWindow(QMainWindow):
     def _migrate_submix_state(raw):
         """Drop legacy entries keyed by the ephemeral pw_id (e.g. '42_Monitor').
         New keys use PipeWire node.name (e.g. 'wavelinux_game_Monitor',
-        'alsa_input.pci-..._Monitor'), which survives a PipeWire restart."""
+        'alsa_input.pci-..._Monitor'), which survives a PipeWire restart.
+
+        Conservative migration: only drop keys whose suffix is exactly
+        `_Monitor` or `_Stream` AND whose prefix int-parses cleanly. That
+        matches the legacy `{pw_id}_{Monitor|Stream}` shape without
+        risking other suffixes (`_linked`, `_gain`, future ones) or
+        node.names that happen to look numeric. The previous version
+        ran the int-prefix test against every key with an underscore,
+        which would have falsely classified e.g. a `1234_Monitor`
+        virtual sink as legacy."""
         if not isinstance(raw, dict):
             return {}
         clean = {}
+        legacy_suffixes = ('_Monitor', '_Stream')
         for key, val in raw.items():
             if not isinstance(key, str) or '_' not in key:
                 continue
-            prefix = key.rsplit('_', 1)[0]
-            try:
-                int(prefix)
-                # Legacy pw_id key — drop it rather than carry junk forward.
-                continue
-            except ValueError:
-                pass
+            if key.endswith(legacy_suffixes):
+                prefix = key.rsplit('_', 1)[0]
+                try:
+                    int(prefix)
+                    # Legacy {pw_id}_{Monitor|Stream} key — drop.
+                    continue
+                except ValueError:
+                    pass
             clean[key] = val
         return clean
 
