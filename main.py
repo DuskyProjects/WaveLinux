@@ -1659,19 +1659,12 @@ class WaveLinuxWindow(QMainWindow):
         self.str_master_slider.valueChanged.connect(lambda v: self._on_master_vol_change("Stream", v))
         str_master_row.addWidget(self.str_master_slider, 1)
 
-        self.clipguard_btn = QPushButton("🛡")
-        self.clipguard_btn.setObjectName("clipguardBtn")
-        self.clipguard_btn.setCheckable(True)
-        self.clipguard_btn.setFixedWidth(36)
-        if self.engine.effect_available('limiter'):
-            self.clipguard_btn.setToolTip("Clipguard — limits the Stream mix so your broadcast never clips")
-            self.clipguard_btn.clicked.connect(self._on_clipguard_toggle)
-        else:
-            self.clipguard_btn.setEnabled(False)
-            self.clipguard_btn.setToolTip(
-                "Install swh-plugins (fast_lookahead_limiter_1913) to enable Clipguard."
-            )
-        str_master_row.addWidget(self.clipguard_btn)
+        # Clipguard moved off the master Stream bus and into the per-channel
+        # FX chain (the `limiter` effect in the channel's right-click → FX
+        # dialog). Per the user's request it now affects only the active
+        # microphone, not the whole stream mix. The `🛡` button used to
+        # live here; it's been retired so the master row is just fader +
+        # OBS hint.
         o_layout.addLayout(str_master_row)
 
         bottom_container.addWidget(out_frame, 1)
@@ -2252,25 +2245,9 @@ class WaveLinuxWindow(QMainWindow):
         self.save_config()
         self._refresh()
 
-    def _on_clipguard_toggle(self):
-        enable = self.clipguard_btn.isChecked()
-        if enable:
-            ok = self.engine.apply_clipguard("Stream", True)
-            if not ok:
-                self.clipguard_btn.setChecked(False)
-                QMessageBox.warning(
-                    self, "Clipguard",
-                    "Could not start the Stream limiter. Check "
-                    "~/.config/wavelinux/fx-logs/limiter-mix_stream.log "
-                    "for the spawn error. WaveLinux ships a builtin "
-                    "clamp-based fallback for systems without swh-plugins, "
-                    "so this typically only happens if PipeWire itself "
-                    "failed to launch the filter-chain."
-                )
-        else:
-            self.engine.apply_clipguard("Stream", False)
-        self.schedule_save()
-
+    # `_on_clipguard_toggle` was the master-bus Clipguard handler. Removed
+    # along with the button when Clipguard moved to the per-channel chain.
+    # Migration of the saved `clipguard: true` flag happens in load_config.
 
 
     # The Wave Link-style "starter" channels we seed on a fresh install so
@@ -2356,10 +2333,22 @@ class WaveLinuxWindow(QMainWindow):
                 self.engine.create_output_mix("Monitor")
                 self.engine.create_output_mix("Stream")
 
-                # Restore clipguard if it was on last run.
-                if conf.get('clipguard'):
-                    self.engine.apply_clipguard("Stream", True)
-                    self.clipguard_btn.setChecked(True)
+                # Migration: pre-rewrite Clipguard was a master-bus
+                # limiter. Per the user's request it now lives per-mic
+                # inside the unified chain. If the old config flag was
+                # set AND we have a single-mic mode selection, surface
+                # the equivalent by adding `limiter` to that mic's
+                # active_effects list (de-duped). The flag itself is
+                # dropped on next save_config so we only migrate once.
+                if conf.get('clipguard') and self.selected_mic:
+                    chain = list(self.active_effects.get(self.selected_mic, []))
+                    if 'limiter' not in chain:
+                        chain.append('limiter')
+                        self.active_effects[self.selected_mic] = chain
+                        logging.info(
+                            "Migrated master-bus clipguard=true → per-mic "
+                            f"limiter on {self.selected_mic}"
+                        )
 
                 # Recreate virtual channels
                 for name in self.virtual_channels:
@@ -2416,10 +2405,10 @@ class WaveLinuxWindow(QMainWindow):
         return {entry for entry in raw if isinstance(entry, str) and entry}
 
     def save_config(self):
-        try:
-            clipguard = self.clipguard_btn.isChecked()
-        except AttributeError:
-            clipguard = False
+        # `clipguard` (the legacy master-bus flag) is intentionally not
+        # written here. It now lives as the per-mic `limiter` effect
+        # inside `active_effects`, so the next save quietly drops the
+        # legacy key and load_config has nothing more to migrate.
         conf = {
             'monitor_hw': self.mon_out_combo.currentData(),
             'stream_hw': self.str_out_combo.currentData(),
@@ -2428,7 +2417,6 @@ class WaveLinuxWindow(QMainWindow):
             'submixes': self.submix_state,
             'hidden': list(self.hidden_nodes),
             'app_routing': self.app_routing,
-            'clipguard': clipguard,
             'channel_order': self.channel_order,
             'effect_params': self.effect_params,
             'active_effects': self.active_effects,

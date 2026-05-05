@@ -1765,19 +1765,13 @@ class PipeWireEngine:
             mix.hardware_output = None
         return changed
 
-    def apply_clipguard(self, mix_name, enable):
-        """Wave Link's 'Clipguard' is a master-bus limiter. Reuse the FX
-        filter-chain with the limiter preset, keyed off the mix sink."""
-        mix = self.output_mixes.get(mix_name)
-        if not mix:
-            return False
-        channel_key = f'mix_{mix_name.lower()}'
-        if enable:
-            return self.apply_effect(channel_key, 'limiter')
-        return self.remove_effect(channel_key, 'limiter')
-
-    def is_clipguard_active(self, mix_name):
-        return self.is_effect_active(f'mix_{mix_name.lower()}', 'limiter')
+    # NOTE: master-bus `apply_clipguard` / `is_clipguard_active` were
+    # removed in the per-channel chain rewrite. Per the user request,
+    # Clipguard now ONLY affects the active microphone — it lives as the
+    # `limiter` effect inside each channel's unified FX chain. Saved
+    # configs that still contain a top-level `clipguard: true` are
+    # migrated to a per-mic `limiter` entry on first load (see the
+    # `load_config` migration in main.py).
 
     # ── Card / profile switching ───────────────────────────────────
 
@@ -2431,23 +2425,279 @@ context.modules = [
         cleaned = re.sub(r'[^A-Za-z0-9]+', '_', (node_name or '').lower()).strip('_')
         return cleaned or 'chan'
 
+    # ── Unified per-channel filter-chain ──────────────────────────────
+    #
+    # Architectural credit: this layout is inspired by EasyEffects
+    # (https://github.com/wwmm/easyeffects, GPL-3.0). EasyEffects uses
+    # `pw_filter` C bindings directly so it can build a single processing
+    # graph with N plugins; we can't reach pw_filter from Python without a
+    # native binding, so the equivalent we can reach is one
+    # `libpipewire-module-filter-chain` config that lists every effect as
+    # a node in one `filter.graph` block with explicit `links`. The user-
+    # visible result is the same: ONE virtual sink and ONE virtual source
+    # per channel, no matter how many effects are enabled. Reference for
+    # filter-chain syntax: https://docs.pipewire.org/page_module_filter_chain.html .
+    #
+    # Pre-rewrite this engine spawned one `pipewire -c` process per effect
+    # plus one `module-loopback` per inter-stage link. With three effects
+    # on a single mic that meant 3 pipewire processes, 3 virtual sinks, 3
+    # virtual sources, 3 inter-stage loopbacks, and 1 submix loopback —
+    # all to do work that fits inside one filter graph.
+
+    def _effect_stage_blocks(self, effect_id, values, stage_idx):
+        """Return the building blocks needed to splice one effect into the
+        unified per-channel filter-chain.
+
+        Effects can have more than one internal node (the 3-Band EQ is a
+        low-shelf → mid-peaking → high-shelf chain of biquads, for
+        example), so each stage namespaces its node names with a
+        `s<idx>_` prefix to avoid collisions when several effects are
+        stacked in the same graph.
+
+        Returns (nodes_text, internal_links, entry_port, exit_port) or
+        (None, None, None, None) for unknown / unavailable effects."""
+        prefix = f's{stage_idx}_'
+
+        if effect_id == 'rnnoise':
+            path = self.ladspa_plugin_path('librnnoise_ladspa') or 'librnnoise_ladspa'
+            name = f'{prefix}rnnoise'
+            nodes = f"""
+                {{
+                    type   = ladspa
+                    name   = {name}
+                    plugin = "{path}"
+                    label  = noise_suppressor_mono
+{self._render_control_block(values)}
+                }}"""
+            return nodes, [], f'{name}:Out', f'{name}:In'
+
+        if effect_id == 'highpass':
+            name = f'{prefix}highpass'
+            nodes = f"""
+                {{
+                    type  = builtin
+                    name  = {name}
+                    label = bq_highpass
+{self._render_control_block(values)}
+                }}"""
+            return nodes, [], f'{name}:Out', f'{name}:In'
+
+        if effect_id == 'eq':
+            low, mid, high = f'{prefix}eq_low', f'{prefix}eq_mid', f'{prefix}eq_high'
+            nodes = f"""
+                {{
+                    type  = builtin
+                    name  = {low}
+                    label = bq_lowshelf
+                    control = {{
+                        "Freq" = {float(values.get('Low Freq', 120.0)):.2f}
+                        "Q"    = 0.707
+                        "Gain" = {float(values.get('Low Gain', 0.0)):.2f}
+                    }}
+                }}
+                {{
+                    type  = builtin
+                    name  = {mid}
+                    label = bq_peaking
+                    control = {{
+                        "Freq" = {float(values.get('Mid Freq', 1000.0)):.2f}
+                        "Q"    = 1.0
+                        "Gain" = {float(values.get('Mid Gain', 0.0)):.2f}
+                    }}
+                }}
+                {{
+                    type  = builtin
+                    name  = {high}
+                    label = bq_highshelf
+                    control = {{
+                        "Freq" = {float(values.get('High Freq', 6000.0)):.2f}
+                        "Q"    = 0.707
+                        "Gain" = {float(values.get('High Gain', 0.0)):.2f}
+                    }}
+                }}"""
+            internal = [
+                f'{{ output = "{low}:Out"  input = "{mid}:In"  }}',
+                f'{{ output = "{mid}:Out"  input = "{high}:In" }}',
+            ]
+            return nodes, internal, f'{high}:Out', f'{low}:In'
+
+        if effect_id == 'compressor':
+            path = self.ladspa_plugin_path('sc4_1882') or 'sc4_1882'
+            name = f'{prefix}compressor'
+            nodes = f"""
+                {{
+                    type   = ladspa
+                    name   = {name}
+                    plugin = "{path}"
+                    label  = sc4
+{self._render_control_block(values)}
+                }}"""
+            return nodes, [], f'{name}:Out', f'{name}:In'
+
+        if effect_id == 'gate':
+            path = self.ladspa_plugin_path('gate_1410') or 'gate_1410'
+            name = f'{prefix}gate'
+            nodes = f"""
+                {{
+                    type   = ladspa
+                    name   = {name}
+                    plugin = "{path}"
+                    label  = gate
+{self._render_control_block(values)}
+                }}"""
+            return nodes, [], f'{name}:Out', f'{name}:In'
+
+        if effect_id == 'limiter':
+            # Wave Link's "Clipguard" name maps onto this effect; per the
+            # user request it now lives per-mic instead of on the master
+            # bus. Prefer the LADSPA fast lookahead limiter when present
+            # (real broadcast limiter), fall back to a builtin
+            # linear-gain → clamp pair so the chain still protects against
+            # clipping on a stock PipeWire install.
+            if self.ladspa_plugin_available('fast_lookahead_limiter_1913'):
+                path = self.ladspa_plugin_path('fast_lookahead_limiter_1913') \
+                    or 'fast_lookahead_limiter_1913'
+                name = f'{prefix}limiter'
+                nodes = f"""
+                {{
+                    type   = ladspa
+                    name   = {name}
+                    plugin = "{path}"
+                    label  = fastLookaheadLimiter
+{self._render_control_block(values)}
+                }}"""
+                return nodes, [], f'{name}:Out', f'{name}:In'
+            ceiling_db = float(values.get('Limit (dB)', -1.0))
+            input_db = float(values.get('Input gain (dB)', 0.0))
+            ceiling = max(0.0001, min(1.0, 10 ** (ceiling_db / 20.0)))
+            in_gain = 10 ** (input_db / 20.0)
+            lin = f'{prefix}lim_in'
+            clp = f'{prefix}lim_out'
+            nodes = f"""
+                {{
+                    type  = builtin
+                    name  = {lin}
+                    label = linear
+                    control = {{ "Mult" = {in_gain:.4f} "Add" = 0.0 }}
+                }}
+                {{
+                    type  = builtin
+                    name  = {clp}
+                    label = clamp
+                    control = {{ "Min" = {-ceiling:.4f} "Max" = {ceiling:.4f} }}
+                }}"""
+            internal = [f'{{ output = "{lin}:Out" input = "{clp}:In" }}']
+            return nodes, internal, f'{clp}:Out', f'{lin}:In'
+
+        return None, None, None, None
+
+    def _build_unified_chain_config(self, safe_key, ordered_effects, params_map):
+        """Write ONE filter-chain config that contains every enabled
+        effect as a node in a single `filter.graph` and explicit `links`
+        that wire the stages together. Spawned as ONE `pipewire -c`
+        process. Returns (config_path, sink_name, source_name) on success
+        or (None, None, None) if no effect was renderable.
+
+        See the architecture credit comment above _effect_stage_blocks
+        for the EasyEffects / PipeWire references."""
+        config_dir = os.path.expanduser('~/.config/pipewire')
+        os.makedirs(config_dir, exist_ok=True)
+
+        all_nodes = []
+        all_links = []
+        prev_exit = None
+        used_effects = []
+
+        for stage_idx, effect_id in enumerate(ordered_effects):
+            values = self._resolved_params(effect_id, params_map.get(effect_id))
+            nodes_text, internal_links, exit_port, entry_port = \
+                self._effect_stage_blocks(effect_id, values, stage_idx)
+            if nodes_text is None:
+                logging.warning(
+                    f"Skipping unknown / unavailable effect {effect_id} "
+                    f"in chain for {safe_key}"
+                )
+                continue
+            all_nodes.append(nodes_text)
+            all_links.extend(internal_links)
+            if prev_exit is not None:
+                all_links.append(
+                    f'{{ output = "{prev_exit}" input = "{entry_port}" }}'
+                )
+            prev_exit = exit_port
+            used_effects.append(effect_id)
+
+        if not used_effects:
+            return None, None, None, []
+
+        sink_name = f'wavelinux.fx.{safe_key}.input'
+        source_name = f'wavelinux.fx.{safe_key}.source'
+
+        nodes_block = '\n'.join(all_nodes)
+        links_block = '\n                    '.join(all_links) if all_links else ''
+
+        # `node.always-process = true` keeps the chain running even when
+        # nothing is currently pulling/pushing — without it the chain can
+        # suspend during construction and the upstream loopback never
+        # sees an active sink to bind to.
+        # `audio.position = [ MONO ]` pins to one channel so a stereo
+        # plugin doesn't get spliced onto a mono mic with one half of
+        # its inputs floating.
+        # `node.virtual = true` + `priority.session = -1000` demote the
+        # chain in Plasma / GNOME / pavucontrol audio menus so the user's
+        # device picker isn't cluttered with WaveLinux plumbing.
+        client_id = f'{safe_key}-chain'
+        filter_chain_args = f"""{{
+            node.description = "_WaveLinux internal: chain ({safe_key})"
+            node.nick        = "_WaveLinux-chain"
+            media.name       = "_WaveLinux-chain ({safe_key})"
+            node.virtual     = true
+            priority.session = -1000
+            priority.driver  = -1000
+            filter.graph = {{
+                nodes = [{nodes_block}
+                ]
+                links = [
+                    {links_block}
+                ]
+            }}
+            capture.props = {{
+                node.name           = "{sink_name}"
+                node.description    = "_WaveLinux internal: chain input"
+                node.nick           = "_WaveLinux-chain-in"
+                media.class         = Audio/Sink
+                node.virtual        = true
+                priority.session    = -1000
+                priority.driver     = -1000
+                audio.rate          = 48000
+                audio.position      = [ MONO ]
+                node.always-process = true
+            }}
+            playback.props = {{
+                node.name           = "{source_name}"
+                node.description    = "_WaveLinux internal: chain output"
+                node.nick           = "_WaveLinux-chain-out"
+                media.class         = Audio/Source
+                node.virtual        = true
+                priority.session    = -1000
+                priority.driver     = -1000
+                audio.rate          = 48000
+                audio.position      = [ MONO ]
+                node.always-process = true
+            }}
+        }}"""
+        config = self._fx_client_config(client_id, filter_chain_args)
+        config_path = os.path.join(config_dir, f'wavelinux-chain-{safe_key}.conf')
+        with open(config_path, 'w') as f:
+            f.write(config)
+        return config_path, sink_name, source_name, used_effects
+
+    # Legacy per-stage builder kept around so any out-of-tree caller
+    # doesn't NameError on import. New chain spawns go through
+    # `_build_unified_chain_config`.
     def _build_fx_stage_config(self, safe_key, idx, effect_id, params):
-        """Write a per-stage filter-chain config to disk and return its
-        path along with the stage's input-sink and output-source node
-        names. Each stage exposes BOTH:
-
-          - a `media.class = Audio/Sink`   on capture.props (the stage
-            sink — anything routed here gets processed),
-          - a `media.class = Audio/Source` on playback.props (the stage
-            source — what the next stage / submix loopback consumes).
-
-        Connecting them is then a normal `module-loopback` from the
-        upstream source into this stage's sink — the same machinery
-        we already use for submix routing. Robust across pipewire
-        versions; doesn't depend on `target.object` binding.
-
-        Returns (config_path, sink_name, source_name) or (None, None, None)
-        for an unknown effect."""
+        """[Legacy] Per-stage filter-chain builder. Superseded by
+        `_build_unified_chain_config`."""
         config_dir = os.path.expanduser('~/.config/pipewire')
         os.makedirs(config_dir, exist_ok=True)
 
@@ -2553,24 +2803,24 @@ context.modules = [
         return None
 
     def set_channel_fx(self, node_name, capture_target, effects, params_map=None):
-        """Replace this channel's effect chain. Tears down whatever was
-        running, then spawns one filter-chain process per enabled effect.
-        Each stage exposes a sink (input) and a source (output); we
-        wire the chain explicitly with `module-loopback` modules — same
-        pattern we use for submix routing, so it doesn't rely on
-        `target.object` semantics that vary by pipewire version.
+        """Replace this channel's effect chain with a SINGLE
+        `pipewire -c` process running one unified filter-chain that
+        contains every enabled effect as a node in one `filter.graph`.
 
-        Returns the final source node.name on success (at least one stage
-        spawned and was loopback-ed in), else None.
+        Returns the chain's virtual source node.name on success, else
+        None.
 
         - `node_name`: stable PipeWire node.name. State is keyed by this so
           chains survive PipeWire restarts.
-        - `capture_target`: the source the FIRST stage should receive
+        - `capture_target`: the source the chain's input should receive
           audio from. For mics this is the mic's node.name; for virtual
           sinks pass `f"{sink_name}.monitor"`.
         - `effects`: effect_id list; reordered to canonical signal flow.
         - `params_map`: {effect_id: {param_key: value}}.
-        """
+
+        Architecture credit: see the comment block above
+        `_effect_stage_blocks` (EasyEffects-inspired layout, PipeWire
+        filter-chain syntax)."""
         if not node_name:
             return None
         params_map = params_map or {}
@@ -2585,57 +2835,41 @@ context.modules = [
             return None
 
         safe_key = self._safe_channel_key(node_name)
-        proc_keys     = []   # filter-chain stage process keys
-        loopback_ids  = []   # module-loopback ids wiring stages together
-        upstream_src  = capture_target
 
-        for i, effect_id in enumerate(ordered):
-            params = params_map.get(effect_id) or None
-            config_path, sink_name, source_name = self._build_fx_stage_config(
-                safe_key, i, effect_id, params,
-            )
-            if config_path is None:
-                continue
-
-            log_path = self._fx_log_path(safe_key, f'{i}_{effect_id}')
-            proc_key = f'chain_{safe_key}_{i}_{effect_id}'
-
-            if not self._spawn_fx(config_path, log_path, proc_key):
-                logging.warning(
-                    f"FX chain stage {i} ({effect_id}) failed to spawn for "
-                    f"{node_name}; remaining stages will be skipped."
-                )
-                # Stop here — chaining over a missing stage produces silence.
-                break
-
-            # Wire upstream → this stage's input sink. Without this loopback
-            # the stage processes silence and the user hears nothing.
-            lb = self._wait_load_loopback(upstream_src, sink_name)
-            if lb is None:
-                logging.warning(
-                    f"FX loopback {upstream_src} → {sink_name} failed; "
-                    f"chain stage {i} ({effect_id}) is dangling."
-                )
-                # Kill the orphan stage and stop building the chain.
-                self.stop_rnnoise(proc_key)
-                break
-
-            proc_keys.append(proc_key)
-            loopback_ids.append(lb)
-            upstream_src = source_name
-
-        if not proc_keys:
+        config_path, sink_name, source_name, used_effects = \
+            self._build_unified_chain_config(safe_key, ordered, params_map)
+        if config_path is None or not used_effects:
             return None
 
-        final_source = upstream_src
-        applied_effects = list(ordered[:len(proc_keys)])
+        log_path = self._fx_log_path(safe_key, 'chain')
+        proc_key = f'chain_{safe_key}'
+
+        if not self._spawn_fx(config_path, log_path, proc_key):
+            logging.warning(
+                f"Unified FX chain failed to spawn for {node_name}; "
+                f"see {log_path} for the pipewire stderr."
+            )
+            return None
+
+        # ONE upstream → chain.input loopback. The chain itself wires its
+        # internal nodes via filter.graph links; downstream consumers
+        # (submix loopbacks) bind to the chain's source.
+        lb = self._wait_load_loopback(capture_target, sink_name)
+        if lb is None:
+            logging.warning(
+                f"FX capture loopback {capture_target} → {sink_name} failed; "
+                f"chain for {node_name} is dangling. Tearing it back down."
+            )
+            self.stop_rnnoise(proc_key)
+            return None
+
         self.channel_fx[node_name] = {
-            'effects':   applied_effects,
+            'effects':   list(used_effects),
             'params':    {fid: dict(params_map.get(fid, {}))
-                          for fid in applied_effects},
-            'procs':     list(proc_keys),
-            'loopbacks': list(loopback_ids),
-            'source':    final_source,
+                          for fid in used_effects},
+            'procs':     [proc_key],
+            'loopbacks': [lb],
+            'source':    source_name,
             'capture_target': capture_target,
             'safe_key':  safe_key,
         }
@@ -2643,7 +2877,7 @@ context.modules = [
         # next refresh tick observes the new chain without waiting up to
         # 250 ms for the snapshot TTL.
         self.invalidate_snapshot()
-        return final_source
+        return source_name
 
     def clear_channel_fx(self, node_name):
         """Tear down the FX chain on a channel. Idempotent. Order matters:
