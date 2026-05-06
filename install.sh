@@ -13,9 +13,10 @@ echo ""
 #   pipewire / pipewire-pulse / wireplumber — the audio server we drive
 #   libpulse — provides `pactl` and `parec` (peak meters use parec)
 #   rnnoise — base library for the noise-suppressor LADSPA plugin
-#   swh-plugins — provides sc4_1882 (compressor) and gate_1410 (gate).
-#                 The limiter is implemented with PipeWire builtins
-#                 (linear + clamp) so it doesn't depend on this package.
+#   swh-plugins — provides sc4m_1916 (compressor, mono) and gate_1410
+#                 (gate). The limiter is implemented with PipeWire
+#                 builtins (linear + clamp) so it doesn't depend on
+#                 this package.
 echo "→ Installing dependencies..."
 sudo pacman -S --needed --noconfirm \
     python \

@@ -299,7 +299,7 @@ class PipeWireEngine:
         that will silently fail at spawn time."""
         requirements = {
             'rnnoise':    ('librnnoise_ladspa',),
-            'compressor': ('sc4_1882',),
+            'compressor': ('sc4m_1916',),
             'gate':       ('gate_1410',),
             # highpass, eq, and limiter use PipeWire's builtin nodes
             # (biquad / linear / clamp) — always available.
@@ -2162,11 +2162,18 @@ context.modules = [
             ('High Gain', 'High Gain', -12.0, 12.0, 0.0, ' dB'),
         ],
         'compressor': [
-            ('threshold_db', 'Threshold', -60.0, 0.0, -20.0, ' dB'),
-            ('ratio', 'Ratio', 1.0, 20.0, 4.0, ':1'),
-            ('attack_ms', 'Attack', 0.1, 200.0, 5.0, ' ms'),
-            ('release_ms', 'Release', 5.0, 1000.0, 100.0, ' ms'),
-            ('makeup_gain_db', 'Makeup', 0.0, 24.0, 0.0, ' dB'),
+            # Keys are the LADSPA control-port names from sc4m_1916's
+            # descriptor — matched verbatim by PipeWire's filter-graph.
+            # Pre-rewrite this list used short snake_case keys
+            # (`threshold_db`, `ratio`, …) which silently didn't match,
+            # so slider tweaks never reached the plugin and the
+            # compressor ran on its built-in defaults. load_config in
+            # main.py migrates old saved keys into these names.
+            ('Threshold level (dB)', 'Threshold', -60.0, 0.0, -20.0, ' dB'),
+            ('Ratio (1:n)',          'Ratio',     1.0,   20.0,  4.0,  ':1'),
+            ('Attack time (ms)',     'Attack',    0.1,   200.0, 5.0,  ' ms'),
+            ('Release time (ms)',    'Release',   5.0,   1000.0,100.0,' ms'),
+            ('Makeup gain (dB)',     'Makeup',    0.0,   24.0,  0.0,  ' dB'),
         ],
         'gate': [
             ('Threshold (dB)', 'Threshold', -80.0, 0.0, -40.0, ' dB'),
@@ -2243,14 +2250,17 @@ context.modules = [
         ],
         'compressor': [
             ("Gentle 2:1",
-             {"threshold_db": -20.0, "ratio": 2.0,
-              "attack_ms": 10.0, "release_ms": 120.0, "makeup_gain_db": 2.0}),
+             {"Threshold level (dB)": -20.0, "Ratio (1:n)": 2.0,
+              "Attack time (ms)": 10.0, "Release time (ms)": 120.0,
+              "Makeup gain (dB)": 2.0}),
             ("Broadcast 4:1",
-             {"threshold_db": -18.0, "ratio": 4.0,
-              "attack_ms": 5.0, "release_ms": 100.0, "makeup_gain_db": 3.0}),
+             {"Threshold level (dB)": -18.0, "Ratio (1:n)": 4.0,
+              "Attack time (ms)": 5.0, "Release time (ms)": 100.0,
+              "Makeup gain (dB)": 3.0}),
             ("Streaming 6:1",
-             {"threshold_db": -16.0, "ratio": 6.0,
-              "attack_ms": 3.0, "release_ms": 80.0, "makeup_gain_db": 4.0}),
+             {"Threshold level (dB)": -16.0, "Ratio (1:n)": 6.0,
+              "Attack time (ms)": 3.0, "Release time (ms)": 80.0,
+              "Makeup gain (dB)": 4.0}),
         ],
         'gate': [
             ("Soft -60 dB",
@@ -2393,7 +2403,7 @@ context.modules = [
         if effect_id == 'gate':
             return self._ladspa_node('gate', 'gate_1410', 'gate', values)
         if effect_id == 'compressor':
-            return self._ladspa_node('compressor', 'sc4_1882', 'sc4', values)
+            return self._ladspa_node('compressor', 'sc4m_1916', 'sc4m', values)
         if effect_id == 'limiter':
             # Mono builtin chain: `linear` applies the input-gain param, then
             # `clamp` brick-walls at the chosen ceiling. We used to prefer
@@ -2554,6 +2564,11 @@ context.modules = [
         prefix = f's{stage_idx}_'
 
         if effect_id == 'rnnoise':
+            # Audio port names come from the LADSPA descriptor verbatim
+            # (PipeWire's filter-graph does an exact `spa_streq` match —
+            # no `:In`/`:Out` aliasing for LADSPA, only for builtins).
+            # noise_suppressor_mono's audio ports are literally "Input"
+            # and "Output".
             path = self.ladspa_plugin_path('librnnoise_ladspa') or 'librnnoise_ladspa'
             name = f'{prefix}rnnoise'
             nodes = f"""
@@ -2564,7 +2579,7 @@ context.modules = [
                     label  = noise_suppressor_mono
 {self._render_control_block(values)}
                 }}"""
-            return nodes, [], f'{name}:Out', f'{name}:In'
+            return nodes, [], f'{name}:Output', f'{name}:Input'
 
         if effect_id == 'highpass':
             name = f'{prefix}highpass'
@@ -2617,19 +2632,28 @@ context.modules = [
             return nodes, internal, f'{high}:Out', f'{low}:In'
 
         if effect_id == 'compressor':
-            path = self.ladspa_plugin_path('sc4_1882') or 'sc4_1882'
+            # Use the MONO sc4m variant (id 1916) — sc4_1882 is stereo,
+            # which trips the same auto-route-to-headphones bug the
+            # limiter used to have. swh-plugins ships both. Audio ports
+            # on sc4m are "Input"/"Output". The LADSPA control names are
+            # the verbose human-readable strings from the descriptor —
+            # `_EFFECT_PARAMS['compressor']` keys are kept identical so
+            # `_render_control_block` emits the right names.
+            path = self.ladspa_plugin_path('sc4m_1916') or 'sc4m_1916'
             name = f'{prefix}compressor'
             nodes = f"""
                 {{
                     type   = ladspa
                     name   = {name}
                     plugin = "{path}"
-                    label  = sc4
+                    label  = sc4m
 {self._render_control_block(values)}
                 }}"""
-            return nodes, [], f'{name}:Out', f'{name}:In'
+            return nodes, [], f'{name}:Output', f'{name}:Input'
 
         if effect_id == 'gate':
+            # gate_1410 is mono — audio ports are literally "Input" and
+            # "Output" per the LADSPA descriptor.
             path = self.ladspa_plugin_path('gate_1410') or 'gate_1410'
             name = f'{prefix}gate'
             nodes = f"""
@@ -2640,7 +2664,7 @@ context.modules = [
                     label  = gate
 {self._render_control_block(values)}
                 }}"""
-            return nodes, [], f'{name}:Out', f'{name}:In'
+            return nodes, [], f'{name}:Output', f'{name}:Input'
 
         if effect_id == 'limiter':
             # Wave Link's "Clipguard" name maps onto this effect; per the

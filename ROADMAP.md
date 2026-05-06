@@ -125,7 +125,7 @@ device for OBS, and a per-mic Limiter (Wave Link's "Clipguard").
       reach it from the tray menu or Settings → Advanced.
 - [x] **Broadened LADSPA probe** — `$LADSPA_PATH`, user paths
       (`~/.ladspa`, `~/.local/lib/ladspa`), and prefix-matching so a
-      plugin named `sc4_1882.so` still answers to `sc4_1882` in the
+      plugin named `sc4m_1916.so` still answers to `sc4m_1916` in the
       requirements list, even when the distro tacks on extra suffixes.
       Compressor / gate no longer fail to enable on systems where the
       plugin is actually installed.

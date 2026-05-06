@@ -2436,6 +2436,30 @@ class WaveLinuxWindow(QMainWindow):
                 # in _refresh once each node's pw_id is known, via
                 # set_channel_fx — see the "_effects_applied" gate there.
 
+                # Compressor key migration. Pre-rewrite the compressor's
+                # `_EFFECT_PARAMS` used short snake_case keys (`threshold_db`
+                # etc.) that did NOT match sc4m's actual LADSPA control-port
+                # names — so any tweaks the user made were silently dropped
+                # and the plugin ran on its built-in defaults. Now that we
+                # use the real port names, rewrite saved keys in place so
+                # existing slider positions carry over instead of resetting.
+                _comp_key_remap = {
+                    'threshold_db':  'Threshold level (dB)',
+                    'ratio':         'Ratio (1:n)',
+                    'attack_ms':     'Attack time (ms)',
+                    'release_ms':    'Release time (ms)',
+                    'makeup_gain_db':'Makeup gain (dB)',
+                }
+                for _node_params in self.effect_params.values():
+                    _comp = _node_params.get('compressor')
+                    if not isinstance(_comp, dict):
+                        continue
+                    for _old, _new in _comp_key_remap.items():
+                        if _old in _comp and _new not in _comp:
+                            _comp[_new] = _comp.pop(_old)
+                        elif _old in _comp:
+                            _comp.pop(_old, None)
+
                 # Create standard mixes (always needed)
                 self.engine.create_output_mix("Monitor")
                 self.engine.create_output_mix("Stream")
