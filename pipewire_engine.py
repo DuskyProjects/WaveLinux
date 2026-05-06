@@ -296,20 +296,15 @@ class PipeWireEngine:
     def effect_available(self, effect_id):
         """Return True if the filter-chain backend for this effect has
         everything it needs on disk. Keeps the FX UI from offering things
-        that will silently fail at spawn time.
-
-        The limiter is special — when the LADSPA fast_lookahead_limiter is
-        missing we still expose the effect because PipeWire's builtin
-        `clamp` is a usable brick-wall fallback. The graph builder picks
-        which path to render at spawn time."""
+        that will silently fail at spawn time."""
         requirements = {
             'rnnoise':    ('librnnoise_ladspa',),
             'compressor': ('sc4_1882',),
             'gate':       ('gate_1410',),
-            # highpass and eq use PipeWire's builtin biquad — always available.
+            # highpass, eq, and limiter use PipeWire's builtin nodes
+            # (biquad / linear / clamp) — always available.
             'highpass':   (),
             'eq':         (),
-            # Limiter: LADSPA preferred, builtin clamp fallback — always offered.
             'limiter':    (),
         }
         needed = requirements.get(effect_id, ())
@@ -2183,7 +2178,6 @@ context.modules = [
         'limiter': [
             ('Input gain (dB)', 'Input Gain', -20.0, 20.0, 0.0, ' dB'),
             ('Limit (dB)', 'Ceiling', -20.0, 0.0, -1.0, ' dB'),
-            ('Release time (s)', 'Release', 0.01, 2.0, 0.1, ' s'),
         ],
     }
 
@@ -2216,8 +2210,8 @@ context.modules = [
             "attenuate when closed; too strong makes breaths choppy.",
         'limiter':
             "A brick-wall ceiling on the signal so nothing clips. Leave "
-            "'Ceiling' at -1 dB for broadcast. Release sets how quickly it "
-            "recovers — too fast sounds pumpy, too slow ducks audio.",
+            "'Ceiling' at -1 dB for broadcast. Bump 'Input Gain' if your "
+            "mic is quiet and you want it to ride harder against the ceiling.",
     }
 
     # Short, labeled preset bundles for each effect. These are all safe
@@ -2271,11 +2265,11 @@ context.modules = [
         ],
         'limiter': [
             ("Gentle -3 dB",
-             {"Input gain (dB)": 0.0, "Limit (dB)": -3.0, "Release time (s)": 0.2}),
+             {"Input gain (dB)": 0.0, "Limit (dB)": -3.0}),
             ("Broadcast -1 dB",
-             {"Input gain (dB)": 0.0, "Limit (dB)": -1.0, "Release time (s)": 0.1}),
+             {"Input gain (dB)": 0.0, "Limit (dB)": -1.0}),
             ("Loud -0.5 dB",
-             {"Input gain (dB)": 3.0, "Limit (dB)": -0.5, "Release time (s)": 0.05}),
+             {"Input gain (dB)": 3.0, "Limit (dB)": -0.5}),
         ],
     }
 
@@ -2401,16 +2395,18 @@ context.modules = [
         if effect_id == 'compressor':
             return self._ladspa_node('compressor', 'sc4_1882', 'sc4', values)
         if effect_id == 'limiter':
-            # Prefer the swh-plugins fast lookahead limiter when present —
-            # real lookahead, real release. Without it, fall back to a
-            # builtin chain: a `linear` gain stage for the input-gain
-            # parameter, then `clamp` set to the user-chosen ceiling.
-            # That isn't a true broadcast limiter (no soft knee, no
-            # release behaviour) but it stops audio from clipping, which
-            # is what Clipguard exists to do.
-            if self.ladspa_plugin_available('fast_lookahead_limiter_1913'):
-                return self._ladspa_node('limiter', 'fast_lookahead_limiter_1913',
-                                         'fastLookaheadLimiter', values)
+            # Mono builtin chain: `linear` applies the input-gain param, then
+            # `clamp` brick-walls at the chosen ceiling. We used to prefer
+            # the `fast_lookahead_limiter_1913` LADSPA plugin here, but it's
+            # a stereo plugin whose audio ports (`Input L/R`, `Output L/R`)
+            # don't match the `:In`/`:Out` aliases the rest of the chain
+            # uses, so PipeWire's filter-chain ended up exposing dangling
+            # ports that WirePlumber then auto-routed onto the user's
+            # default output — surfacing as a phantom self-monitor on the
+            # headphones that bypassed every WaveLinux fader. The builtins
+            # are mono-native, integrate cleanly into the unified graph,
+            # and do exactly what Clipguard needs: stop the signal from
+            # clipping. We give up soft-knee / release behaviour for that.
             ceiling_db = float(values.get('Limit (dB)', -1.0))
             input_db   = float(values.get('Input gain (dB)', 0.0))
             ceiling = max(0.0001, min(1.0, 10 ** (ceiling_db / 20.0)))
@@ -2649,23 +2645,17 @@ context.modules = [
         if effect_id == 'limiter':
             # Wave Link's "Clipguard" name maps onto this effect; per the
             # user request it now lives per-mic instead of on the master
-            # bus. Prefer the LADSPA fast lookahead limiter when present
-            # (real broadcast limiter), fall back to a builtin
-            # linear-gain → clamp pair so the chain still protects against
-            # clipping on a stock PipeWire install.
-            if self.ladspa_plugin_available('fast_lookahead_limiter_1913'):
-                path = self.ladspa_plugin_path('fast_lookahead_limiter_1913') \
-                    or 'fast_lookahead_limiter_1913'
-                name = f'{prefix}limiter'
-                nodes = f"""
-                {{
-                    type   = ladspa
-                    name   = {name}
-                    plugin = "{path}"
-                    label  = fastLookaheadLimiter
-{self._render_control_block(values)}
-                }}"""
-                return nodes, [], f'{name}:Out', f'{name}:In'
+            # bus. Implemented as a mono builtin pair — `linear` for the
+            # input-gain parameter, `clamp` for the ceiling. We used to
+            # prefer the `fast_lookahead_limiter_1913` LADSPA plugin here,
+            # but it's a stereo plugin whose audio ports (`Input L/R`,
+            # `Output L/R`) don't match the `:In`/`:Out` aliases the rest
+            # of the chain uses, so PipeWire's filter-chain left dangling
+            # ports that WirePlumber auto-routed onto the user's default
+            # output — a phantom self-monitor on the headphones that
+            # bypassed every WaveLinux fader. The builtins are mono-native
+            # and integrate cleanly. Trade-off: brick-wall clamp instead
+            # of true lookahead with soft knee / release.
             ceiling_db = float(values.get('Limit (dB)', -1.0))
             input_db = float(values.get('Input gain (dB)', 0.0))
             ceiling = max(0.0001, min(1.0, 10 ** (ceiling_db / 20.0)))
