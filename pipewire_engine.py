@@ -296,20 +296,15 @@ class PipeWireEngine:
     def effect_available(self, effect_id):
         """Return True if the filter-chain backend for this effect has
         everything it needs on disk. Keeps the FX UI from offering things
-        that will silently fail at spawn time.
-
-        The limiter is special — when the LADSPA fast_lookahead_limiter is
-        missing we still expose the effect because PipeWire's builtin
-        `clamp` is a usable brick-wall fallback. The graph builder picks
-        which path to render at spawn time."""
+        that will silently fail at spawn time."""
         requirements = {
             'rnnoise':    ('librnnoise_ladspa',),
-            'compressor': ('sc4_1882',),
+            'compressor': ('sc4m_1916',),
             'gate':       ('gate_1410',),
-            # highpass and eq use PipeWire's builtin biquad — always available.
+            # highpass, eq, and limiter use PipeWire's builtin nodes
+            # (biquad / linear / clamp) — always available.
             'highpass':   (),
             'eq':         (),
-            # Limiter: LADSPA preferred, builtin clamp fallback — always offered.
             'limiter':    (),
         }
         needed = requirements.get(effect_id, ())
@@ -2167,11 +2162,18 @@ context.modules = [
             ('High Gain', 'High Gain', -12.0, 12.0, 0.0, ' dB'),
         ],
         'compressor': [
-            ('threshold_db', 'Threshold', -60.0, 0.0, -20.0, ' dB'),
-            ('ratio', 'Ratio', 1.0, 20.0, 4.0, ':1'),
-            ('attack_ms', 'Attack', 0.1, 200.0, 5.0, ' ms'),
-            ('release_ms', 'Release', 5.0, 1000.0, 100.0, ' ms'),
-            ('makeup_gain_db', 'Makeup', 0.0, 24.0, 0.0, ' dB'),
+            # Keys are the LADSPA control-port names from sc4m_1916's
+            # descriptor — matched verbatim by PipeWire's filter-graph.
+            # Pre-rewrite this list used short snake_case keys
+            # (`threshold_db`, `ratio`, …) which silently didn't match,
+            # so slider tweaks never reached the plugin and the
+            # compressor ran on its built-in defaults. load_config in
+            # main.py migrates old saved keys into these names.
+            ('Threshold level (dB)', 'Threshold', -60.0, 0.0, -20.0, ' dB'),
+            ('Ratio (1:n)',          'Ratio',     1.0,   20.0,  4.0,  ':1'),
+            ('Attack time (ms)',     'Attack',    0.1,   200.0, 5.0,  ' ms'),
+            ('Release time (ms)',    'Release',   5.0,   1000.0,100.0,' ms'),
+            ('Makeup gain (dB)',     'Makeup',    0.0,   24.0,  0.0,  ' dB'),
         ],
         'gate': [
             ('Threshold (dB)', 'Threshold', -80.0, 0.0, -40.0, ' dB'),
@@ -2183,7 +2185,6 @@ context.modules = [
         'limiter': [
             ('Input gain (dB)', 'Input Gain', -20.0, 20.0, 0.0, ' dB'),
             ('Limit (dB)', 'Ceiling', -20.0, 0.0, -1.0, ' dB'),
-            ('Release time (s)', 'Release', 0.01, 2.0, 0.1, ' s'),
         ],
     }
 
@@ -2216,8 +2217,8 @@ context.modules = [
             "attenuate when closed; too strong makes breaths choppy.",
         'limiter':
             "A brick-wall ceiling on the signal so nothing clips. Leave "
-            "'Ceiling' at -1 dB for broadcast. Release sets how quickly it "
-            "recovers — too fast sounds pumpy, too slow ducks audio.",
+            "'Ceiling' at -1 dB for broadcast. Bump 'Input Gain' if your "
+            "mic is quiet and you want it to ride harder against the ceiling.",
     }
 
     # Short, labeled preset bundles for each effect. These are all safe
@@ -2249,14 +2250,17 @@ context.modules = [
         ],
         'compressor': [
             ("Gentle 2:1",
-             {"threshold_db": -20.0, "ratio": 2.0,
-              "attack_ms": 10.0, "release_ms": 120.0, "makeup_gain_db": 2.0}),
+             {"Threshold level (dB)": -20.0, "Ratio (1:n)": 2.0,
+              "Attack time (ms)": 10.0, "Release time (ms)": 120.0,
+              "Makeup gain (dB)": 2.0}),
             ("Broadcast 4:1",
-             {"threshold_db": -18.0, "ratio": 4.0,
-              "attack_ms": 5.0, "release_ms": 100.0, "makeup_gain_db": 3.0}),
+             {"Threshold level (dB)": -18.0, "Ratio (1:n)": 4.0,
+              "Attack time (ms)": 5.0, "Release time (ms)": 100.0,
+              "Makeup gain (dB)": 3.0}),
             ("Streaming 6:1",
-             {"threshold_db": -16.0, "ratio": 6.0,
-              "attack_ms": 3.0, "release_ms": 80.0, "makeup_gain_db": 4.0}),
+             {"Threshold level (dB)": -16.0, "Ratio (1:n)": 6.0,
+              "Attack time (ms)": 3.0, "Release time (ms)": 80.0,
+              "Makeup gain (dB)": 4.0}),
         ],
         'gate': [
             ("Soft -60 dB",
@@ -2271,11 +2275,11 @@ context.modules = [
         ],
         'limiter': [
             ("Gentle -3 dB",
-             {"Input gain (dB)": 0.0, "Limit (dB)": -3.0, "Release time (s)": 0.2}),
+             {"Input gain (dB)": 0.0, "Limit (dB)": -3.0}),
             ("Broadcast -1 dB",
-             {"Input gain (dB)": 0.0, "Limit (dB)": -1.0, "Release time (s)": 0.1}),
+             {"Input gain (dB)": 0.0, "Limit (dB)": -1.0}),
             ("Loud -0.5 dB",
-             {"Input gain (dB)": 3.0, "Limit (dB)": -0.5, "Release time (s)": 0.05}),
+             {"Input gain (dB)": 3.0, "Limit (dB)": -0.5}),
         ],
     }
 
@@ -2399,18 +2403,20 @@ context.modules = [
         if effect_id == 'gate':
             return self._ladspa_node('gate', 'gate_1410', 'gate', values)
         if effect_id == 'compressor':
-            return self._ladspa_node('compressor', 'sc4_1882', 'sc4', values)
+            return self._ladspa_node('compressor', 'sc4m_1916', 'sc4m', values)
         if effect_id == 'limiter':
-            # Prefer the swh-plugins fast lookahead limiter when present —
-            # real lookahead, real release. Without it, fall back to a
-            # builtin chain: a `linear` gain stage for the input-gain
-            # parameter, then `clamp` set to the user-chosen ceiling.
-            # That isn't a true broadcast limiter (no soft knee, no
-            # release behaviour) but it stops audio from clipping, which
-            # is what Clipguard exists to do.
-            if self.ladspa_plugin_available('fast_lookahead_limiter_1913'):
-                return self._ladspa_node('limiter', 'fast_lookahead_limiter_1913',
-                                         'fastLookaheadLimiter', values)
+            # Mono builtin chain: `linear` applies the input-gain param, then
+            # `clamp` brick-walls at the chosen ceiling. We used to prefer
+            # the `fast_lookahead_limiter_1913` LADSPA plugin here, but it's
+            # a stereo plugin whose audio ports (`Input L/R`, `Output L/R`)
+            # don't match the `:In`/`:Out` aliases the rest of the chain
+            # uses, so PipeWire's filter-chain ended up exposing dangling
+            # ports that WirePlumber then auto-routed onto the user's
+            # default output — surfacing as a phantom self-monitor on the
+            # headphones that bypassed every WaveLinux fader. The builtins
+            # are mono-native, integrate cleanly into the unified graph,
+            # and do exactly what Clipguard needs: stop the signal from
+            # clipping. We give up soft-knee / release behaviour for that.
             ceiling_db = float(values.get('Limit (dB)', -1.0))
             input_db   = float(values.get('Input gain (dB)', 0.0))
             ceiling = max(0.0001, min(1.0, 10 ** (ceiling_db / 20.0)))
@@ -2558,6 +2564,11 @@ context.modules = [
         prefix = f's{stage_idx}_'
 
         if effect_id == 'rnnoise':
+            # Audio port names come from the LADSPA descriptor verbatim
+            # (PipeWire's filter-graph does an exact `spa_streq` match —
+            # no `:In`/`:Out` aliasing for LADSPA, only for builtins).
+            # noise_suppressor_mono's audio ports are literally "Input"
+            # and "Output".
             path = self.ladspa_plugin_path('librnnoise_ladspa') or 'librnnoise_ladspa'
             name = f'{prefix}rnnoise'
             nodes = f"""
@@ -2568,7 +2579,7 @@ context.modules = [
                     label  = noise_suppressor_mono
 {self._render_control_block(values)}
                 }}"""
-            return nodes, [], f'{name}:Out', f'{name}:In'
+            return nodes, [], f'{name}:Output', f'{name}:Input'
 
         if effect_id == 'highpass':
             name = f'{prefix}highpass'
@@ -2621,19 +2632,28 @@ context.modules = [
             return nodes, internal, f'{high}:Out', f'{low}:In'
 
         if effect_id == 'compressor':
-            path = self.ladspa_plugin_path('sc4_1882') or 'sc4_1882'
+            # Use the MONO sc4m variant (id 1916) — sc4_1882 is stereo,
+            # which trips the same auto-route-to-headphones bug the
+            # limiter used to have. swh-plugins ships both. Audio ports
+            # on sc4m are "Input"/"Output". The LADSPA control names are
+            # the verbose human-readable strings from the descriptor —
+            # `_EFFECT_PARAMS['compressor']` keys are kept identical so
+            # `_render_control_block` emits the right names.
+            path = self.ladspa_plugin_path('sc4m_1916') or 'sc4m_1916'
             name = f'{prefix}compressor'
             nodes = f"""
                 {{
                     type   = ladspa
                     name   = {name}
                     plugin = "{path}"
-                    label  = sc4
+                    label  = sc4m
 {self._render_control_block(values)}
                 }}"""
-            return nodes, [], f'{name}:Out', f'{name}:In'
+            return nodes, [], f'{name}:Output', f'{name}:Input'
 
         if effect_id == 'gate':
+            # gate_1410 is mono — audio ports are literally "Input" and
+            # "Output" per the LADSPA descriptor.
             path = self.ladspa_plugin_path('gate_1410') or 'gate_1410'
             name = f'{prefix}gate'
             nodes = f"""
@@ -2644,28 +2664,22 @@ context.modules = [
                     label  = gate
 {self._render_control_block(values)}
                 }}"""
-            return nodes, [], f'{name}:Out', f'{name}:In'
+            return nodes, [], f'{name}:Output', f'{name}:Input'
 
         if effect_id == 'limiter':
             # Wave Link's "Clipguard" name maps onto this effect; per the
             # user request it now lives per-mic instead of on the master
-            # bus. Prefer the LADSPA fast lookahead limiter when present
-            # (real broadcast limiter), fall back to a builtin
-            # linear-gain → clamp pair so the chain still protects against
-            # clipping on a stock PipeWire install.
-            if self.ladspa_plugin_available('fast_lookahead_limiter_1913'):
-                path = self.ladspa_plugin_path('fast_lookahead_limiter_1913') \
-                    or 'fast_lookahead_limiter_1913'
-                name = f'{prefix}limiter'
-                nodes = f"""
-                {{
-                    type   = ladspa
-                    name   = {name}
-                    plugin = "{path}"
-                    label  = fastLookaheadLimiter
-{self._render_control_block(values)}
-                }}"""
-                return nodes, [], f'{name}:Out', f'{name}:In'
+            # bus. Implemented as a mono builtin pair — `linear` for the
+            # input-gain parameter, `clamp` for the ceiling. We used to
+            # prefer the `fast_lookahead_limiter_1913` LADSPA plugin here,
+            # but it's a stereo plugin whose audio ports (`Input L/R`,
+            # `Output L/R`) don't match the `:In`/`:Out` aliases the rest
+            # of the chain uses, so PipeWire's filter-chain left dangling
+            # ports that WirePlumber auto-routed onto the user's default
+            # output — a phantom self-monitor on the headphones that
+            # bypassed every WaveLinux fader. The builtins are mono-native
+            # and integrate cleanly. Trade-off: brick-wall clamp instead
+            # of true lookahead with soft knee / release.
             ceiling_db = float(values.get('Limit (dB)', -1.0))
             input_db = float(values.get('Input gain (dB)', 0.0))
             ceiling = max(0.0001, min(1.0, 10 ** (ceiling_db / 20.0)))

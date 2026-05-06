@@ -13,7 +13,7 @@ depends=(
   'pipewire-pulse'
   'wireplumber'     # provides wpctl (used for BT autoswitch lock + volume)
   'libpulse'        # provides pactl, parec
-  'swh-plugins'     # compressor / gate / limiter LADSPA plugins
+  'swh-plugins'     # compressor (sc4m_1916) and gate (gate_1410) LADSPA plugins
   'procps-ng'       # provides pkill (used by uninstall.sh and the orphan-FX reaper)
 )
 optdepends=(

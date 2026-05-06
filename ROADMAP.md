@@ -79,10 +79,10 @@ device for OBS, and a per-mic Limiter (Wave Link's "Clipguard").
       Clipguard button is gone; the equivalent now lives as the
       `Limiter` effect inside the channel's unified FX chain so it only
       affects the active mic, not every source mixed into Stream.
-      Uses the `fast_lookahead_limiter_1913` LADSPA plugin when
-      available, otherwise falls back to PipeWire's builtin
-      `linear` + `clamp` chain so the limiter still works on a stock
-      PipeWire install.
+      Implemented with PipeWire's builtin `linear` (input gain) →
+      `clamp` (ceiling) pair so it's mono-native and integrates cleanly
+      with the rest of the chain's nodes — no LADSPA dependency, no
+      stereo-in-mono port quirks.
 - [x] **FX bus per channel** — one unified `pipewire -c` filter-chain
       process per channel. Every enabled effect lives as a node in a
       single `filter.graph` block with explicit inter-stage `links`,
@@ -125,10 +125,10 @@ device for OBS, and a per-mic Limiter (Wave Link's "Clipguard").
       reach it from the tray menu or Settings → Advanced.
 - [x] **Broadened LADSPA probe** — `$LADSPA_PATH`, user paths
       (`~/.ladspa`, `~/.local/lib/ladspa`), and prefix-matching so a
-      plugin named `fast_lookahead_limiter_1913.so` still answers to
-      `fast_lookahead_limiter` in the requirements list. Clipguard
-      no longer fails to enable on systems where the plugin is
-      actually installed.
+      plugin named `sc4m_1916.so` still answers to `sc4m_1916` in the
+      requirements list, even when the distro tacks on extra suffixes.
+      Compressor / gate no longer fail to enable on systems where the
+      plugin is actually installed.
 - [x] **Volume ceiling at 100%** everywhere. PipeWire allows up to
       150% but it sounds clipped; `PipeWireEngine.MAX_VOLUME` is
       clamped in every write path.
