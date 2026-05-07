@@ -1523,7 +1523,7 @@ class WaveLinuxWindow(QMainWindow):
 
         # ── Body (Inputs) ──
         body = QVBoxLayout()
-        body.setContentsMargins(20, 16, 20, 0)
+        body.setContentsMargins(20, 6, 20, 0)
         body.setSpacing(0)
 
         input_lbl = QLabel("AUDIO SOURCES")
@@ -1559,18 +1559,18 @@ class WaveLinuxWindow(QMainWindow):
         bottom_outer.setSpacing(0)
 
         bottom_container = QHBoxLayout()
-        bottom_container.setContentsMargins(20, 8, 20, 0)
+        bottom_container.setContentsMargins(20, 4, 20, 4)
         bottom_container.setSpacing(20)
         
         # Outputs Assignment Panel
         out_frame = QFrame()
         out_frame.setObjectName("routingPanel")
         o_layout = QVBoxLayout(out_frame)
-        o_layout.setContentsMargins(20, 20, 20, 20)
+        o_layout.setContentsMargins(12, 8, 12, 8)
         o_title = QLabel("MASTER")
         o_title.setObjectName("sectionLabel")
         o_layout.addWidget(o_title)
-        o_layout.addSpacing(10)
+        o_layout.addSpacing(4)
 
         # Mic picker — single-mic mode. Per-mic state is keyed by
         # node.name so it survives swaps. Labelled "Microphone Input"
@@ -1584,7 +1584,7 @@ class WaveLinuxWindow(QMainWindow):
         mic_row.addWidget(mic_lbl)
         mic_row.addWidget(self.mic_in_combo, 1)
         o_layout.addLayout(mic_row)
-        o_layout.addSpacing(8)
+        o_layout.addSpacing(4)
 
         # Monitor output — labelled "Monitor" instead of "Headphones"
         # since many users monitor through speakers.
@@ -1605,7 +1605,7 @@ class WaveLinuxWindow(QMainWindow):
         self.mon_master_slider.setFixedHeight(20)
         self.mon_master_slider.valueChanged.connect(lambda v: self._on_master_vol_change("Monitor", v))
         o_layout.addWidget(self.mon_master_slider)
-        o_layout.addSpacing(10)
+        o_layout.addSpacing(6)
 
         # Stream — fixed to the virtual `WaveLinux-Stream` device so OBS
         # has one stable source to pick (matching Wave Link).

@@ -11,7 +11,7 @@ QWidget#central {
 QFrame#header {
     background: rgba(18,17,31,0.9);
     border-bottom: 1px solid rgba(255,255,255,0.06);
-    padding: 12px 20px;
+    padding: 6px 16px;
 }
 QLabel#logoLabel {
     color: #ffffff;
@@ -32,7 +32,7 @@ QLabel#sectionLabel {
     font-weight: 700;
     letter-spacing: 2px;
     font-family: 'Outfit', sans-serif;
-    padding: 8px 4px;
+    padding: 3px 4px;
 }
 
 /* ── Channel Strip ── */
@@ -417,7 +417,7 @@ QFrame#routingPanel {
     background: rgba(22,21,36,0.7);
     border: 1px solid rgba(255,255,255,0.06);
     border-radius: 14px;
-    padding: 16px;
+    padding: 8px;
 }
 QLabel#routingTitle {
     color: #e0e0ee;
