@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QMenu, QInputDialog, QProgressBar, QSizePolicy, QTabWidget,
     QSpinBox, QCheckBox
 )
-from PyQt6.QtCore import Qt, QTimer, QLockFile, QProcess, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QTimer, QLockFile, QProcess, pyqtSignal, QObject, QEvent
 from PyQt6.QtGui import QFont, QIcon, QAction
 
 from pipewire_engine import PipeWireEngine
@@ -611,8 +611,7 @@ class ChannelStrip(QFrame):
     def __init__(self, node_id, node_name, name, ch_type, icon, engine, parent=None):
         super().__init__(parent)
         self.setObjectName("channelStrip")
-        self.setMinimumWidth(160)
-        self.setMaximumWidth(180)
+        self.setFixedWidth(self._MAX_W)
         self.node_id = node_id          # PipeWire numeric id (ephemeral)
         self.node_name = node_name      # PipeWire node.name (stable across restarts)
         self.ch_name = name
@@ -697,6 +696,7 @@ class ChannelStrip(QFrame):
         # Two-column fader layout (Headphones + Stream).
         faders_row = QHBoxLayout()
         faders_row.setSpacing(10)
+        self._faders_row = faders_row
 
         mon_col = QVBoxLayout()
         mon_col.setAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -752,6 +752,23 @@ class ChannelStrip(QFrame):
         # don't fail. The real FX entry point is the right-click menu.
         self.fx_btn = QPushButton()
         self.fx_btn.setVisible(False)
+
+    _MIN_W = 120
+    _MAX_W = 180
+    _MIN_SLIDER_H = 80
+    _MAX_SLIDER_H = 140
+
+    def apply_scale(self, width: int, slider_h: int):
+        """Resize this strip to `width` px and set slider minimum height."""
+        self.setFixedWidth(width)
+        t = (width - self._MIN_W) / (self._MAX_W - self._MIN_W)
+        t = max(0.0, min(1.0, t))
+        margin = max(4, int(4 + t * 4))
+        self.layout().setContentsMargins(margin, margin, margin, margin)
+        spacing = max(6, int(6 + t * 4))
+        self._faders_row.setSpacing(spacing)
+        self.mon_slider.setMinimumHeight(slider_h)
+        self.str_slider.setMinimumHeight(slider_h)
 
     def _stash_submix(self, mix_name, vol, mute):
         win = self.window()
@@ -1529,6 +1546,7 @@ class WaveLinuxWindow(QMainWindow):
         self.input_layout.setContentsMargins(4, 4, 4, 4)
         self.input_layout.setSpacing(10)
         self.inputs_scroll.setWidget(self.inputs_container)
+        self.inputs_scroll.viewport().installEventFilter(self)
         body.addWidget(self.inputs_scroll, 1)
 
         root.addLayout(body, 1)
@@ -1689,6 +1707,42 @@ class WaveLinuxWindow(QMainWindow):
                 w.deleteLater()
             elif item.layout():
                 self._clear_layout(item.layout())
+
+    # ── Responsive strip scaling ────────────────────────────────────
+
+    _MIN_STRIP_W = 120
+    _MAX_STRIP_W = 180
+    _MIN_SLIDER_H = 80
+    _MAX_SLIDER_H = 140
+
+    def eventFilter(self, obj, event):
+        if obj is self.inputs_scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._rescale_strips()
+        return super().eventFilter(obj, event)
+
+    def _rescale_strips(self):
+        strips = list(self.channel_widgets.values())
+        n = len(strips)
+        if n == 0:
+            return
+        avail = self.inputs_scroll.viewport().width()
+        spacing = self.input_layout.spacing()   # 10
+        margins = (self.input_layout.contentsMargins().left()
+                   + self.input_layout.contentsMargins().right())
+        space = avail - spacing * (n - 1) - margins
+        ideal_w = space // n if n > 0 else self._MAX_STRIP_W
+        if ideal_w >= self._MIN_STRIP_W:
+            strip_w = min(ideal_w, self._MAX_STRIP_W)
+            self.inputs_scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        else:
+            strip_w = self._MIN_STRIP_W
+            self.inputs_scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        t = (strip_w - self._MIN_STRIP_W) / (self._MAX_STRIP_W - self._MIN_STRIP_W)
+        slider_h = int(self._MIN_SLIDER_H + t * (self._MAX_SLIDER_H - self._MIN_SLIDER_H))
+        for strip in strips:
+            strip.apply_scale(strip_w, slider_h)
 
     def _refresh(self):
         """Update UI to match PipeWire state without destroying everything.
@@ -1942,8 +1996,8 @@ class WaveLinuxWindow(QMainWindow):
                 if meter is not None:
                     meter.stop()
 
-            # Let the strips container compute its natural width so the
-            # enclosing horizontal scroll area can size / scroll correctly.
+            # Recompute strip sizes then let the container measure itself.
+            self._rescale_strips()
             self.inputs_container.adjustSize()
 
             # 2. Update App Routing (Persistent & Grouped)
@@ -2464,6 +2518,8 @@ class WaveLinuxWindow(QMainWindow):
         # Anything not in channel_order goes to the end.
         for w in name_to_widget.values():
             self.input_layout.addWidget(w)
+        self._rescale_strips()
+        self.inputs_container.adjustSize()
 
     def rename_channel(self, old_node_name):
         """Rename a user-created virtual channel. Hardware mic
