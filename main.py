@@ -199,20 +199,16 @@ class FXSelectionDialog(QDialog):
         self._param_frames  = {}   # effect_id -> QFrame holding the param rows
         self._toggle_btns   = {}   # effect_id -> QPushButton
 
-        # The user's *intent*: which effects they last had ON. We surface
-        # this in the dialog (tick the toggles) regardless of whether the
-        # filter-chain is actually running right now, because the chain
-        # might have died (PipeWire restart, stage crash) without the user
-        # touching anything. This is what makes "turn ON, click Done,
-        # reopen" show ON instead of OFF.
+        # Saved intent (which toggles were last ON) so the dialog still
+        # ticks them when the chain isn't currently running — the chain
+        # may have died from a PipeWire restart or stage crash.
         win = self._main_window_static(parent)
         self._saved_effects = set(
             (win.active_effects.get(self.node_name, []) if win else [])
         )
 
-        # If we have saved chain state but it isn't currently running on
-        # the engine, try to spawn it now so what the dialog displays
-        # matches what's audible.
+        # Re-spawn from saved state if the chain isn't running, so the
+        # dialog reflects what's actually audible.
         if self._saved_effects and not self.engine.is_channel_fx_running(self.node_name):
             params = (win.effect_params.get(self.node_name, {})
                       if win else {})
@@ -221,10 +217,8 @@ class FXSelectionDialog(QDialog):
                 list(self._saved_effects), params,
             )
 
-        # Slider drags fire valueChanged on every pixel; tearing down and
-        # respawning the whole chain at that rate would be unusable. Instead
-        # debounce param-driven rebuilds to ~150 ms, which feels live but
-        # only spawns once the user pauses.
+        # Debounce param-driven rebuilds — 150ms feels live but doesn't
+        # respawn the chain on every pixel of slider drag.
         self._param_timer = QTimer(self)
         self._param_timer.setSingleShot(True)
         self._param_timer.setInterval(150)
@@ -262,10 +256,7 @@ class FXSelectionDialog(QDialog):
         close_btn.clicked.connect(self._on_done)
         root.addWidget(close_btn)
 
-        # Surface "this stage failed to start" state once the dialog
-        # has finished constructing every toggle. Done after the layout
-        # so toggles that were ticked by saved-intent but aren't actually
-        # running get the red border + log-path tooltip immediately.
+        # Mark any failed-to-start toggles with red border + log tooltip.
         self._refresh_toggle_status()
 
     @staticmethod
@@ -316,9 +307,7 @@ class FXSelectionDialog(QDialog):
         toggle_btn = QPushButton()
         toggle_btn.setCheckable(True)
         toggle_btn.setProperty("role", "fxToggle")
-        # Brand-colour the toggle when ON so the dialog reads at a glance.
-        # `:checked` is the standard Qt pseudo-state for QPushButton
-        # toggles, paired with `setCheckable(True)` above.
+        # Brand-colour the toggle when ON.
         toggle_btn.setStyleSheet(
             "QPushButton[role=\"fxToggle\"] {"
             " background: #1a1a28; color: #8b8b9e;"
@@ -333,11 +322,8 @@ class FXSelectionDialog(QDialog):
             " background: #14141e; color: #555568;"
             " border-color: rgba(255,255,255,0.06); }"
         )
-        # Saved intent wins over live state: if the user previously turned
-        # this ON and the chain isn't running (because a stage crashed
-        # / PipeWire restarted / the spawn failed quietly), the toggle
-        # still shows ON so the user can see their saved settings and
-        # we can attempt a respawn.
+        # Saved intent wins over live state — if the chain isn't running,
+        # the toggle still shows the user's last ON/OFF choice.
         active = (
             fid in self._saved_effects
             or self.engine.is_channel_effect_active(self.node_name, fid)
@@ -480,13 +466,9 @@ class FXSelectionDialog(QDialog):
             out[key] = val
         return out
 
-    # ── Chain rebuild (one path, three triggers) ───────────────────
-    #
-    # Toggling an effect, picking a preset, or dragging a slider all end
-    # up calling `_rebuild_chain` so the channel's filter-chain is exactly
-    # the set of "ON" effects with their current parameter values. That
-    # also triggers a refresh on the main window so the submix loopbacks
-    # get re-routed through (or around) the new bus immediately.
+    # Toggle, preset pick, and slider drag all funnel through
+    # `_rebuild_chain` to respawn the channel's filter-chain with the
+    # current ON-set + parameter values.
 
     def _active_effect_ids(self):
         """Return the effect ids whose toggle buttons are currently ON,
@@ -500,10 +482,8 @@ class FXSelectionDialog(QDialog):
         return wanted
 
     def _all_params_map(self):
-        """Snapshot every effect's current slider values, even effects that
-        aren't ON right now. Persisting all of them means flipping an effect
-        back ON later resumes from the user's last-tweaked values rather
-        than the canned defaults."""
+        """Snapshot every effect's current slider values (including OFF
+        effects) so toggling back ON resumes the user's last tweak."""
         out = {}
         for fid in self._param_sliders.keys():
             out[fid] = self._collect_params(fid)
@@ -524,18 +504,13 @@ class FXSelectionDialog(QDialog):
         win = self._main_window()
         if win is not None and hasattr(win, '_request_reroute'):
             win._request_reroute(self.node_name)
-        # Update each toggle's diagnostic state — failed stages get a
-        # red border + tooltip pointing at the per-stage log so the user
-        # can tell apart "feature off" from "feature broken".
+        # Failed stages get a red border + log-path tooltip.
         self._refresh_toggle_status()
 
     def _refresh_toggle_status(self):
-        """Annotate each toggle with the current chain state. A 'failed'
-        stage means we tried to spawn it but it died — usually a missing
-        plugin or a malformed config — and the tooltip points at the log.
-        Running stages get the brand-blue checked style; inactive ones
-        get the default. Done as a styleSheet override so it composes
-        with the base toggle stylesheet."""
+        """Annotate each toggle with the live chain state (running /
+        failed / inactive). Failed stages get a red border + tooltip
+        with the log path."""
         if not hasattr(self, 'engine'):
             return
         status = self.engine.fx_chain_status(self.node_name)
@@ -571,9 +546,8 @@ class FXSelectionDialog(QDialog):
                 btn.setToolTip("")
 
     def _save_chain_state(self, effects, params_map):
-        """Mirror the new chain into the main window's persistence buckets:
-        active_effects keeps the ordered list, effect_params keeps every
-        slider position so it survives a session restart."""
+        """Mirror chain into main-window state: `active_effects` (ordered
+        ids) and `effect_params` (slider positions)."""
         win = self._main_window()
         if win is None:
             return
@@ -581,8 +555,7 @@ class FXSelectionDialog(QDialog):
             win.active_effects[self.node_name] = list(effects)
         else:
             win.active_effects.pop(self.node_name, None)
-        # Always save params even for OFF effects so toggling back ON
-        # resumes from the user's last tweak.
+        # Save params for OFF effects too so re-enable resumes the tweak.
         if params_map:
             stash = win.effect_params.setdefault(self.node_name, {})
             for fid, vals in params_map.items():
@@ -605,8 +578,7 @@ class FXSelectionDialog(QDialog):
         self._rebuild_chain()
 
     def _apply_preset(self, effect_id, values):
-        """A preset slams every slider in the effect panel to a known good
-        starting point, then rebuilds the chain so the change is audible."""
+        """Snap the effect's sliders to a labelled preset and respawn."""
         sliders = self._param_sliders.get(effect_id, {})
         for key, (slider, value_lbl) in sliders.items():
             if key not in values:
@@ -628,12 +600,7 @@ class FXSelectionDialog(QDialog):
         suffix = slider.property("psuffix") or ""
         val = pmin + (pmax - pmin) * (slider.value() / 1000.0)
         value_lbl.setText(self._fmt_value(val, suffix))
-        # Debounce: a slider drag fires valueChanged for every pixel, and
-        # set_channel_fx tears down + respawns the whole chain. Without
-        # debouncing the chain would be in a restart loop the entire time
-        # the user is dragging. 150 ms feels live but only commits the
-        # change once the slider settles. The "Done" button flushes any
-        # pending rebuild on close.
+        # Debounced — _on_done flushes any pending rebuild on close.
         self._param_timer.start()
 
 
@@ -656,13 +623,8 @@ class ChannelStrip(QFrame):
         self._mon_muted = False
         self._str_muted = False
 
-        # Slider commit debouncers. Slider drags fire `valueChanged` for every
-        # pixel; before this each pixel triggered an independent
-        # `pactl set-sink-input-volume` subprocess (~50 ms), so a fast drag
-        # queued up several seconds of pactl work and the audio dragged
-        # behind the user's finger. The debouncer lets the slider visually
-        # move at full Qt rate but only commits the LAST value to the engine
-        # after the slider's been still for ~40 ms.
+        # Slider-commit debouncers — UI moves at full Qt rate but only
+        # the final value reaches `pactl set-sink-input-volume`.
         self._mon_commit_timer = QTimer(self)
         self._mon_commit_timer.setSingleShot(True)
         self._mon_commit_timer.setInterval(40)
@@ -680,8 +642,7 @@ class ChannelStrip(QFrame):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(4)
 
-        # Icon + (optional) FX indicator. Wave Link keeps the header almost
-        # empty — everything extra lives behind the right-click menu.
+        # Icon + optional FX indicator. Other actions live in right-click.
         head_row = QHBoxLayout()
         head_row.setContentsMargins(0, 0, 0, 0)
         head_row.addStretch()
@@ -710,8 +671,8 @@ class ChannelStrip(QFrame):
 
         layout.addSpacing(4)
 
-        # Peak meter sits *between* the name and the faders so it's clearly
-        # "this channel's level", not associated with a specific mix.
+        # Peak meter — placed between the name and the faders so it
+        # reads as "this channel's level", not "this fader's level".
         self.peak_bar = QProgressBar()
         self.peak_bar.setObjectName("peakBar")
         self.peak_bar.setRange(0, 1000)
@@ -787,9 +748,8 @@ class ChannelStrip(QFrame):
 
         layout.addLayout(faders_row, 1)
 
-        # fx_btn kept as a hidden widget so existing code paths that touch
-        # `strip.fx_btn.setProperty(...)` can keep functioning. The real FX
-        # entry point is the right-click menu.
+        # Hidden no-op kept so callers that touch `strip.fx_btn.setProperty(...)`
+        # don't fail. The real FX entry point is the right-click menu.
         self.fx_btn = QPushButton()
         self.fx_btn.setVisible(False)
 
@@ -804,10 +764,8 @@ class ChannelStrip(QFrame):
     def _on_link_toggle(self):
         linked = self.link_btn.isChecked()
         if linked:
-            # Snap Stream to Monitor so they start at the same place.
             self.str_slider.setValue(self.mon_slider.value())
-        # Persist regardless of direction — the previous version only saved
-        # when linking ON, so unlinking was silently lost.
+        # Persist regardless of direction so unlink isn't silently lost.
         self._save_link_state(linked)
 
     def _save_link_state(self, linked):
@@ -818,9 +776,7 @@ class ChannelStrip(QFrame):
                 win.schedule_save()
 
     def _on_mon_vol(self, value):
-        # Visual update is immediate (label + linked slider) so the UI feels
-        # snappy. The actual engine write is deferred through a 40 ms timer
-        # so a fast drag doesn't queue up a backlog of pactl spawns.
+        # Visual update is immediate; engine write is debounced 40ms.
         self.mon_vol_lbl.setText(f"{value}%")
         self._pending_mon_vol = value
         self._mon_commit_timer.start()
@@ -835,8 +791,7 @@ class ChannelStrip(QFrame):
             self.mon_slider.setValue(value)
 
     def _commit_mon_vol(self):
-        """Fire the deferred Monitor-fader write. Called by the debounce
-        timer once the user has stopped dragging for ~40 ms."""
+        """Fire the deferred Monitor-fader write."""
         v = self._pending_mon_vol
         self._pending_mon_vol = None
         if v is None or not self.node_id:
@@ -877,9 +832,8 @@ class ChannelStrip(QFrame):
         self._apply_mute_style(self.str_mute, self._str_muted)
 
     def fx_capture_target(self):
-        """The PipeWire source name the FX chain's first stage should
-        pull audio from. For mics that's the mic itself; for virtual
-        sinks (Audio/Sink), it's the sink's monitor node."""
+        """Source the FX chain's first stage pulls from. Mics → mic
+        node.name; virtual sinks → `<sink>.monitor`."""
         if self.is_mic:
             return self.node_name
         return f"{self.node_name}.monitor"
@@ -900,9 +854,7 @@ class ChannelStrip(QFrame):
         self.fx_indicator.setVisible(self.engine.is_channel_fx_running(self.node_name))
 
     def _show_context_menu(self, pos):
-        """Right-click context menu for channel-strip actions.
-        Lives here instead of on visible buttons so the strip stays as
-        clean as Wave Link's."""
+        """Right-click menu for channel-strip actions."""
         menu = QMenu(self)
         menu.setStyleSheet(
             "QMenu { background: #1a1a28; color: #e0e0ee;"
@@ -915,8 +867,7 @@ class ChannelStrip(QFrame):
         fx_act = menu.addAction("✨ Effects…")
         fx_act.triggered.connect(self._on_fx_toggle)
 
-        # Optional: VST / LV2 hosting via Carla. Shown only if `carla` is
-        # on $PATH; otherwise we'd be advertising broken functionality.
+        # Carla VST/LV2 host — only shown when `carla` is on $PATH.
         if shutil.which("carla"):
             vst_act = menu.addAction("🎹 Open VST plugin (Carla)…")
             vst_act.triggered.connect(self._launch_carla)
@@ -948,18 +899,16 @@ class ChannelStrip(QFrame):
             win._remove_sink(self.node_name)
 
     def _launch_carla(self):
-        """Spawn Carla so the user can host a VST/VST3/LV2 plugin and
-        route it into this channel. We don't supervise the Carla process;
-        the user wires its input/output in Carla itself. This keeps us
-        out of the business of hosting proprietary plugin formats."""
+        """Spawn Carla. The user wires plugin I/O in Carla itself —
+        WaveLinux doesn't supervise the process."""
         try:
             subprocess.Popen(["carla"])
         except FileNotFoundError:
             QMessageBox.information(
                 self, "Carla not found",
                 "Install Carla (e.g. `sudo pacman -S carla`) to host VST3 / "
-                "LV2 plugins. WaveLinux doesn't host VST3 directly — it "
-                "bridges to Carla, which does."
+                "LV2 plugins. WaveLinux bridges to Carla rather than hosting "
+                "those plugin formats directly."
             )
 
     def _request_hide(self):
@@ -989,8 +938,8 @@ class ChannelStrip(QFrame):
         self.peak_bar.setValue(int(max(0.0, min(peak_01, 1.0)) * 1000))
 
     def update_from_node(self, mon_vol, mon_mute, str_vol, str_mute, is_hidden):
-        """Update UI from stored state. `is_hidden` is informational; the
-        strip is hidden/shown by the parent window, not by this widget."""
+        """Update strip UI from stored state. `is_hidden` is informational;
+        the parent window controls visibility, not this widget."""
         self._mon_muted = mon_mute
         self._str_muted = str_mute
 
@@ -1071,10 +1020,7 @@ class AppRoutingRow(QWidget):
         self.forget_btn.clicked.connect(self._on_forget)
         layout.addWidget(self.forget_btn)
 
-        # Per-row volume debouncer — same reasoning as the channel-strip
-        # faders: every pixel of slider drag fires `valueChanged` and used
-        # to spawn one `pactl set-sink-input-volume` per pixel. Now the
-        # latest value is held for ~40 ms and committed once the user pauses.
+        # 40ms volume-write debouncer (same reasoning as the channel strip).
         self._pending_app_vol = None
         self._app_commit_timer = QTimer(self)
         self._app_commit_timer.setSingleShot(True)
@@ -1108,8 +1054,8 @@ class AppRoutingRow(QWidget):
             win.save_config()
 
     def _on_forget(self):
-        """Remove this app from persisted app_routing. Only meaningful for
-        offline apps; running apps would just re-appear next refresh."""
+        """Permanently hide this app. Only useful for offline apps —
+        running apps would re-appear on the next refresh."""
         win = self.window()
         if hasattr(win, 'forget_app'):
             win.forget_app(self.app_name)
@@ -1136,26 +1082,16 @@ class AppRoutingRow(QWidget):
             self.vol_slider.setValue(int(vol * 100))
             self.vol_slider.blockSignals(False)
 
-        # ✕ is a hard forget. The clicked row goes onto the persistent
-        # blocklist and won't return on refresh, regardless of whether the
-        # app is currently making sound. Recover via Settings → Advanced
-        # → "Forget all offline apps now" or by editing config.json.
+        # ✕ is a hard forget — recover via Settings → Advanced.
         self.forget_btn.setEnabled(True)
         self.forget_btn.setToolTip(
             "Permanently hide this app from the routing list. "
             "Drops its saved volume / destination too."
         )
 
-        # Update combo box. Users can send an app to:
-        #   • any hardware output (ALSA / Bluetooth / JACK)
-        #   • any user-created WaveLinux channel (starred)
-        # Internal mix/source devices stay hidden.
-        #
-        # Combo rebuild used to happen on every refresh tick — even when
-        # the sink list hadn't changed. With ~5 apps and a poll every
-        # second, that was 25 unnecessary `display_name_for_sink` lookups
-        # per second (each of which walks the snapshot). Cache a fingerprint
-        # of the sink list and only rebuild when it actually changes.
+        # Combo: hardware sinks + user-created WaveLinux channels (starred).
+        # Internal mix/source nodes stay hidden. Rebuild only when the
+        # sink list actually changes (cached via a fingerprint).
         if not self.combo.view().isVisible():
             sink_fp = tuple(s['name'] for s in sinks)
             if getattr(self, '_combo_sink_fp', None) != sink_fp:
@@ -1217,33 +1153,22 @@ class WaveLinuxWindow(QMainWindow):
         self.app_routing = {}       # app_name -> sink_name (persistent)
         self.app_last_seen = {}     # app_name -> epoch seconds (for stale prune)
         self.app_prune_days = 14    # forget routing entries not seen in this many days
-        # Apps the user has explicitly clicked ✕ on. Persisted across
-        # restarts. PipeWire keeps surfacing some streams (host-bound bells,
-        # speech-dispatcher, leftover sandboxed clients) every refresh tick,
-        # so an in-memory delete from `app_routing` isn't enough — the row
-        # would just be re-synthesised from `apps_by_name`. The blocklist
-        # is consulted in `_refresh` *before* the row is built, which makes
-        # the ✕ button stick.
-        self.forgotten_apps = set()  # {app_name} — hard-forget blocklist
-        self.virtual_channels = []  # list of names
-        # Single-mic mode: only ONE microphone shows up as a strip in the top
-        # section at any time. This is the node.name of the mic the user has
-        # picked in the master "Microphone Input" combo. None on first
-        # launch (we'll fall back to `pactl get-default-source` when refresh
-        # runs and persist the choice).
+        # ✕'d apps. Consulted in `_refresh` BEFORE the row is built so
+        # the ✕ button sticks across re-syntheses.
+        self.forgotten_apps = set()  # {app_name}
+        self.virtual_channels = []   # list of display names
+        # Single-mic mode: one mic strip at a time, picked from the master
+        # combo. None → resolved to `pactl get-default-source` on first refresh.
         self.selected_mic = None
-        # All user-facing state is keyed by PipeWire node.name (stable across
-        # PipeWire restarts); pw_id is only used when talking to the engine.
-        self.hidden_nodes = set()      # {node.name}
+        # State below is keyed by PipeWire node.name (stable across PW
+        # restarts). pw_id is only used at the engine boundary.
+        self.hidden_nodes = set()
         self.show_hidden = False
-        self.effect_params = {}        # node.name -> effect_id -> {param_key: value}
-        self.active_effects = {}       # node.name -> [effect_id, ...] — restored each run
-        self._effects_applied = set()  # node.name keys we've already reconciled this session
-        # Per-channel record of the submix loopback module ids we've
-        # last pushed saved volume/mute against. Used in `_refresh()`
-        # to detect a loopback rebuild (the module id changes) and
-        # re-push state. Lives here so the per-channel hot loop doesn't
-        # have to do a `hasattr` probe on every node every tick.
+        self.effect_params = {}        # node.name -> {effect_id: {key: val}}
+        self.active_effects = {}       # node.name -> [effect_id, ...]
+        self._effects_applied = set()  # nodes whose chain we've reconciled this session
+        # Submix loopback module ids per channel. Used to detect rebuilds
+        # (module id changes) and re-push saved volume/mute state.
         self._synced_submix_owners = {}  # node.name -> {"Monitor": id, "Stream": id}
         self.channel_order = []        # [node.name, ...] — persistent UI order
         self.meters = {}               # pw_id -> MeterWorker
@@ -1251,19 +1176,18 @@ class WaveLinuxWindow(QMainWindow):
         self.config_path = os.path.expanduser("~/.config/wavelinux/config.json")
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
         
-        # The 2-second timer is our fallback — the event subscriber below
-        # drives most refreshes, and we want a backstop in case pactl
-        # subscribe is unavailable or misses an event.
+        # Backstop poll. `pactl subscribe` drives most refreshes; this
+        # only fires when an event was missed.
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self._refresh)
 
-        # Coalesce rapid save requests (sliders fire valueChanged on every pixel).
+        # Coalesce rapid save requests (slider drags).
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self.save_config)
 
-        # Coalesce rapid refresh requests (pactl subscribe can fire 5+ events
-        # for a single operation); one refresh per 150 ms is plenty.
+        # Coalesce rapid refresh requests — pactl-subscribe storms can
+        # fire 5+ events per operation.
         self._event_refresh_timer = QTimer(self)
         self._event_refresh_timer.setSingleShot(True)
         self._event_refresh_timer.setInterval(150)
@@ -1272,12 +1196,8 @@ class WaveLinuxWindow(QMainWindow):
         self._setup_ui()
         self.load_config()
         self._refresh()
-        # 5 s, not 2 s. `pactl subscribe` already drives most refreshes
-        # (debounced to 150 ms), so the poll timer is purely a backstop
-        # for environments where subscribe events miss something. At 2 s
-        # the poll was firing roughly as often as the user could think,
-        # spawning six pactl subprocesses each time and making the UI
-        # feel sluggish. 5 s is plenty of backstop without being noisy.
+        # 5s backstop interval — subscribe-driven refreshes carry the
+        # real-time signal; this just catches missed events.
         self.refresh_timer.start(5000)
         self._start_event_subscriber()
 
@@ -1288,8 +1208,8 @@ class WaveLinuxWindow(QMainWindow):
         self.settings_dialog.raise_()
 
     def _build_advanced_tab(self):
-        """Fine-grained knobs that most users never need. Each setting is
-        applied immediately and persisted to config.json."""
+        """Settings → Advanced tab. Each control writes through to
+        config.json immediately."""
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -1317,11 +1237,9 @@ class WaveLinuxWindow(QMainWindow):
         forget_all_btn.clicked.connect(self._forget_all_offline)
         layout.addWidget(forget_all_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        # Recovery path for the persistent ✕ blocklist. Without this the
-        # only way to un-forget an app the user clicked ✕ on by mistake
-        # was hand-editing config.json. Button is enabled only when the
-        # blocklist actually has something to clear (set in
-        # `_refresh_advanced_tab`).
+        # Recovery for the ✕ blocklist (otherwise the only way out is
+        # editing config.json by hand). Enabled state is set by
+        # `_refresh_advanced_tab`.
         self.restore_forgotten_btn = QPushButton("Restore forgotten apps")
         self.restore_forgotten_btn.setObjectName("showHiddenBtn")
         self.restore_forgotten_btn.setToolTip(
@@ -1490,10 +1408,8 @@ class WaveLinuxWindow(QMainWindow):
         self._save_timer.start(500)
 
     def _any_slider_dragging(self):
-        """True if the user is currently holding down ANY slider thumb.
-        We use this to defer the heavy `_refresh` snapshot work — refreshing
-        mid-drag interleaves subprocess calls with valueChanged events and
-        produces visible stutter."""
+        """True if any slider thumb is being held — refresh defers when
+        true to avoid stutter from mid-drag subprocess calls."""
         for s in (getattr(self, 'mon_master_slider', None),
                   getattr(self, 'str_master_slider', None)):
             if s is not None and s.isSliderDown():
@@ -1510,21 +1426,14 @@ class WaveLinuxWindow(QMainWindow):
         return False
 
     def _request_reroute(self, node_name):
-        """The FX dialog calls this after rebuilding a channel's chain.
-        Trigger the debounced refresh so submix loopbacks pick up the new
-        (or removed) FX virtual-source without waiting up to five seconds
-        for the poll timer. The re-sync of saved volume/mute is automatic:
-        `set_channel_fx` → `clear_channel_fx` clears the relevant submix
-        loopback entries; the next `route_input_to_submix` call mints a
-        fresh module id; main's `_synced_submix_owners` sees that id
-        change and re-pushes saved state."""
+        """Kick the debounced refresh so submix loopbacks pick up a
+        rebuilt FX chain immediately. Saved volume/mute re-syncs
+        automatically via `_synced_submix_owners`."""
         self._event_refresh_timer.start()
 
     def _start_event_subscriber(self):
-        """Run `pactl subscribe` under a QProcess so an external mute/volume
-        change (pavucontrol, media keys, another app) triggers a refresh
-        within ~150 ms instead of waiting up to 2 s for the poll timer.
-        The poll timer is kept as a backstop."""
+        """Run `pactl subscribe` under a QProcess so external mute/volume
+        changes (pavucontrol, media keys) refresh within ~150ms."""
         self._event_proc = QProcess(self)
         self._event_proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self._event_proc.readyReadStandardOutput.connect(self._on_pactl_event)
@@ -1535,8 +1444,8 @@ class WaveLinuxWindow(QMainWindow):
             logging.warning(f"pactl subscribe unavailable: {e} — falling back to poll")
 
     def _on_pactl_event(self):
-        """Any event at all just kicks the debounce; we don't filter here
-        because the refresh body is already cheap under the snapshot cache."""
+        """Any subscribe event kicks the debounce. Refresh body is
+        cheap under the snapshot cache — no need to filter here."""
         try:
             _ = bytes(self._event_proc.readAllStandardOutput())
         except Exception:
@@ -1604,11 +1513,9 @@ class WaveLinuxWindow(QMainWindow):
         input_lbl.setObjectName("sectionLabel")
         body.addWidget(input_lbl)
 
-        # Inputs area — wrapped in a horizontal scroll so the strips stay
-        # usable below 1200 px window width. The inner widget keeps its
-        # natural sizeHint (strip count × ~160 px) instead of being
-        # squashed by the scroll area, which is why `setWidgetResizable`
-        # is False here.
+        # Inputs row — horizontally scrolling so the strips stay usable
+        # below 1200px window width. `setWidgetResizable(False)` so the
+        # inner widget keeps its natural size (strip count × ~160px).
         self.inputs_scroll = QScrollArea()
         self.inputs_scroll.setObjectName("inputsScroll")
         self.inputs_scroll.setWidgetResizable(False)
@@ -1647,13 +1554,9 @@ class WaveLinuxWindow(QMainWindow):
         o_layout.addWidget(o_title)
         o_layout.addSpacing(10)
 
-        # Microphone Input row (which physical mic feeds the mixer).
-        # Single-mic mode: only the selected mic gets a strip in the top
-        # section. Switching the picker swaps the mic that's mixed; per-mic
-        # MON/STR/effect state is keyed by node.name so it survives a swap.
-        # We picked this name (not "Microphone Source") because users with
-        # speakers as their listening output otherwise read "Headphones" as
-        # "I don't have those, this app isn't for me".
+        # Mic picker — single-mic mode. Per-mic state is keyed by
+        # node.name so it survives swaps. Labelled "Microphone Input"
+        # rather than "Microphone Source" for less-technical users.
         mic_row = QHBoxLayout()
         mic_lbl = QLabel("🎤 Microphone Input")
         mic_lbl.setObjectName("masterMixLabel")
@@ -1665,8 +1568,8 @@ class WaveLinuxWindow(QMainWindow):
         o_layout.addLayout(mic_row)
         o_layout.addSpacing(8)
 
-        # Monitor Output row (was "Headphones" — renamed because lots of
-        # users monitor through speakers and "Headphones" implies otherwise).
+        # Monitor output — labelled "Monitor" instead of "Headphones"
+        # since many users monitor through speakers.
         mon_row = QHBoxLayout()
         mon_lbl = QLabel("🎧 Monitor Output")
         mon_lbl.setObjectName("masterMixLabel")
@@ -1686,9 +1589,8 @@ class WaveLinuxWindow(QMainWindow):
         o_layout.addWidget(self.mon_master_slider)
         o_layout.addSpacing(10)
 
-        # Stream row (what OBS / your audience hears). Always routes to the
-        # dedicated virtual device so there's one stable thing to pick in
-        # OBS — matching Wave Link's behaviour.
+        # Stream — fixed to the virtual `WaveLinux-Stream` device so OBS
+        # has one stable source to pick (matching Wave Link).
         str_row = QHBoxLayout()
         str_lbl = QLabel("📡 Stream")
         str_lbl.setObjectName("masterMixLabel")
@@ -1708,12 +1610,8 @@ class WaveLinuxWindow(QMainWindow):
         self.str_master_slider.valueChanged.connect(lambda v: self._on_master_vol_change("Stream", v))
         str_master_row.addWidget(self.str_master_slider, 1)
 
-        # Clipguard moved off the master Stream bus and into the per-channel
-        # FX chain (the `limiter` effect in the channel's right-click → FX
-        # dialog). Per the user's request it now affects only the active
-        # microphone, not the whole stream mix. The `🛡` button used to
-        # live here; it's been retired so the master row is just fader +
-        # OBS hint.
+        # Clipguard lives on the per-channel FX chain (`limiter` effect),
+        # not the master Stream bus. The master row is just fader + OBS hint.
         o_layout.addLayout(str_master_row)
 
         bottom_container.addWidget(out_frame, 1)
@@ -1800,12 +1698,8 @@ class WaveLinuxWindow(QMainWindow):
         if self.tray is not None and not self.isVisible():
             return
 
-        # Skip refresh while the user is actively dragging a slider — a
-        # full snapshot is hundreds of ms of subprocess work, and during
-        # a drag we'd interleave it with the slider's own updates and
-        # produce visible stutter. The next pactl-subscribe event or the
-        # 5-second backstop timer will pick up any state we missed
-        # within milliseconds of the drag finishing.
+        # Defer refresh while a slider is dragging — the next subscribe
+        # event or backstop tick picks up missed state.
         if self._any_slider_dragging():
             self._event_refresh_timer.start()  # try again shortly
             return
@@ -1817,9 +1711,8 @@ class WaveLinuxWindow(QMainWindow):
             apps = self.engine.get_sink_inputs(snap=snap)
             all_sinks = self.engine.get_all_sinks(snap=snap)
 
-            # pw-dump returning nothing is usually PipeWire mid-restart.
-            # Show status, keep existing widget state, and let the next
-            # tick reconcile rather than tearing the UI down.
+            # Empty pw-dump usually means PipeWire is mid-restart — keep
+            # widget state and let the next tick reconcile.
             if not snap.nodes and not all_sinks:
                 self.status_lbl.setText("PipeWire error — is pipewire running?")
                 return
@@ -1842,18 +1735,11 @@ class WaveLinuxWindow(QMainWindow):
             # 1. Update Input Channels (Mics & Virtual Sinks)
             current_node_ids = set()
 
-            # Single-mic mode: of the N hardware mics PipeWire is showing us,
-            # only ONE gets a strip in the top section — whichever the user
-            # has picked in the master "Microphone Input" combo. The rest
-            # are still listed in that combo so the user can switch, but
-            # they don't clutter the channel row. On first run we resolve
-            # `selected_mic = None` to the system default source so the
-            # mixer comes up usable immediately.
+            # Single-mic mode: only the picked mic gets a strip; the
+            # others stay listed in the master combo for switching.
             self._sync_mic_picker(mics)
-            # Now that selected_mic is resolved (either from saved state
-            # or from `_sync_mic_picker`'s default-source fallback),
-            # apply any pending clipguard→limiter migration we couldn't
-            # land at load_config time because the mic was unset.
+            # Apply any pending clipguard→limiter migration once
+            # selected_mic has resolved.
             if getattr(self, '_pending_clipguard_migration', False) \
                     and self.selected_mic:
                 self._apply_pending_clipguard_migration()
@@ -1873,10 +1759,9 @@ class WaveLinuxWindow(QMainWindow):
                 key=lambda n: order_index.get(n.name, len(order_index) + 1),
             )
 
-            # Hide widget rows for any hardware mic that's NOT the selected
-            # one. The reaper at the bottom of this loop drops widgets
-            # whose pw_id isn't in `current_node_ids`, so all we have to do
-            # is exclude unselected mics from `current_node_ids` below.
+            # The reaper at the end of this loop drops widgets whose
+            # pw_id isn't in `current_node_ids` — that's how unselected
+            # mics get hidden.
             for node in sorted_nodes:
                 pw_id = node.pw_id
                 current_node_ids.add(pw_id)
@@ -1893,13 +1778,11 @@ class WaveLinuxWindow(QMainWindow):
                 self.engine.route_input_to_submix(pw_id, nname, node.media_class, "Monitor", snap=snap)
                 self.engine.route_input_to_submix(pw_id, nname, node.media_class, "Stream", snap=snap)
 
-                # First time we've ever seen this node: pick safe defaults.
-                # Mics default to MUTED in Monitor so a fresh install does NOT
-                # immediately scream the user's voice back at them through their
-                # headphones / speakers (which on a 4-monitor setup turns into a
-                # screaming feedback loop). Stream stays unmuted because that
-                # mix exists for a recording target (OBS) where 'no audio'
-                # would be more confusing than 'audio'.
+                # First-time defaults. Mics start MUTED in Monitor so a
+                # fresh install doesn't immediately scream the user's
+                # voice into their headphones (feedback risk on a
+                # multi-monitor setup). Stream stays unmuted because
+                # that's where the recording goes.
                 mon_key = f"{nname}_Monitor"
                 str_key = f"{nname}_Stream"
                 fresh_mon = mon_key not in self.submix_state
@@ -1916,14 +1799,10 @@ class WaveLinuxWindow(QMainWindow):
                 if fresh_mon or fresh_str:
                     self.schedule_save()
 
-                # State sync: push our saved config into PipeWire so mutes
-                # and volumes survive across sessions. We re-sync any time
-                # the underlying submix loopback module id changes — that
-                # happens on first tick after startup AND any time the FX
-                # chain toggles (the loopback gets rebuilt with a fresh
-                # sink-input that has default-everything-zero state).
-                # Without re-syncing on rebuild, enabling effects on a
-                # muted mic silently un-mutes it.
+                # Push saved volume/mute through to PipeWire whenever
+                # the underlying loopback module id changes (first tick,
+                # FX toggle rebuild). Without this, enabling effects on
+                # a muted mic would silently un-mute it.
                 owner_mon = self.engine.submix_loopbacks.get(f"{pw_id}->Monitor")
                 owner_str = self.engine.submix_loopbacks.get(f"{pw_id}->Stream")
                 last = self._synced_submix_owners.get(nname, {})
@@ -1934,13 +1813,10 @@ class WaveLinuxWindow(QMainWindow):
                 )
 
                 if needs_sync:
-                    # set_submix_volume / set_submix_mute now return
-                    # False if the loopback's sink-input couldn't be
-                    # found (e.g. the module loaded but pulse-bridge
-                    # hasn't catalogued the sink-input yet). Only stamp
-                    # `_synced_submix_owners` once every push landed,
-                    # so the next tick retries on a transient miss
-                    # instead of leaving the saved state un-applied.
+                    # set_submix_volume / set_submix_mute return False if
+                    # the sink-input isn't catalogued yet. Stamp the
+                    # owner only when every push lands so a transient
+                    # miss retries on the next tick.
                     pushed = (
                         self.engine.set_submix_volume(pw_id, "Monitor", mon_state['vol'])
                         and self.engine.set_submix_mute(pw_id, "Monitor", mon_state.get('mute', False))
@@ -1952,15 +1828,12 @@ class WaveLinuxWindow(QMainWindow):
                             "Monitor": owner_mon, "Stream": owner_str,
                         }
                 else:
-                    # After initial push, overlay live PipeWire state into the
-                    # UI. We only PERSIST the live state for real microphones
-                    # — for those, an external mute (pavucontrol, media keys)
-                    # is a legitimate user intent we want to remember across
-                    # restarts. For our OWN virtual sinks (Music, Game, etc.),
-                    # WE are the only writer; treating PipeWire's transient
-                    # state as user intent caused the "audio randomly stops
-                    # working after Bluetooth profile changes" bug — a brief
-                    # mute during BT switching got captured and persisted.
+                    # Overlay live state into the UI so external mutes
+                    # (pavucontrol, media keys) are visible. Persist
+                    # only for real mics — virtual sinks own their own
+                    # state, persisting transient PipeWire state on them
+                    # caused the "audio randomly stops after BT profile
+                    # change" bug.
                     is_real_mic = node in mics
                     overlay_changed = False
                     for mix_name, state, mix_key in (
@@ -2005,8 +1878,8 @@ class WaveLinuxWindow(QMainWindow):
                     self.input_layout.addWidget(strip)
 
                 strip = self.channel_widgets[pw_id]
-                # Keep the strip's pw_id fresh across PipeWire restarts — the
-                # node.name stays stable but the numeric id can change.
+                # Refresh pw_id — node.name is stable across PW restarts
+                # but the numeric id is not.
                 strip.node_id = pw_id
                 strip.show()
                 gain = self.submix_state.get(f"{nname}_gain", 1.0)
@@ -2034,12 +1907,9 @@ class WaveLinuxWindow(QMainWindow):
                     meter.start()
                     self.meters[pw_id] = meter
                 
-                # Re-apply any saved effects the first time this node shows
-                # up in the session. `active_effects` is keyed by node.name
-                # (stable across PipeWire restarts); filter-chain processes
-                # live in-memory on the engine, so we re-spawn the chain
-                # via set_channel_fx. The next routing pass below will
-                # then thread the loopbacks through the chain's output.
+                # First time this node shows up in the session — re-spawn
+                # any saved FX chain. The next routing pass threads the
+                # loopbacks through the chain's output.
                 if nname and nname not in self._effects_applied:
                     self._effects_applied.add(nname)
                     saved_chain = list(self.active_effects.get(nname, []))
@@ -2062,10 +1932,9 @@ class WaveLinuxWindow(QMainWindow):
                 widget.setParent(None)
                 widget.deleteLater()
                 self.engine.remove_node_routing(stale)
-                # The mic is gone, so its FX chain is now processing nothing
-                # — kill the stage processes too so they don't sit idle.
-                # The dropped node will be re-discovered (and its chain
-                # re-applied via _effects_applied) if it comes back.
+                # The mic is gone — kill its FX chain stage processes
+                # so they don't sit idle. Re-applied via _effects_applied
+                # if the node comes back.
                 if stale_nname:
                     self.engine.clear_channel_fx(stale_nname)
                     self._effects_applied.discard(stale_nname)
@@ -2131,15 +2000,10 @@ class WaveLinuxWindow(QMainWindow):
 
             for app_name in all_display_apps:
                 active_indices = apps_by_name.get(app_name, [])
-                # The dropdown reflects USER INTENT, not the raw observation
-                # from PipeWire. When a saved routing exists we show that,
-                # even if the live sink-input is still on the system default
-                # for one tick (the move_app_to_sink call above flips it
-                # asynchronously). Without this preference the dropdown
-                # would visibly reset to "System Default" every time an
-                # app launches and then re-snap to the saved sink a
-                # heartbeat later — which the user reports as "saves don't
-                # persist".
+                # Dropdown reflects user intent. If a saved routing
+                # exists, show it even when the live sink-input is still
+                # on the system default for one tick — otherwise the
+                # dropdown briefly resets every time the app launches.
                 preferred_sink = self.app_routing.get(app_name)
                 live_sink = None
                 if active_indices:
@@ -2163,10 +2027,9 @@ class WaveLinuxWindow(QMainWindow):
                     self.app_widgets[name].deleteLater()
                     del self.app_widgets[name]
 
-            # 3. Update Monitor output dropdown (Stream is fixed to virtual).
-            # Use the PipeWire Description field so Bluetooth sinks show real
-            # model names ('Sony WH-1000XM4') instead of garbled 'Bd 10 1'
-            # from the ALSA node.name.
+            # 3. Monitor output dropdown (Stream is fixed to virtual).
+            # Use the Description field so BT sinks show real model names
+            # like 'Sony WH-1000XM4' instead of 'Bd 10 1'.
             combo = self.mon_out_combo
             if not combo.view().isVisible():  # Don't update while user is looking at it
                 curr_data = combo.currentData()
@@ -2210,9 +2073,7 @@ class WaveLinuxWindow(QMainWindow):
 
 
     def _on_master_vol_change(self, mix_name, value):
-        # Debounce master-fader writes too — same reasoning as the per-strip
-        # MON/STR sliders. Stash the latest value and let the timer commit
-        # the trailing-edge value once the user pauses for ~40 ms.
+        # 40ms debounce — same reasoning as the per-strip faders.
         if not hasattr(self, '_pending_master_vol'):
             self._pending_master_vol = {}
             self._master_commit_timer = QTimer(self)
@@ -2242,13 +2103,10 @@ class WaveLinuxWindow(QMainWindow):
             self.engine.unroute_mix_from_hardware(mix_name)
 
     def _apply_pending_clipguard_migration(self):
-        """One-shot rewrite of the legacy `clipguard: true` (master-bus)
-        flag into a per-mic `limiter` entry on `selected_mic`'s
-        active_effects. Idempotent — clears `_pending_clipguard_migration`
-        once it runs so subsequent refresh ticks don't re-add the
-        limiter even if the user has explicitly removed it. The legacy
-        flag itself was already dropped on the next save (save_config
-        no longer writes `clipguard`)."""
+        """Rewrite the legacy master-bus `clipguard: true` flag as a
+        per-mic `limiter` on `selected_mic`'s active_effects. Idempotent
+        — once cleared, refresh ticks won't re-add the limiter even if
+        the user removed it."""
         mic = self.selected_mic
         if not mic:
             return
@@ -2263,22 +2121,13 @@ class WaveLinuxWindow(QMainWindow):
         self._pending_clipguard_migration = False
 
     def _sync_mic_picker(self, mics):
-        """Refresh the master "Microphone Input" combo to show every mic
-        PipeWire knows about. Called on every refresh tick. Cheap: only
-        rebuilds the items when the mic list (by node.name) actually
-        changes — otherwise just keeps the combo's current selection
-        in sync with `self.selected_mic`.
-
-        Falls back to `pactl get-default-source` when nothing's saved
-        and at least one mic exists, so first launch picks something
-        sensible and the user isn't stuck staring at an empty mixer."""
+        """Refresh the master mic combo. Cheap on each tick — only
+        rebuilds items when the mic list changes. Falls back to
+        `pactl get-default-source` when nothing's saved yet."""
         combo = self.mic_in_combo
         mic_names = {m.name for m in mics}
-        # Resolve "None" — or a stale/disappeared selection — to a present
-        # mic. `selected_mic` can go stale if the user unplugs the device
-        # they previously picked; without this fallback the master combo
-        # ends up showing nothing selected and the top section has no
-        # mic strip even though other mics are available.
+        # Resolve a stale or unset selected_mic (unplugged device, fresh
+        # launch) to the system default if available, else the first mic.
         if mics and (not self.selected_mic or self.selected_mic not in mic_names):
             default_src = (
                 self.engine.get_default_source()
@@ -2310,18 +2159,14 @@ class WaveLinuxWindow(QMainWindow):
             combo.blockSignals(False)
 
     def _on_mic_input_change(self, idx):
-        """User picked a different mic in the master combo. Persist the
-        choice and force an immediate refresh so the channel strip swaps
-        to the new mic on the same tick."""
+        """Persist a mic-picker change and refresh immediately so the
+        strip swaps to the new mic on the same tick."""
         new_mic = self.mic_in_combo.itemData(idx)
         if new_mic == self.selected_mic:
             return
-        # Drop the new mic out of `_synced_submix_owners` so its saved
-        # volume / mute gets re-pushed the moment the loopbacks come up.
-        # Without this the new strip would briefly inherit the previous
-        # mic's last live state in the visual. The owner-id-change path
-        # in `_refresh` would also catch it eventually, but only after
-        # one tick where the user might see the wrong values.
+        # Drop the new mic from `_synced_submix_owners` so saved state
+        # gets re-pushed as soon as the loopbacks come up. Without this
+        # the strip briefly inherits the previous mic's live state.
         if new_mic:
             self._synced_submix_owners.pop(new_mic, None)
         self.selected_mic = new_mic
@@ -2357,11 +2202,9 @@ class WaveLinuxWindow(QMainWindow):
     # Migration of the saved `clipguard: true` flag happens in load_config.
 
 
-    # The Wave Link-style "starter" channels we seed on a fresh install so
-    # the user opens the app and sees a working mixer instead of an empty
-    # page. Picked to match Elgato's reference layout. These are FIRST-RUN
-    # ONLY — once the user deletes one we don't bring it back, so config
-    # presence (not channel-list presence) is the seeding gate.
+    # Wave Link-style starter channels seeded on first install so users
+    # don't open the app to an empty mixer. First-run only — deletions
+    # aren't undone on subsequent launches.
     _DEFAULT_CHANNELS = ("Music", "Game", "Browser", "Voice Chat", "System")
 
     def _seed_default_channels(self):
@@ -2375,10 +2218,7 @@ class WaveLinuxWindow(QMainWindow):
     def load_config(self):
         if not os.path.exists(self.config_path):
             # First launch — set up the standard mixes, route Monitor to
-            # the system default output, and seed the Wave Link-style
-            # starter channels so the user has something usable from the
-            # first open. Persist immediately so subsequent launches load
-            # the seeded list (and respect any deletions the user makes).
+            # the system default, and seed starter channels.
             self.engine.create_output_mix("Monitor")
             self.engine.create_output_mix("Stream")
             def_sink = self.engine.get_default_sink()
@@ -2399,18 +2239,13 @@ class WaveLinuxWindow(QMainWindow):
                     if isinstance(k, str) and isinstance(v, (int, float))
                 }
                 self.app_prune_days = int(conf.get('app_prune_days', self.app_prune_days) or 14)
-                # Persistent ✕ blocklist. Stored as a list in JSON; rehydrate
-                # to a set for O(1) membership checks in _refresh.
+                # Persistent ✕ blocklist. Set for O(1) membership.
                 self.forgotten_apps = {
                     name for name in (conf.get('forgotten_apps', []) or [])
                     if isinstance(name, str) and name
                 }
-                # One-shot migration: older configs may have host-named ghosts
-                # ('Dusky Pc', 'dusky_pc', etc.) baked into app_routing /
-                # app_last_seen because the substring filter at the engine
-                # didn't normalise whitespace. Purge them so the user doesn't
-                # have to manually click ✕ on a row that the filter now
-                # suppresses upstream anyway.
+                # Purge host-named ghosts from older configs whose engine
+                # filter didn't normalise whitespace.
                 for name in list(self.app_routing.keys()):
                     if PipeWireEngine.name_matches_host(name):
                         self.app_routing.pop(name, None)
@@ -2431,18 +2266,11 @@ class WaveLinuxWindow(QMainWindow):
                     if isinstance(v, list)
                 }
 
-                # Saved effect parameters are loaded into self.effect_params
-                # / self.active_effects above. The actual chain spawn happens
-                # in _refresh once each node's pw_id is known, via
-                # set_channel_fx — see the "_effects_applied" gate there.
+                # The chain spawn itself happens in _refresh once each
+                # node's pw_id is known (`_effects_applied` gate).
 
-                # Compressor key migration. Pre-rewrite the compressor's
-                # `_EFFECT_PARAMS` used short snake_case keys (`threshold_db`
-                # etc.) that did NOT match sc4m's actual LADSPA control-port
-                # names — so any tweaks the user made were silently dropped
-                # and the plugin ran on its built-in defaults. Now that we
-                # use the real port names, rewrite saved keys in place so
-                # existing slider positions carry over instead of resetting.
+                # Migrate compressor keys from pre-rewrite snake_case
+                # (`threshold_db` etc.) to sc4m's real LADSPA port names.
                 _comp_key_remap = {
                     'threshold_db':  'Threshold level (dB)',
                     'ratio':         'Ratio (1:n)',
@@ -2464,16 +2292,10 @@ class WaveLinuxWindow(QMainWindow):
                 self.engine.create_output_mix("Monitor")
                 self.engine.create_output_mix("Stream")
 
-                # Migration: pre-rewrite Clipguard was a master-bus
-                # limiter. Per the user's request it now lives per-mic
-                # inside the unified chain. The migration adds `limiter`
-                # to `active_effects[selected_mic]`, but on a fresh
-                # config `selected_mic` may not be resolved yet at
-                # load_config time (it gets auto-filled from
-                # `pactl get-default-source` later in `_sync_mic_picker`).
-                # So we just stash the intent here; `_refresh` runs
-                # `_apply_pending_clipguard_migration` once the mic
-                # picker has had a chance to land on a real source.
+                # Legacy master-bus Clipguard → per-mic limiter migration.
+                # `selected_mic` may not be resolved yet here, so we just
+                # stash the intent and `_refresh` applies it once the
+                # picker has landed.
                 self._pending_clipguard_migration = bool(conf.get('clipguard'))
                 if self._pending_clipguard_migration and self.selected_mic:
                     self._apply_pending_clipguard_migration()
@@ -2505,18 +2327,11 @@ class WaveLinuxWindow(QMainWindow):
 
     @staticmethod
     def _migrate_submix_state(raw):
-        """Drop legacy entries keyed by the ephemeral pw_id (e.g. '42_Monitor').
-        New keys use PipeWire node.name (e.g. 'wavelinux_game_Monitor',
-        'alsa_input.pci-..._Monitor'), which survives a PipeWire restart.
-
-        Conservative migration: only drop keys whose suffix is exactly
-        `_Monitor` or `_Stream` AND whose prefix int-parses cleanly. That
-        matches the legacy `{pw_id}_{Monitor|Stream}` shape without
-        risking other suffixes (`_linked`, `_gain`, future ones) or
-        node.names that happen to look numeric. The previous version
-        ran the int-prefix test against every key with an underscore,
-        which would have falsely classified e.g. a `1234_Monitor`
-        virtual sink as legacy."""
+        """Drop entries keyed by ephemeral pw_id (`42_Monitor`). Current
+        keys are `<node.name>_Monitor`/`_Stream` so they survive a
+        PipeWire restart. Only drops keys whose prefix int-parses AND
+        whose suffix is exactly `_Monitor`/`_Stream` so other suffixes
+        (`_linked` etc.) and numeric-looking node.names aren't touched."""
         if not isinstance(raw, dict):
             return {}
         clean = {}
@@ -2544,10 +2359,8 @@ class WaveLinuxWindow(QMainWindow):
         return {entry for entry in raw if isinstance(entry, str) and entry}
 
     def save_config(self):
-        # `clipguard` (the legacy master-bus flag) is intentionally not
-        # written here. It now lives as the per-mic `limiter` effect
-        # inside `active_effects`, so the next save quietly drops the
-        # legacy key and load_config has nothing more to migrate.
+        # `clipguard` (legacy master-bus flag) is not written — it's
+        # been replaced by the per-mic `limiter` effect.
         conf = {
             'monitor_hw': self.mon_out_combo.currentData(),
             'stream_hw': self.str_out_combo.currentData(),
@@ -2574,13 +2387,9 @@ class WaveLinuxWindow(QMainWindow):
 
 
     def forget_app(self, app_name):
-        """Drop ALL state for an app and add it to the persistent
-        `forgotten_apps` blocklist so the row stays gone for good. Running
-        apps used to "come back" on the next refresh because the row was
-        re-synthesised from `apps_by_name`; the blocklist short-circuits
-        that path. To recover a forgotten app, use Settings → Advanced →
-        "Restore forgotten apps" (clears the blocklist) or hand-edit
-        `forgotten_apps` in `~/.config/wavelinux/config.json`."""
+        """Drop all state for an app and add it to the persistent
+        `forgotten_apps` blocklist. Recover via Settings → Advanced →
+        'Restore forgotten apps' or by editing config.json."""
         self.app_routing.pop(app_name, None)
         self.app_last_seen.pop(app_name, None)
         self.forgotten_apps.add(app_name)
@@ -2592,12 +2401,9 @@ class WaveLinuxWindow(QMainWindow):
         self._refresh()
 
     def _prune_stale_apps(self):
-        """On load, drop saved app_routing entries we haven't seen in
-        `app_prune_days`. Apps get their last_seen stamp refreshed every
-        tick they're active, so quietly-running notification-only apps
-        (Discord background, Slack, etc.) keep their slot. The 'offline'
-        forever-clutter problem shows up when you install an app, route
-        it once, and never open it again — that's what this reaps."""
+        """Drop saved app_routing / app_last_seen entries we haven't
+        seen in `app_prune_days`. Last-seen stamps are refreshed every
+        tick the app is active, so quietly-running apps keep their slot."""
         if self.app_prune_days <= 0:
             return
         cutoff = int(time.time()) - self.app_prune_days * 24 * 3600
@@ -2608,9 +2414,7 @@ class WaveLinuxWindow(QMainWindow):
         for name in stale_routed:
             self.app_routing.pop(name, None)
             self.app_last_seen.pop(name, None)
-        # Apps whose last_seen is older than the cutoff but which never had a
-        # saved routing also get reaped — without this, the panel would grow
-        # forever with apps the user opened once two years ago.
+        # Apps without a saved routing also get reaped past the cutoff.
         stale_seen = [
             name for name, ts in list(self.app_last_seen.items())
             if ts < cutoff
@@ -2628,13 +2432,10 @@ class WaveLinuxWindow(QMainWindow):
 
     def move_channel(self, node_name, delta):
         """Move a channel left (-1) or right (+1) in the persistent order."""
-        # Seed the order with every known node so the visible strips and
-        # the persisted list stay in lockstep.
         order = list(self.channel_order)
         if node_name not in order:
             order.append(node_name)
-        # Make sure all currently-visible channels are in the order list;
-        # anything previously unseen goes to the end.
+        # Append currently-visible names that aren't in the order yet.
         visible_names = [s.node_name for s in self.channel_widgets.values() if s.node_name]
         for nm in visible_names:
             if nm not in order:
@@ -2651,8 +2452,7 @@ class WaveLinuxWindow(QMainWindow):
         self._relayout_channel_strips()
 
     def _relayout_channel_strips(self):
-        """Re-home the existing ChannelStrip widgets in persistent order."""
-        # Detach everything from the HBox, then re-add in order.
+        """Re-home existing ChannelStrips in `channel_order`."""
         widgets = list(self.channel_widgets.values())
         for w in widgets:
             self.input_layout.removeWidget(w)
@@ -2661,12 +2461,12 @@ class WaveLinuxWindow(QMainWindow):
             w = name_to_widget.pop(nm, None)
             if w is not None:
                 self.input_layout.addWidget(w)
-        # Anything left over (no order entry yet) goes to the end.
+        # Anything not in channel_order goes to the end.
         for w in name_to_widget.values():
             self.input_layout.addWidget(w)
 
     def rename_channel(self, old_node_name):
-        """Rename a user-created virtual channel in place. Hardware mic
+        """Rename a user-created virtual channel. Hardware mic
         node.names aren't ours to rename."""
         if not old_node_name.startswith("wavelinux_"):
             QMessageBox.information(self, "Rename",
@@ -2697,8 +2497,7 @@ class WaveLinuxWindow(QMainWindow):
         else:
             self.virtual_channels.append(cleaned)
 
-        # Strip's pw_id is about to change — drop the widget so _refresh
-        # re-creates it with the new label.
+        # Drop the widget so _refresh re-creates it with the new label.
         for pw_id, widget in list(self.channel_widgets.items()):
             if widget.node_name == old_node_name:
                 self.input_layout.removeWidget(widget)
