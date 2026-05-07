@@ -1493,6 +1493,7 @@ class WaveLinuxWindow(QMainWindow):
         header = QFrame()
         header.setObjectName("header")
         h_layout = QHBoxLayout(header)
+        h_layout.setContentsMargins(0, 0, 0, 0)
 
         logo_col = QVBoxLayout()
         logo_col.setSpacing(0)
@@ -1553,7 +1554,6 @@ class WaveLinuxWindow(QMainWindow):
 
         # ── Outputs & App Routing ──
         bottom_widget = QWidget()
-        bottom_widget.setMinimumHeight(200)
         bottom_outer = QVBoxLayout(bottom_widget)
         bottom_outer.setContentsMargins(0, 0, 0, 0)
         bottom_outer.setSpacing(0)
@@ -1687,6 +1687,7 @@ class WaveLinuxWindow(QMainWindow):
         status = QFrame()
         status.setObjectName("statusBar")
         s_layout = QHBoxLayout(status)
+        s_layout.setContentsMargins(0, 0, 0, 0)
         dot = QLabel("●")
         dot.setObjectName("statusDot")
         s_layout.addWidget(dot)
