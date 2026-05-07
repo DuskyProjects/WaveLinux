@@ -50,12 +50,9 @@ class OutputMix:
 
 
 class EngineSnapshot:
-    """One-shot cache of pactl/pw-dump outputs. Built at the top of a
-    refresh tick and threaded through engine helpers, so a single 2-second
-    tick runs each heavy subprocess call at most once instead of 5+ times.
-
-    Write paths (load/unload-module, move-sink-input) don't use the snapshot
-    — they always re-query to avoid acting on stale data."""
+    """One-shot cache of pactl/pw-dump outputs, built at the top of a
+    refresh tick so a single tick runs each heavy subprocess at most once.
+    Write paths re-query directly to avoid acting on stale data."""
 
     __slots__ = ("modules_text", "short_modules_text", "sink_inputs_text",
                  "sinks_text", "nodes", "sinks", "_loopback_index",
@@ -69,9 +66,9 @@ class EngineSnapshot:
         self.sinks_text = sinks_text or ""
         self.nodes = nodes or []
         self.sinks = sinks or []
-        self._loopback_index = None     # lazily built
-        self._sink_state_by_name = None # lazily built: name -> (vol, muted)
-        self._sink_descriptions = None  # lazily built: name -> description
+        self._loopback_index = None
+        self._sink_state_by_name = None
+        self._sink_descriptions = None
 
 
 class PipeWireEngine:
@@ -96,58 +93,35 @@ class PipeWireEngine:
         self.rnnoise_processes = {}      # channel_key -> subprocess
         self.loopback_modules = {}       # "mix_name->hw_name" -> module id
         self.submix_loopbacks = {}       # "node_id->mix_name" -> module id
-        # Tracks the *source* token used when each submix loopback was
-        # created. When effects on a mic toggle on/off, the loopback's
-        # source has to swap from the raw mic to the FX bus output (or
-        # back) — this lets `route_input_to_submix` notice the change and
-        # rebuild the loopback rather than silently keeping the old wiring.
+        # Source token used when each submix loopback was created. Lets
+        # `route_input_to_submix` notice when an FX toggle changes a mic's
+        # source (raw mic ↔ FX bus output) and rebuild the loopback.
         self.submix_sources = {}         # "node_id->mix_name" -> source_token
-        # FX bus per channel. Keyed by the stable PipeWire node.name (mic
-        # name or virtual sink name), so this survives PipeWire restarts.
-        # Each entry is the active chain on a channel: an ordered list of
-        # effect_ids, the per-effect parameter map, the spawned filter-chain
-        # process keys, the capture target (raw mic / sink monitor), and
-        # the resulting virtual-source name that downstream loopbacks pull
-        # from. None / missing = no chain running on that channel.
+        # Per-channel FX chain. Keyed by stable PipeWire node.name so it
+        # survives PipeWire restarts.
         self.channel_fx = {}             # node_name -> {effects, params, procs,
                                          #               source, capture_target,
                                          #               safe_key}
 
-        # Which LADSPA plugins are actually present on this system —
-        # filter-chain will silently fail-to-start if we reference one that
-        # isn't installed, so we probe once at startup.
+        # Probe LADSPA plugins once at startup; filter-chain silently
+        # fails to start if it references one that isn't installed.
         self.ladspa_plugins = self._probe_ladspa_plugins()
 
-        # Reap any orphan `pipewire -c` filter-chain processes left behind
-        # by previous WaveLinux crashes. Without this they keep their
-        # virtual sinks/sources alive in the system audio graph forever,
-        # which is one of the things the user complained about ("names
-        # showing up in system settings sound menu that shouldn't").
+        # Reap orphan `pipewire -c` filter-chain processes from previous
+        # crashes — otherwise their virtual sinks/sources stay alive in
+        # the system audio graph forever.
         self._reap_orphan_fx_processes()
 
-        # Ensure clean state from any previous crashes (pactl-loaded modules).
         self.cleanup()
 
-        # Track whether we've successfully overridden the WirePlumber
-        # bluetooth auto-switch setting so cleanup can flip it back without
-        # a stale call when the override never landed (old wpctl, no BT
-        # stack, etc.).
         self._bt_autoswitch_overridden = False
         self.lock_bluetooth_to_a2dp()
 
     @staticmethod
     def _reap_orphan_fx_processes():
-        """Kill any `pipewire -c` processes whose config path lives in
-        OUR canonical config directory and starts with our filename
-        prefix — they're filter-chain stages from a previous WaveLinux
-        session that didn't shut down cleanly. Idempotent and safe to
-        run on every start. Uses `pkill -f` so we don't have to parse
-        `ps` output ourselves.
-
-        The pattern is anchored to `*.config/pipewire/wavelinux-` so we
-        don't accidentally match a user's own `pipewire -c` client
-        whose command line happens to contain the substring 'wavelinux'
-        somewhere unrelated."""
+        """Kill leftover `pipewire -c` filter-chain processes from a previous
+        WaveLinux session. Pattern is anchored to `*.config/pipewire/wavelinux-`
+        so we don't hit unrelated user clients."""
         try:
             subprocess.run(
                 ['pkill', '-f', r'pipewire -c [^ ]*\.config/pipewire/wavelinux-'],
@@ -155,52 +129,28 @@ class PipeWireEngine:
                 timeout=2,
             )
         except Exception:
-            # `pkill` returns non-zero if no matches — that's fine, ignore.
             pass
 
     # ── Bluetooth profile lock ─────────────────────────────────────
     #
-    # WirePlumber 0.5+ ships with `bluetooth.autoswitch-to-headset-profile`
-    # set to `true`. The instant ANY client (Discord, Telegram, even a
-    # browser tab requesting microphone access) opens a stream targeting
-    # the BT mic, WirePlumber auto-flips the device from A2DP (high-fi
-    # stereo) to HSP/HFP (mono headset). The A2DP sink disappears for the
-    # duration — which the user reported as "WaveLinux removed my
-    # Bluetooth headset from the audio stack". WaveLinux never unloads
-    # hardware sinks (the cleanup sweep is scoped to wavelinux_* modules)
-    # so the disappearance is BlueZ destroying the A2DP node during the
-    # profile flip, not us.
-    #
-    # The user picked option (b) when asked: lock the headset to A2DP for
-    # the duration WaveLinux is running, accepting that the BT mic will
-    # be unavailable / very low quality while the lock is in effect.
-    # Volatile (no `--save`) so the user's normal preference comes back
-    # automatically when WaveLinux quits or wireplumber restarts.
+    # WirePlumber 0.5+ defaults `bluetooth.autoswitch-to-headset-profile`
+    # to true, which flips a BT device from A2DP to HSP/HFP the moment any
+    # client opens its mic. The A2DP sink disappears for the duration. We
+    # disable that autoswitch (volatile, no `--save`) so the headset stays
+    # visible as a stereo output the whole time WaveLinux is running.
 
     def lock_bluetooth_to_a2dp(self):
-        """Disable WirePlumber's A2DP↔HSP/HFP auto-switch for the duration
-        of this session so a Bluetooth headset stays visible as a high-fi
-        stereo output even when the mic is in use. Volatile — the user's
-        original preference returns when wireplumber restarts or
-        `unlock_bluetooth_autoswitch` is called.
-
-        Returns True if the override was applied, False if the local wpctl
-        is too old to support `settings` (WirePlumber < 0.5) or if the
-        wpctl call otherwise failed. Failure is non-fatal: the headset
-        will still work, the user just gets the system default
-        auto-switch behaviour."""
-        # `wpctl settings` is the WirePlumber 0.5 settings interface; pre-0.5
-        # wpctl does not have a `settings` subcommand and exits non-zero,
-        # which we treat as "this knob doesn't exist on this system."
+        """Disable WirePlumber's A2DP↔HSP autoswitch for this session.
+        Volatile — restored when wireplumber restarts or `unlock_bluetooth_autoswitch`
+        is called. Returns False if wpctl is too old (< 0.5) or the call failed;
+        non-fatal in that case."""
         try:
             res = subprocess.run(
                 ['wpctl', 'settings', 'bluetooth.autoswitch-to-headset-profile', 'false'],
                 capture_output=True, text=True, timeout=3,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            logging.warning(
-                f"Could not lock bluetooth profile (wpctl unavailable): {e}"
-            )
+            logging.warning(f"Could not lock bluetooth profile (wpctl unavailable): {e}")
             return False
         if res.returncode != 0:
             logging.warning(
@@ -209,17 +159,11 @@ class PipeWireEngine:
             )
             return False
         self._bt_autoswitch_overridden = True
-        logging.info(
-            "Locked BT profile to A2DP for this session "
-            "(bluetooth.autoswitch-to-headset-profile=false)"
-        )
+        logging.info("Locked BT profile to A2DP for this session")
         return True
 
     def unlock_bluetooth_autoswitch(self):
-        """Restore WirePlumber's BT auto-switch to its default ON state.
-        Called from cleanup() so the user's other apps regain the normal
-        'flip to HSP when mic opens' behaviour the moment WaveLinux quits.
-        No-op if we never successfully applied the override."""
+        """Restore the BT autoswitch default. No-op if the lock never landed."""
         if not self._bt_autoswitch_overridden:
             return False
         try:
@@ -231,7 +175,6 @@ class PipeWireEngine:
             return False
         if res.returncode == 0:
             self._bt_autoswitch_overridden = False
-            logging.info("Restored bluetooth.autoswitch-to-headset-profile=true")
             return True
         return False
 
@@ -265,14 +208,10 @@ class PipeWireEngine:
         return False
 
     def ladspa_plugin_path(self, name):
-        """Find the full filesystem path to a LADSPA plugin .so. PipeWire's
-        filter-chain technically accepts a bare plugin name (it walks
-        $LADSPA_PATH internally) but using the absolute path eliminates
-        a class of "plugin not found" silent failures we've seen in the
-        wild — particularly on systems where the librnnoise .so lives in
-        a non-default directory the spawned `pipewire -c` process didn't
-        inherit. Returns None if the plugin isn't on disk anywhere we
-        searched."""
+        """Find the absolute path to a LADSPA plugin .so. Returns None if
+        not found. Filter-chain accepts a bare plugin name but using the
+        absolute path eliminates a class of "plugin not found" failures on
+        systems where the .so lives in a non-standard directory."""
         env_path = os.environ.get("LADSPA_PATH", "")
         roots = [p for p in env_path.split(":") if p] + list(self._LADSPA_PATHS)
         target_lower = name.lower()
@@ -313,10 +252,8 @@ class PipeWireEngine:
     # ── Helpers ─────────────────────────────────────────────────────
 
     def _run(self, cmd, timeout=2):
-        # Defensive: drop None entries and stringify everything. Historically
-        # this helper crashed the whole UI when any caller accidentally passed
-        # None (e.g. the App Routing "System Default" case), because even the
-        # error-logging path did `' '.join(cmd)` which trips on None.
+        # Drop None entries and stringify everything — joining `None` into
+        # an error log raises TypeError.
         cmd = [str(c) for c in cmd if c is not None]
         if not cmd:
             return None
@@ -411,10 +348,9 @@ class PipeWireEngine:
 
     @staticmethod
     def _parse_sink_descriptions(text):
-        """Return {sink_name: friendly_description} from `pactl list sinks`.
-        We use descriptions for UI labels because PipeWire puts model info
-        (e.g. 'Sony WH-1000XM4') there, while node.name is usually
-        something like 'bluez_output.8C_1D_96_4A_59_0B.1'."""
+        """Return {sink_name: description} from `pactl list sinks`. UI uses
+        descriptions because they hold model info (e.g. 'Sony WH-1000XM4'),
+        while node.name is typically 'bluez_output.8C_1D_…'."""
         out = {}
         curr_name = None
         curr_desc = None
@@ -466,12 +402,8 @@ class PipeWireEngine:
     def _parse_nodes(self):
         raw = self._run(['pw-dump'], timeout=4)
         if not raw:
-            # `pw-dump` timed out or returned empty. Returning an empty
-            # list collapses the entire PipeWire node graph for this
-            # tick — every channel disappears for one refresh and then
-            # comes back. Log so a chronically slow `pw-dump` (e.g. a
-            # backed-up daemon, NUMA-pinned RT scheduling thrashing) is
-            # visible in the log instead of a mystery flicker.
+            # Empty pw-dump collapses the node graph for one tick and the
+            # UI flickers. Log so a chronically slow daemon is visible.
             logging.warning("pw-dump returned no output; node graph empty for this tick")
             return []
         try:
@@ -514,11 +446,10 @@ class PipeWireEngine:
 
     @staticmethod
     def _pretty_bt(raw):
-        """Turn a PipeWire Bluetooth node.name
-        ('bluez_output.8C_1D_96_4A_59_0B.1') or an ALSA dashed form into
-        a MAC. We can't derive the model from the MAC — callers need to
-        prefer description for Bluetooth — but at least we won't output
-        'Bd 96 1' garbage."""
+        """Extract a MAC address from a PipeWire bluetooth node.name and
+        format it as 'Bluetooth XX:XX:…'. For UI labels callers should
+        prefer the description (which has the model name) — this is just
+        the fallback for when description is missing."""
         m = re.search(r'([0-9A-Fa-f]{2}(?:[:_-][0-9A-Fa-f]{2}){5})', raw)
         if m:
             return "Bluetooth " + m.group(1).replace('_', ':').upper()
@@ -677,22 +608,15 @@ class PipeWireEngine:
     # ── Virtual Sink (Input Channel) Management ────────────────────
 
     def route_input_to_submix(self, node_id, node_name, media_class, mix_name, snap=None):
-        """Create a loopback connecting an input source (or sink monitor) to a submix.
-        Called on every refresh tick — idempotent: if the loopback we created
-        earlier is still alive AND its source still matches the current FX
-        state, do nothing. When the channel's FX chain toggles on or off the
-        source token changes (raw mic ↔ FX virtual-source), in which case we
-        unload the stale loopback and re-create it pointing at the new
-        source. Without that swap, enabling effects would leave the audio
-        flowing direct from the mic to the mixes, bypassing the chain.
+        """Loopback an input source (or sink monitor) into a submix.
+        Idempotent on every refresh tick. When the channel's FX chain
+        toggles, the source token changes (raw mic ↔ FX virtual-source) and
+        the loopback gets rebuilt pointing at the new source.
 
-        Returns True if `submix_loopbacks[key]` is up to date after the
-        call, False on failure. The caller should compare
-        `submix_loopbacks[key]` before vs. after to detect a rebuild and
-        re-push the user's saved volume/mute — this function intentionally
-        does NOT reset volume or mute on a fresh loopback (used to, but
-        that quietly clobbered the user's Monitor-mute every time the FX
-        state changed)."""
+        Returns True if `submix_loopbacks[key]` is up to date afterwards.
+        Does NOT reset volume/mute on a fresh loopback — caller compares
+        the module id before/after to detect a rebuild and re-push saved
+        state, otherwise FX toggles silently clobber Monitor-mute."""
         key = f'{node_id}->{mix_name}'
 
         mix = self.output_mixes.get(mix_name)
@@ -742,16 +666,8 @@ class PipeWireEngine:
             return False
         self.submix_loopbacks[key] = out
         self.submix_sources[key] = source_id
-        # NOTE: we do not touch the freshly-created sink-input's volume or
-        # mute. That used to default to 100%/unmuted "to work around a
-        # pulse-bridge initial-state race", but it also stomped on the
-        # user's saved Monitor-mute every time the FX chain rebuilt the
-        # loopback — which the user reported as "I muted myself but I can
-        # still hear myself". The caller (WaveLinuxWindow._refresh) now
-        # detects rebuilds via the submix_loopbacks[key] change and re-
-        # pushes the saved submix_state, so the right values land
-        # deterministically instead of leaning on a default that overrode
-        # user intent.
+        # Do NOT reset volume/mute on the new sink-input. Caller detects
+        # rebuilds and re-pushes saved submix_state.
         return True
 
     def _build_loopback_index(self, modules_text):
@@ -824,11 +740,9 @@ class PipeWireEngine:
         return None
 
     def set_submix_volume(self, node_id, mix_name, volume):
-        """Returns True on success, False if the underlying sink-input
-        couldn't be located (loopback hasn't loaded yet, or the loopback
-        was unloaded mid-tick). The UI uses the boolean to flag a tick
-        where the volume slider's intent wasn't actually applied so the
-        next refresh can re-try."""
+        """Set the submix volume. Returns False if the sink-input isn't
+        found yet (loopback hasn't loaded or was unloaded mid-tick); UI
+        uses the bool to retry on the next refresh."""
         si = self.get_submix_sink_input(node_id, mix_name)
         if not si:
             logging.warning(f"Could not find sink-input for {node_id}->{mix_name}")
@@ -838,8 +752,7 @@ class PipeWireEngine:
         return True
 
     def set_submix_mute(self, node_id, mix_name, mute):
-        """Returns True on success, False if the underlying sink-input
-        couldn't be located. See `set_submix_volume` for the rationale."""
+        """Set the submix mute. Same retry semantics as set_submix_volume."""
         si = self.get_submix_sink_input(node_id, mix_name)
         if not si:
             logging.warning(f"Could not find sink-input to mute for {node_id}->{mix_name}")
@@ -892,19 +805,13 @@ class PipeWireEngine:
 
     @staticmethod
     def _branding_label(display_clean):
-        """Build the visible device label that shows in KDE's Audio Volume
-        panel, pavucontrol, OBS, etc.
-
-        The hard rule: NO WHITESPACE. `pactl`'s `sink_properties=...`
-        splits on whitespace to find key=value pairs, and its handling of
-        quoted values differs between PulseAudio and PipeWire's pipewire-pulse
-        bridge. The only way to guarantee every front-end shows the right
-        name is to make each property value a single token.
-        """
+        """Build the visible 'WaveLinux-<name>' device label. Whitespace
+        is collapsed to '-' because pactl's `sink_properties=` parser
+        splits on spaces and quoting behaviour differs between PulseAudio
+        and pipewire-pulse — single-token values render identically
+        everywhere."""
         if not display_clean:
             return "WaveLinux"
-        # Collapse internal whitespace to a single hyphen so 'Voice Chat'
-        # → 'WaveLinux-Voice-Chat'.
         compact = re.sub(r'\s+', '-', display_clean.strip())
         return f"WaveLinux-{compact}"
 
@@ -1028,17 +935,10 @@ class PipeWireEngine:
         return True
 
     def route_mix_to_hardware(self, mix_name, hw_sink_name):
-        """Route an output mix to a hardware output using a loopback.
-
-        Bluetooth-aware: the previous version locked the loopback to its
-        initial sink with `sink_dont_move=true`, but Bluetooth devices
-        rotate their PipeWire sink name when the profile changes
-        (`bluez_output.MAC.1` for A2DP, `.2` for HSP/HFP, etc.). Holding
-        the loopback to a stale sink name was the "audio randomly stops
-        working after I reconnect / change BT profile" bug. We now allow
-        the session manager to follow the hardware, AND after the loopback
-        comes up we explicitly find its sink-input and force volume=100%
-        + unmute (instead of trusting pactl's defaults), so a freshly-
+        """Route a mix bus to a hardware output via module-loopback.
+        Bluetooth-aware: doesn't pin the loopback's sink (BT sinks rotate
+        names on profile change, e.g. `bluez_output.MAC.1` ↔ `.2`). After
+        load, force the new sink-input to 100% / unmuted so a freshly
         routed BT device isn't silently created at 0%."""
         mix = self.output_mixes.get(mix_name)
         if not mix:
@@ -1049,10 +949,8 @@ class PipeWireEngine:
                 self._run(['pactl', 'unload-module', self.loopback_modules[key]])
                 del self.loopback_modules[key]
 
-        # If the user just picked a sink that pipewire-pulse hasn't
-        # surfaced yet (Bluetooth in the middle of profile negotiation,
-        # USB device still enumerating), retry briefly so the load doesn't
-        # fail just because we got there a tick early.
+        # Retry briefly — picked sink may not be visible yet (BT mid-profile
+        # negotiation, USB still enumerating).
         out = None
         for attempt in range(8):
             if self._sink_visible(hw_sink_name):
@@ -1077,10 +975,8 @@ class PipeWireEngine:
         key = f'{mix_name}->{hw_sink_name}'
         self.loopback_modules[key] = out
         mix.hardware_output = hw_sink_name
-        # Force the new loopback's playback-side sink-input to 100% / unmuted.
-        # Pactl loopbacks can come up at the wrong volume if pulse-bridge
-        # carried a stale per-app-per-sink rule from a previous session,
-        # which manifests as "audio reaches the mix but I hear nothing".
+        # Force the new sink-input to 100%/unmuted — pulse-bridge can
+        # apply a stale per-app-per-sink rule that defaults it to 0%.
         si = self._sink_input_for_module(out)
         if si is not None:
             self._run(['pactl', 'set-sink-input-volume', si, '100%'])
@@ -1234,27 +1130,18 @@ class PipeWireEngine:
 
     @staticmethod
     def _normalize_for_host_match(value):
-        """Collapse a string down to a comparable token for hostname matching.
-        PipeWire surfaces the host name through different properties with
-        different casings and punctuation: 'DuskyPC', 'dusky_pc', 'Dusky PC',
-        'dusky-pc.local'. Lower-case and strip every non-alphanumeric so all
-        of those map to the single canonical token 'duskypc' / 'duskypclocal'.
-        Without this normalisation the substring filter at the call site
-        misses anything PipeWire spelled with whitespace, underscores, or
-        hyphens — which is exactly what produced the long-running 'dusky pc
-        offline' ghost row in the App Routing tab."""
+        """Lower-case and strip non-alphanumerics so 'DuskyPC',
+        'dusky_pc', 'Dusky PC', 'dusky-pc.local' all collapse to one
+        comparable token. Used by the host filter for the App Routing tab."""
         if not value:
             return ''
         return re.sub(r'[^a-z0-9]', '', value.lower())
 
     @classmethod
     def _host_aliases(cls):
-        """Return the set of normalised tokens that identify *this machine* —
-        used to filter sink-inputs that PipeWire hangs off the local host
-        instead of a real app. Tokens are lower-cased and stripped of every
-        non-alphanumeric so the comparison at the call site can normalise its
-        candidate the same way and survive ``DuskyPC`` ↔ ``Dusky_PC`` ↔
-        ``dusky pc`` mismatches. Cached so we don't re-stat /proc every tick."""
+        """Cached set of normalised tokens identifying this machine.
+        Used to drop sink-inputs that PipeWire hangs off the local host
+        instead of a real app from the App Routing tab."""
         cached = getattr(cls, '_host_alias_cache', None)
         if cached is not None:
             return cached
@@ -1279,10 +1166,8 @@ class PipeWireEngine:
         names = {cls._normalize_for_host_match(h) for h in raw}
         names.discard('')
         if not names:
-            # Both gethostname() and /etc/hostname failed — unusual
-            # (sandboxed environment, /proc not mounted, etc.). Log
-            # once so the host filter's silent-pass-through isn't a
-            # mystery if a system stream slips into App Routing.
+            # gethostname() and /etc/hostname both failed — host filter
+            # is now a silent passthrough, log once.
             logging.warning(
                 "Could not determine hostname; host-name filter for "
                 "system streams in App Routing will be inactive."
@@ -1293,9 +1178,7 @@ class PipeWireEngine:
     @classmethod
     def name_matches_host(cls, value):
         """True if `value` is one of this machine's hostnames after
-        normalisation. Public so the UI can also call this when pruning
-        previously-saved app_routing entries that came from the broken
-        substring filter."""
+        normalisation."""
         token = cls._normalize_for_host_match(value)
         if not token:
             return False
@@ -1408,11 +1291,9 @@ class PipeWireEngine:
 
     @classmethod
     def _desktop_app_index(cls):
-        """Build a one-shot index of every .desktop file on the system mapping
-        the binary basename → display Name.  Lets us name a native app like
-        AUR Spotify ('spotify' on $PATH) by reading its own /usr/share/
-        applications/spotify.desktop instead of relying on a hand-curated alias
-        table.  Cached for 60 s so refresh ticks don't keep re-scanning."""
+        """Index of every .desktop file's binary-basename → display Name.
+        Lets us resolve native apps (AUR Spotify → 'Spotify') without a
+        curated alias table. Cached for 60s."""
         now = time.time()
         cache = getattr(cls, '_desktop_cache', None)
         cache_at = getattr(cls, '_desktop_cache_at', 0)
@@ -1521,11 +1402,9 @@ class PipeWireEngine:
     )
 
     def _infer_name_from_exe(self, pid, current_name=None):
-        """When a process's comm is a generic launcher binary (e.g. 'aces' for
-        War Thunder, 'eldenring' for Elden Ring, 'launcher' for too many
-        games to count) but its on-disk path includes the title, use the
-        directory name as the app's friendly name. The current `comm` is
-        passed in only so we can prefer it when nothing better is found."""
+        """Use the install-path directory name when comm is a generic
+        launcher (e.g. 'aces' for War Thunder, 'launcher' for many games)
+        but the exe path contains the real title."""
         if not pid:
             return None
         try:
@@ -1644,14 +1523,9 @@ class PipeWireEngine:
         if is_internal:
             return
 
-        # Filter out sink-inputs that look like the local machine itself.
-        # PipeWire surfaces its own host (e.g. "DuskyPC") as an app whenever a
-        # system-level stream — `speech-dispatcher`, the X11 bell, RTP receiver,
-        # etc. — has nothing better to report. We are not an app on our own
-        # mixer, so suppress anything whose visible name normalises to our
-        # hostname. Compares NORMALISED tokens (lowercase, alphanumeric only)
-        # so 'Dusky_PC' / 'dusky pc' / 'DuskyPC.local' all collapse to the
-        # same 'duskypc' / 'duskypclocal' and get filtered uniformly.
+        # Drop sink-inputs whose visible name is just the local host —
+        # PipeWire surfaces the hostname for system streams that have
+        # nothing better to report (speech-dispatcher, RTP receiver, etc.).
         host = self._host_aliases()
         if host:
             for prop in ('application.name', 'node.description',
@@ -1660,17 +1534,13 @@ class PipeWireEngine:
                 if token and token in host:
                     return
 
-        # Stable-first name resolution. Flatpak'd apps (Spotify, Discord…)
-        # often set `application.name` to "audio-src" while their real
-        # identity lives in FLATPAK_ID / cgroup / env, so we ALWAYS run
-        # the sandbox probe first and let its result win over a generic
-        # `application.name`.
+        # Sandbox-probe first: Flatpak'd apps often publish a generic
+        # `application.name` ("audio-src") while their real identity lives
+        # in FLATPAK_ID / cgroup / env.
         pid = current.get('pid') or current.get('application.process.id')
         sandbox_name = self._identify_sandboxed_app(pid)
-        # Native (non-sandboxed) apps still publish a .desktop file with the
-        # real display name. Read that — it's the truth about what AUR/dpkg
-        # think the app is called — so e.g. native Spotify resolves to
-        # 'Spotify' instead of 'audio-src' or 'spotify'.
+        # Native apps: pull display name from their .desktop entry so e.g.
+        # AUR Spotify resolves to 'Spotify' instead of 'spotify'.
         desktop_name = self._identify_via_desktop(pid)
 
         # Any of these reverse-DNS-style ids gets run through the curated
@@ -1717,22 +1587,17 @@ class PipeWireEngine:
         if name and name.islower():
             name = name.title()
 
-        # Final-name host check. The header-property filter above only
-        # looks at four PipeWire properties; the resolved name above may
-        # come from PID resolution, .desktop matching, install-path
-        # inference, etc. — any of those can land on the host name when
-        # the underlying stream is a system-level service. Re-check the
-        # final resolved name against `_host_aliases()` so 'DuskyPC'
-        # gets dropped no matter which resolution path produced it.
+        # Re-check the final resolved name against host aliases — PID /
+        # .desktop / install-path resolution can also land on the hostname
+        # for system-level streams.
         if name and host and self._normalize_for_host_match(name) in host:
             return
 
         current['app_name'] = name or "Unknown App"
         entries.append(current)
 
-    # Single source of truth for "0..1.0 is unity". Everything that writes
-    # a volume into PipeWire clamps to 100% so audio can't silently clip
-    # past unity.
+    # All volume writes clamp to this — PipeWire allows 1.5 (150%) but
+    # that audibly clips, so we cap at unity everywhere.
     MAX_VOLUME = 1.0
 
     def _clamp(self, volume):
@@ -1742,21 +1607,16 @@ class PipeWireEngine:
             return 1.0
 
     def move_app_to_sink(self, sink_input_index, sink_name):
-        """Move a running app's sink-input to `sink_name`. `sink_name=None`
-        means "System Default" — route back to whatever PipeWire calls the
-        default sink right now."""
+        """Move a sink-input to `sink_name`. None means System Default."""
         if sink_name is None:
             sink_name = self.get_default_sink()
         if not sink_name:
-            # If we still don't know where to send it, just leave it alone
-            # rather than raising.
             return
         self._run(['pactl', 'move-sink-input', str(sink_input_index), sink_name])
 
     def set_sink_input_volume(self, sink_input_index, volume):
-        """App-stream volume. pactl works on sink-input indices; wpctl
-        wants numeric PipeWire node IDs which don't match, which is why
-        the previous wpctl path silently no-opped."""
+        """App-stream volume. Uses pactl (sink-input indices); wpctl wants
+        numeric PipeWire node IDs which don't match here."""
         pct = max(0, min(int(round(self._clamp(volume) * 100)), 100))
         self._run(['pactl', 'set-sink-input-volume', str(sink_input_index), f'{pct}%'])
 
@@ -1825,14 +1685,6 @@ class PipeWireEngine:
         if mix:
             mix.hardware_output = None
         return changed
-
-    # NOTE: master-bus `apply_clipguard` / `is_clipguard_active` were
-    # removed in the per-channel chain rewrite. Per the user request,
-    # Clipguard now ONLY affects the active microphone — it lives as the
-    # `limiter` effect inside each channel's unified FX chain. Saved
-    # configs that still contain a top-level `clipguard: true` are
-    # migrated to a per-mic `limiter` entry on first load (see the
-    # `load_config` migration in main.py).
 
     # ── Card / profile switching ───────────────────────────────────
 
@@ -1911,44 +1763,22 @@ class PipeWireEngine:
 
     # ── Effects / RNNoise ──────────────────────────────────────────
     #
-    # A `pipewire -c <conf>` invocation starts a NEW pipewire instance with
-    # the given conf as its COMPLETE config (no merge with the system
-    # default). For that instance to participate in the user's running
-    # audio graph — i.e. for its filter-chain's Audio/Sink and Audio/Source
-    # nodes to actually appear in `pactl list sinks` / `pactl list sources`
-    # so we can pipe audio into them — the conf must:
-    #
-    #   1. Set `core.daemon = false` so it doesn't try to BE the system
-    #      pipewire daemon.
-    #   2. Load the basic SPA libs (`audioconvert`, `support`).
-    #   3. Load the basic client modules (`rt`, `protocol-native`,
-    #      `client-node`, `adapter`, `metadata`).
-    #   4. THEN load `libpipewire-module-filter-chain` with our filter graph.
-    #
-    # Earlier versions of this file shipped only step 1, so the spawned
-    # process either ran as an orphan audio system with no devices (and
-    # thus processed nothing) or failed silently to register its nodes
-    # with the running daemon. The user heard their mic untouched and
-    # — with `noise_suppressor_mono` clearly installed — would understandably
-    # conclude "the effects don't actually do anything".
+    # `pipewire -c <conf>` runs a fresh pipewire instance with `conf` as
+    # its COMPLETE config (no merge with the system default). For its
+    # filter-chain nodes to register with the running daemon, the conf
+    # must (1) set `core.daemon = false`, (2) load the audioconvert/
+    # support SPA libs, (3) load rt/protocol-native/client-node/adapter
+    # modules, and (4) load `libpipewire-module-filter-chain` last with
+    # our graph. See `_fx_client_config`.
 
     @staticmethod
     def _fx_client_config(client_id, filter_chain_args):
-        """Build a complete `pipewire -c` config that runs as a CLIENT
-        of the user's running daemon (not as a standalone audio system)
-        and loads exactly one `libpipewire-module-filter-chain` whose
-        args are the SPA-JSON object passed in.
+        """Build a `pipewire -c` config that runs as a client of the
+        running daemon and loads one `libpipewire-module-filter-chain`.
 
-        The module list and SPA libs match — exactly — PipeWire's own
-        canonical `filter-chain.conf` (the file pipewire(1) loads when
-        you run `pipewire -c filter-chain.conf`). That config is the
-        upstream reference for "run a filter chain as a client of the
-        running daemon", so anything more or less is a guess. In
-        particular: do NOT add `libpipewire-module-metadata` here —
-        canonical omits it, and on some setups loading metadata as a
-        client of an existing daemon throws an ENOENT and aborts the
-        entire client. We want filter-chain spawns to come up reliably,
-        not depend on every distro's metadata-interface init."""
+        Module list and SPA libs match upstream's canonical
+        `filter-chain.conf`. Do NOT add `libpipewire-module-metadata` —
+        on some setups it ENOENTs and aborts the whole client."""
         return f"""\
 context.properties = {{
     core.daemon = false
@@ -1976,10 +1806,7 @@ context.modules = [
 ]
 """
 
-    # Old _FX_PREAMBLE-based callers still exist (apply_effect / start_rnnoise
-    # are kept as a legacy path used by Clipguard). They get the same
-    # complete client preamble via `_fx_client_config` now — preserved here
-    # only as a stub so an unupgraded checkout doesn't NameError on import.
+    # Stub kept so an unupgraded checkout doesn't NameError on import.
     _FX_PREAMBLE = ""
 
     @staticmethod
@@ -1989,27 +1816,15 @@ context.modules = [
         return os.path.join(log_dir, f'{effect_id}-{channel_key}.log')
 
     def _spawn_fx(self, config_path, log_path, key):
-        """Spawn a `pipewire -c <config>` process. Returns True if the
-        process is still alive after a 1.5 s settle window, in which case
-        it's parked in `rnnoise_processes[key]` for later teardown.
+        """Spawn `pipewire -c <config>`. Returns True if the process is
+        still alive after a 1.5s settle window (parked in
+        `rnnoise_processes[key]` for later teardown), False otherwise.
 
-        The settle window is the only crash signal we have — a config
-        with a bad LADSPA path / wrong port name / unknown SPA factory
-        exits immediately, so waiting longer than the worst-case startup
-        gives us a reliable pass/fail. 1.5 s is empirical: filter-chain
-        spawn on a typical Linux system completes in ~250 ms; the headroom
-        catches slower setups (Bluetooth audio waking up, NUMA-pinned
-        rt scheduling, etc.) without leaving the UI feeling sluggish.
-
-        We also dump a debug header into the log file (the config we ran,
-        the env, the pipewire version) so post-mortem on a failed spawn
-        doesn't require re-running anything — `cat <log>` shows what we
-        tried and why it didn't fly. Without this header it's impossible
-        to tell from outside whether a config-syntax error or a missing
-        plugin or a daemon-connection failure is the culprit."""
-        # Read config back so the debug header is the FILE we ran (not
-        # whatever the caller intended). Avoids mismatch when someone
-        # races us with a hand-edit.
+        1.5s is empirical — typical filter-chain spawn is ~250ms; the
+        headroom covers BT-audio wakeup and NUMA-pinned RT scheduling.
+        Logs a debug header (config, env, pipewire version) so post-
+        mortem on a failed spawn just needs `cat <log>`."""
+        # Read config back from disk so the header is the FILE we ran.
         try:
             with open(config_path, 'r') as cf:
                 rendered_config = cf.read()
@@ -2038,13 +1853,8 @@ context.modules = [
             logging.error(f"Could not open FX log file {log_path}: {e}")
             return False
 
-        # CRITICAL: close log_file in the PARENT once Popen has dup'd the
-        # FD into the child. Without this finally we'd leak one file
-        # descriptor for every chain spawn (every effect toggle, every
-        # parameter slider commit), and a long session of FX edits would
-        # eventually hit EMFILE. The child keeps writing to its own dup,
-        # so the log file still receives pipewire's stderr; only the
-        # parent's redundant handle goes away.
+        # Close log_file in the parent once Popen has dup'd the FD into
+        # the child — otherwise long FX-edit sessions leak FDs to EMFILE.
         proc = None
         try:
             log_file.write(header.encode('utf-8'))
@@ -2072,11 +1882,8 @@ context.modules = [
         return False
 
     def start_rnnoise(self, channel_key='default', params=None):
-        """Legacy single-effect rnnoise spawn (kept for backwards-compat).
-        New code should go through `set_channel_fx` which routes the mic
-        through the chain explicitly. This path is only used when something
-        directly calls `apply_effect('rnnoise', …)` — currently nothing
-        in-tree does so."""
+        """Single-effect rnnoise spawn. Reachable via `apply_effect`;
+        new code should go through `set_channel_fx` for proper chain routing."""
         config_dir = os.path.expanduser('~/.config/pipewire')
         os.makedirs(config_dir, exist_ok=True)
         config_path = os.path.join(config_dir, f'wavelinux-rnnoise-{channel_key}.conf')
@@ -2162,13 +1969,9 @@ context.modules = [
             ('High Gain', 'High Gain', -12.0, 12.0, 0.0, ' dB'),
         ],
         'compressor': [
-            # Keys are the LADSPA control-port names from sc4m_1916's
-            # descriptor — matched verbatim by PipeWire's filter-graph.
-            # Pre-rewrite this list used short snake_case keys
-            # (`threshold_db`, `ratio`, …) which silently didn't match,
-            # so slider tweaks never reached the plugin and the
-            # compressor ran on its built-in defaults. load_config in
-            # main.py migrates old saved keys into these names.
+            # Keys must match sc4m_1916's LADSPA control-port names
+            # verbatim — PipeWire's filter-graph does exact-string matching.
+            # load_config in main.py migrates pre-rewrite snake_case keys.
             ('Threshold level (dB)', 'Threshold', -60.0, 0.0, -20.0, ' dB'),
             ('Ratio (1:n)',          'Ratio',     1.0,   20.0,  4.0,  ':1'),
             ('Attack time (ms)',     'Attack',    0.1,   200.0, 5.0,  ' ms'),
@@ -2292,13 +2095,10 @@ context.modules = [
         return list(cls._EFFECT_PRESETS.get(effect_id, []))
 
     def _resolved_params(self, effect_id, overrides):
-        """Merge user overrides on top of defaults from _EFFECT_PARAMS,
-        clamping each value to the declared min/max range. The FX dialog
-        sliders already clamp at the UI layer, but a hand-edited
-        config.json or a future caller that bypasses the dialog could
-        still produce out-of-range values that the LADSPA plugin would
-        either reject or interpret as undefined behaviour. Clamping here
-        means the filter-chain config is always within sane bounds."""
+        """Merge overrides on top of `_EFFECT_PARAMS` defaults, clamped
+        to each entry's declared min/max range. UI sliders already clamp,
+        but a hand-edited config.json could otherwise smuggle in values
+        the LADSPA plugin would reject."""
         ranges = {key: (mn, mx) for (key, _l, mn, mx, _d, _u)
                   in self._EFFECT_PARAMS.get(effect_id, [])}
         out = {key: default for (key, _l, _mn, _mx, default, _u)
@@ -2324,10 +2124,9 @@ context.modules = [
         return f"                        control = {{\n{body}\n                        }}"
 
     def _ladspa_node(self, name, plugin, label, values):
-        """Render a single LADSPA node block for filter.graph, using the
-        full filesystem path to the .so when we can find it. Falls back
-        to the bare name (which pipewire resolves via $LADSPA_PATH) when
-        the plugin isn't on disk in any path we know about."""
+        """Render a single LADSPA node block for filter.graph. Uses the
+        absolute .so path when we can find one — falls back to the bare
+        plugin name (pipewire resolves it via $LADSPA_PATH)."""
         path = self.ladspa_plugin_path(plugin) or plugin
         return f"""
                 nodes = [
@@ -2342,9 +2141,9 @@ context.modules = [
 """
 
     def _build_filter_graph(self, effect_id, values):
-        """Render the `filter.graph` body for a given effect. Returns None for
-        unknown effect ids. Shared by both the legacy single-effect spawn
-        path (used by clipguard) and the per-stage chain path (`set_channel_fx`)."""
+        """Render the `filter.graph` body for a single effect. Returns
+        None for unknown ids. Used by `apply_effect` (single-effect spawn);
+        the unified per-channel chain uses `_effect_stage_blocks` instead."""
         if effect_id == 'rnnoise':
             return self._ladspa_node('rnnoise', 'librnnoise_ladspa',
                                      'noise_suppressor_mono', values)
@@ -2405,18 +2204,10 @@ context.modules = [
         if effect_id == 'compressor':
             return self._ladspa_node('compressor', 'sc4m_1916', 'sc4m', values)
         if effect_id == 'limiter':
-            # Mono builtin chain: `linear` applies the input-gain param, then
-            # `clamp` brick-walls at the chosen ceiling. We used to prefer
-            # the `fast_lookahead_limiter_1913` LADSPA plugin here, but it's
-            # a stereo plugin whose audio ports (`Input L/R`, `Output L/R`)
-            # don't match the `:In`/`:Out` aliases the rest of the chain
-            # uses, so PipeWire's filter-chain ended up exposing dangling
-            # ports that WirePlumber then auto-routed onto the user's
-            # default output — surfacing as a phantom self-monitor on the
-            # headphones that bypassed every WaveLinux fader. The builtins
-            # are mono-native, integrate cleanly into the unified graph,
-            # and do exactly what Clipguard needs: stop the signal from
-            # clipping. We give up soft-knee / release behaviour for that.
+            # `linear` applies input gain, `clamp` brick-walls at the ceiling.
+            # Mono-native builtins — chosen over `fast_lookahead_limiter_1913`
+            # which is a stereo LADSPA plugin and surfaced a phantom
+            # self-monitor via WirePlumber auto-routing in this graph.
             ceiling_db = float(values.get('Limit (dB)', -1.0))
             input_db   = float(values.get('Input gain (dB)', 0.0))
             ceiling = max(0.0001, min(1.0, 10 ** (ceiling_db / 20.0)))
@@ -2443,13 +2234,10 @@ context.modules = [
         return None
 
     def apply_effect(self, channel_key, effect_id, params=None):
-        """Apply a single effect via filter-chain. Used by the master-bus
-        clipguard (limiter on the Stream mix). For per-channel mic effects,
-        prefer `set_channel_fx` — it builds a real chain and routes the mic
-        through it, where this just spawns a free-floating filter-chain."""
-        # rnnoise keeps its dedicated config path because the original
-        # codebase shipped it as the default mic effect — keeping the file
-        # name predictable means stale configs from prior runs don't pile up.
+        """Spawn a single-effect filter-chain in isolation. Per-channel
+        mic effects should go through `set_channel_fx` instead — that
+        actually routes the mic through the chain. This is just a
+        free-floating filter-chain."""
         if effect_id == 'rnnoise':
             return self.start_rnnoise(channel_key, params=params)
 
@@ -2500,20 +2288,14 @@ context.modules = [
 
     # ── Chain API (per-channel FX bus) ─────────────────────────────
     #
-    # The legacy apply_effect / remove_effect / is_effect_active functions
-    # spawn a free-floating filter-chain that processes audio it never
-    # actually sees. The chain API below replaces that with a real bus:
-    # each enabled effect is its own filter-chain process exposing both
-    # an Audio/Sink (its input) and an Audio/Source (its output). We wire
-    # the chain together with explicit `module-loopback` modules — same
-    # mechanism we use for submix routing — so the mic feeds stage 0's
-    # sink, stage N's source feeds stage N+1's sink, and the final
-    # stage's source is what the submix loopbacks pull from. That last
-    # link is what makes the effects audible: without it the chain runs
-    # but processes nothing.
+    # `set_channel_fx` builds ONE `pipewire -c` filter-chain process per
+    # channel, with every enabled effect as a node in a single
+    # `filter.graph` block. The chain's input sink takes audio from the
+    # mic via a `module-loopback`; the submix loopbacks pull from the
+    # chain's output source.
 
-    # Order to apply effects in the chain. Anything not in this list
-    # appears at the end in user-specified order.
+    # Canonical signal-flow order. Effects toggled on are sorted into
+    # this order regardless of how the user enabled them.
     _CHAIN_ORDER = ('rnnoise', 'highpass', 'eq', 'compressor', 'gate', 'limiter')
 
     @classmethod
@@ -2532,43 +2314,22 @@ context.modules = [
 
     # ── Unified per-channel filter-chain ──────────────────────────────
     #
-    # Architectural credit: this layout is inspired by EasyEffects
-    # (https://github.com/wwmm/easyeffects, GPL-3.0). EasyEffects uses
-    # `pw_filter` C bindings directly so it can build a single processing
-    # graph with N plugins; we can't reach pw_filter from Python without a
-    # native binding, so the equivalent we can reach is one
-    # `libpipewire-module-filter-chain` config that lists every effect as
-    # a node in one `filter.graph` block with explicit `links`. The user-
-    # visible result is the same: ONE virtual sink and ONE virtual source
-    # per channel, no matter how many effects are enabled. Reference for
-    # filter-chain syntax: https://docs.pipewire.org/page_module_filter_chain.html .
-    #
-    # Pre-rewrite this engine spawned one `pipewire -c` process per effect
-    # plus one `module-loopback` per inter-stage link. With three effects
-    # on a single mic that meant 3 pipewire processes, 3 virtual sinks, 3
-    # virtual sources, 3 inter-stage loopbacks, and 1 submix loopback —
-    # all to do work that fits inside one filter graph.
+    # Layout inspired by EasyEffects (GPL-3.0,
+    # https://github.com/wwmm/easyeffects). PipeWire reference:
+    # https://docs.pipewire.org/page_module_filter_chain.html
 
     def _effect_stage_blocks(self, effect_id, values, stage_idx):
-        """Return the building blocks needed to splice one effect into the
-        unified per-channel filter-chain.
+        """Building blocks for one effect inside the unified chain.
 
-        Effects can have more than one internal node (the 3-Band EQ is a
-        low-shelf → mid-peaking → high-shelf chain of biquads, for
-        example), so each stage namespaces its node names with a
-        `s<idx>_` prefix to avoid collisions when several effects are
-        stacked in the same graph.
-
-        Returns (nodes_text, internal_links, entry_port, exit_port) or
-        (None, None, None, None) for unknown / unavailable effects."""
+        Returns (nodes_text, internal_links, exit_port, entry_port) or
+        (None, None, None, None) for unknown / unavailable effects.
+        Multi-node effects (e.g. the 3-band EQ) namespace internal node
+        names with an `s<idx>_` prefix to avoid collisions across stages."""
         prefix = f's{stage_idx}_'
 
         if effect_id == 'rnnoise':
-            # Audio port names come from the LADSPA descriptor verbatim
-            # (PipeWire's filter-graph does an exact `spa_streq` match —
-            # no `:In`/`:Out` aliasing for LADSPA, only for builtins).
-            # noise_suppressor_mono's audio ports are literally "Input"
-            # and "Output".
+            # LADSPA port names are matched exactly by filter-graph;
+            # noise_suppressor_mono exposes "Input" / "Output".
             path = self.ladspa_plugin_path('librnnoise_ladspa') or 'librnnoise_ladspa'
             name = f'{prefix}rnnoise'
             nodes = f"""
@@ -2632,13 +2393,9 @@ context.modules = [
             return nodes, internal, f'{high}:Out', f'{low}:In'
 
         if effect_id == 'compressor':
-            # Use the MONO sc4m variant (id 1916) — sc4_1882 is stereo,
-            # which trips the same auto-route-to-headphones bug the
-            # limiter used to have. swh-plugins ships both. Audio ports
-            # on sc4m are "Input"/"Output". The LADSPA control names are
-            # the verbose human-readable strings from the descriptor —
-            # `_EFFECT_PARAMS['compressor']` keys are kept identical so
-            # `_render_control_block` emits the right names.
+            # Mono sc4m (id 1916). The stereo sc4_1882 trips the same
+            # auto-route-to-headphones bug the limiter used to have.
+            # Audio ports on sc4m: "Input" / "Output".
             path = self.ladspa_plugin_path('sc4m_1916') or 'sc4m_1916'
             name = f'{prefix}compressor'
             nodes = f"""
@@ -2667,19 +2424,11 @@ context.modules = [
             return nodes, [], f'{name}:Output', f'{name}:Input'
 
         if effect_id == 'limiter':
-            # Wave Link's "Clipguard" name maps onto this effect; per the
-            # user request it now lives per-mic instead of on the master
-            # bus. Implemented as a mono builtin pair — `linear` for the
-            # input-gain parameter, `clamp` for the ceiling. We used to
-            # prefer the `fast_lookahead_limiter_1913` LADSPA plugin here,
-            # but it's a stereo plugin whose audio ports (`Input L/R`,
-            # `Output L/R`) don't match the `:In`/`:Out` aliases the rest
-            # of the chain uses, so PipeWire's filter-chain left dangling
-            # ports that WirePlumber auto-routed onto the user's default
-            # output — a phantom self-monitor on the headphones that
-            # bypassed every WaveLinux fader. The builtins are mono-native
-            # and integrate cleanly. Trade-off: brick-wall clamp instead
-            # of true lookahead with soft knee / release.
+            # Mono builtin pair: `linear` (input gain) → `clamp` (ceiling).
+            # NOT `fast_lookahead_limiter_1913` — that's stereo and its
+            # dangling outputs got auto-routed onto the default sink as a
+            # phantom self-monitor. Trade-off: brick-wall clamp instead of
+            # lookahead+release.
             ceiling_db = float(values.get('Limit (dB)', -1.0))
             input_db = float(values.get('Input gain (dB)', 0.0))
             ceiling = max(0.0001, min(1.0, 10 ** (ceiling_db / 20.0)))
@@ -2705,14 +2454,10 @@ context.modules = [
         return None, None, None, None
 
     def _build_unified_chain_config(self, safe_key, ordered_effects, params_map):
-        """Write ONE filter-chain config that contains every enabled
-        effect as a node in a single `filter.graph` and explicit `links`
-        that wire the stages together. Spawned as ONE `pipewire -c`
-        process. Returns (config_path, sink_name, source_name) on success
-        or (None, None, None) if no effect was renderable.
-
-        See the architecture credit comment above _effect_stage_blocks
-        for the EasyEffects / PipeWire references."""
+        """Write the filter-chain config combining all enabled effects in
+        one `filter.graph` with explicit inter-stage `links`. Returns
+        (config_path, sink_name, source_name, used_effects) or
+        (None, None, None, []) if nothing was renderable."""
         config_dir = os.path.expanduser('~/.config/pipewire')
         os.makedirs(config_dir, exist_ok=True)
 
@@ -2749,16 +2494,12 @@ context.modules = [
         nodes_block = '\n'.join(all_nodes)
         links_block = '\n                    '.join(all_links) if all_links else ''
 
-        # `node.always-process = true` keeps the chain running even when
-        # nothing is currently pulling/pushing — without it the chain can
-        # suspend during construction and the upstream loopback never
-        # sees an active sink to bind to.
-        # `audio.position = [ MONO ]` pins to one channel so a stereo
-        # plugin doesn't get spliced onto a mono mic with one half of
-        # its inputs floating.
-        # `node.virtual = true` + `priority.session = -1000` demote the
-        # chain in Plasma / GNOME / pavucontrol audio menus so the user's
-        # device picker isn't cluttered with WaveLinux plumbing.
+        # `node.always-process` prevents the chain from suspending mid-
+        # construction (which would race the upstream loopback's bind).
+        # `audio.position = [ MONO ]` keeps the chain mono so stereo
+        # plugins don't end up half-connected.
+        # `node.virtual` + `priority.session = -1000` demote these nodes
+        # in the system audio panels so they don't clutter device pickers.
         client_id = f'{safe_key}-chain'
         filter_chain_args = f"""{{
             node.description = "_WaveLinux internal: chain ({safe_key})"
@@ -2801,22 +2542,18 @@ context.modules = [
         }}"""
         config = self._fx_client_config(client_id, filter_chain_args)
         config_path = os.path.join(config_dir, f'wavelinux-chain-{safe_key}.conf')
-        # Atomic write: a partial write (disk-full, sigkill mid-write,
-        # NFS hiccup) would leave a syntactically broken config that the
-        # next `pipewire -c` spawn would refuse to load. tmp + rename is
-        # cheap insurance.
+        # Atomic write — a partial write would leave a broken config that
+        # blocks the next spawn.
         tmp_path = config_path + '.tmp'
         with open(tmp_path, 'w') as f:
             f.write(config)
         os.replace(tmp_path, config_path)
         return config_path, sink_name, source_name, used_effects
 
-    # Legacy per-stage builder kept around so any out-of-tree caller
-    # doesn't NameError on import. New chain spawns go through
-    # `_build_unified_chain_config`.
     def _build_fx_stage_config(self, safe_key, idx, effect_id, params):
-        """[Legacy] Per-stage filter-chain builder. Superseded by
-        `_build_unified_chain_config`."""
+        """Per-stage filter-chain builder. Superseded by
+        `_build_unified_chain_config` — kept so an out-of-tree import
+        doesn't NameError."""
         config_dir = os.path.expanduser('~/.config/pipewire')
         os.makedirs(config_dir, exist_ok=True)
 
@@ -2829,25 +2566,8 @@ context.modules = [
         source_name = f'wavelinux.fx.{safe_key}.{idx}.{effect_id}.source'
 
         client_id = f'{safe_key}-{idx}-{effect_id}'
-        # `node.always-process = true` forces the filter chain to run even
-        # when nothing is currently pulling on the playback side or pushing
-        # on the capture side. Without it, pipewire is free to suspend the
-        # chain until both sides have an active link — which during chain
-        # construction is briefly true and creates a chicken-and-egg with
-        # the loopback wiring (the loopback is what creates the link, but
-        # the link is what activates the chain).
-        # `audio.position = [ MONO ]` pins the channel layout to a single
-        # channel so a stereo LADSPA plugin doesn't get spliced onto a
-        # mono mic with one half of its inputs floating.
-        # `node.virtual = true` + `priority.session = -1000` together demote
-        # these nodes in user-facing audio menus (KDE Plasma's audio panel,
-        # GNOME's sound prefs, pavucontrol's "default device" picker) so
-        # they don't clutter the user's view of "real" inputs and outputs.
-        # The description prefixed with `_WaveLinux internal` makes it
-        # obvious what they are if they DO show up — KDE/GNOME don't have a
-        # strict "hide virtual nodes" toggle, so the demotion isn't 100 %
-        # invisibility, but it pushes them to the bottom of every list and
-        # labels them clearly as plumbing.
+        # See `_build_unified_chain_config` for the rationale behind
+        # always-process / mono position / virtual+priority props.
         filter_chain_args = f"""{{
             node.description = "_WaveLinux internal: {effect_id} ({safe_key}#{idx})"
             node.nick        = "_WaveLinux-{effect_id}"
@@ -2892,19 +2612,12 @@ context.modules = [
 
     def _wait_load_loopback(self, source, sink, latency_msec=20, attempts=20, delay=0.1):
         """Load a `module-loopback` from `source` to `sink`, retrying for
-        up to ~2 s while pipewire-pulse registers a freshly-spawned node.
-        Inter-stage FX wiring would race the spawn otherwise: pipewire-pulse
-        catalogues the new sink a beat after the filter-chain process comes
-        up, and a one-shot `pactl load-module` sees an unknown sink and
-        fails. Returns the loopback module id (str) or None.
+        up to ~2s while pipewire-pulse registers a freshly-spawned node.
+        Returns the loopback module id, or None on failure.
 
-        `latency_msec=20` matches the default the rest of the codebase
-        uses for submix loopbacks. Lower values (we briefly used 5) were
-        unstable on a couple of test rigs — pulse-bridge would create the
-        module successfully but the chain wouldn't actually flow audio,
-        because filter-chain's internal scheduler couldn't keep up at
-        a 5ms quantum. 20 ms is quiet enough for live monitoring (well
-        under the perception threshold for self-monitoring) and reliable."""
+        20ms latency matches the rest of the codebase. Lower (5ms) was
+        unstable on some rigs — filter-chain couldn't keep up at that
+        quantum and audio stopped flowing despite the module loading."""
         import time as _time
         for _ in range(attempts):
             out = self._run([
@@ -2922,30 +2635,21 @@ context.modules = [
         return None
 
     def set_channel_fx(self, node_name, capture_target, effects, params_map=None):
-        """Replace this channel's effect chain with a SINGLE
-        `pipewire -c` process running one unified filter-chain that
-        contains every enabled effect as a node in one `filter.graph`.
+        """Replace a channel's FX chain with one `pipewire -c` process
+        running every enabled effect in a single `filter.graph`. Returns
+        the chain's virtual source node.name, or None on failure.
 
-        Returns the chain's virtual source node.name on success, else
-        None.
-
-        - `node_name`: stable PipeWire node.name. State is keyed by this so
-          chains survive PipeWire restarts.
-        - `capture_target`: the source the chain's input should receive
-          audio from. For mics this is the mic's node.name; for virtual
-          sinks pass `f"{sink_name}.monitor"`.
-        - `effects`: effect_id list; reordered to canonical signal flow.
-        - `params_map`: {effect_id: {param_key: value}}.
-
-        Architecture credit: see the comment block above
-        `_effect_stage_blocks` (EasyEffects-inspired layout, PipeWire
-        filter-chain syntax)."""
+        - `node_name`: stable PipeWire node.name. State is keyed by this
+          so chains survive a PipeWire restart.
+        - `capture_target`: source for the chain's input. For mics, the
+          mic's node.name; for virtual sinks, `f"{sink_name}.monitor"`.
+        - `effects`: list of effect ids (reordered to canonical flow).
+        - `params_map`: {effect_id: {param_key: value}}."""
         if not node_name:
             return None
         params_map = params_map or {}
 
-        # Always reset first — makes the call idempotent and gives a clean
-        # baseline when respawning after a parameter change.
+        # Always reset first so the call is idempotent.
         self.clear_channel_fx(node_name)
 
         ordered = [fid for fid in self._ordered_chain(effects)
@@ -3009,13 +2713,9 @@ context.modules = [
         if not info:
             return False
 
-        # 1. Drop submix loopbacks whose source is part of this channel's
-        # chain — without this, route_input_to_submix would happily keep
-        # using the cached loopback (still alive in `pactl list modules`)
-        # even though its source was just unloaded, and the user gets
-        # silence on the submix until the next chain spawn re-uses the
-        # exact same source name. We can't compare by source identity
-        # cheaply, so we match the well-known FX-source prefix.
+        # 1. Drop submix loopbacks whose source belongs to this chain.
+        # Without this, route_input_to_submix keeps using a cached module
+        # whose source is gone — silence on the submix until next spawn.
         prefix = f'wavelinux.fx.{info.get("safe_key", "")}.'
         for skey in list(self.submix_sources.keys()):
             src = self.submix_sources.get(skey, '')
@@ -3069,23 +2769,15 @@ context.modules = [
         return list(info.get('effects', [])) if info else []
 
     def fx_chain_status(self, node_name):
-        """Diagnostic snapshot of a channel's FX chain. Returns a dict of
+        """Diagnostic snapshot of a channel's FX chain. Returns
         `{effect_id: {'state': 'running' | 'failed' | 'inactive',
                       'log': <path or None>}}`.
 
-        - 'running'  = the stage's filter-chain process is alive AND its
-                       inbound module-loopback exists.
-        - 'failed'   = we attempted to spawn it but the process died, OR
-                       the inbound loopback couldn't be created. The log
-                       path points at the per-stage spawn log so the UI
-                       can offer a "click to inspect" hint.
-        - 'inactive' = the user never enabled this effect (or it was
-                       cleared). No log to show.
+        - 'running'  = stage process alive and loopback exists.
+        - 'failed'   = spawn attempted but the process died.
+        - 'inactive' = effect never enabled (or cleared).
 
-        Used by the FX dialog to show a red border + tooltip on toggles
-        whose chain didn't actually come up — without that, a failed
-        spawn is invisible and the user understandably thinks the
-        feature is broken when it's really just missing a plugin."""
+        The FX dialog uses this to red-border failed toggles."""
         out = {}
         info = self.channel_fx.get(node_name) or {}
         live_effects = list(info.get('effects', []))
@@ -3159,26 +2851,18 @@ context.modules = [
     # ── Cleanup ────────────────────────────────────────────────────
 
     def cleanup(self):
-        """Hard cleanup of all wavelinux PipeWire modules."""
-        # Restore the BT auto-switch knob first. It's volatile state on
-        # WirePlumber so it will reset itself when the user's wireplumber
-        # restarts anyway, but flipping it back here makes the moment
-        # WaveLinux exits the moment any other app's HSP/HFP behaviour
-        # returns to normal — no need to log out and back in.
+        """Hard cleanup of all WaveLinux PipeWire modules."""
+        # Restore BT auto-switch first so other apps' HSP/HFP behaviour
+        # returns to normal the moment WaveLinux exits.
         try:
             self.unlock_bluetooth_autoswitch()
         except AttributeError:
-            # Older builds or a partially-initialised engine that aborted
-            # before lock_bluetooth_to_a2dp ran — nothing to restore.
             pass
-        # Tear down channel chains first so their stage processes go away
-        # cleanly (they're tracked in rnnoise_processes too — clear_channel_fx
-        # routes through stop_rnnoise — but doing them via the chain API
-        # also frees the channel_fx state).
+        # Tear down channel chains via the chain API so channel_fx state
+        # gets freed too.
         for nname in list(self.channel_fx.keys()):
             self.clear_channel_fx(nname)
-        # Anything still parked in rnnoise_processes (legacy single-effect
-        # spawns, master-bus clipguard) gets the same treatment.
+        # Anything else parked in rnnoise_processes.
         for key in list(self.rnnoise_processes.keys()):
             self.stop_rnnoise(key)
 
