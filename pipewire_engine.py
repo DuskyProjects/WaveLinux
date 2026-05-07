@@ -279,6 +279,55 @@ class PipeWireEngine:
         combo with the same mic the rest of the user's apps default to."""
         return self._run(['pactl', 'get-default-source'])
 
+    def set_default_source(self, source_name):
+        """Set the system default capture source. Apps that follow the
+        default mic (Discord, Zoom, browsers via getUserMedia) start
+        recording from `source_name` after this call without changing
+        their own settings. Returns True on success."""
+        if not source_name:
+            return False
+        return self._run(['pactl', 'set-default-source', source_name]) is not None
+
+    def _source_id_to_name(self):
+        """Build {source_id: source_name} from `pactl list short sources`."""
+        out = self._run(['pactl', 'list', 'short', 'sources'])
+        mapping = {}
+        if not out:
+            return mapping
+        for line in out.splitlines():
+            parts = line.split('\t')
+            if len(parts) >= 2 and parts[0].strip().isdigit():
+                mapping[parts[0].strip()] = parts[1].strip()
+        return mapping
+
+    def _list_source_outputs_on(self, source_name):
+        """Return [source_output_id, ...] for streams currently capturing
+        from `source_name`. Uses `pactl list short source-outputs`, where
+        column 3 is the numeric source id, then resolves to name."""
+        out = self._run(['pactl', 'list', 'short', 'source-outputs'])
+        if not out:
+            return []
+        id_to_name = self._source_id_to_name()
+        ids = []
+        for line in out.splitlines():
+            parts = line.split('\t')
+            if len(parts) < 3:
+                continue
+            so_id = parts[0].strip()
+            src_id = parts[2].strip()
+            if id_to_name.get(src_id) == source_name:
+                ids.append(so_id)
+        return ids
+
+    def _move_source_outputs(self, from_source, to_source):
+        """Move every source-output currently capturing from `from_source`
+        onto `to_source`. No-op if either is missing or the lookup
+        returns nothing."""
+        if not from_source or not to_source or from_source == to_source:
+            return
+        for sid in self._list_source_outputs_on(from_source):
+            self._run(['pactl', 'move-source-output', sid, to_source])
+
     # ── Per-refresh snapshot ───────────────────────────────────────
 
     # Minimum age (seconds) below which a fresh snapshot request just hands
@@ -530,16 +579,26 @@ class PipeWireEngine:
     def get_all_nodes(self, snap=None):
         return snap.nodes if snap else self._parse_nodes()
 
+    @staticmethod
+    def _is_internal_node_name(name):
+        # Internal plumbing uses both `wavelinux_` (underscore, for sinks
+        # we create via pactl) and `wavelinux.` (dot, for filter-chain
+        # virtual nodes spawned by `pipewire -c`). Both must be hidden
+        # from device pickers, otherwise the FX chain's own input/output
+        # surfaces in the mic / output dropdowns.
+        return (name.startswith('wavelinux_')
+                or name.startswith('wavelinux.'))
+
     def get_hardware_outputs(self, snap=None):
         return [n for n in self.get_all_nodes(snap)
                 if n.media_class == 'Audio/Sink'
-                and not n.name.startswith('wavelinux_')]
+                and not self._is_internal_node_name(n.name)]
 
     def get_hardware_inputs(self, snap=None):
         return [n for n in self.get_all_nodes(snap)
                 if n.media_class == 'Audio/Source'
                 and 'rnnoise' not in n.name.lower()
-                and not n.name.startswith('wavelinux_')]
+                and not self._is_internal_node_name(n.name)]
 
     def get_virtual_sinks(self, snap=None):
         """User-created WaveLinux channels only (no internal mix/source sinks)."""
@@ -2816,6 +2875,21 @@ context.modules = [
             self.stop_rnnoise(proc_key)
             return None
 
+        # Promote the FX virtual source to default + drag existing capture
+        # streams onto it. Without this, apps reading the raw mic (Discord,
+        # Zoom, OBS-via-mic-picker) bypass the chain entirely and still
+        # hear ambient noise. `prev_default` is captured BEFORE we flip so
+        # teardown can restore exactly what the user had.
+        prev_default = None
+        if capture_target and not capture_target.endswith('.monitor'):
+            current_default = self.get_default_source()
+            # Don't overwrite a save from another channel's chain — only
+            # the first chain captures the user-facing default.
+            if current_default and current_default != source_name:
+                prev_default = current_default
+            self.set_default_source(source_name)
+            self._move_source_outputs(capture_target, source_name)
+
         self.channel_fx[node_name] = {
             'effects':   list(used_effects),
             'params':    {fid: dict(params_map.get(fid, {}))
@@ -2825,6 +2899,7 @@ context.modules = [
             'source':    source_name,
             'capture_target': capture_target,
             'safe_key':  safe_key,
+            'prev_default': prev_default,
         }
         # We just changed pactl's view of the world — drop the cache so the
         # next refresh tick observes the new chain without waiting up to
@@ -2842,6 +2917,19 @@ context.modules = [
         info = self.channel_fx.pop(node_name, None)
         if not info:
             return False
+
+        # 0. Restore the default source and move active capture streams
+        # off the FX source BEFORE we kill it. Otherwise apps recording
+        # via the chain glitch on a vanishing source instead of a clean
+        # handover back to the raw mic.
+        fx_source = info.get('source')
+        capture_target = info.get('capture_target') or ''
+        prev_default = info.get('prev_default')
+        if fx_source and capture_target and not capture_target.endswith('.monitor'):
+            current_default = self.get_default_source()
+            if current_default == fx_source:
+                self.set_default_source(prev_default or capture_target)
+            self._move_source_outputs(fx_source, capture_target)
 
         # 1. Drop submix loopbacks whose source belongs to this chain.
         # Without this, route_input_to_submix keeps using a cached module
