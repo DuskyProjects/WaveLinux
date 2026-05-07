@@ -2024,11 +2024,13 @@ class WaveLinuxWindow(QMainWindow):
                 if app_name not in apps_by_name:
                     apps_by_name[app_name] = []
                 idx = app.get('index')
+                # An app is "live" as long as it appears in the detection
+                # results, even if the pactl index hasn't materialised yet
+                # (pw-dump sees it first, pactl entry follows on the next
+                # event). Always update last_seen so the row doesn't vanish.
+                self.app_last_seen[app_name] = now
                 if idx:
                     apps_by_name[app_name].append(idx)
-                    # Touch the last-seen stamp so this app's saved routing
-                    # survives another prune cycle.
-                    self.app_last_seen[app_name] = now
                     # Apply persistent routing immediately if new instance
                     preferred_sink = self.app_routing.get(app_name)
                     if preferred_sink and app.get('sink') != preferred_sink:
@@ -2095,6 +2097,11 @@ class WaveLinuxWindow(QMainWindow):
                     self.app_widgets[name].setParent(None)
                     self.app_widgets[name].deleteLater()
                     del self.app_widgets[name]
+
+            # Tell the scroll area's inner widget to recalculate its height
+            # so newly-added rows are immediately visible.
+            self.routing_container.updateGeometry()
+            self.routing_container.adjustSize()
 
             # 3. Monitor output dropdown (Stream is fixed to virtual).
             # Use the Description field so BT sinks show real model names
