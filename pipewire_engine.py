@@ -609,8 +609,11 @@ class PipeWireEngine:
                 and not n.name.startswith('wavelinux_src_')]
 
     def get_app_streams(self, snap=None):
+        # Accept any media.class that starts with Stream/Output/Audio to
+        # catch variants like Stream/Output/Audio:Playback used by some
+        # PipeWire builds and Chromium-family apps (Brave, Ferdium, etc.).
         return [n for n in self.get_all_nodes(snap)
-                if n.media_class == 'Stream/Output/Audio']
+                if n.media_class.startswith('Stream/Output/Audio')]
 
     # ── Volume & Mute ──────────────────────────────────────────────
 
@@ -1173,13 +1176,19 @@ class PipeWireEngine:
             pw_id_str = str(node.pw_id)
             seen_pw_ids.add(pw_id_str)
 
-            # Merge: start from the full pw-dump props dict, then overlay the
-            # text-parsed pactl properties (same source, but text parsing may
-            # capture fields the props dict misses and vice-versa).
+            # Merge: pw-dump JSON is authoritative for identity props
+            # (application.name, node.description, pid, …). pactl text adds
+            # pactl-only fields (sink index, sink id) and fills in any prop
+            # that pw-dump didn't carry — but must NOT overwrite a good
+            # pw-dump value with a blank/wrong one from the text parser.
             pactl = by_node_id.get(pw_id_str, {})
-            current = dict(node.props)          # pw-dump JSON props
-            current.update({k: v for k, v in pactl.items()
-                            if k not in ('_index', '_sink_id')})
+            current = dict(node.props)          # pw-dump JSON props (authoritative)
+            for k, v in pactl.items():
+                if k in ('_index', '_sink_id'):
+                    continue
+                # Only let pactl fill gaps; don't clobber non-empty pw-dump values.
+                if v and not current.get(k):
+                    current[k] = v
 
             # Ensure the convenience aliases used by _process_sink_input are set.
             current.setdefault('node.name', node.name)
@@ -1244,6 +1253,11 @@ class PipeWireEngine:
         "org.mozilla.thunderbird": "Thunderbird",
         "com.google.chrome": "Chrome",
         "com.brave.browser": "Brave",
+        "com.brave.browser.beta": "Brave Beta",
+        "com.brave.browser.nightly": "Brave Nightly",
+        "com.brave.browser.origin": "Brave Origin Beta",
+        "io.ferdium.ferdium": "Ferdium",
+        "org.ferdium.ferdium": "Ferdium",
         "org.telegram.desktop": "Telegram",
         "com.slack.slack": "Slack",
         "us.zoom.zoom": "Zoom",
@@ -1600,9 +1614,30 @@ class PipeWireEngine:
         if cmdline:
             candidates.append(os.path.basename(cmdline[0]).lower())
         for c in candidates:
+            # Binary display table wins over .desktop lookup for well-known
+            # browser/Electron apps whose renderer comm matches the main binary.
+            if c in self._BINARY_DISPLAY_NAMES:
+                return self._BINARY_DISPLAY_NAMES[c]
             if c in index:
                 return index[c]
         return None
+
+    # Chromium-renderer and Electron-renderer processes report the parent
+    # binary name as comm. Map the binary stem directly to a display name
+    # so we don't surface raw comm strings like "brave-browser" in the UI.
+    _BINARY_DISPLAY_NAMES = {
+        "brave": "Brave",
+        "brave-browser": "Brave",
+        "brave-browser-stable": "Brave",
+        "brave-browser-beta": "Brave Beta",
+        "brave-browser-nightly": "Brave Nightly",
+        # Origin (unstable) channel used on CachyOS.
+        "brave-browser-origin": "Brave Origin Beta",
+        "brave-origin": "Brave Origin Beta",
+        "ferdium": "Ferdium",
+        "ferdi": "Ferdi",
+        "hamsket": "Hamsket",
+    }
 
     def _app_name_from_pid(self, pid):
         """Best-effort process-name lookup, skipping wrapper binaries."""
@@ -1615,7 +1650,12 @@ class PipeWireEngine:
             comm = ""
         wrapper_set = {"bwrap", "flatpak", "snap", "snap-confine", "bash", "sh",
                        "python", "python3", "wine", "wine64", "wineserver"}
-        if comm and comm.lower() not in wrapper_set:
+        comm_lower = comm.lower() if comm else ''
+        # Check binary display names first so e.g. "brave-browser" → "Brave"
+        # without going through title-case heuristics.
+        if comm_lower in self._BINARY_DISPLAY_NAMES:
+            return self._BINARY_DISPLAY_NAMES[comm_lower]
+        if comm and comm_lower not in wrapper_set:
             return comm
         # Walk up the ppid chain for a non-wrapper parent.
         seen = set()
@@ -1638,7 +1678,10 @@ class PipeWireEngine:
                     parent_comm = f.read().strip()
             except OSError:
                 return comm or None
-            if parent_comm and parent_comm.lower() not in wrapper_set:
+            parent_lower = parent_comm.lower()
+            if parent_lower in self._BINARY_DISPLAY_NAMES:
+                return self._BINARY_DISPLAY_NAMES[parent_lower]
+            if parent_comm and parent_lower not in wrapper_set:
                 return parent_comm
             cur = ppid
         return comm or None
@@ -1729,10 +1772,15 @@ class PipeWireEngine:
                     break
 
         if not name:
-            # Absolute last resort: distinguish multiple unidentifiable streams
-            # by their PW node.id so they get separate rows instead of all
-            # collapsing into one "Audio Src" entry.
-            node_id = current.get('node.id') or current.get('index', '?')
+            # Last resort: use the PW node ID to distinguish multiple
+            # unidentifiable streams. Skip entirely if we have no stable
+            # ID — that means we raced pw-dump vs pactl and neither had
+            # the entry yet; the stream will be picked up on the next tick
+            # with a real id. Skipping prevents the un-removable
+            # "Media Stream #None" phantom entries.
+            node_id = current.get('node.id') or current.get('index')
+            if not node_id:
+                return
             name = f"Media Stream #{node_id}"
 
         # Strip common reverse-dns prefixes (org.mozilla.firefox → firefox)
