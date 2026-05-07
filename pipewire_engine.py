@@ -1643,8 +1643,10 @@ class PipeWireEngine:
             raw_app_name,
             current.get('snap.name'),
             current.get('application.display_name'),
+            current.get('node.description'),         # often the real display name
             current.get('application.process.binary'),
             current.get('binary'),
+            current.get('node.name'),                # lower priority; filtered below
         ]
         name = next((c for c in candidates if c and c.strip()
                      and c.lower() not in self._GENERIC_APP_NAMES), None)
@@ -1657,8 +1659,22 @@ class PipeWireEngine:
                 inferred = self._infer_name_from_exe(pid, proc_name)
                 name = inferred or proc_name
 
+        if not name or name.lower() in self._GENERIC_APP_NAMES:
+            # Walk node.description → node.name → media.name, skipping any
+            # value that is itself a known-generic token so we don't surface
+            # "audio-src" as "Audio Src".
+            for fb_key in ('node.description', 'node.name', 'media.name'):
+                fb = (current.get(fb_key) or '').strip()
+                if fb and fb.lower() not in self._GENERIC_APP_NAMES:
+                    name = fb
+                    break
+
         if not name:
-            name = current.get('node.name') or current.get('media.name') or f"App #{current.get('index', '?')}"
+            # Absolute last resort: distinguish multiple unidentifiable streams
+            # by their PW node.id so they get separate rows instead of all
+            # collapsing into one "Audio Src" entry.
+            node_id = current.get('node.id') or current.get('index', '?')
+            name = f"Media Stream #{node_id}"
 
         # Strip common reverse-dns prefixes (org.mozilla.firefox → firefox)
         if '.' in name and ' ' not in name and len(name.split('.')) >= 2:
