@@ -1721,16 +1721,23 @@ class WaveLinuxWindow(QMainWindow):
             self._rescale_strips()
         return super().eventFilter(obj, event)
 
+    # Approximate fixed-height overhead in a strip (icon row, name label,
+    # peak bar, link row, MON/STR labels, %, mute buttons, margins/spacing)
+    # — everything that isn't the slider. Used to back-compute how much
+    # vertical room is left for the sliders.
+    _STRIP_VERT_OVERHEAD = 170
+
     def _rescale_strips(self):
         strips = list(self.channel_widgets.values())
         n = len(strips)
         if n == 0:
             return
-        avail = self.inputs_scroll.viewport().width()
-        spacing = self.input_layout.spacing()   # 10
+        # Horizontal sizing
+        avail_w = self.inputs_scroll.viewport().width()
+        spacing = self.input_layout.spacing()
         margins = (self.input_layout.contentsMargins().left()
                    + self.input_layout.contentsMargins().right())
-        space = avail - spacing * (n - 1) - margins
+        space = avail_w - spacing * (n - 1) - margins
         ideal_w = space // n if n > 0 else self._MAX_STRIP_W
         if ideal_w >= self._MIN_STRIP_W:
             strip_w = min(ideal_w, self._MAX_STRIP_W)
@@ -1740,8 +1747,15 @@ class WaveLinuxWindow(QMainWindow):
             strip_w = self._MIN_STRIP_W
             self.inputs_scroll.setHorizontalScrollBarPolicy(
                 Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # Slider height is the min of the width-driven cap and the
+        # height-driven cap so the strip fits in both axes before
+        # scrolling kicks in.
         t = (strip_w - self._MIN_STRIP_W) / (self._MAX_STRIP_W - self._MIN_STRIP_W)
-        slider_h = int(self._MIN_SLIDER_H + t * (self._MAX_SLIDER_H - self._MIN_SLIDER_H))
+        slider_h_w = int(self._MIN_SLIDER_H + t * (self._MAX_SLIDER_H - self._MIN_SLIDER_H))
+        avail_h = self.inputs_scroll.viewport().height()
+        slider_h_h = avail_h - self._STRIP_VERT_OVERHEAD
+        slider_h = max(self._MIN_SLIDER_H,
+                       min(self._MAX_SLIDER_H, slider_h_w, slider_h_h))
         for strip in strips:
             strip.apply_scale(strip_w, slider_h)
 
