@@ -1162,14 +1162,48 @@ class PipeWireEngine:
         return entries
 
     # Known-generic names that should trigger a deeper lookup instead of being displayed.
+    # Compared via _is_generic_name(), which normalizes hyphens/underscores/dots
+    # to spaces and collapses whitespace — so "audio-src", "Audio Src", and
+    # "AudioSrc" all match the single entry "audio src" below. Keep entries in
+    # the canonical normalized form (lowercase, spaces only).
     _GENERIC_APP_NAMES = {
-        "audio-src", "audio-sink", "speech-dispatcher", "unknown",
-        "libcanberra", "playback", "pipewire", "pipewire-pulse",
-        "pulseaudio", "alsa-plugins", "alsa plug-in", "alsa-plug-in",
-        "audiostreamforandroid", "application", "pw-loopback",
+        "audio src", "audio sink", "audio stream", "audio output",
+        "audiostream", "audio playback", "playback stream", "output",
+        "speech dispatcher", "unknown", "libcanberra", "playback",
+        "pipewire", "pipewire pulse", "pulseaudio", "alsa plugins",
+        "alsa plug in", "alsa plug ins", "audiostreamforandroid",
+        "audio stream for android", "application", "pw loopback", "loopback",
         # Chromium/Electron Flatpak apps often default to these:
-        "chromium", "electron", "chrome",
+        "chromium", "electron", "chrome", "chrome browser",
+        # Generic Qt / GStreamer / SDL stream names:
+        "qt", "qtmultimedia", "gstreamer", "sdl", "sdl audio", "media stream",
     }
+
+    @staticmethod
+    def _normalize_app_name(s):
+        """Canonical form for generic-name comparison: lowercase, hyphens/
+        underscores/dots → space, collapse whitespace. So "Audio-Src",
+        "audio src", and "AUDIO_SRC" all normalize to "audio src"."""
+        if not s:
+            return ''
+        s = str(s).strip().lower()
+        for ch in '-_.':
+            s = s.replace(ch, ' ')
+        return ' '.join(s.split())
+
+    def _is_generic_name(self, s):
+        """True if `s` (after normalization) is in _GENERIC_APP_NAMES, OR is
+        empty / a bare numeric stream id. Single source of truth for every
+        name-resolution fallback in _process_sink_input."""
+        norm = self._normalize_app_name(s)
+        if not norm:
+            return True
+        if norm in self._GENERIC_APP_NAMES:
+            return True
+        # Numeric-only or single-letter tokens are useless as display names.
+        if norm.isdigit() or len(norm) <= 1:
+            return True
+        return False
 
     # Reverse-DNS → friendly-name fallback for Flatpak / .desktop app IDs
     # we've seen in the wild. Wins when heuristics can't pick a good name.
@@ -1629,12 +1663,12 @@ class PipeWireEngine:
                     'application.process.host', 'application.id',
                     'application.icon_name'):
             mapped = self._canonicalize_app_id(current.get(key))
-            if mapped and mapped.lower() not in self._GENERIC_APP_NAMES:
+            if mapped and not self._is_generic_name(mapped):
                 sandbox_name = sandbox_name or mapped
                 break
 
         raw_app_name = current.get('application.name', '').strip()
-        if raw_app_name.lower() in self._GENERIC_APP_NAMES:
+        if self._is_generic_name(raw_app_name):
             raw_app_name = ''
 
         candidates = [
@@ -1648,24 +1682,24 @@ class PipeWireEngine:
             current.get('binary'),
             current.get('node.name'),                # lower priority; filtered below
         ]
-        name = next((c for c in candidates if c and c.strip()
-                     and c.lower() not in self._GENERIC_APP_NAMES), None)
+        name = next((c for c in candidates
+                     if c and not self._is_generic_name(c)), None)
 
-        if not name or name.lower() in self._GENERIC_APP_NAMES:
+        if not name:
             proc_name = self._app_name_from_pid(pid)
-            if proc_name:
+            if proc_name and not self._is_generic_name(proc_name):
                 # The bare process name might still be a wrapper (e.g. 'aces'
                 # for War Thunder) — let install-path inference upgrade it.
                 inferred = self._infer_name_from_exe(pid, proc_name)
                 name = inferred or proc_name
 
-        if not name or name.lower() in self._GENERIC_APP_NAMES:
+        if not name:
             # Walk node.description → node.name → media.name, skipping any
-            # value that is itself a known-generic token so we don't surface
-            # "audio-src" as "Audio Src".
+            # value that normalizes to a known-generic token so we don't
+            # surface "audio-src"/"Audio Src"/"AudioSrc" as a display name.
             for fb_key in ('node.description', 'node.name', 'media.name'):
                 fb = (current.get(fb_key) or '').strip()
-                if fb and fb.lower() not in self._GENERIC_APP_NAMES:
+                if fb and not self._is_generic_name(fb):
                     name = fb
                     break
 
