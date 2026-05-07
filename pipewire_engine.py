@@ -24,12 +24,13 @@ logging.basicConfig(
 
 class AudioNode:
     """Represents a PipeWire audio node."""
-    def __init__(self, pw_id, name, description, media_class, app_name=None):
+    def __init__(self, pw_id, name, description, media_class, app_name=None, props=None):
         self.pw_id = pw_id
         self.name = name
         self.description = description
         self.media_class = media_class
         self.app_name = app_name
+        self.props = props or {}
         self.volume = 1.0
         self.muted = False
 
@@ -425,6 +426,7 @@ class PipeWireEngine:
                 description=props.get('node.description', props.get('node.name', 'Unknown')),
                 media_class=mc,
                 app_name=props.get('application.name'),
+                props=props,
             ))
         return nodes
 
@@ -1044,41 +1046,119 @@ class PipeWireEngine:
 
     # ── App Routing ────────────────────────────────────────────────
 
-    def get_sink_inputs(self, snap=None):
-        sinks = self.get_all_sinks(snap=snap)
-        sink_id_to_name = {s['index']: s['name'] for s in sinks}
+    def _parse_pactl_si_map(self, text):
+        """Parse `pactl list sink-inputs` text into two lookup dicts.
 
-        out = snap.sink_inputs_text if snap else self._run(['pactl', 'list', 'sink-inputs'])
-        if not out:
-            return []
-        entries = []
+        Returns (by_node_id, by_index) where each value is a dict of all
+        raw k=v properties plus special keys '_index' (pactl sink-input
+        index string) and '_sink_id' (Sink: line value).
+
+        by_node_id is keyed by the PipeWire node.id string so it can be
+        cross-referenced against pw-dump AudioNode.pw_id values.
+        by_index is keyed by the pactl sink-input index string.
+        """
+        by_node_id = {}
+        by_index = {}
         current = {}
-        for line in out.splitlines():
-            line = line.strip()
-            if line.startswith('Sink Input #'):
-                if current:
-                    self._process_sink_input(current, entries, sink_id_to_name)
-                current = {'index': line.split('#')[1]}
-            elif line.startswith('Sink:'):
-                current['sink_id'] = line.split(':', 1)[1].strip()
-            elif '=' in line:
-                parts = line.split('=', 1)
+        current_index = None
+
+        def _flush():
+            if current_index is None:
+                return
+            entry = dict(current)
+            entry['_index'] = current_index
+            by_index[current_index] = entry
+            node_id = current.get('node.id') or current_index
+            by_node_id[str(node_id)] = entry
+
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('Sink Input #'):
+                _flush()
+                current_index = stripped.split('#', 1)[1].strip()
+                current = {}
+            elif stripped.startswith('Sink:') and current_index is not None:
+                current['_sink_id'] = stripped.split(':', 1)[1].strip()
+            elif '=' in stripped and current_index is not None:
+                parts = stripped.split('=', 1)
                 if len(parts) == 2:
                     key = parts[0].strip()
                     val = parts[1].strip().strip('"')
                     current[key] = val
-                    # Handle specific PipeWire property names
-                    if key == 'pipewire.sec.pid' or key == 'application.process.id':
+                    if key in ('pipewire.sec.pid', 'application.process.id'):
                         current['pid'] = val
-                    elif key in ['application.name', 'application.name ']:
-                        current['app_name'] = val
                     elif key == 'application.process.binary':
                         current['binary'] = val
-                    elif key == 'media.name':
-                        current['media_name'] = val
+        _flush()
+        return by_node_id, by_index
 
-        if current:
+    def get_sink_inputs(self, snap=None):
+        sinks = self.get_all_sinks(snap=snap)
+        sink_id_to_name = {s['index']: s['name'] for s in sinks}
+
+        si_text = snap.sink_inputs_text if snap else (
+            self._run(['pactl', 'list', 'sink-inputs']) or '')
+        by_node_id, by_index = self._parse_pactl_si_map(si_text)
+
+        entries = []
+        seen_pw_ids = set()
+
+        # Primary path: pw-dump Stream/Output/Audio nodes give reliable
+        # discovery even for native PipeWire clients that may not surface
+        # cleanly through the PulseAudio compat text output. Each node is
+        # enriched with the matching pactl properties (pid, binary, app IDs)
+        # via a node.id cross-reference so _process_sink_input gets the full
+        # property set it needs for name resolution.
+        stream_nodes = self.get_app_streams(snap=snap)
+        for node in stream_nodes:
+            pw_id_str = str(node.pw_id)
+            seen_pw_ids.add(pw_id_str)
+
+            # Merge: start from the full pw-dump props dict, then overlay the
+            # text-parsed pactl properties (same source, but text parsing may
+            # capture fields the props dict misses and vice-versa).
+            pactl = by_node_id.get(pw_id_str, {})
+            current = dict(node.props)          # pw-dump JSON props
+            current.update({k: v for k, v in pactl.items()
+                            if k not in ('_index', '_sink_id')})
+
+            # Ensure the convenience aliases used by _process_sink_input are set.
+            current.setdefault('node.name', node.name)
+            current.setdefault('node.description', node.description)
+            if node.app_name:
+                current.setdefault('application.name', node.app_name)
+
+            # Derive the 'pid' shorthand from whichever PW property is present.
+            if 'pid' not in current:
+                current['pid'] = (current.get('pipewire.sec.pid')
+                                  or current.get('application.process.id'))
+
+            # pactl-specific fields (index is None when pactl has no entry yet;
+            # the app will still show in the list but can't be moved yet).
+            current['index'] = pactl.get('_index')
+            sink_id = pactl.get('_sink_id')
+            current['sink_id'] = sink_id
+            current['sink'] = sink_id_to_name.get(sink_id, sink_id) if sink_id else None
+
             self._process_sink_input(current, entries, sink_id_to_name)
+
+        # Fallback path: pactl entries that have no matching pw-dump node
+        # (e.g. PulseAudio-compat streams on some PipeWire builds, or
+        # entries that appeared between pw-dump and pactl calls).
+        for node_id_str, pactl in by_node_id.items():
+            if node_id_str in seen_pw_ids:
+                continue
+            current = {k: v for k, v in pactl.items()
+                       if k not in ('_index', '_sink_id')}
+            current['index'] = pactl['_index']
+            sink_id = pactl.get('_sink_id')
+            current['sink_id'] = sink_id
+            current['sink'] = sink_id_to_name.get(sink_id, sink_id) if sink_id else None
+            if 'pid' not in current:
+                current['pid'] = (current.get('pipewire.sec.pid')
+                                  or current.get('application.process.id'))
+            self._process_sink_input(current, entries, sink_id_to_name)
+
         return entries
 
     # Known-generic names that should trigger a deeper lookup instead of being displayed.
