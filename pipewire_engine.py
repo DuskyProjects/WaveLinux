@@ -1595,9 +1595,7 @@ class PipeWireEngine:
         by looking at /proc/<pid>/exe and /proc/<pid>/comm."""
         if not pid:
             return None
-        index = self._desktop_app_index()
-        if not index:
-            return None
+        index = self._desktop_app_index() or {}
         # Try the resolved binary path first (handles `/usr/bin/spotify` →
         # 'spotify' even when comm reports something different).
         candidates = []
@@ -1620,6 +1618,8 @@ class PipeWireEngine:
         for c in candidates:
             # Binary display table wins over .desktop lookup for well-known
             # browser/Electron apps whose renderer comm matches the main binary.
+            # Run this BEFORE the empty-index short-circuit so a missing
+            # .desktop index doesn't skip the curated mappings.
             if c in self._BINARY_DISPLAY_NAMES:
                 return self._BINARY_DISPLAY_NAMES[c]
             if c in index:
@@ -1643,24 +1643,52 @@ class PipeWireEngine:
         "hamsket": "Hamsket",
     }
 
+    @staticmethod
+    def _proc_exe_basename(pid):
+        """Resolve /proc/<pid>/exe to its basename. Unlike /proc/<pid>/comm
+        this is NOT truncated to 15 chars, so it preserves long binary
+        names like 'brave-browser-origin' which comm truncates to
+        'brave-browser-o'."""
+        if not pid:
+            return ''
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return ''
+        return os.path.basename(exe) if exe else ''
+
     def _app_name_from_pid(self, pid):
-        """Best-effort process-name lookup, skipping wrapper binaries."""
+        """Best-effort process-name lookup, skipping wrapper binaries.
+
+        Tries the exe symlink first (full binary name, no comm truncation),
+        then falls back to comm and the ppid chain. Each candidate is run
+        through `_BINARY_DISPLAY_NAMES` so e.g. 'brave-browser-origin' →
+        'Brave Origin Beta' instead of leaking the raw binary name."""
         if not pid:
             return None
+        exe_base = self._proc_exe_basename(pid)
         try:
             with open(f"/proc/{pid}/comm", "r") as f:
                 comm = f.read().strip()
         except OSError:
             comm = ""
+
         wrapper_set = {"bwrap", "flatpak", "snap", "snap-confine", "bash", "sh",
                        "python", "python3", "wine", "wine64", "wineserver"}
-        comm_lower = comm.lower() if comm else ''
-        # Check binary display names first so e.g. "brave-browser" → "Brave"
-        # without going through title-case heuristics.
-        if comm_lower in self._BINARY_DISPLAY_NAMES:
-            return self._BINARY_DISPLAY_NAMES[comm_lower]
-        if comm and comm_lower not in wrapper_set:
+
+        # Try exe basename first since it's not truncated.
+        for cand in (exe_base, comm):
+            cl = cand.lower() if cand else ''
+            if cl and cl in self._BINARY_DISPLAY_NAMES:
+                return self._BINARY_DISPLAY_NAMES[cl]
+
+        # Prefer the exe basename over comm when both are non-wrapper —
+        # exe is the authoritative binary name.
+        if exe_base and exe_base.lower() not in wrapper_set:
+            return exe_base
+        if comm and comm.lower() not in wrapper_set:
             return comm
+
         # Walk up the ppid chain for a non-wrapper parent.
         seen = set()
         cur = pid
@@ -1673,22 +1701,26 @@ class PipeWireEngine:
                             ppid = line.split()[1]
                             break
             except OSError:
-                return comm or None
+                return comm or exe_base or None
             if not ppid or ppid in seen or ppid == "0":
-                return comm or None
+                return comm or exe_base or None
             seen.add(ppid)
+            parent_exe = self._proc_exe_basename(ppid)
             try:
                 with open(f"/proc/{ppid}/comm", "r") as f:
                     parent_comm = f.read().strip()
             except OSError:
-                return comm or None
-            parent_lower = parent_comm.lower()
-            if parent_lower in self._BINARY_DISPLAY_NAMES:
-                return self._BINARY_DISPLAY_NAMES[parent_lower]
-            if parent_comm and parent_lower not in wrapper_set:
+                parent_comm = ''
+            for cand in (parent_exe, parent_comm):
+                cl = cand.lower() if cand else ''
+                if cl and cl in self._BINARY_DISPLAY_NAMES:
+                    return self._BINARY_DISPLAY_NAMES[cl]
+            if parent_exe and parent_exe.lower() not in wrapper_set:
+                return parent_exe
+            if parent_comm and parent_comm.lower() not in wrapper_set:
                 return parent_comm
             cur = ppid
-        return comm or None
+        return comm or exe_base or None
 
     def _process_sink_input(self, current, entries, sink_id_to_name):
         # Resolve sink name
