@@ -1755,128 +1755,187 @@ class PipeWireEngine:
             cur = ppid
         return comm or exe_base or None
 
+    SYSTEM_SOUNDS_BUCKET = "System Sounds"
+
+    @staticmethod
+    def _is_system_sound_stream(current):
+        """Detect notification / event / alert streams. These get bucketed
+        under a single 'System Sounds' entry so the user can route every
+        ding-and-bong to one channel."""
+        media_role = (current.get('media.role') or '').lower()
+        if media_role in ('event', 'notification', 'phone-notification', 'phone',
+                          'alert', 'production'):
+            return True
+        binary = (current.get('application.process.binary') or '').lower()
+        if binary in {'canberra-gtk-play', 'canberra-gtk-module', 'paplay',
+                      'aplay', 'speaker-test', 'notify-send', 'kdialog',
+                      'kdedialog', 'plasma-pa'}:
+            return True
+        app_name = (current.get('application.name') or '').lower()
+        if app_name in {'libcanberra', 'canberra', 'plasma-pa',
+                        'speech-dispatcher', 'org.freedesktop.notifications',
+                        'plasma-pulseaudio', 'plasmashell', 'kded', 'kded5',
+                        'kded6', 'org.kde.plasmashell', 'org.kde.kded'}:
+            return True
+        node_name = (current.get('node.name') or '').lower()
+        if 'canberra' in node_name or 'notification' in node_name:
+            return True
+        return False
+
+    def _resolve_via_gio_env(self, pid):
+        """The KDE/GNOME-blessed way to identify an app from a process:
+        walk the ppid chain looking for the GIO_LAUNCHED_DESKTOP_FILE env
+        var. When set, it points at the .desktop file the user launched,
+        and its Name= field is exactly what KDE shows in the taskbar.
+        Returns the friendly name or None."""
+        if not pid:
+            return None
+        seen = set()
+        cur = str(pid)
+        for _ in range(10):
+            if cur in seen or cur in ('0', ''):
+                break
+            seen.add(cur)
+            env = self._read_proc_env(cur)
+            desktop_path = env.get("GIO_LAUNCHED_DESKTOP_FILE")
+            if desktop_path and os.path.isfile(desktop_path):
+                name, _e, _h = self._parse_desktop_file(desktop_path)
+                if name:
+                    return name
+            try:
+                with open(f"/proc/{cur}/status", "r") as f:
+                    ppid = None
+                    for line in f:
+                        if line.startswith("PPid:"):
+                            ppid = line.split()[1]
+                            break
+            except OSError:
+                return None
+            if not ppid or ppid == "0":
+                break
+            cur = ppid
+        return None
+
     def _process_sink_input(self, current, entries, sink_id_to_name):
         # Resolve sink name
         sink_id = current.get('sink_id')
         current['sink'] = sink_id_to_name.get(sink_id, sink_id)
 
-        # Filter out internal wavelinux loopbacks/effects, but NOT the apps playing to them!
-        node_name = current.get('node.name', '').lower()
-        media_name = current.get('media.name', '').lower()
-        is_internal = (
-            'wavelinux_mix' in node_name or
-            'wavelinux_src' in node_name or
-            'wavelinux.fx' in node_name or
-            'rnnoise' in node_name or
-            'loopback' in node_name or
-            'wavelinux_mix' in media_name
-        )
-        if is_internal:
+        # Drop our own internals — but never drop the apps playing to them.
+        node_name = (current.get('node.name') or '').lower()
+        media_name = (current.get('media.name') or '').lower()
+        if any(t in node_name for t in
+               ('wavelinux_mix', 'wavelinux_src', 'wavelinux.fx',
+                'rnnoise', 'loopback')):
+            return
+        if 'wavelinux_mix' in media_name:
             return
 
-        # Drop sink-inputs whose visible name is just the local host —
-        # PipeWire surfaces the hostname for system streams that have
-        # nothing better to report (speech-dispatcher, RTP receiver, etc.).
-        host = self._host_aliases()
-        if host:
-            for prop in ('application.name', 'node.description',
-                         'node.nick', 'media.name'):
-                token = self._normalize_for_host_match(current.get(prop, ''))
-                if token and token in host:
-                    return
+        # Bucket system / notification sounds under one entry.
+        if self._is_system_sound_stream(current):
+            current['app_name'] = self.SYSTEM_SOUNDS_BUCKET
+            current['_is_system_sound'] = True
+            entries.append(current)
+            return
 
-        # Sandbox-probe first: Flatpak'd apps often publish a generic
-        # `application.name` ("audio-src") while their real identity lives
-        # in FLATPAK_ID / cgroup / env.
         pid = current.get('pid') or current.get('application.process.id')
-        sandbox_name = self._identify_sandboxed_app(pid)
-        # Native apps: pull display name from their .desktop entry so e.g.
-        # AUR Spotify resolves to 'Spotify' instead of 'spotify'.
-        desktop_name = self._identify_via_desktop(pid)
 
-        # Any of these reverse-DNS-style ids gets run through the curated
-        # _KNOWN_APP_IDS table and _BINARY_DISPLAY_NAMES.
-        # application.icon_name is especially reliable for Chromium-family
-        # browsers (it's "brave-browser-origin", "google-chrome", etc.).
-        for key in ('flatpak.app_id', 'pipewire.access.portal.app_id',
-                    'application.id', 'application.icon_name'):
-            raw_val = current.get(key)
-            if not raw_val:
-                continue
-            # Check _BINARY_DISPLAY_NAMES first (handles icon names like
-            # "brave-browser-origin" → "Brave Origin Beta").
-            display = self._BINARY_DISPLAY_NAMES.get(raw_val.lower())
-            if display:
-                sandbox_name = sandbox_name or display
-                break
-            mapped = self._canonicalize_app_id(raw_val)
-            if mapped and mapped.lower() not in self._GENERIC_APP_NAMES:
-                sandbox_name = sandbox_name or mapped
-                break
+        # ── Identity chain — first match wins ───────────────────────
+        # 1. GIO_LAUNCHED_DESKTOP_FILE (KDE/GNOME): reads the launching
+        #    .desktop file straight off the process tree. Survives
+        #    Electron/Chromium renderer subprocesses.
+        name = self._resolve_via_gio_env(pid)
 
-        raw_app_name = current.get('application.name', '').strip()
-        if raw_app_name.lower() in self._GENERIC_APP_NAMES:
-            raw_app_name = ''
-        # application.process.binary: check _BINARY_DISPLAY_NAMES before
-        # using the raw string (e.g. "spotify" → "Spotify").
-        proc_binary = current.get('application.process.binary', '').strip()
-        if proc_binary:
-            proc_binary = self._BINARY_DISPLAY_NAMES.get(proc_binary.lower(), proc_binary)
+        # 2. Sandbox detection (Flatpak / Snap).
+        if not name:
+            name = self._identify_sandboxed_app(pid)
 
-        candidates = [
-            sandbox_name,
-            desktop_name,
-            raw_app_name,
-            current.get('snap.name'),
-            current.get('application.display_name'),
-            current.get('node.description'),         # often the real display name
-            proc_binary or None,
-            current.get('binary'),
-            current.get('node.name'),                # lower priority; filtered below
-        ]
-        name = next((c for c in candidates if c and c.strip()
-                     and c.lower() not in self._GENERIC_APP_NAMES), None)
-
-        if not name or name.lower() in self._GENERIC_APP_NAMES:
-            proc_name = self._app_name_from_pid(pid)
-            if proc_name:
-                # The bare process name might still be a wrapper (e.g. 'aces'
-                # for War Thunder) — let install-path inference upgrade it.
-                inferred = self._infer_name_from_exe(pid, proc_name)
-                name = inferred or proc_name
-
-        if not name or name.lower() in self._GENERIC_APP_NAMES:
-            # Walk node.description → node.name → media.name, skipping any
-            # value that is itself a known-generic token so we don't surface
-            # "audio-src" as "Audio Src".
-            for fb_key in ('node.description', 'node.name', 'media.name'):
-                fb = (current.get(fb_key) or '').strip()
-                if fb and fb.lower() not in self._GENERIC_APP_NAMES:
-                    name = fb
+        # 3. Reverse-DNS app IDs and icon names. Run each through both
+        #    the binary table (for things like "brave-browser-origin")
+        #    and the reverse-DNS canonicaliser.
+        if not name:
+            for key in ('flatpak.app_id', 'pipewire.access.portal.app_id',
+                        'application.id', 'application.icon_name'):
+                raw_val = current.get(key)
+                if not raw_val:
+                    continue
+                display = self._BINARY_DISPLAY_NAMES.get(raw_val.lower())
+                if display:
+                    name = display
+                    break
+                mapped = self._canonicalize_app_id(raw_val)
+                if mapped and mapped.lower() not in self._GENERIC_APP_NAMES:
+                    name = mapped
                     break
 
+        # 4. .desktop index lookup via PID's binary basename.
         if not name:
-            # Last resort: use the PW node ID to distinguish multiple
-            # unidentifiable streams. Skip entirely if we have no stable
-            # ID — that means we raced pw-dump vs pactl and neither had
-            # the entry yet; the stream will be picked up on the next tick
-            # with a real id. Skipping prevents the un-removable
-            # "Media Stream #None" phantom entries.
-            node_id = current.get('node.id') or current.get('index')
-            if not node_id:
-                return
-            name = f"Media Stream #{node_id}"
+            name = self._identify_via_desktop(pid)
 
-        # Strip common reverse-dns prefixes (org.mozilla.firefox → firefox)
+        # 5. application.name (skip if generic).
+        if not name:
+            raw = (current.get('application.name') or '').strip()
+            if raw and raw.lower() not in self._GENERIC_APP_NAMES:
+                name = self._BINARY_DISPLAY_NAMES.get(raw.lower(), raw)
+
+        # 6. application.process.binary.
+        if not name:
+            raw = (current.get('application.process.binary') or '').strip()
+            if raw:
+                disp = self._BINARY_DISPLAY_NAMES.get(raw.lower())
+                if disp:
+                    name = disp
+                elif raw.lower() not in self._GENERIC_APP_NAMES:
+                    name = raw
+
+        # 7. PID walk: exe basename + comm + ppid chain. Already handles
+        #    the binary table internally.
+        if not name:
+            proc_name = self._app_name_from_pid(pid)
+            if proc_name and proc_name.lower() not in self._GENERIC_APP_NAMES:
+                name = self._infer_name_from_exe(pid, proc_name) or proc_name
+
+        # 8. Direct property fallbacks. `node.description` / `node.name`
+        #    almost always contain SOMETHING for a real audio stream;
+        #    we'd rather show "Audio Output" than skip the row.
+        if not name:
+            for key in ('snap.name', 'application.display_name',
+                        'node.description', 'node.nick',
+                        'node.name', 'media.name'):
+                val = (current.get(key) or '').strip()
+                if val and val.lower() not in self._GENERIC_APP_NAMES:
+                    name = val
+                    break
+
+        # 9. Last resort: use ANY non-empty descriptor, even a generic
+        #    one. We want every sink-input on the screen so the user can
+        #    route it — silent dropping is what causes the "no app shows
+        #    up for YouTube" complaint.
+        if not name:
+            for key in ('node.description', 'node.name', 'media.name',
+                        'application.name'):
+                val = (current.get(key) or '').strip()
+                if val:
+                    name = val
+                    break
+
+        # 10. Truly nothing — give it an ID-based name so it's at least
+        #     visible. node.id is seeded from pw_id upstream so this is
+        #     always defined for streams found via pw-dump.
+        if not name:
+            node_id = current.get('node.id') or current.get('index') or '?'
+            name = f"Audio Stream #{node_id}"
+
+        # ── Cleanup ────────────────────────────────────────────────
+        # Strip reverse-DNS prefixes (org.mozilla.firefox → firefox)
         if '.' in name and ' ' not in name and len(name.split('.')) >= 2:
             name = name.rsplit('.', 1)[-1]
         name = name.replace('-', ' ').replace('_', ' ').strip()
         if name and name.islower():
             name = name.title()
 
-        # Re-check the final resolved name against host aliases — PID /
-        # .desktop / install-path resolution can also land on the hostname
-        # for system-level streams.
+        # Drop streams whose final name is literally the hostname.
+        host = self._host_aliases()
         if name and host and self._normalize_for_host_match(name) in host:
             return
 

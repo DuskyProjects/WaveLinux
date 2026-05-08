@@ -1205,10 +1205,13 @@ class AppRoutingRow(QWidget):
     def update_state(self, active_indices, sinks, current_sink):
         self._active_indices = active_indices
         is_active = len(active_indices) > 0
+        is_system = (self.app_name == "System Sounds")
 
-        # Dim if inactive
+        if is_system:
+            self.icon_lbl.setText("🔔")
         if not is_active:
-            self.name_lbl.setText(f"{self.app_name} (Offline)")
+            self.name_lbl.setText(f"{self.app_name} (Idle)" if is_system
+                                  else f"{self.app_name} (Offline)")
             self.vol_slider.setEnabled(False)
             self.vol_lbl.setStyleSheet("color: #666;")
             self.name_lbl.setStyleSheet("color: #888;")
@@ -1218,18 +1221,21 @@ class AppRoutingRow(QWidget):
             self.vol_lbl.setStyleSheet("")
             self.name_lbl.setStyleSheet("")
 
-            # Update volume from engine
             vol = self.engine.get_sink_input_volume(active_indices[0])
             self.vol_slider.blockSignals(True)
             self.vol_slider.setValue(int(vol * 100))
             self.vol_slider.blockSignals(False)
 
-        # ✕ is a hard forget — recover via Settings → Advanced.
-        self.forget_btn.setEnabled(True)
-        self.forget_btn.setToolTip(
-            "Permanently hide this app from the routing list. "
-            "Drops its saved volume / destination too."
-        )
+        # System Sounds is a permanent fixture — hide its ✕ button.
+        if is_system:
+            self.forget_btn.setVisible(False)
+        else:
+            self.forget_btn.setVisible(True)
+            self.forget_btn.setEnabled(True)
+            self.forget_btn.setToolTip(
+                "Permanently hide this app from the routing list. "
+                "Drops its saved volume / destination too."
+            )
 
         # Combo: hardware sinks + user-created WaveLinux channels (starred).
         # Internal mix/source nodes stay hidden. Rebuild only when the
@@ -1315,6 +1321,10 @@ class WaveLinuxWindow(QMainWindow):
         self.channel_order = []        # [node.name, ...] — persistent UI order
         self.meters = {}               # pw_id -> MeterWorker
         self._known_node_names = set() # for hot-plug detection
+        # Sink-input indices we've already auto-routed to a saved sink.
+        # Tracks per-stream so we don't re-fight a manual move via
+        # pavucontrol; cleared when the index disappears.
+        self._auto_routed_indices = set()
         self.config_path = os.path.expanduser("~/.config/wavelinux/config.json")
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
         
@@ -2345,22 +2355,35 @@ class WaveLinuxWindow(QMainWindow):
             # Map app_name -> list of active indices
             apps_by_name = {}
             now = int(time.time())
+
+            # Auto-route enforcement: move new sink-inputs to their saved
+            # sink exactly once per index. Tracking the index in
+            # `_auto_routed_indices` keeps us from fighting manual moves
+            # made via pavucontrol after the initial placement.
+            valid_sink_names = {s['name'] for s in all_sinks}
+            current_indices = set()
+
             for app in apps:
                 app_name = app.get('app_name') or app.get('binary') or "Unknown App"
                 if app_name not in apps_by_name:
                     apps_by_name[app_name] = []
                 idx = app.get('index')
-                # An app is "live" as long as it appears in the detection
-                # results, even if the pactl index hasn't materialised yet
-                # (pw-dump sees it first, pactl entry follows on the next
-                # event). Always update last_seen so the row doesn't vanish.
                 self.app_last_seen[app_name] = now
-                if idx:
+                if idx is not None:
                     apps_by_name[app_name].append(idx)
-                    # Apply persistent routing immediately if new instance
+                    current_indices.add(idx)
+
                     preferred_sink = self.app_routing.get(app_name)
-                    if preferred_sink and app.get('sink') != preferred_sink:
-                        self.engine.move_app_to_sink(idx, preferred_sink)
+                    if (preferred_sink
+                            and preferred_sink in valid_sink_names
+                            and idx not in self._auto_routed_indices):
+                        if app.get('sink') != preferred_sink:
+                            self.engine.move_app_to_sink(idx, preferred_sink)
+                        self._auto_routed_indices.add(idx)
+
+            # Drop tracking for indices that no longer exist so a
+            # restarted app gets re-routed on its next first sighting.
+            self._auto_routed_indices &= current_indices
 
             # Show every app we still 'remember' — currently making sound,
             # has a saved routing, OR was seen within the prune window. The
@@ -2376,6 +2399,7 @@ class WaveLinuxWindow(QMainWindow):
                 set(apps_by_name.keys())
                 | set(self.app_routing.keys())
                 | recently_seen
+                | {PipeWireEngine.SYSTEM_SOUNDS_BUCKET}
             )
             # Hard-forget blocklist: rows the user explicitly clicked ✕ on
             # never come back, even if PipeWire keeps surfacing the stream.
@@ -2798,6 +2822,10 @@ class WaveLinuxWindow(QMainWindow):
         """Drop all state for an app and add it to the persistent
         `forgotten_apps` blocklist. Recover via Settings → Advanced →
         'Restore forgotten apps' or by editing config.json."""
+        # System Sounds is a permanent built-in entry — never let it
+        # land in the blocklist, even if something calls forget on it.
+        if app_name == PipeWireEngine.SYSTEM_SOUNDS_BUCKET:
+            return
         self.app_routing.pop(app_name, None)
         self.app_last_seen.pop(app_name, None)
         self.forgotten_apps.add(app_name)
