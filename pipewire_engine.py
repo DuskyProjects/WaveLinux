@@ -133,9 +133,13 @@ class PipeWireEngine:
         # the system audio graph forever.
         self._reap_orphan_fx_processes()
 
-        self.cleanup()
-
+        # Must be set before cleanup() runs — cleanup → unlock_bluetooth_autoswitch
+        # reads this attribute. The previous order initialised it AFTER
+        # cleanup, relying on a `try/except AttributeError` swallow that
+        # would mask any real failure mode any future contributor adds
+        # to that path.
         self._bt_autoswitch_overridden = False
+        self.cleanup()
         self.lock_bluetooth_to_a2dp()
 
     @staticmethod
@@ -1111,6 +1115,17 @@ class PipeWireEngine:
             if key.startswith(mix_name + '->'):
                 self._run(['pactl', 'unload-module', str(self.loopback_modules[key])])
                 del self.loopback_modules[key]
+        # Drop submix loopbacks for this mix. Submix-loopback keys are
+        # `node_id->mix_name`, so match the suffix. Without this,
+        # set_submix_volume / set_submix_mute keep targeting a dead
+        # module id forever — there's no later code path that rebuilds
+        # them, because the mix is gone.
+        for skey in list(self.submix_loopbacks.keys()):
+            if skey.endswith(f'->{mix_name}'):
+                mod = self.submix_loopbacks.pop(skey, None)
+                self.submix_sources.pop(skey, None)
+                if mod is not None:
+                    self._run(['pactl', 'unload-module', str(mod)])
         del self.output_mixes[mix_name]
         return True
 
@@ -2014,7 +2029,7 @@ class PipeWireEngine:
                     name = display
                     break
                 mapped = self._canonicalize_app_id(raw_val)
-                if mapped and mapped.lower() not in self._GENERIC_APP_NAMES:
+                if mapped and not self._is_generic_name(mapped):
                     name = mapped
                     break
 
@@ -2025,7 +2040,7 @@ class PipeWireEngine:
         # 5. application.name (skip if generic).
         if not name:
             raw = (current.get('application.name') or '').strip()
-            if raw and raw.lower() not in self._GENERIC_APP_NAMES:
+            if raw and not self._is_generic_name(raw):
                 name = self._BINARY_DISPLAY_NAMES.get(raw.lower(), raw)
 
         # 6. application.process.binary.
@@ -2035,14 +2050,14 @@ class PipeWireEngine:
                 disp = self._BINARY_DISPLAY_NAMES.get(raw.lower())
                 if disp:
                     name = disp
-                elif raw.lower() not in self._GENERIC_APP_NAMES:
+                elif not self._is_generic_name(raw):
                     name = raw
 
         # 7. PID walk: exe basename + comm + ppid chain. Already handles
         #    the binary table internally.
         if not name:
             proc_name = self._app_name_from_pid(pid)
-            if proc_name and proc_name.lower() not in self._GENERIC_APP_NAMES:
+            if proc_name and not self._is_generic_name(proc_name):
                 name = self._infer_name_from_exe(pid, proc_name) or proc_name
 
         # 8. Direct property fallbacks. `node.description` / `node.name`
@@ -2053,7 +2068,7 @@ class PipeWireEngine:
                         'node.description', 'node.nick',
                         'node.name', 'media.name'):
                 val = (current.get(key) or '').strip()
-                if val and val.lower() not in self._GENERIC_APP_NAMES:
+                if val and not self._is_generic_name(val):
                     name = val
                     break
 
@@ -2238,7 +2253,10 @@ class PipeWireEngine:
         return cards
 
     def set_card_profile(self, card_name, profile_name):
-        return self._run(['pactl', 'set-card-profile', card_name, profile_name]) is not None or True
+        # The trailing `or True` was unconditionally turning every result
+        # into success — masking real `pactl set-card-profile` failures
+        # (e.g. unavailable profile). Return what `_run` actually says.
+        return self._run(['pactl', 'set-card-profile', card_name, profile_name]) is not None
 
     # ── Rename ─────────────────────────────────────────────────────
 
@@ -2380,6 +2398,12 @@ context.modules = [
     def start_rnnoise(self, channel_key='default', params=None):
         """Single-effect rnnoise spawn. Reachable via `apply_effect`;
         new code should go through `set_channel_fx` for proper chain routing."""
+        # If a previous spawn for this key is still alive, terminate it
+        # first — `_spawn_fx` blindly overwrites `rnnoise_processes[key]`
+        # otherwise, orphaning the old `pipewire -c` process and leaking
+        # its filter-chain virtual nodes into the audio graph.
+        if self.rnnoise_processes.get(channel_key) is not None:
+            self.stop_rnnoise(channel_key)
         config_dir = os.path.expanduser('~/.config/pipewire')
         os.makedirs(config_dir, exist_ok=True)
         config_path = os.path.join(config_dir, f'wavelinux-rnnoise-{channel_key}.conf')
@@ -2416,7 +2440,15 @@ context.modules = [
                 proc.send_signal(signal.SIGTERM)
                 proc.wait(timeout=3)
             except Exception:
+                # SIGTERM didn't take or wait timed out — force-kill and
+                # reap so we don't leak a zombie. Without this final
+                # wait(), the child sits in the kernel proc table until
+                # Popen's __del__ happens to run.
                 proc.kill()
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
             del self.rnnoise_processes[channel_key]
             return True
         return False
@@ -2767,6 +2799,10 @@ context.modules = [
         with open(config_path, 'w') as f:
             f.write(config)
         key = f'{channel_key}_{effect_id}'
+        # Same orphan-process guard as start_rnnoise — `_spawn_fx`
+        # overwrites `rnnoise_processes[key]` blindly.
+        if self.rnnoise_processes.get(key) is not None:
+            self.stop_rnnoise(key)
         return self._spawn_fx(config_path, self._fx_log_path(channel_key, effect_id), key)
 
     def remove_effect(self, channel_key, effect_id):
@@ -3368,16 +3404,27 @@ context.modules = [
         - 'failed'   = spawn attempted but the process died.
         - 'inactive' = effect never enabled (or cleared).
 
-        The FX dialog uses this to red-border failed toggles."""
+        The FX dialog uses this to red-border failed toggles. The unified
+        chain spawns ONE pipewire process for every enabled effect, so all
+        live effects share the same proc_key — index-mapping into procs
+        used to fall through to 'failed' for every effect after the first
+        because procs has only a single element."""
         out = {}
         info = self.channel_fx.get(node_name) or {}
         live_effects = list(info.get('effects', []))
         live_procs   = list(info.get('procs', []))
         safe_key     = info.get('safe_key', self._safe_channel_key(node_name))
 
+        # The unified chain has one shared backing process. Pre-resolve it
+        # once so per-effect status checks all agree on liveness instead of
+        # disagreeing because of ill-defined index → proc mapping.
+        chain_proc_key = live_procs[0] if live_procs else None
+        chain_proc = (self.rnnoise_processes.get(chain_proc_key)
+                      if chain_proc_key else None)
+        chain_alive = chain_proc is not None and chain_proc.poll() is None
+
         for eid in self.get_available_effects():
             fid = eid['id']
-            log_path = self._fx_log_path(safe_key, f'_{fid}')
             if fid not in live_effects:
                 # Either never enabled, or attempted-and-removed. We can
                 # tell apart by checking the per-stage log on disk.
@@ -3390,19 +3437,12 @@ context.modules = [
                 out[fid] = {'state': 'inactive', 'log': stage_log}
                 continue
 
-            # Stage exists in the chain. Map effect → its proc by index.
-            try:
-                idx = live_effects.index(fid)
-                proc_key = live_procs[idx]
-            except (ValueError, IndexError):
-                out[fid] = {'state': 'failed', 'log': self._fx_log_path(safe_key, f'_{fid}')}
-                continue
-            proc = self.rnnoise_processes.get(proc_key)
+            idx = live_effects.index(fid)
             stage_log = self._fx_log_path(safe_key, f'{idx}_{fid}')
-            if proc is None or proc.poll() is not None:
-                out[fid] = {'state': 'failed', 'log': stage_log}
-            else:
-                out[fid] = {'state': 'running', 'log': stage_log}
+            out[fid] = {
+                'state': 'running' if chain_alive else 'failed',
+                'log':   stage_log,
+            }
         return out
 
     def _find_module_by_arg(self, pattern, modules_text=None):

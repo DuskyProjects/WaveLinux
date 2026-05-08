@@ -374,11 +374,15 @@ class FXSelectionDialog(QDialog):
 
         # Saved intent (which toggles were last ON) so the dialog still
         # ticks them when the chain isn't currently running — the chain
-        # may have died from a PipeWire restart or stage crash.
+        # may have died from a PipeWire restart or stage crash. Keep the
+        # ORDERED list separate from the membership set: re-spawning from
+        # a set discards the user's saved chain order and may flip the
+        # canonical signal flow on rebuild.
         win = self._main_window_static(parent)
-        self._saved_effects = set(
-            (win.active_effects.get(self.node_name, []) if win else [])
+        self._saved_effects_list = list(
+            win.active_effects.get(self.node_name, []) if win else []
         )
+        self._saved_effects = set(self._saved_effects_list)
 
 
         # Background worker for spawning filter chains without blocking UI
@@ -392,10 +396,10 @@ class FXSelectionDialog(QDialog):
 
         # Re-spawn from saved state if the chain isn't running, so the
         # dialog reflects what's actually audible.
-        if self._saved_effects and not self.engine.is_channel_fx_running(self.node_name):
+        if self._saved_effects_list and not self.engine.is_channel_fx_running(self.node_name):
             params = (win.effect_params.get(self.node_name, {})
                       if win else {})
-            self._start_fx_worker(list(self._saved_effects), params)
+            self._start_fx_worker(list(self._saved_effects_list), params)
 
         # Debounce param-driven rebuilds — 150ms feels live but doesn't
         # respawn the chain on every pixel of slider drag.
@@ -629,8 +633,6 @@ class FXSelectionDialog(QDialog):
 
     def _current_params(self, effect_id):
         """Look up the parent window's saved effect params for this node."""
-        win = self.window().parent()
-        # self.window() is the dialog itself; walk through parent() to main.
         p = self.parent()
         while p is not None and not hasattr(p, 'effect_params'):
             p = p.parent()
@@ -775,10 +777,17 @@ class FXSelectionDialog(QDialog):
         else:
             win.active_effects.pop(self.node_name, None)
         # Save params for OFF effects too so re-enable resumes the tweak.
+        # Drop the per-effect dict when its slider stash is empty, and
+        # drop the whole node entry when nothing is left — the previous
+        # version's `if not stash` check ran AFTER unconditionally writing
+        # every key, so it never fired.
         if params_map:
             stash = win.effect_params.setdefault(self.node_name, {})
             for fid, vals in params_map.items():
-                stash[fid] = dict(vals)
+                if vals:
+                    stash[fid] = dict(vals)
+                else:
+                    stash.pop(fid, None)
             if not stash:
                 win.effect_params.pop(self.node_name, None)
         if hasattr(win, 'schedule_save'):
@@ -1593,15 +1602,29 @@ class WaveLinuxWindow(QMainWindow):
         self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
         self._update_progress.setVisible(False)
 
+        # Cancel any in-flight checker so we don't end up with two
+        # threads racing into the same queue.
+        prev = getattr(self, '_updater', None)
+        if prev is not None:
+            prev.cancel()
+
         app_dir = os.path.dirname(os.path.abspath(__file__))
         self._updater = UpdateChecker(app_dir=app_dir)
         self._updater.check()
         # Poll the result queue every 200 ms on the Qt thread — avoids
         # calling QTimer.singleShot from a non-Qt thread which is unreliable.
-        self._update_poll_timer = QTimer(self)
-        self._update_poll_timer.setInterval(200)
-        self._update_poll_timer.timeout.connect(self._poll_updater)
-        self._update_poll_timer.start()
+        # Reuse the existing timer instead of constructing a new one each
+        # press; otherwise a check / download / re-check sequence stacks
+        # multiple QTimers all firing the same slot.
+        timer = getattr(self, '_update_poll_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(200)
+            timer.timeout.connect(self._poll_updater)
+            self._update_poll_timer = timer
+        else:
+            timer.stop()
+        timer.start()
 
     def _poll_updater(self):
         """Drain the updater queue on the main thread."""
@@ -1697,13 +1720,24 @@ class WaveLinuxWindow(QMainWindow):
 
     def _check_for_updates_bg(self):
         """Silent background check 30 s after startup."""
+        prev = getattr(self, '_bg_updater', None)
+        if prev is not None:
+            prev.cancel()
+
         app_dir = os.path.dirname(os.path.abspath(__file__))
         self._bg_updater = UpdateChecker(app_dir=app_dir)
         self._bg_updater.check()
-        self._bg_poll_timer = QTimer(self)
-        self._bg_poll_timer.setInterval(500)
-        self._bg_poll_timer.timeout.connect(self._poll_bg_updater)
-        self._bg_poll_timer.start()
+        # Reuse the bg poll timer if one already exists rather than
+        # constructing a fresh QTimer each call.
+        timer = getattr(self, '_bg_poll_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(500)
+            timer.timeout.connect(self._poll_bg_updater)
+            self._bg_poll_timer = timer
+        else:
+            timer.stop()
+        timer.start()
 
     def _poll_bg_updater(self):
         updater = getattr(self, '_bg_updater', None)
@@ -2278,6 +2312,14 @@ class WaveLinuxWindow(QMainWindow):
                 if is_hidden and not self.show_hidden:
                     if pw_id in self.channel_widgets:
                         self.channel_widgets[pw_id].hide()
+                    # Stop the parec subprocess driving the meter on a
+                    # hidden strip — otherwise it keeps reading from the
+                    # source forever (one parec per hidden mic) and the
+                    # reaper at the end of this loop won't catch it
+                    # because pw_id is still in current_node_ids.
+                    meter = self.meters.pop(pw_id, None)
+                    if meter is not None:
+                        meter.stop()
                     continue
 
                 # First-time defaults. Mics start MUTED in Monitor so a
@@ -2531,7 +2573,16 @@ class WaveLinuxWindow(QMainWindow):
                 if not PipeWireEngine.name_matches_host(name)
             }
 
-            for app_name in all_display_apps:
+            # Iterate in a stable order so newly-created rows always land in
+            # the same position in `routing_layout`. A bare `for x in set(...)`
+            # produces hash-randomised order and visibly shuffles the list
+            # every tick a row appears or is recreated.
+            sys_bucket = PipeWireEngine.SYSTEM_SOUNDS_BUCKET
+            ordered_display_apps = sorted(
+                all_display_apps,
+                key=lambda n: (0 if n == sys_bucket else 1, n.lower()),
+            )
+            for app_name in ordered_display_apps:
                 active_indices = apps_by_name.get(app_name, [])
                 # Dropdown reflects user intent. If a saved routing
                 # exists, show it even when the live sink-input is still
@@ -3062,13 +3113,13 @@ class WaveLinuxWindow(QMainWindow):
 
     def _rekey_state(self, old_name, new_name):
         """Migrate everything keyed by node.name when a channel is renamed."""
-        for mix in ("Monitor", "Stream"):
-            k_old = f"{old_name}_{mix}"
+        # `_linked` lives in submix_state with the same `<node>_<suffix>`
+        # key shape as Monitor/Stream/gain, so it must migrate too —
+        # otherwise the Link toggle silently resets after a rename.
+        for suffix in ("Monitor", "Stream", "gain", "linked"):
+            k_old = f"{old_name}_{suffix}"
             if k_old in self.submix_state:
-                self.submix_state[f"{new_name}_{mix}"] = self.submix_state.pop(k_old)
-        k_gain_old = f"{old_name}_gain"
-        if k_gain_old in self.submix_state:
-            self.submix_state[f"{new_name}_gain"] = self.submix_state.pop(k_gain_old)
+                self.submix_state[f"{new_name}_{suffix}"] = self.submix_state.pop(k_old)
         if old_name in self.hidden_nodes:
             self.hidden_nodes.discard(old_name)
             self.hidden_nodes.add(new_name)
@@ -3077,6 +3128,10 @@ class WaveLinuxWindow(QMainWindow):
         if old_name in self.active_effects:
             self.active_effects[new_name] = self.active_effects.pop(old_name)
         self._effects_applied.discard(old_name)
+        # Force a state-resync for the renamed channel — the loopback
+        # owners refer to a sink-input ID under the new node.name and
+        # the previous mapping no longer applies.
+        self._synced_submix_owners.pop(old_name, None)
         if old_name in self.channel_order:
             i = self.channel_order.index(old_name)
             self.channel_order[i] = new_name
@@ -3120,6 +3175,17 @@ class WaveLinuxWindow(QMainWindow):
         dlg = CardProfileDialog(self.engine, self)
         dlg.exec()
 
+    def _show_notification(self, title, body):
+        """Tray bubble + log entry. Used for update-available notices and
+        any other one-shot user-visible message. No-op when no tray is
+        available, so we never crash a headless run."""
+        if self.tray is not None and self.tray.isVisible():
+            try:
+                self.tray.showMessage(title, body, self.tray_icon_obj, 3000)
+            except Exception:
+                pass
+        logging.info(f"{title}: {body}")
+
     def _notify_hotplug(self, node_names, *, added):
         """Show a tray bubble (if available) so the user knows WaveLinux saw
         a device come or go — the refresh loop already rebuilds routes, but
@@ -3133,12 +3199,7 @@ class WaveLinuxWindow(QMainWindow):
             title, body = "Device connected", f"{pretty}{suffix}"
         else:
             title, body = "Device disconnected", f"{pretty}{suffix}"
-        if self.tray is not None and self.tray.isVisible():
-            try:
-                self.tray.showMessage(title, body, self.tray_icon_obj, 3000)
-            except Exception:
-                pass
-        logging.info(f"{title}: {body}")
+        self._show_notification(title, body)
 
     def hide_node(self, node_name):
         self.hidden_nodes.add(node_name)
