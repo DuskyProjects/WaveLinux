@@ -9,6 +9,10 @@ import sys
 import os
 import re
 import time
+import tempfile
+import threading
+import urllib.request
+import urllib.error
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -23,8 +27,125 @@ from PyQt6.QtGui import QFont, QIcon, QAction
 from pipewire_engine import PipeWireEngine
 from wavelinux_theme import STYLESHEET
 
-
 import struct
+
+APP_VERSION = "1.1.0"
+_GITHUB_OWNER = "excalprimeacct-gif"
+_GITHUB_REPO  = "WaveLinux"
+_UPDATE_FILES = ["main.py", "pipewire_engine.py", "wavelinux_theme.py"]
+
+
+# ── In-app updater ───────────────────────────────────────────────
+def _parse_version(v):
+    """Return a comparable tuple from a semver string like '1.2.3' or 'v1.2.3'."""
+    v = v.lstrip('v').strip()
+    try:
+        return tuple(int(x) for x in v.split('.'))
+    except ValueError:
+        return (0,)
+
+
+class UpdateChecker:
+    """Runs version checks and downloads on a daemon thread.
+
+    All public methods fire and forget — results are delivered via
+    the callback callables supplied at construction time so the Qt
+    main thread can update the UI safely using QTimer.singleShot(0, …).
+    """
+
+    _API_URL  = (f"https://api.github.com/"
+                 f"repos/{_GITHUB_OWNER}/{_GITHUB_REPO}/releases/latest")
+    _RAW_BASE = (f"https://raw.githubusercontent.com/"
+                 f"{_GITHUB_OWNER}/{_GITHUB_REPO}")
+
+    def __init__(self, app_dir, on_result, on_progress, on_error):
+        self._app_dir    = app_dir
+        self._on_result  = on_result   # (latest_version: str, download_url_base: str) | None
+        self._on_progress = on_progress # (filename: str, bytes_done: int, bytes_total: int)
+        self._on_error   = on_error    # (message: str)
+        self._cancel     = threading.Event()
+
+    def check(self):
+        """Start a background version check. Calls on_result(tag, raw_base) or on_error."""
+        self._cancel.clear()
+        t = threading.Thread(target=self._do_check, daemon=True)
+        t.start()
+
+    def download(self, tag):
+        """Download and apply update from *tag*. Calls on_progress/on_error."""
+        self._cancel.clear()
+        t = threading.Thread(target=self._do_download, args=(tag,), daemon=True)
+        t.start()
+
+    def cancel(self):
+        self._cancel.set()
+
+    # ── internals ──────────────────────────────────────────────────
+
+    def _fetch_json(self, url):
+        req = urllib.request.Request(url, headers={"User-Agent": "WaveLinux-Updater"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+
+    def _do_check(self):
+        try:
+            data = self._fetch_json(self._API_URL)
+            tag = data.get("tag_name", "").lstrip('v')
+            if not tag:
+                self._on_error("GitHub returned no release tag.")
+                return
+            self._on_result(tag)
+        except urllib.error.URLError as e:
+            self._on_error(f"Network error: {e.reason}")
+        except Exception as e:
+            self._on_error(f"Check failed: {e}")
+
+    def _do_download(self, tag):
+        tmp_dir = tempfile.mkdtemp(prefix="wavelinux-update-")
+        try:
+            for filename in _UPDATE_FILES:
+                if self._cancel.is_set():
+                    return
+                url = f"{self._RAW_BASE}/v{tag}/{filename}"
+                dest = os.path.join(tmp_dir, filename)
+                self._download_file(url, dest, filename)
+                if self._cancel.is_set():
+                    return
+
+            # Atomic replacement — write to temp then os.replace
+            for filename in _UPDATE_FILES:
+                src  = os.path.join(tmp_dir, filename)
+                dst  = os.path.join(self._app_dir, filename)
+                if not os.path.exists(src):
+                    continue
+                bak = dst + ".bak"
+                try:
+                    if os.path.exists(dst):
+                        shutil.copy2(dst, bak)
+                    os.replace(src, dst)
+                except OSError as e:
+                    self._on_error(f"Could not replace {filename}: {e}")
+                    return
+
+            self._on_progress("__done__", 0, 0)
+        except Exception as e:
+            self._on_error(f"Download failed: {e}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _download_file(self, url, dest, filename):
+        req = urllib.request.Request(url, headers={"User-Agent": "WaveLinux-Updater"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            done  = 0
+            with open(dest, "wb") as fh:
+                while not self._cancel.is_set():
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    done += len(chunk)
+                    self._on_progress(filename, done, total)
 
 
 # ── Per-channel peak meter (VU) ───────────────────────────────────
@@ -1217,6 +1338,9 @@ class WaveLinuxWindow(QMainWindow):
         # real-time signal; this just catches missed events.
         self.refresh_timer.start(5000)
         self._start_event_subscriber()
+        self._pending_update_tag = None
+        # Silent update check 30 s after startup so it never blocks startup.
+        QTimer.singleShot(30_000, self._check_for_updates_bg)
 
     def _open_settings(self):
         self._refresh_hidden_list()
@@ -1298,6 +1422,181 @@ class WaveLinuxWindow(QMainWindow):
 
         layout.addStretch(1)
         return tab
+
+    # ── Update tab ────────────────────────────────────────────────
+
+    def _build_update_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        ver_lbl = QLabel(f"Current version: <b>{APP_VERSION}</b>")
+        ver_lbl.setStyleSheet("color: #e0e0ee; font-size: 13px;")
+        layout.addWidget(ver_lbl)
+
+        self._update_status_lbl = QLabel("Click 'Check for Updates' to see if a newer version is available.")
+        self._update_status_lbl.setWordWrap(True)
+        self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
+        layout.addWidget(self._update_status_lbl)
+
+        self._update_progress = QProgressBar()
+        self._update_progress.setRange(0, 100)
+        self._update_progress.setValue(0)
+        self._update_progress.setVisible(False)
+        self._update_progress.setTextVisible(True)
+        self._update_progress.setStyleSheet(
+            "QProgressBar { background: #1a1a2e; border: 1px solid #3a3a5c;"
+            " border-radius: 4px; color: #e0e0ee; text-align: center; }"
+            "QProgressBar::chunk { background: #00d4aa; border-radius: 3px; }"
+        )
+        layout.addWidget(self._update_progress)
+
+        btn_row = QHBoxLayout()
+        self._check_update_btn = QPushButton("Check for Updates")
+        self._check_update_btn.setObjectName("showHiddenBtn")
+        self._check_update_btn.clicked.connect(self._check_for_updates)
+        btn_row.addWidget(self._check_update_btn)
+
+        self._apply_update_btn = QPushButton("Download and Apply Update")
+        self._apply_update_btn.setObjectName("addBtn")
+        self._apply_update_btn.setVisible(False)
+        self._apply_update_btn.clicked.connect(self._download_and_apply_update)
+        btn_row.addWidget(self._apply_update_btn)
+
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        note = QLabel(
+            "Updates replace main.py, pipewire_engine.py, and wavelinux_theme.py.\n"
+            "The old files are backed up with a .bak extension.\n"
+            "A restart is required after applying an update."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #5a5a72; font-size: 11px;")
+        layout.addWidget(note)
+
+        layout.addStretch(1)
+        return tab
+
+    def _check_for_updates(self):
+        self._check_update_btn.setEnabled(False)
+        self._apply_update_btn.setVisible(False)
+        self._update_status_lbl.setText("Checking for updates…")
+        self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
+        self._update_progress.setVisible(False)
+
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        self._updater = UpdateChecker(
+            app_dir=app_dir,
+            on_result=self._on_update_check_result,
+            on_progress=self._on_update_progress,
+            on_error=self._on_update_error,
+        )
+        self._updater.check()
+
+    def _on_update_check_result(self, latest_tag):
+        def _ui():
+            self._check_update_btn.setEnabled(True)
+            current = _parse_version(APP_VERSION)
+            latest  = _parse_version(latest_tag)
+            if latest > current:
+                self._update_status_lbl.setText(
+                    f"Update available: v{latest_tag}  (current: v{APP_VERSION})"
+                )
+                self._update_status_lbl.setStyleSheet("color: #00d4aa; font-size: 12px; font-weight: bold;")
+                self._apply_update_btn.setVisible(True)
+                self._pending_update_tag = latest_tag
+                if hasattr(self, 'tray') and self.tray is not None:
+                    self._show_notification(
+                        "WaveLinux Update Available",
+                        f"Version {latest_tag} is available. Open Settings → Updates to apply.",
+                    )
+            else:
+                self._update_status_lbl.setText(f"You're up to date! (v{APP_VERSION})")
+                self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
+                self._apply_update_btn.setVisible(False)
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, _ui)
+
+    def _on_update_error(self, message):
+        def _ui():
+            self._check_update_btn.setEnabled(True)
+            self._apply_update_btn.setVisible(False)
+            self._update_progress.setVisible(False)
+            self._update_status_lbl.setText(f"Error: {message}")
+            self._update_status_lbl.setStyleSheet("color: #e05050; font-size: 12px;")
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, _ui)
+
+    def _download_and_apply_update(self):
+        tag = getattr(self, '_pending_update_tag', None)
+        if not tag:
+            return
+        self._apply_update_btn.setEnabled(False)
+        self._check_update_btn.setEnabled(False)
+        self._update_progress.setValue(0)
+        self._update_progress.setVisible(True)
+        self._update_status_lbl.setText("Downloading update…")
+        self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
+        self._updater.download(tag)
+
+    def _on_update_progress(self, filename, done, total):
+        def _ui():
+            if filename == "__done__":
+                self._update_progress.setValue(100)
+                self._update_progress.setVisible(False)
+                self._apply_update_btn.setVisible(False)
+                self._check_update_btn.setEnabled(True)
+                self._update_status_lbl.setText(
+                    "Update applied! Restart WaveLinux for the new version to take effect."
+                )
+                self._update_status_lbl.setStyleSheet("color: #00d4aa; font-size: 12px; font-weight: bold;")
+                yn = QMessageBox.question(
+                    self.settings_dialog, "Update Applied",
+                    "Update applied successfully. Restart WaveLinux now?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if yn == QMessageBox.StandardButton.Yes:
+                    self._restart_app()
+                return
+            if total > 0:
+                pct = int(done * 100 / total)
+            else:
+                pct = 0
+            self._update_progress.setValue(pct)
+            short = os.path.basename(filename)
+            self._update_status_lbl.setText(f"Downloading {short}… {pct}%")
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, _ui)
+
+    def _restart_app(self):
+        self.save_config()
+        self.engine.cleanup()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    def _check_for_updates_bg(self):
+        """Silent background check at startup — only notifies if update available."""
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+
+        def _silent_result(tag):
+            if _parse_version(tag) > _parse_version(APP_VERSION):
+                self._pending_update_tag = tag
+                def _notify():
+                    self._show_notification(
+                        "WaveLinux Update Available",
+                        f"Version {tag} is ready. Open Settings → Updates to apply.",
+                    )
+                from PyQt6.QtCore import QTimer
+                QTimer.singleShot(0, _notify)
+
+        checker = UpdateChecker(
+            app_dir=app_dir,
+            on_result=_silent_result,
+            on_progress=lambda *a: None,
+            on_error=lambda *a: None,
+        )
+        checker.check()
 
     def _refresh_advanced_tab(self):
         # Called when the dialog opens so values reflect any recent change.
@@ -1680,6 +1979,9 @@ class WaveLinuxWindow(QMainWindow):
 
         # — Advanced tab —
         tabs.addTab(self._build_advanced_tab(), "Advanced")
+
+        # — Updates tab —
+        tabs.addTab(self._build_update_tab(), "Updates")
 
         bottom_outer.addLayout(bottom_container)
 
