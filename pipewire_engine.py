@@ -1195,6 +1195,10 @@ class PipeWireEngine:
             current.setdefault('node.description', node.description)
             if node.app_name:
                 current.setdefault('application.name', node.app_name)
+            # Seed node.id from the pw-dump object id so _process_sink_input's
+            # last-resort fallback name has a stable non-None id even for native
+            # PipeWire clients that never appear in pactl list sink-inputs.
+            current.setdefault('node.id', str(node.pw_id))
 
             # Derive the 'pid' shorthand from whichever PW property is present.
             if 'pid' not in current:
