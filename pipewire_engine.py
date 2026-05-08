@@ -799,9 +799,8 @@ class PipeWireEngine:
         if initial_state is not None:
             si = self._sink_input_for_module(out)
             if si is None:
-                import time as _time
                 for _ in range(20):
-                    _time.sleep(0.005)
+                    time.sleep(0.005)
                     si = self._sink_input_for_module(out)
                     if si is not None:
                         break
@@ -1043,9 +1042,19 @@ class PipeWireEngine:
         for mid in to_drop:
             self._run(['pactl', 'unload-module', mid])
 
-        for key in list(self.submix_loopbacks.keys()):
-            if key.endswith(f"->{sink_name}"):
-                self._run(['pactl', 'unload-module', str(self.submix_loopbacks.pop(key))])
+        # Drop submix loopbacks that READ from this sink's monitor.
+        # The submix_loopbacks key format is `node_id->mix_name`, so
+        # the old `key.endswith(...)` check never matched anything;
+        # filter on the tracked source token instead.
+        monitor_token = f"{sink_name}.monitor"
+        for skey in list(self.submix_sources.keys()):
+            if self.submix_sources.get(skey) != monitor_token:
+                continue
+            mod = self.submix_loopbacks.pop(skey, None)
+            self.submix_sources.pop(skey, None)
+            self.submix_state_cache.pop(skey, None)
+            if mod is not None:
+                self._run(['pactl', 'unload-module', str(mod)])
 
         self._run(['pactl', 'unload-module', str(module_id)])
         return True
@@ -1134,7 +1143,7 @@ class PipeWireEngine:
                 ])
                 if out:
                     break
-            import time as _t; _t.sleep(0.1)
+            time.sleep(0.1)
 
         if not out:
             logging.warning(
@@ -3105,7 +3114,6 @@ context.modules = [
         20ms latency matches the rest of the codebase. Lower (5ms) was
         unstable on some rigs — filter-chain couldn't keep up at that
         quantum and audio stopped flowing despite the module loading."""
-        import time as _time
         for _ in range(attempts):
             out = self._run([
                 'pactl', 'load-module', 'module-loopback',
@@ -3118,7 +3126,7 @@ context.modules = [
                 stripped = out.strip().splitlines()[-1].strip()
                 if stripped.isdigit():
                     return stripped
-            _time.sleep(delay)
+            time.sleep(delay)
         return None
 
     def is_fx_rebuilding(self):

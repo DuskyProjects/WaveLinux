@@ -454,6 +454,15 @@ class FXSelectionDialog(QDialog):
         if self._param_timer.isActive():
             self._param_timer.stop()
             self._rebuild_chain()
+        # Closing the dialog tears down `_fx_poll`, so any 'done' the
+        # bg thread posts after this point is dropped. Kick the main
+        # window's reroute timer ourselves — its 150ms debounce
+        # combined with the engine's `is_fx_rebuilding()` gate means
+        # the next refresh fires once the chain is up, even without
+        # `_poll_fx_queue` ever firing again.
+        win = self._main_window()
+        if win is not None and hasattr(win, '_request_reroute'):
+            win._request_reroute(self.node_name)
         self.accept()
 
     # ── Card construction ──────────────────────────────────────────
