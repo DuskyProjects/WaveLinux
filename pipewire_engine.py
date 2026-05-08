@@ -300,14 +300,33 @@ class PipeWireEngine:
                 mapping[parts[0].strip()] = parts[1].strip()
         return mapping
 
-    def _list_source_outputs_on(self, source_name):
+    def _list_source_outputs_on(self, source_name, exclude_modules=None):
         """Return [source_output_id, ...] for streams currently capturing
         from `source_name`. Uses `pactl list short source-outputs`, where
-        column 3 is the numeric source id, then resolves to name."""
+        column 3 is the numeric source id, then resolves to name.
+
+        If `exclude_modules` is provided, source-outputs whose owner
+        module is in that set are skipped — this lets callers protect
+        WaveLinux's own loopbacks from being swept up in a bulk move."""
         out = self._run(['pactl', 'list', 'short', 'source-outputs'])
         if not out:
             return []
         id_to_name = self._source_id_to_name()
+
+        excluded = {str(m) for m in (exclude_modules or ()) if m is not None}
+        skip_so_ids = set()
+        if excluded:
+            full = self._run(['pactl', 'list', 'source-outputs']) or ''
+            current_so = None
+            for line in full.splitlines():
+                stripped = line.strip()
+                if stripped.startswith('Source Output #'):
+                    current_so = stripped.split('#', 1)[1].strip()
+                elif current_so and stripped.startswith('Owner Module:'):
+                    owner = stripped.split(':', 1)[1].strip()
+                    if owner in excluded:
+                        skip_so_ids.add(current_so)
+
         ids = []
         for line in out.splitlines():
             parts = line.split('\t')
@@ -315,17 +334,27 @@ class PipeWireEngine:
                 continue
             so_id = parts[0].strip()
             src_id = parts[2].strip()
+            if so_id in skip_so_ids:
+                continue
             if id_to_name.get(src_id) == source_name:
                 ids.append(so_id)
         return ids
 
-    def _move_source_outputs(self, from_source, to_source):
+    def _move_source_outputs(self, from_source, to_source, exclude_modules=None):
         """Move every source-output currently capturing from `from_source`
         onto `to_source`. No-op if either is missing or the lookup
-        returns nothing."""
+        returns nothing.
+
+        `exclude_modules` is a collection of pactl module ids whose
+        source-outputs must NOT be moved. Critically, when a channel's
+        FX chain is brought up, the chain's own upstream loopback
+        (raw_mic → chain.input) is reading from `from_source` — moving
+        it onto `to_source` (= chain.source) closes a feedback loop
+        that silences the chain entirely."""
         if not from_source or not to_source or from_source == to_source:
             return
-        for sid in self._list_source_outputs_on(from_source):
+        for sid in self._list_source_outputs_on(
+                from_source, exclude_modules=exclude_modules):
             self._run(['pactl', 'move-source-output', sid, to_source])
 
     # ── Per-refresh snapshot ───────────────────────────────────────
@@ -3070,7 +3099,10 @@ context.modules = [
         # streams onto it. Without this, apps reading the raw mic (Discord,
         # Zoom, OBS-via-mic-picker) bypass the chain entirely and still
         # hear ambient noise. `prev_default` is captured BEFORE we flip so
-        # teardown can restore exactly what the user had.
+        # teardown can restore exactly what the user had. The upstream
+        # loopback (`lb`, raw_mic → chain.input) is excluded from the
+        # move — otherwise it gets re-pointed at the chain's own output
+        # and feeds the chain into itself, killing the audio.
         prev_default = None
         if capture_target and not capture_target.endswith('.monitor'):
             current_default = self.get_default_source()
@@ -3079,7 +3111,9 @@ context.modules = [
             if current_default and current_default != source_name:
                 prev_default = current_default
             self.set_default_source(source_name)
-            self._move_source_outputs(capture_target, source_name)
+            self._move_source_outputs(
+                capture_target, source_name, exclude_modules=[lb],
+            )
 
         self.channel_fx[node_name] = {
             'effects':   list(used_effects),
@@ -3112,7 +3146,10 @@ context.modules = [
         # 0. Restore the default source and move active capture streams
         # off the FX source BEFORE we kill it. Otherwise apps recording
         # via the chain glitch on a vanishing source instead of a clean
-        # handover back to the raw mic.
+        # handover back to the raw mic. Submix loopbacks reading from
+        # the FX source are excluded — they're about to be unloaded in
+        # step 1, so dragging them onto the raw mic mid-teardown would
+        # just be a wasted route flip.
         fx_source = info.get('source')
         capture_target = info.get('capture_target') or ''
         prev_default = info.get('prev_default')
@@ -3120,7 +3157,16 @@ context.modules = [
             current_default = self.get_default_source()
             if current_default == fx_source:
                 self.set_default_source(prev_default or capture_target)
-            self._move_source_outputs(fx_source, capture_target)
+            internal_modules = list(info.get('loopbacks', []))
+            for skey in list(self.submix_sources.keys()):
+                if self.submix_sources.get(skey) == fx_source:
+                    mod = self.submix_loopbacks.get(skey)
+                    if mod is not None:
+                        internal_modules.append(mod)
+            self._move_source_outputs(
+                fx_source, capture_target,
+                exclude_modules=internal_modules,
+            )
 
         # 1. Drop submix loopbacks whose source belongs to this chain.
         # Without this, route_input_to_submix keeps using a cached module
