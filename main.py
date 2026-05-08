@@ -2193,6 +2193,15 @@ class WaveLinuxWindow(QMainWindow):
             self._event_refresh_timer.start()  # try again shortly
             return
 
+        # Defer refresh while a background FX rebuild is in flight.
+        # Otherwise we'd observe channel_fx, submix_sources, and pactl
+        # routing in a half-mutated state and unload the working submix
+        # loopback — exactly the "monitor stops outputting after FX
+        # apply" symptom.
+        if self.engine.is_fx_rebuilding():
+            self._event_refresh_timer.start()
+            return
+
         try:
             snap = self.engine.create_snapshot()
             mics = self.engine.get_hardware_inputs(snap=snap)

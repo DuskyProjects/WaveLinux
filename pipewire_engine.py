@@ -11,6 +11,7 @@ import signal
 import re
 import socket
 import time
+import threading
 import logging
 
 _LOG_PATH = os.path.expanduser("~/.config/wavelinux/wavelinux.log")
@@ -103,6 +104,17 @@ class PipeWireEngine:
         self.channel_fx = {}             # node_name -> {effects, params, procs,
                                          #               source, capture_target,
                                          #               safe_key}
+
+        # FX chain rebuilds run on a background thread so the UI stays
+        # responsive. While one is in flight the engine's view of the
+        # world (channel_fx, submix_sources, default source, pactl
+        # source-output routing) is briefly inconsistent — a refresh
+        # tick observing that mid-rebuild will unload the working
+        # submix loopback and silence audio. Callers gate on
+        # `is_fx_rebuilding()` to defer their refresh until the
+        # rebuild has stamped a coherent state.
+        self._fx_rebuild_count = 0
+        self._fx_rebuild_lock = threading.Lock()
 
         # Probe LADSPA plugins once at startup; filter-chain silently
         # fails to start if it references one that isn't installed.
@@ -3043,6 +3055,13 @@ context.modules = [
             _time.sleep(delay)
         return None
 
+    def is_fx_rebuilding(self):
+        """True while a set_channel_fx / clear_channel_fx call is in
+        flight. Refresh-tick callers consult this so they don't observe
+        the engine mid-mutation and unload the working submix loopback
+        out from under audible audio."""
+        return self._fx_rebuild_count > 0
+
     def set_channel_fx(self, node_name, capture_target, effects, params_map=None):
         """Replace a channel's FX chain with one `pipewire -c` process
         running every enabled effect in a single `filter.graph`. Returns
@@ -3054,6 +3073,17 @@ context.modules = [
           mic's node.name; for virtual sinks, `f"{sink_name}.monitor"`.
         - `effects`: list of effect ids (reordered to canonical flow).
         - `params_map`: {effect_id: {param_key: value}}."""
+        with self._fx_rebuild_lock:
+            self._fx_rebuild_count += 1
+        try:
+            return self._set_channel_fx_inner(
+                node_name, capture_target, effects, params_map,
+            )
+        finally:
+            with self._fx_rebuild_lock:
+                self._fx_rebuild_count -= 1
+
+    def _set_channel_fx_inner(self, node_name, capture_target, effects, params_map):
         if not node_name:
             return None
         params_map = params_map or {}
@@ -3114,6 +3144,17 @@ context.modules = [
             self._move_source_outputs(
                 capture_target, source_name, exclude_modules=[lb],
             )
+            # Mirror the move into our own state. _move_source_outputs has
+            # already pointed the channel's submix loopbacks at the FX
+            # source in pactl, so leaving submix_sources stale would force
+            # the next refresh tick to unload + reload them — that brief
+            # silence is exactly the "audio stops again" symptom users see
+            # right after an FX-apply tick. Limit to entries whose source
+            # is the raw mic, so other channels' submix routes are
+            # untouched.
+            for skey in list(self.submix_sources.keys()):
+                if self.submix_sources.get(skey) == capture_target:
+                    self.submix_sources[skey] = source_name
 
         self.channel_fx[node_name] = {
             'effects':   list(used_effects),
@@ -3139,17 +3180,26 @@ context.modules = [
         filter-chain stages, so we don't leave PipeWire briefly routing
         audio into a sink that's about to disappear (which can wedge
         pipewire-pulse for a beat)."""
+        with self._fx_rebuild_lock:
+            self._fx_rebuild_count += 1
+        try:
+            return self._clear_channel_fx_inner(node_name)
+        finally:
+            with self._fx_rebuild_lock:
+                self._fx_rebuild_count -= 1
+
+    def _clear_channel_fx_inner(self, node_name):
         info = self.channel_fx.pop(node_name, None)
         if not info:
             return False
 
-        # 0. Restore the default source and move active capture streams
-        # off the FX source BEFORE we kill it. Otherwise apps recording
-        # via the chain glitch on a vanishing source instead of a clean
-        # handover back to the raw mic. Submix loopbacks reading from
-        # the FX source are excluded — they're about to be unloaded in
-        # step 1, so dragging them onto the raw mic mid-teardown would
-        # just be a wasted route flip.
+        # 0. Restore the default source and re-route every source-output
+        # off the FX source BEFORE we kill it. Apps (Discord, Zoom, OBS)
+        # hand back to the raw mic; the submix loopbacks (Monitor,
+        # Stream) re-point at the raw mic too, so they stay alive across
+        # the rebuild and audio keeps flowing without an unload+reload
+        # gap. The chain.input upstream loopback is excluded — it's
+        # about to be unloaded in step 2 anyway.
         fx_source = info.get('source')
         capture_target = info.get('capture_target') or ''
         prev_default = info.get('prev_default')
@@ -3157,20 +3207,22 @@ context.modules = [
             current_default = self.get_default_source()
             if current_default == fx_source:
                 self.set_default_source(prev_default or capture_target)
-            internal_modules = list(info.get('loopbacks', []))
-            for skey in list(self.submix_sources.keys()):
-                if self.submix_sources.get(skey) == fx_source:
-                    mod = self.submix_loopbacks.get(skey)
-                    if mod is not None:
-                        internal_modules.append(mod)
             self._move_source_outputs(
                 fx_source, capture_target,
-                exclude_modules=internal_modules,
+                exclude_modules=list(info.get('loopbacks', [])),
             )
+            # Mirror the move into our own state. After this, the
+            # surviving submix loopbacks read from the raw mic, so
+            # step 1's prefix-match below leaves them alone — that's
+            # what keeps audio uninterrupted through an FX-toggle.
+            for skey in list(self.submix_sources.keys()):
+                if self.submix_sources.get(skey) == fx_source:
+                    self.submix_sources[skey] = capture_target
 
-        # 1. Drop submix loopbacks whose source belongs to this chain.
-        # Without this, route_input_to_submix keeps using a cached module
-        # whose source is gone — silence on the submix until next spawn.
+        # 1. Drop any submix loopbacks still pinned to this chain's
+        # source — virtual-sink chains skip step 0 (no default source
+        # to restore), so they reach this point with submix routes
+        # still on the chain prefix and need the cleanup.
         prefix = f'wavelinux.fx.{info.get("safe_key", "")}.'
         for skey in list(self.submix_sources.keys()):
             src = self.submix_sources.get(skey, '')
