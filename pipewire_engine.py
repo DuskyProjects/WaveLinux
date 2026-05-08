@@ -767,6 +767,13 @@ class PipeWireEngine:
                 self._run(['pactl', 'unload-module', str(known)])
             self.submix_loopbacks.pop(key, None)
             self.submix_sources.pop(key, None)
+            # Drop the cache entry too so the next loopback's initial_state
+            # push (or the caller's sync push) populates it cleanly,
+            # rather than letting `_reapply_submix_state_cache` push the
+            # old loopback's last-known state at a freshly-loaded
+            # sink-input that the user may have meant to start in a
+            # different state.
+            self.submix_state_cache.pop(key, None)
 
         existing = self._find_loopback_for(source_id, mix.sink_name, snap=snap)
         if existing:
@@ -3298,6 +3305,7 @@ context.modules = [
                 continue
             mod_id = self.submix_loopbacks.pop(skey, None)
             self.submix_sources.pop(skey, None)
+            self.submix_state_cache.pop(skey, None)
             if mod_id is not None:
                 self._run(['pactl', 'unload-module', str(mod_id)])
 
