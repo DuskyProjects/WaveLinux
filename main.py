@@ -239,71 +239,116 @@ class CardProfileDialog(QDialog):
         self.setStyleSheet(STYLESHEET)
         self._combos = []   # (card_name, combo)
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(20, 20, 20, 20)
+        self._layout = QVBoxLayout(self)
+        self._layout.setSpacing(12)
+        self._layout.setContentsMargins(20, 20, 20, 20)
 
         title = QLabel("🎛 Sound Card Profiles")
         title.setStyleSheet("font-size: 18px; font-weight: bold; color: #fff;")
-        layout.addWidget(title)
+        self._layout.addWidget(title)
 
         desc = QLabel("Pick the ALSA profile for each card — e.g. Analog Stereo "
                       "for headphones or Pro Audio for interfaces with many channels.")
         desc.setStyleSheet("color: #8b8b9e; font-size: 11px;")
         desc.setWordWrap(True)
-        layout.addWidget(desc)
+        self._layout.addWidget(desc)
 
-        cards = self.engine.list_cards()
-        if not cards:
-            empty = QLabel("No cards reported by PipeWire.")
-            empty.setStyleSheet("color: #6b6b82; padding: 24px;")
-            layout.addWidget(empty)
-        for card in cards:
-            row = QFrame()
-            row.setObjectName("fxItemFrame")
-            row.setStyleSheet(
-                "QFrame#fxItemFrame {"
-                " background: rgba(255,255,255,0.03);"
-                " border: 1px solid rgba(255,255,255,0.06);"
-                " border-radius: 10px; padding: 10px; }"
-            )
-            rlay = QVBoxLayout(row)
-            name_lbl = QLabel(card.get('description') or card['name'])
-            name_lbl.setStyleSheet("color: #e0e0ee; font-weight: bold;")
-            rlay.addWidget(name_lbl)
-            subtle = QLabel(card['name'])
-            subtle.setStyleSheet("color: #6b6b82; font-size: 10px;")
-            rlay.addWidget(subtle)
+        # Placeholder while cards load on background thread.
+        self._loading_lbl = QLabel("Loading sound cards…")
+        self._loading_lbl.setStyleSheet("color: #6b6b82; padding: 24px;")
+        self._loading_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._layout.addWidget(self._loading_lbl)
 
-            combo = QComboBox()
-            for prof in card['profiles']:
-                label = prof['description']
-                if not prof['available']:
-                    label += "  (unavailable)"
-                combo.addItem(label, prof['name'])
-                if not prof['available']:
-                    item = combo.model().item(combo.count() - 1)
-                    if item is not None:
-                        item.setEnabled(False)
-            idx = combo.findData(card['active_profile'])
-            if idx >= 0:
-                combo.setCurrentIndex(idx)
-            rlay.addWidget(combo)
-            layout.addWidget(row)
-            self._combos.append((card['name'], combo))
+        self._cards_container = QWidget()
+        self._cards_layout = QVBoxLayout(self._cards_container)
+        self._cards_layout.setContentsMargins(0, 0, 0, 0)
+        self._cards_layout.setSpacing(10)
+        self._cards_container.setVisible(False)
+        self._layout.addWidget(self._cards_container)
 
-        btns = QDialogButtonBox(
+        self._btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Close
         )
-        btns.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self._apply)
-        btns.button(QDialogButtonBox.StandardButton.Close).clicked.connect(self.accept)
-        layout.addWidget(btns)
+        self._btns.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self._apply)
+        self._btns.button(QDialogButtonBox.StandardButton.Apply).setEnabled(False)
+        self._btns.button(QDialogButtonBox.StandardButton.Close).clicked.connect(self.accept)
+        self._layout.addWidget(self._btns)
+
+        # Load cards on a background thread so __init__ doesn't block.
+        self._card_queue = queue.SimpleQueue()
+        self._card_poll = QTimer(self)
+        self._card_poll.setInterval(30)
+        self._card_poll.timeout.connect(self._poll_cards)
+        self._card_poll.start()
+        threading.Thread(target=self._load_cards_bg, daemon=True).start()
+
+    def _load_cards_bg(self):
+        try:
+            cards = self.engine.list_cards()
+            self._card_queue.put(('ok', cards))
+        except Exception as e:
+            self._card_queue.put(('error', str(e)))
+
+    def _poll_cards(self):
+        try:
+            msg = self._card_queue.get_nowait()
+        except Exception:
+            return
+        self._card_poll.stop()
+        self._loading_lbl.setVisible(False)
+
+        status, data = msg
+        if status == 'error' or not data:
+            empty = QLabel("No cards reported by PipeWire.")
+            empty.setStyleSheet("color: #6b6b82; padding: 24px;")
+            self._cards_layout.addWidget(empty)
+        else:
+            for card in data:
+                row = QFrame()
+                row.setObjectName("fxItemFrame")
+                row.setStyleSheet(
+                    "QFrame#fxItemFrame {"
+                    " background: rgba(255,255,255,0.03);"
+                    " border: 1px solid rgba(255,255,255,0.06);"
+                    " border-radius: 10px; padding: 10px; }"
+                )
+                rlay = QVBoxLayout(row)
+                name_lbl = QLabel(card.get('description') or card['name'])
+                name_lbl.setStyleSheet("color: #e0e0ee; font-weight: bold;")
+                rlay.addWidget(name_lbl)
+                subtle = QLabel(card['name'])
+                subtle.setStyleSheet("color: #6b6b82; font-size: 10px;")
+                rlay.addWidget(subtle)
+
+                combo = QComboBox()
+                for prof in card['profiles']:
+                    label = prof['description']
+                    if not prof['available']:
+                        label += "  (unavailable)"
+                    combo.addItem(label, prof['name'])
+                    if not prof['available']:
+                        item = combo.model().item(combo.count() - 1)
+                        if item is not None:
+                            item.setEnabled(False)
+                idx = combo.findData(card['active_profile'])
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                rlay.addWidget(combo)
+                self._cards_layout.addWidget(row)
+                self._combos.append((card['name'], combo))
+
+        self._cards_container.setVisible(True)
+        self._btns.button(QDialogButtonBox.StandardButton.Apply).setEnabled(bool(self._combos))
 
     def _apply(self):
         for card_name, combo in self._combos:
             target = combo.currentData()
             if target:
-                self.engine.set_card_profile(card_name, target)
+                threading.Thread(
+                    target=self.engine.set_card_profile,
+                    args=(card_name, target),
+                    daemon=True,
+                ).start()
 
 
 # ── FX Selection Dialog ───────────────────────────────────────────
@@ -335,15 +380,22 @@ class FXSelectionDialog(QDialog):
             (win.active_effects.get(self.node_name, []) if win else [])
         )
 
+
+        # Background worker for spawning filter chains without blocking UI
+        self._fx_queue = queue.SimpleQueue()
+        self._fx_poll = QTimer(self)
+        self._fx_poll.setInterval(30)
+        self._fx_poll.timeout.connect(self._poll_fx_queue)
+        self._fx_poll.start()
+        self._fx_thread = None
+        self._fx_next_job = None
+
         # Re-spawn from saved state if the chain isn't running, so the
         # dialog reflects what's actually audible.
         if self._saved_effects and not self.engine.is_channel_fx_running(self.node_name):
             params = (win.effect_params.get(self.node_name, {})
                       if win else {})
-            self.engine.set_channel_fx(
-                self.node_name, self.capture_target,
-                list(self._saved_effects), params,
-            )
+            self._start_fx_worker(list(self._saved_effects), params)
 
         # Debounce param-driven rebuilds — 150ms feels live but doesn't
         # respawn the chain on every pixel of slider drag.
@@ -623,17 +675,47 @@ class FXSelectionDialog(QDialog):
         submix loopbacks through the new bus."""
         wanted = self._active_effect_ids()
         params_map = self._all_params_map()
-        self.engine.set_channel_fx(
-            self.node_name, self.capture_target, wanted, params_map,
-        )
+        
         # Persist on the main-window state objects so a restart re-applies.
         self._save_chain_state(wanted, params_map)
+        
+        self._start_fx_worker(wanted, params_map)
+
+    def _start_fx_worker(self, wanted, params_map):
+        if self._fx_thread and self._fx_thread.is_alive():
+            self._fx_next_job = (wanted, params_map)
+            return
+            
+        self._fx_thread = threading.Thread(
+            target=self._fx_bg_worker, 
+            args=(wanted, params_map),
+            daemon=True
+        )
+        self._fx_thread.start()
+
+    def _fx_bg_worker(self, wanted, params_map):
+        self.engine.set_channel_fx(
+            self.node_name, self.capture_target, wanted, params_map
+        )
+        self._fx_queue.put('done')
+        
+    def _poll_fx_queue(self):
+        try:
+            self._fx_queue.get_nowait()
+        except Exception:
+            return
+
         # Force a routing pass so the loopbacks pick up the new source.
         win = self._main_window()
         if win is not None and hasattr(win, '_request_reroute'):
             win._request_reroute(self.node_name)
         # Failed stages get a red border + log-path tooltip.
         self._refresh_toggle_status()
+
+        if self._fx_next_job:
+            w, p = self._fx_next_job
+            self._fx_next_job = None
+            self._start_fx_worker(w, p)
 
     def _refresh_toggle_status(self):
         """Annotate each toggle with the live chain state (running /
@@ -703,7 +785,8 @@ class FXSelectionDialog(QDialog):
         btn.setText("ON" if btn.isChecked() else "OFF")
         if frame:
             frame.setVisible(btn.isChecked())
-        self._rebuild_chain()
+        # Debounced — _on_done flushes any pending rebuild on close.
+        self._param_timer.start()
 
     def _apply_preset(self, effect_id, values):
         """Snap the effect's sliders to a labelled preset and respawn."""
@@ -720,7 +803,8 @@ class FXSelectionDialog(QDialog):
             slider.blockSignals(False)
             suffix = slider.property("psuffix") or ""
             value_lbl.setText(self._fmt_value(target, suffix))
-        self._rebuild_chain()
+        # Debounced — _on_done flushes any pending rebuild on close.
+        self._param_timer.start()
 
     def _on_param_changed(self, effect_id, slider, value_lbl):
         pmin = float(slider.property("pmin"))
