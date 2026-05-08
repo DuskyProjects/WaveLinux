@@ -2271,16 +2271,15 @@ class WaveLinuxWindow(QMainWindow):
                         self.channel_widgets[pw_id].hide()
                     continue
 
-                # Create submix routes if they don't exist. Pass the snapshot
-                # so we don't re-run `pactl list modules` four times per tick.
-                self.engine.route_input_to_submix(pw_id, nname, node.media_class, "Monitor", snap=snap)
-                self.engine.route_input_to_submix(pw_id, nname, node.media_class, "Stream", snap=snap)
-
                 # First-time defaults. Mics start MUTED in Monitor so a
                 # fresh install doesn't immediately scream the user's
                 # voice into their headphones (feedback risk on a
                 # multi-monitor setup). Stream stays unmuted because
-                # that's where the recording goes.
+                # that's where the recording goes. Computed BEFORE the
+                # routing calls so we can hand the saved state to the
+                # engine — a fresh module-loopback's pulse-bridge default
+                # is unmuted, and without an immediate state push the
+                # mic leaks into Monitor for the gap before sync runs.
                 mon_key = f"{nname}_Monitor"
                 str_key = f"{nname}_Stream"
                 fresh_mon = mon_key not in self.submix_state
@@ -2296,6 +2295,17 @@ class WaveLinuxWindow(QMainWindow):
                     self.submix_state[str_key] = dict(str_state)
                 if fresh_mon or fresh_str:
                     self.schedule_save()
+
+                # Create submix routes if they don't exist. Pass the snapshot
+                # so we don't re-run `pactl list modules` four times per tick.
+                self.engine.route_input_to_submix(
+                    pw_id, nname, node.media_class, "Monitor",
+                    snap=snap, initial_state=mon_state,
+                )
+                self.engine.route_input_to_submix(
+                    pw_id, nname, node.media_class, "Stream",
+                    snap=snap, initial_state=str_state,
+                )
 
                 # Push saved volume/mute through to PipeWire whenever
                 # the underlying loopback module id changes (first tick,
