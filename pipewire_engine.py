@@ -1248,6 +1248,7 @@ class PipeWireEngine:
     _KNOWN_APP_IDS = {
         "com.spotify.client": "Spotify",
         "com.spotify.spotify": "Spotify",
+        "spotify": "Spotify",
         "com.discordapp.discord": "Discord",
         "com.discordapp.discordcanary": "Discord Canary",
         "com.discordapp.discordptb": "Discord PTB",
@@ -1630,17 +1631,49 @@ class PipeWireEngine:
     # binary name as comm. Map the binary stem directly to a display name
     # so we don't surface raw comm strings like "brave-browser" in the UI.
     _BINARY_DISPLAY_NAMES = {
+        # Brave channels (binary name, comm, and icon_name variants)
         "brave": "Brave",
         "brave-browser": "Brave",
         "brave-browser-stable": "Brave",
         "brave-browser-beta": "Brave Beta",
         "brave-browser-nightly": "Brave Nightly",
-        # Origin (unstable) channel used on CachyOS.
         "brave-browser-origin": "Brave Origin Beta",
         "brave-origin": "Brave Origin Beta",
+        # Chrome / Chromium
+        "google-chrome": "Chrome",
+        "google-chrome-stable": "Chrome",
+        "google-chrome-beta": "Chrome Beta",
+        "google-chrome-unstable": "Chrome Dev",
+        "chromium-browser": "Chromium",
+        # Firefox variants
+        "firefox": "Firefox",
+        "firefox-esr": "Firefox ESR",
+        "firefox-developer-edition": "Firefox Dev",
+        "librewolf": "LibreWolf",
+        # Multi-app wrappers
         "ferdium": "Ferdium",
         "ferdi": "Ferdi",
         "hamsket": "Hamsket",
+        # Spotify
+        "spotify": "Spotify",
+        # Common media players
+        "vlc": "VLC",
+        "mpv": "mpv",
+        "rhythmbox": "Rhythmbox",
+        "clementine": "Clementine",
+        "strawberry": "Strawberry",
+        "elisa": "Elisa",
+        # Communication
+        "discord": "Discord",
+        "vesktop": "Vesktop",
+        "webcord": "WebCord",
+        "signal-desktop": "Signal",
+        "telegram-desktop": "Telegram",
+        "slack": "Slack",
+        # Streaming / video
+        "obs": "OBS Studio",
+        "obs-studio": "OBS Studio",
+        "zoom": "Zoom",
     }
 
     @staticmethod
@@ -1762,11 +1795,21 @@ class PipeWireEngine:
         desktop_name = self._identify_via_desktop(pid)
 
         # Any of these reverse-DNS-style ids gets run through the curated
-        # _KNOWN_APP_IDS table too.
+        # _KNOWN_APP_IDS table and _BINARY_DISPLAY_NAMES.
+        # application.icon_name is especially reliable for Chromium-family
+        # browsers (it's "brave-browser-origin", "google-chrome", etc.).
         for key in ('flatpak.app_id', 'pipewire.access.portal.app_id',
-                    'application.process.host', 'application.id',
-                    'application.icon_name'):
-            mapped = self._canonicalize_app_id(current.get(key))
+                    'application.id', 'application.icon_name'):
+            raw_val = current.get(key)
+            if not raw_val:
+                continue
+            # Check _BINARY_DISPLAY_NAMES first (handles icon names like
+            # "brave-browser-origin" → "Brave Origin Beta").
+            display = self._BINARY_DISPLAY_NAMES.get(raw_val.lower())
+            if display:
+                sandbox_name = sandbox_name or display
+                break
+            mapped = self._canonicalize_app_id(raw_val)
             if mapped and mapped.lower() not in self._GENERIC_APP_NAMES:
                 sandbox_name = sandbox_name or mapped
                 break
@@ -1774,6 +1817,11 @@ class PipeWireEngine:
         raw_app_name = current.get('application.name', '').strip()
         if raw_app_name.lower() in self._GENERIC_APP_NAMES:
             raw_app_name = ''
+        # application.process.binary: check _BINARY_DISPLAY_NAMES before
+        # using the raw string (e.g. "spotify" → "Spotify").
+        proc_binary = current.get('application.process.binary', '').strip()
+        if proc_binary:
+            proc_binary = self._BINARY_DISPLAY_NAMES.get(proc_binary.lower(), proc_binary)
 
         candidates = [
             sandbox_name,
@@ -1782,7 +1830,7 @@ class PipeWireEngine:
             current.get('snap.name'),
             current.get('application.display_name'),
             current.get('node.description'),         # often the real display name
-            current.get('application.process.binary'),
+            proc_binary or None,
             current.get('binary'),
             current.get('node.name'),                # lower priority; filtered below
         ]
