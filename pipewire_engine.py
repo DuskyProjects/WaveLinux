@@ -116,6 +116,14 @@ class PipeWireEngine:
         self._fx_rebuild_count = 0
         self._fx_rebuild_lock = threading.Lock()
 
+        # Last vol/mute pushed via set_submix_volume / set_submix_mute,
+        # plus the value applied at loopback creation. Used to re-push
+        # state after operations (notably _move_source_outputs) that
+        # can transiently flip a moved sink-input back to pulse-bridge's
+        # stale default — without this, audio leaks for the gap between
+        # the move and the next refresh tick's sync push.
+        self.submix_state_cache = {}    # "node_id->mix_name" -> {'vol', 'mute'}
+
         # Probe LADSPA plugins once at startup; filter-chain silently
         # fails to start if it references one that isn't installed.
         self.ladspa_plugins = self._probe_ladspa_plugins()
@@ -712,16 +720,22 @@ class PipeWireEngine:
 
     # ── Virtual Sink (Input Channel) Management ────────────────────
 
-    def route_input_to_submix(self, node_id, node_name, media_class, mix_name, snap=None):
+    def route_input_to_submix(self, node_id, node_name, media_class, mix_name,
+                              snap=None, initial_state=None):
         """Loopback an input source (or sink monitor) into a submix.
         Idempotent on every refresh tick. When the channel's FX chain
         toggles, the source token changes (raw mic ↔ FX virtual-source) and
         the loopback gets rebuilt pointing at the new source.
 
         Returns True if `submix_loopbacks[key]` is up to date afterwards.
-        Does NOT reset volume/mute on a fresh loopback — caller compares
-        the module id before/after to detect a rebuild and re-push saved
-        state, otherwise FX toggles silently clobber Monitor-mute."""
+
+        `initial_state={'vol': float, 'mute': bool}` is applied
+        synchronously to a freshly-loaded sink-input — without it,
+        pulse-bridge's default for a new module-loopback is unmuted,
+        and any audio leaks for the ~150ms gap before the caller's
+        first sync push silences it. (Most visible at startup with a
+        muted-by-default mic Monitor.) Reused loopbacks keep their
+        existing state."""
         key = f'{node_id}->{mix_name}'
 
         mix = self.output_mixes.get(mix_name)
@@ -753,6 +767,13 @@ class PipeWireEngine:
                 self._run(['pactl', 'unload-module', str(known)])
             self.submix_loopbacks.pop(key, None)
             self.submix_sources.pop(key, None)
+            # Drop the cache entry too so the next loopback's initial_state
+            # push (or the caller's sync push) populates it cleanly,
+            # rather than letting `_reapply_submix_state_cache` push the
+            # old loopback's last-known state at a freshly-loaded
+            # sink-input that the user may have meant to start in a
+            # different state.
+            self.submix_state_cache.pop(key, None)
 
         existing = self._find_loopback_for(source_id, mix.sink_name, snap=snap)
         if existing:
@@ -771,8 +792,25 @@ class PipeWireEngine:
             return False
         self.submix_loopbacks[key] = out
         self.submix_sources[key] = source_id
-        # Do NOT reset volume/mute on the new sink-input. Caller detects
-        # rebuilds and re-pushes saved submix_state.
+        # Apply caller-provided saved state immediately. The sink-input
+        # may not be enumerable in the very first `pactl list sink-inputs`
+        # tick after load — wait briefly so we don't fall through to
+        # pulse-bridge's mute=0 default.
+        if initial_state is not None:
+            si = self._sink_input_for_module(out)
+            if si is None:
+                for _ in range(20):
+                    time.sleep(0.005)
+                    si = self._sink_input_for_module(out)
+                    if si is not None:
+                        break
+            if si is not None:
+                vol = self._clamp(initial_state.get('vol', 1.0))
+                mute = bool(initial_state.get('mute', False))
+                pct = max(0, min(int(round(vol * 100)), 100))
+                self._run(['pactl', 'set-sink-input-volume', si, f'{pct}%'])
+                self._run(['pactl', 'set-sink-input-mute', si, '1' if mute else '0'])
+                self.submix_state_cache[key] = {'vol': vol, 'mute': mute}
         return True
 
     def _build_loopback_index(self, modules_text):
@@ -820,6 +858,7 @@ class PipeWireEngine:
             if key.startswith(f"{node_id}->"):
                 mod_id = self.submix_loopbacks.pop(key)
                 self.submix_sources.pop(key, None)
+                self.submix_state_cache.pop(key, None)
                 self._run(['pactl', 'unload-module', str(mod_id)])
 
     def get_submix_sink_input(self, node_id, mix_name, snap=None):
@@ -852,8 +891,11 @@ class PipeWireEngine:
         if not si:
             logging.warning(f"Could not find sink-input for {node_id}->{mix_name}")
             return False
-        pct = max(0, min(int(round(self._clamp(volume) * 100)), 100))
+        clamped = self._clamp(volume)
+        pct = max(0, min(int(round(clamped * 100)), 100))
         self._run(['pactl', 'set-sink-input-volume', si, f'{pct}%'])
+        cache = self.submix_state_cache.setdefault(f'{node_id}->{mix_name}', {})
+        cache['vol'] = clamped
         return True
 
     def set_submix_mute(self, node_id, mix_name, mute):
@@ -862,8 +904,31 @@ class PipeWireEngine:
         if not si:
             logging.warning(f"Could not find sink-input to mute for {node_id}->{mix_name}")
             return False
-        self._run(['pactl', 'set-sink-input-mute', si, '1' if mute else '0'])
+        bmute = bool(mute)
+        self._run(['pactl', 'set-sink-input-mute', si, '1' if bmute else '0'])
+        cache = self.submix_state_cache.setdefault(f'{node_id}->{mix_name}', {})
+        cache['mute'] = bmute
         return True
+
+    def _reapply_submix_state_cache(self):
+        """Re-push every cached submix sink-input state. Calling this
+        after `_move_source_outputs` closes the brief unmute window
+        where pulse-bridge can flip a moved sink-input back to its
+        stale per-app default — the audio leak users hear as 'mic
+        plays for a second every time effects rebuild'."""
+        for key, cache in list(self.submix_state_cache.items()):
+            mod_id = self.submix_loopbacks.get(key)
+            if mod_id is None:
+                continue
+            si = self._sink_input_for_module(mod_id)
+            if si is None:
+                continue
+            if 'vol' in cache:
+                pct = max(0, min(int(round(cache['vol'] * 100)), 100))
+                self._run(['pactl', 'set-sink-input-volume', si, f'{pct}%'])
+            if 'mute' in cache:
+                self._run(['pactl', 'set-sink-input-mute', si,
+                           '1' if cache['mute'] else '0'])
 
     def snapshot_sink_inputs_by_owner(self, snap=None):
         """Map `owner_module_id -> (volume 0..1.5, muted)` in a single
@@ -977,9 +1042,19 @@ class PipeWireEngine:
         for mid in to_drop:
             self._run(['pactl', 'unload-module', mid])
 
-        for key in list(self.submix_loopbacks.keys()):
-            if key.endswith(f"->{sink_name}"):
-                self._run(['pactl', 'unload-module', str(self.submix_loopbacks.pop(key))])
+        # Drop submix loopbacks that READ from this sink's monitor.
+        # The submix_loopbacks key format is `node_id->mix_name`, so
+        # the old `key.endswith(...)` check never matched anything;
+        # filter on the tracked source token instead.
+        monitor_token = f"{sink_name}.monitor"
+        for skey in list(self.submix_sources.keys()):
+            if self.submix_sources.get(skey) != monitor_token:
+                continue
+            mod = self.submix_loopbacks.pop(skey, None)
+            self.submix_sources.pop(skey, None)
+            self.submix_state_cache.pop(skey, None)
+            if mod is not None:
+                self._run(['pactl', 'unload-module', str(mod)])
 
         self._run(['pactl', 'unload-module', str(module_id)])
         return True
@@ -1068,7 +1143,7 @@ class PipeWireEngine:
                 ])
                 if out:
                     break
-            import time as _t; _t.sleep(0.1)
+            time.sleep(0.1)
 
         if not out:
             logging.warning(
@@ -3039,7 +3114,6 @@ context.modules = [
         20ms latency matches the rest of the codebase. Lower (5ms) was
         unstable on some rigs — filter-chain couldn't keep up at that
         quantum and audio stopped flowing despite the module loading."""
-        import time as _time
         for _ in range(attempts):
             out = self._run([
                 'pactl', 'load-module', 'module-loopback',
@@ -3052,7 +3126,7 @@ context.modules = [
                 stripped = out.strip().splitlines()[-1].strip()
                 if stripped.isdigit():
                     return stripped
-            _time.sleep(delay)
+            time.sleep(delay)
         return None
 
     def is_fx_rebuilding(self):
@@ -3155,6 +3229,11 @@ context.modules = [
             for skey in list(self.submix_sources.keys()):
                 if self.submix_sources.get(skey) == capture_target:
                     self.submix_sources[skey] = source_name
+            # And re-push our cached vol/mute to every submix sink-input
+            # — pulse-bridge can transiently reset a moved sink-input's
+            # mute to its stale default, leaking the mic's raw audio
+            # for the gap before the next sync push lands.
+            self._reapply_submix_state_cache()
 
         self.channel_fx[node_name] = {
             'effects':   list(used_effects),
@@ -3218,6 +3297,10 @@ context.modules = [
             for skey in list(self.submix_sources.keys()):
                 if self.submix_sources.get(skey) == fx_source:
                     self.submix_sources[skey] = capture_target
+            # Re-push cached vol/mute — same reasoning as set_channel_fx,
+            # so the mic doesn't briefly leak audio while pulse-bridge
+            # re-applies its stale default to the just-moved sink-input.
+            self._reapply_submix_state_cache()
 
         # 1. Drop any submix loopbacks still pinned to this chain's
         # source — virtual-sink chains skip step 0 (no default source
@@ -3230,6 +3313,7 @@ context.modules = [
                 continue
             mod_id = self.submix_loopbacks.pop(skey, None)
             self.submix_sources.pop(skey, None)
+            self.submix_state_cache.pop(skey, None)
             if mod_id is not None:
                 self._run(['pactl', 'unload-module', str(mod_id)])
 
@@ -3378,6 +3462,7 @@ context.modules = [
         self.loopback_modules.clear()
         self.submix_loopbacks.clear()
         self.submix_sources.clear()
+        self.submix_state_cache.clear()
 
         # Hard sweep using full list (short mode doesn't show arguments)
         out = self._run(['pactl', 'list', 'modules'])
