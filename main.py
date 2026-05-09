@@ -18,7 +18,7 @@ import urllib.error
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QSlider, QPushButton, QFrame, QScrollArea, QDialog,
-    QLineEdit, QDialogButtonBox, QComboBox, QMessageBox, QSystemTrayIcon,
+    QDialogButtonBox, QComboBox, QMessageBox, QSystemTrayIcon,
     QMenu, QInputDialog, QProgressBar, QSizePolicy, QTabWidget,
     QSpinBox, QCheckBox
 )
