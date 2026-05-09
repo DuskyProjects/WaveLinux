@@ -114,11 +114,13 @@ class UpdateChecker:
         try:
             for filename in _UPDATE_FILES:
                 if self._cancel.is_set():
+                    self._q.put(('cancelled',))
                     return
                 url = f"{self._RAW_BASE}/v{tag}/{filename}"
                 dest = os.path.join(tmp_dir, filename)
                 self._download_file(url, dest, filename)
                 if self._cancel.is_set():
+                    self._q.put(('cancelled',))
                     return
 
             for filename in _UPDATE_FILES:
@@ -1645,6 +1647,9 @@ class WaveLinuxWindow(QMainWindow):
             elif kind == 'progress':
                 _, filename, done, total = item
                 self._handle_update_progress(filename, done, total)
+            elif kind == 'cancelled':
+                self._update_poll_timer.stop()
+                self._handle_update_cancelled()
 
     def _handle_update_result(self, latest_tag):
         self._check_update_btn.setEnabled(True)
@@ -1665,6 +1670,14 @@ class WaveLinuxWindow(QMainWindow):
             self._update_status_lbl.setText(f"You're up to date! (v{APP_VERSION})")
             self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
             self._apply_update_btn.setVisible(False)
+
+
+    def _handle_update_cancelled(self):
+        self._check_update_btn.setEnabled(True)
+        self._apply_update_btn.setEnabled(True)
+        self._update_progress.setVisible(False)
+        self._update_status_lbl.setText("Update cancelled.")
+        self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
 
     def _handle_update_error(self, message):
         self._check_update_btn.setEnabled(True)
