@@ -3197,9 +3197,7 @@ context.modules = [
         if not node_name:
             return None
         params_map = params_map or {}
-
-        # Always reset first so the call is idempotent.
-        self.clear_channel_fx(node_name)
+        old_info = self.channel_fx.get(node_name)
 
         ordered = [fid for fid in self._ordered_chain(effects)
                    if self.effect_available(fid)]
@@ -3234,6 +3232,12 @@ context.modules = [
             )
             self.stop_rnnoise(proc_key)
             return None
+
+        # Build-first semantics: only tear down the previous chain after the
+        # replacement chain is alive and wired. This keeps audio flowing if the
+        # new build is slow/flaky and prevents "change FX => silence" regressions.
+        if old_info:
+            self._clear_channel_fx_info(old_info)
 
         # Promote the FX virtual source to default + drag existing capture
         # streams onto it. Without this, apps reading the raw mic (Discord,
@@ -3305,6 +3309,11 @@ context.modules = [
 
     def _clear_channel_fx_inner(self, node_name):
         info = self.channel_fx.pop(node_name, None)
+        if not info:
+            return False
+        return self._clear_channel_fx_info(info)
+
+    def _clear_channel_fx_info(self, info):
         if not info:
             return False
 
