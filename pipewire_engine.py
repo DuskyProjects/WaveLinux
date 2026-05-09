@@ -3197,13 +3197,13 @@ context.modules = [
         if not node_name:
             return None
         params_map = params_map or {}
-
-        # Always reset first so the call is idempotent.
-        self.clear_channel_fx(node_name)
+        old_info = self.channel_fx.get(node_name)
 
         ordered = [fid for fid in self._ordered_chain(effects)
                    if self.effect_available(fid)]
         if not ordered:
+            # No usable effects means "disable FX" for this channel.
+            self.clear_channel_fx(node_name)
             return None
 
         safe_key = self._safe_channel_key(node_name)
@@ -3244,32 +3244,69 @@ context.modules = [
         # move — otherwise it gets re-pointed at the chain's own output
         # and feeds the chain into itself, killing the audio.
         prev_default = None
-        if capture_target and not capture_target.endswith('.monitor'):
-            current_default = self.get_default_source()
-            # Don't overwrite a save from another channel's chain — only
-            # the first chain captures the user-facing default.
-            if current_default and current_default != source_name:
-                prev_default = current_default
-            self.set_default_source(source_name)
-            self._move_source_outputs(
-                capture_target, source_name, exclude_modules=[lb],
+        current_default = self.get_default_source() if capture_target else None
+        tracked_sources = {capture_target, source_name}
+        if old_info:
+            tracked_sources.update({
+                old_info.get('source'),
+                old_info.get('capture_target'),
+            })
+        tracked_sources.discard(None)
+        tracked_sources.discard('')
+        prior_submix_sources = {
+            skey: src for skey, src in self.submix_sources.items()
+            if src in tracked_sources
+        }
+        prior_submix_loopbacks = {
+            skey: self.submix_loopbacks.get(skey)
+            for skey in prior_submix_sources
+        }
+        try:
+            if old_info:
+                self._clear_channel_fx_info(old_info)
+
+            if capture_target and not capture_target.endswith('.monitor'):
+                # Don't overwrite a save from another channel's chain — only
+                # the first chain captures the user-facing default.
+                if current_default and current_default != source_name:
+                    prev_default = current_default
+                self.set_default_source(source_name)
+                self._move_source_outputs(
+                    capture_target, source_name, exclude_modules=[lb],
+                )
+                for skey in list(self.submix_sources.keys()):
+                    if self.submix_sources.get(skey) == capture_target:
+                        self.submix_sources[skey] = source_name
+                self._reapply_submix_state_cache()
+        except Exception as exc:
+            logging.warning(
+                "FX cutover failed for node=%s old_source=%s new_source=%s "
+                "old_loopbacks=%s new_loopback=%s error=%s",
+                node_name, old_info.get('source') if old_info else None,
+                source_name, old_info.get('loopbacks') if old_info else None,
+                lb, exc,
             )
-            # Mirror the move into our own state. _move_source_outputs has
-            # already pointed the channel's submix loopbacks at the FX
-            # source in pactl, so leaving submix_sources stale would force
-            # the next refresh tick to unload + reload them — that brief
-            # silence is exactly the "audio stops again" symptom users see
-            # right after an FX-apply tick. Limit to entries whose source
-            # is the raw mic, so other channels' submix routes are
-            # untouched.
-            for skey in list(self.submix_sources.keys()):
-                if self.submix_sources.get(skey) == capture_target:
-                    self.submix_sources[skey] = source_name
-            # And re-push our cached vol/mute to every submix sink-input
-            # — pulse-bridge can transiently reset a moved sink-input's
-            # mute to its stale default, leaking the mic's raw audio
-            # for the gap before the next sync push lands.
-            self._reapply_submix_state_cache()
+            if capture_target and not capture_target.endswith('.monitor'):
+                restore_default = current_default or (old_info or {}).get('source') or capture_target
+                try:
+                    self.set_default_source(restore_default)
+                except Exception as restore_exc:
+                    logging.warning(
+                        "Failed restoring default source after cutover failure "
+                        "for node=%s target=%s error=%s",
+                        node_name, restore_default, restore_exc,
+                    )
+            for skey in prior_submix_sources:
+                self.submix_sources[skey] = prior_submix_sources[skey]
+            for skey, mod_id in prior_submix_loopbacks.items():
+                if mod_id is not None:
+                    self.submix_loopbacks[skey] = mod_id
+            try:
+                self._run(['pactl', 'unload-module', str(lb)])
+            except Exception:
+                pass
+            self.stop_rnnoise(proc_key)
+            return None
 
         self.channel_fx[node_name] = {
             'effects':   list(used_effects),
@@ -3307,6 +3344,12 @@ context.modules = [
         info = self.channel_fx.pop(node_name, None)
         if not info:
             return False
+        self._clear_channel_fx_info(info)
+        return True
+
+    def _clear_channel_fx_info(self, info):
+        if not info:
+            return
 
         # 0. Restore the default source and re-route every source-output
         # off the FX source BEFORE we kill it. Apps (Discord, Zoom, OBS)
@@ -3361,7 +3404,6 @@ context.modules = [
         for pk in info.get('procs', []):
             self.stop_rnnoise(pk)
         self.invalidate_snapshot()
-        return True
 
     def get_channel_fx_source(self, node_name):
         """Return the final FX virtual source for a channel, or None."""
