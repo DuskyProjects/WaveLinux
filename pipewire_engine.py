@@ -3198,8 +3198,25 @@ context.modules = [
             return None
         params_map = params_map or {}
 
-        # Always reset first so the call is idempotent.
-        self.clear_channel_fx(node_name)
+        # If replacing an existing chain, tear down detached info now but
+        # keep `channel_fx[node_name]` populated until this call successfully
+        # writes replacement state below.
+        # NOTE: Keep the current channel_fx entry in place during teardown;
+        # this function intentionally overwrites `channel_fx[node_name]` later
+        # only after replacement chain startup succeeds.
+        old_info = self.channel_fx.get(node_name)
+        if old_info:
+            self._teardown_channel_fx_info(
+                node_name,
+                {
+                    **old_info,
+                    "effects": list(old_info.get("effects", [])),
+                    "procs": list(old_info.get("procs", [])),
+                    "loopbacks": list(old_info.get("loopbacks", [])),
+                    "params": {k: dict(v) for k, v in old_info.get("params", {}).items()},
+                },
+                replacement_safe_key=self._safe_channel_key(node_name),
+            )
 
         ordered = [fid for fid in self._ordered_chain(effects)
                    if self.effect_available(fid)]
@@ -3307,6 +3324,20 @@ context.modules = [
         info = self.channel_fx.pop(node_name, None)
         if not info:
             return False
+        self._teardown_channel_fx_info(node_name, info)
+        return True
+
+    def _teardown_channel_fx_info(self, node_name, info, replacement_safe_key=None):
+        """Tear down a channel FX chain from detached `info`.
+
+        Caller must pass info that is already detached from `self.channel_fx`
+        (for example via `pop`) so this helper cannot accidentally tear down
+        a chain that is still treated as active state.
+        """
+        if replacement_safe_key and info.get('safe_key') == replacement_safe_key:
+            logging.warning(
+                f"FX replacement for {node_name} is tearing down the same safe_key={replacement_safe_key}; check for accidental self-teardown regression"
+            )
 
         # 0. Restore the default source and re-route every source-output
         # off the FX source BEFORE we kill it. Apps (Discord, Zoom, OBS)
