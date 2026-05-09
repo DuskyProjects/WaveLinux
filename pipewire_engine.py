@@ -13,6 +13,7 @@ import socket
 import time
 import threading
 import logging
+import copy
 
 _LOG_PATH = os.path.expanduser("~/.config/wavelinux/wavelinux.log")
 os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
@@ -3199,7 +3200,12 @@ context.modules = [
         params_map = params_map or {}
 
         # Always reset first so the call is idempotent.
-        self.clear_channel_fx(node_name)
+        # Snapshot before teardown so async rebuild activity can't mutate
+        # the values teardown is iterating over.
+        old_info = copy.deepcopy(self.channel_fx.get(node_name))
+        if old_info:
+            self.channel_fx.pop(node_name, None)
+            self._clear_channel_fx_info(old_info)
 
         ordered = [fid for fid in self._ordered_chain(effects)
                    if self.effect_available(fid)]
@@ -3305,6 +3311,11 @@ context.modules = [
 
     def _clear_channel_fx_inner(self, node_name):
         info = self.channel_fx.pop(node_name, None)
+        if not info:
+            return False
+        return self._clear_channel_fx_info(info)
+
+    def _clear_channel_fx_info(self, info):
         if not info:
             return False
 
