@@ -756,7 +756,17 @@ class PipeWireEngine:
         elif media_class == 'Audio/Sink':
             source_id = f"{node_name}.monitor"
         else:
-            source_id = str(node_id)
+            # Use the stable Pulse/PipeWire source token (`node.name`) for
+            # input devices instead of the transient numeric node id.
+            #
+            # FX toggles and source-output migration paths track capture
+            # targets by name (e.g. `alsa_input.*`). If we build Monitor/
+            # Stream loopbacks from the numeric id, a refresh can mismatch
+            # routing state after an FX apply/clear and leave a submix
+            # loopback pinned to a stale source token. Using the same
+            # name-based token here keeps submix routing coherent across FX
+            # rebuilds.
+            source_id = str(node_name)
 
         # If a loopback we created earlier is still live AND its source
         # matches the current routing (FX state hasn't changed), keep it.
