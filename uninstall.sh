@@ -68,7 +68,12 @@ update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 # OBS plugins, JACK setups, etc.) and removing them can break unrelated
 # software. We ask first and never strip pipewire itself.
 echo ""
-read -r -p "Also remove WaveLinux pacman dependencies (swh-plugins, rnnoise, noise-suppression-for-voice)? [y/N] " yn
+if [ -t 0 ]; then
+    read -r -p "Also remove WaveLinux pacman dependencies (swh-plugins, rnnoise, noise-suppression-for-voice)? [y/N] " yn
+else
+    yn="n"
+    echo "Non-interactive session detected; keeping pacman packages installed."
+fi
 case "$yn" in
     [yY]|[yY][eE][sS])
         echo "→ Removing optional packages..."
