@@ -3198,23 +3198,23 @@ context.modules = [
             return None
         params_map = params_map or {}
 
-        # If replacing an existing chain, tear down detached info now but
-        # keep `channel_fx[node_name]` populated until this call successfully
-        # writes replacement state below.
-        # NOTE: Keep the current channel_fx entry in place during teardown;
-        # this function intentionally overwrites `channel_fx[node_name]` later
-        # only after replacement chain startup succeeds.
-        old_info = self.channel_fx.get(node_name)
+        # If replacing an existing chain, remove live state first so
+        # concurrent liveness checks cannot observe stale proc keys while
+        # teardown/rebuild is in flight. The old state is torn down from a
+        # detached copy, and any early return below leaves the channel with
+        # no FX metadata rather than stale metadata.
+        old_info = self.channel_fx.pop(node_name, None)
         if old_info:
+            detached_old_info = {
+                **old_info,
+                "effects": list(old_info.get("effects", [])),
+                "procs": list(old_info.get("procs", [])),
+                "loopbacks": list(old_info.get("loopbacks", [])),
+                "params": {k: dict(v) for k, v in old_info.get("params", {}).items()},
+            }
             self._teardown_channel_fx_info(
                 node_name,
-                {
-                    **old_info,
-                    "effects": list(old_info.get("effects", [])),
-                    "procs": list(old_info.get("procs", [])),
-                    "loopbacks": list(old_info.get("loopbacks", [])),
-                    "params": {k: dict(v) for k, v in old_info.get("params", {}).items()},
-                },
+                detached_old_info,
                 replacement_safe_key=self._safe_channel_key(node_name),
             )
 
