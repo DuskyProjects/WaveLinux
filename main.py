@@ -12,6 +12,7 @@ import time
 import tempfile
 import threading
 import queue
+import hashlib
 import urllib.request
 import urllib.error
 
@@ -34,6 +35,7 @@ APP_VERSION = "1.1.0"
 _GITHUB_OWNER = "excalprimeacct-gif"
 _GITHUB_REPO  = "WaveLinux"
 _UPDATE_FILES = ["main.py", "pipewire_engine.py", "wavelinux_theme.py"]
+_RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire"]
 
 
 # ── In-app updater ───────────────────────────────────────────────
@@ -60,6 +62,7 @@ class UpdateChecker:
                  f"repos/{_GITHUB_OWNER}/{_GITHUB_REPO}/releases/latest")
     _RAW_BASE = (f"https://raw.githubusercontent.com/"
                  f"{_GITHUB_OWNER}/{_GITHUB_REPO}")
+    _CHECKSUMS_FILE = "sha256sums.txt"
 
     def __init__(self, app_dir):
         self._app_dir = app_dir
@@ -112,6 +115,10 @@ class UpdateChecker:
     def _do_download(self, tag):
         tmp_dir = tempfile.mkdtemp(prefix="wavelinux-update-")
         try:
+            expected = self._fetch_checksums(tag)
+            if not expected:
+                self._q.put(('error', "Release is missing sha256sums.txt; refusing insecure update."))
+                return
             for filename in _UPDATE_FILES:
                 if self._cancel.is_set():
                     self._q.put(('cancelled',))
@@ -119,6 +126,14 @@ class UpdateChecker:
                 url = f"{self._RAW_BASE}/v{tag}/{filename}"
                 dest = os.path.join(tmp_dir, filename)
                 self._download_file(url, dest, filename)
+                got = self._sha256_file(dest)
+                want = expected.get(filename)
+                if not want:
+                    self._q.put(('error', f"sha256sums.txt missing entry for {filename}; refusing update."))
+                    return
+                if got.lower() != want.lower():
+                    self._q.put(('error', f"Checksum mismatch for {filename}; refusing update."))
+                    return
                 if self._cancel.is_set():
                     self._q.put(('cancelled',))
                     return
@@ -141,6 +156,36 @@ class UpdateChecker:
             self._q.put(('error', f"Download failed: {e}"))
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _fetch_checksums(self, tag):
+        url = f"{self._RAW_BASE}/v{tag}/{self._CHECKSUMS_FILE}"
+        req = urllib.request.Request(url, headers={"User-Agent": "WaveLinux-Updater"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        out = {}
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            digest = parts[0].strip()
+            filename = parts[-1].strip().lstrip("*")
+            if filename in _UPDATE_FILES:
+                out[filename] = digest
+        return out
+
+    @staticmethod
+    def _sha256_file(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
 
     def _download_file(self, url, dest, filename):
         req = urllib.request.Request(url, headers={"User-Agent": "WaveLinux-Updater"})
@@ -707,16 +752,29 @@ class FXSelectionDialog(QDialog):
         self._fx_thread.start()
 
     def _fx_bg_worker(self, wanted, params_map):
-        self.engine.set_channel_fx(
-            self.node_name, self.capture_target, wanted, params_map
-        )
-        self._fx_queue.put('done')
+        try:
+            self.engine.set_channel_fx(
+                self.node_name, self.capture_target, wanted, params_map
+            )
+            self._fx_queue.put(('done', None))
+        except Exception as e:
+            logging.exception(f"FX rebuild failed for {self.node_name}: {e}")
+            self._fx_queue.put(('error', str(e)))
         
     def _poll_fx_queue(self):
         try:
-            self._fx_queue.get_nowait()
+            kind, message = self._fx_queue.get_nowait()
         except Exception:
             return
+
+        if kind == 'error':
+            QMessageBox.warning(
+                self,
+                "Effects rebuild failed",
+                "WaveLinux could not apply one or more effects.\n\n"
+                f"Error: {message}\n\n"
+                "Check ~/.config/wavelinux/fx-logs for stage logs."
+            )
 
         # Force a routing pass so the loopbacks pick up the new source.
         win = self._main_window()
@@ -1450,6 +1508,7 @@ class WaveLinuxWindow(QMainWindow):
         self._event_refresh_timer.timeout.connect(self._refresh)
 
         self._setup_ui()
+        self._run_startup_preflight()
         self.load_config()
         self._refresh()
         # 5s backstop interval — subscribe-driven refreshes carry the
@@ -1459,6 +1518,20 @@ class WaveLinuxWindow(QMainWindow):
         self._pending_update_tag = None
         # Silent update check 30 s after startup so it never blocks startup.
         QTimer.singleShot(30_000, self._check_for_updates_bg)
+
+    def _run_startup_preflight(self):
+        """Check for required runtime binaries and surface a clear warning."""
+        missing = [cmd for cmd in _RUNTIME_DEPS if shutil.which(cmd) is None]
+        if not missing:
+            return
+        msg = (
+            "Missing required audio/runtime tools:\n"
+            f"  {', '.join(missing)}\n\n"
+            "WaveLinux can start, but routing/meter/update features may fail.\n"
+            "Install PipeWire + WirePlumber + PulseAudio compatibility tools first."
+        )
+        logging.warning(msg.replace("\n", " "))
+        QMessageBox.warning(self, "WaveLinux dependency check", msg)
 
     def _open_settings(self):
         self._refresh_hidden_list()
@@ -1587,6 +1660,7 @@ class WaveLinuxWindow(QMainWindow):
 
         note = QLabel(
             "Updates replace main.py, pipewire_engine.py, and wavelinux_theme.py.\n"
+            "For safety, the release must include sha256sums.txt and all file checksums must match.\n"
             "The old files are backed up with a .bak extension.\n"
             "A restart is required after applying an update."
         )
@@ -1690,13 +1764,18 @@ class WaveLinuxWindow(QMainWindow):
         tag = getattr(self, '_pending_update_tag', None)
         if not tag:
             return
+        updater = getattr(self, '_updater', None)
+        if updater is None:
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            updater = UpdateChecker(app_dir=app_dir)
+            self._updater = updater
         self._apply_update_btn.setEnabled(False)
         self._check_update_btn.setEnabled(False)
         self._update_progress.setValue(0)
         self._update_progress.setVisible(True)
         self._update_status_lbl.setText("Downloading update…")
         self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
-        self._updater.download(tag)
+        updater.download(tag)
         # Reuse the poll timer for download progress
         if not getattr(self, '_update_poll_timer', None):
             self._update_poll_timer = QTimer(self)
