@@ -13,7 +13,6 @@ import socket
 import time
 import threading
 import logging
-import shutil
 
 _LOG_PATH = os.path.expanduser("~/.config/wavelinux/wavelinux.log")
 os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
@@ -140,23 +139,8 @@ class PipeWireEngine:
         # would mask any real failure mode any future contributor adds
         # to that path.
         self._bt_autoswitch_overridden = False
-        self._log_runtime_dependency_gaps()
         self.cleanup()
         self.lock_bluetooth_to_a2dp()
-
-    @staticmethod
-    def _log_runtime_dependency_gaps():
-        """Log missing runtime tools once at startup.
-        WaveLinux relies on PipeWire's PulseAudio compatibility tools;
-        missing binaries are a common distro packaging issue."""
-        required = ('pactl', 'pw-dump', 'wpctl', 'parec')
-        missing = [tool for tool in required if shutil.which(tool) is None]
-        if missing:
-            logging.warning(
-                "Missing required audio tools: %s. "
-                "WaveLinux expects pipewire-pulse + wireplumber + libpulse CLI utilities.",
-                ', '.join(missing)
-            )
 
     @staticmethod
     def _reap_orphan_fx_processes():
@@ -1134,9 +1118,9 @@ class PipeWireEngine:
         mix = self.output_mixes.get(mix_name)
         if not mix:
             return False
-        # Tear down dependent loopbacks first so we don't leave dangling
-        # module-loopback instances briefly targeting sinks/sources that are
-        # already gone.
+        for mid in (getattr(mix, 'source_module_id', None), mix.sink_module_id):
+            if mid:
+                self._run(['pactl', 'unload-module', str(mid)])
         for key in list(self.loopback_modules.keys()):
             if key.startswith(mix_name + '->'):
                 self._run(['pactl', 'unload-module', str(self.loopback_modules[key])])
@@ -1150,19 +1134,8 @@ class PipeWireEngine:
             if skey.endswith(f'->{mix_name}'):
                 mod = self.submix_loopbacks.pop(skey, None)
                 self.submix_sources.pop(skey, None)
-                self.submix_state_cache.pop(skey, None)
                 if mod is not None:
                     self._run(['pactl', 'unload-module', str(mod)])
-        # Defensive cleanup: cache keys can outlive submix_loopbacks if a
-        # loopback vanished externally. Purge any remaining state for this
-        # mix so future reapply attempts don't target ghost routes.
-        for ckey in list(self.submix_state_cache.keys()):
-            if ckey.endswith(f'->{mix_name}'):
-                self.submix_state_cache.pop(ckey, None)
-        # Finally unload the mix's own source/sink modules.
-        for mid in (getattr(mix, 'source_module_id', None), mix.sink_module_id):
-            if mid:
-                self._run(['pactl', 'unload-module', str(mid)])
         del self.output_mixes[mix_name]
         return True
 
