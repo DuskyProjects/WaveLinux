@@ -381,6 +381,44 @@ class PipeWireEngine:
                 from_source, exclude_modules=exclude_modules):
             self._run(['pactl', 'move-source-output', sid, to_source])
 
+    def _rebuild_submix_loopbacks_for_source(self, old_source, new_source):
+        """Force-rebuild WaveLinux-owned submix loopbacks that currently read
+        from `old_source` so they definitely bind to `new_source`.
+
+        This is intentionally heavier than `_move_source_outputs`: some
+        Pulse/PipeWire builds occasionally ignore move-source-output for
+        module-loopback owned source-outputs during active graph churn
+        (exactly when FX chains are toggled). Rebuilding the module is
+        deterministic and keeps Monitor/Stream from getting stuck silent."""
+        if not old_source or not new_source or old_source == new_source:
+            return
+        for skey in list(self.submix_sources.keys()):
+            if self.submix_sources.get(skey) != old_source:
+                continue
+            mod_id = self.submix_loopbacks.get(skey)
+            cache = self.submix_state_cache.get(skey)
+            if mod_id:
+                self._run(['pactl', 'unload-module', str(mod_id)])
+            self.submix_loopbacks.pop(skey, None)
+            self.submix_sources[skey] = new_source
+
+            mix_name = skey.split('->', 1)[1] if '->' in skey else None
+            mix = self.output_mixes.get(mix_name) if mix_name else None
+            if not mix or not mix.sink_name:
+                continue
+            new_mod = self._wait_load_loopback(new_source, mix.sink_name)
+            if not new_mod:
+                continue
+            self.submix_loopbacks[skey] = new_mod
+            if cache:
+                si = self._sink_input_for_module(new_mod)
+                if si:
+                    vol = self._clamp(cache.get('vol', 1.0))
+                    mute = bool(cache.get('mute', False))
+                    pct = max(0, min(int(round(vol * 100)), 100))
+                    self._run(['pactl', 'set-sink-input-volume', si, f'{pct}%'])
+                    self._run(['pactl', 'set-sink-input-mute', si, '1' if mute else '0'])
+
     # ── Per-refresh snapshot ───────────────────────────────────────
 
     # Minimum age (seconds) below which a fresh snapshot request just hands
@@ -756,7 +794,17 @@ class PipeWireEngine:
         elif media_class == 'Audio/Sink':
             source_id = f"{node_name}.monitor"
         else:
-            source_id = str(node_id)
+            # Use the stable Pulse/PipeWire source token (`node.name`) for
+            # input devices instead of the transient numeric node id.
+            #
+            # FX toggles and source-output migration paths track capture
+            # targets by name (e.g. `alsa_input.*`). If we build Monitor/
+            # Stream loopbacks from the numeric id, a refresh can mismatch
+            # routing state after an FX apply/clear and leave a submix
+            # loopback pinned to a stale source token. Using the same
+            # name-based token here keeps submix routing coherent across FX
+            # rebuilds.
+            source_id = str(node_name)
 
         # If a loopback we created earlier is still live AND its source
         # matches the current routing (FX state hasn't changed), keep it.
@@ -3258,6 +3306,7 @@ context.modules = [
             self._move_source_outputs(
                 capture_target, source_name, exclude_modules=[lb],
             )
+            self._rebuild_submix_loopbacks_for_source(capture_target, source_name)
             # Mirror the move into our own state. _move_source_outputs has
             # already pointed the channel's submix loopbacks at the FX
             # source in pactl, so leaving submix_sources stale would force
@@ -3335,6 +3384,7 @@ context.modules = [
                 fx_source, capture_target,
                 exclude_modules=list(info.get('loopbacks', [])),
             )
+            self._rebuild_submix_loopbacks_for_source(fx_source, capture_target)
             # Mirror the move into our own state. After this, the
             # surviving submix loopbacks read from the raw mic, so
             # step 1's prefix-match below leaves them alone — that's
