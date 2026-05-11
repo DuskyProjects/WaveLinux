@@ -1430,15 +1430,22 @@ class WaveLinuxWindow(QMainWindow):
         
         self.resize(1200, 720)
         
-        # Set app icon (using new perfectly centered icon.png)
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
-        if os.path.exists(icon_path):
-            app_icon = QIcon(icon_path)
+        # Set app icon and tray icon.
+        assets_dir = os.path.dirname(os.path.abspath(__file__))
+        app_icon_path = os.path.join(assets_dir, "icon.png")
+        tray_icon_path = os.path.join(assets_dir, "tray_icon.png")
+
+        if os.path.exists(app_icon_path):
+            app_icon = QIcon(app_icon_path)
             self.setWindowIcon(app_icon)
             QApplication.instance().setWindowIcon(app_icon)
-            self.tray_icon_obj = app_icon
         else:
-            self.tray_icon_obj = QIcon.fromTheme("audio-card")
+            app_icon = QIcon.fromTheme("audio-card")
+
+        if os.path.exists(tray_icon_path):
+            self.tray_icon_obj = QIcon(tray_icon_path)
+        else:
+            self.tray_icon_obj = app_icon
         
         self.engine = PipeWireEngine()
         # ── State ──
