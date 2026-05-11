@@ -1,230 +1,25 @@
-# WaveLinux — Session Init Summary
+# WaveLinux Notes
 
-A barebones priming doc for any future session. Loaded first; everything
-else (README, ROADMAP, code) builds on this.
+## Purpose
 
-## What it is
+Quick technical orientation for contributors.
 
-A PyQt6 desktop mixer for PipeWire on Linux. It mimics Elgato Wave Link:
-two master buses (Monitor + Stream), per-channel dual faders (one for
-what you hear, one for what gets streamed), per-channel effects, per-app
-output routing, and a dedicated virtual recording device for OBS.
+## Key files
 
-Single user-process app. No daemon, no system service, no root, no
-direct libpipewire binding — talks to PipeWire over `pactl`, `pw-dump`,
-`wpctl`, and `parec` subprocesses.
+- `main.py`: Qt UI and dialogs
+- `pipewire_engine.py`: PipeWire routing, state, FX chain
+- `wavelinux_theme.py`: stylesheet
 
-## Source layout (repo root: WaveLinux/)
+## Runtime model
 
-- `main.py` (~3140 lines) — Qt UI, dialogs, channel strips, app-routing
-  tab, tray, settings, update checker, scene wiring. Owns the
-  PipeWireEngine instance.
-- `pipewire_engine.py` (~3300 lines) — virtual sink/source creation,
-  loopback routing, FX chain spawning, snapshot caching, event
-  subscriber, LADSPA probe, app-name resolution (10-step identity
-  chain), system-sound bucketing, hostname filtering.
-- `wavelinux_theme.py` — Qt stylesheet (dark, cyan/violet accents).
-- `install.sh`, `uninstall.sh`, `start.sh`, `PKGBUILD` — packaging.
-- `README.md`, `ROADMAP.md` — user docs / status.
-- `icon.png` — 512x512 app icon.
+- User-space app only (no daemon/service)
+- Uses subprocess tools: `pactl`, `pw-dump`, `wpctl`, `parec`
+- State stored in `~/.config/wavelinux/config.json`
 
-## Architecture facts that matter
+## Core behavior
 
-- **Two master buses**: 🎧 Monitor (routable to any non-WaveLinux sink)
-  and 📡 Stream (locked to virtual sink `wavelinux_mix_stream`, exposed
-  to OBS as `WaveLinux-Stream`). Each is null-sink + virtual-source on
-  the monitor.
-- **Channels**: user virtual sinks (`wavelinux_<name>`) + every real mic
-  / hardware source surfaced. Each has a MON fader and a STR fader,
-  optional Link to move them together.
-- **Per-app routing**: `app_routing[<app_name>] = sink_name`. Persisted
-  in config. Stale entries pruned after `app_prune_days` (default 14).
-  Auto-routing on first sight via `_auto_routed_indices` — moves a
-  stream once when it appears on the wrong sink, then leaves it alone
-  so manual pavucontrol moves stick.
-- **System Sounds bucket**: streams with `media.role = event`,
-  notification apps (canberra, paplay, kdialog, etc.) are all grouped
-  under a single permanent "System Sounds" row in app routing, like
-  Wave Link's System entry. Always visible even when idle.
-- **Effects per channel**: RNNoise, HighPass, EQ (3-band), Compressor,
-  Gate, Limiter. Built-ins use PipeWire's `bq_*` filters; the others
-  are LADSPA (`swh-plugins`, `noise-suppression-for-voice`).
-- **FX implementation**: `set_channel_fx` builds ONE unified config
-  per channel via `_build_unified_chain_config` and spawns ONE
-  `pipewire -c <conf>` client. The config's `filter.graph` lists every
-  enabled effect as a node (namespaced `s<idx>_<id>`) with explicit
-  `links` chaining them together. Result: one virtual sink (`*.input`)
-  + one virtual source (`*.source`) per channel regardless of effect
-  count. Uses `_effect_stage_blocks` for per-effect config generation.
-- **Clipguard** is no longer a master-bus button — it's the per-mic
-  `Limiter` effect inside the unified chain. Old `clipguard: true`
-  configs are migrated to per-mic `limiter` on first load if a
-  `selected_mic` is present.
-- **Branding rule**: every value WaveLinux writes into
-  `device.description` / `node.description` / `node.nick` /
-  `media.name` / `application.name` is whitespace-free
-  (`WaveLinux-Voice-Chat`, not `WaveLinux Voice Chat`). Internal sink
-  names (`sink_name=`) stay underscore-style (`wavelinux_voice_chat`).
-- **State key**: per-channel saved state is keyed by PipeWire
-  `node.name` so it survives a PipeWire restart.
-- **Volume ceiling**: 100% everywhere (`PipeWireEngine.MAX_VOLUME`),
-  even though PipeWire allows 150%.
-- **Refresh model**: 2 s poll backstop + `pactl subscribe` event stream
-  with 150 ms debounce + per-tick snapshot cache (`EngineSnapshot`)
-  that runs each heavy command exactly once.
-- **Peak meters**: one `parec --raw --format=s16le --channels=1` per
-  visible strip, parsed on the Qt event loop (~40 Hz).
-- **In-app update checker**: `UpdateChecker` class polls GitHub releases
-  API on startup (background, non-blocking via queue + QTimer polling).
-  Handles 404 (no releases yet) gracefully.
-
-## App name resolution (10-step identity chain)
-
-The `_process_sink_input` method resolves a human-readable name for each
-audio stream. Steps are tried in order, first match wins:
-
-1. **GIO_LAUNCHED_DESKTOP_FILE** — walks PID parent chain for this env
-   var, set by KDE/GNOME on every .desktop-launched process. Survives
-   Electron/Chromium renderer subprocesses.
-2. **Sandbox detection** — Flatpak ID, Snap name, cgroup scopes,
-   AppImage mount paths.
-3. **Reverse-DNS app IDs / icon names** — checked against both
-   `_BINARY_DISPLAY_NAMES` table and `_KNOWN_APP_IDS` canonicaliser.
-   `application.process.host` is deliberately NOT checked here (that's
-   the hostname, not an app).
-4. **.desktop index** — looks up PID's binary basename in a cached
-   index of all installed `.desktop` files.
-5. **application.name** — from PulseAudio properties, skipped if generic.
-6. **application.process.binary** — checked against
-   `_BINARY_DISPLAY_NAMES` (e.g. `spotify` → `Spotify`).
-7. **PID walk** — `/proc/<pid>/exe` basename + comm + ppid chain,
-   with `_infer_name_from_exe` for install-path inference.
-8. **Direct property fallbacks** — snap.name, node.description,
-   node.nick, node.name, media.name.
-9. **Last resort generic** — accepts even generic-named properties to
-   ensure every stream gets a row.
-10. **Absolute fallback** — `Audio Stream #<id>` so nothing is silently
-    dropped.
-
-Hostname filtering: streams whose final resolved name matches the
-machine hostname (via `_host_aliases`) are filtered out to prevent
-"DuskyPC" appearing in app routing.
-
-`_BINARY_DISPLAY_NAMES` maps ~40 common binary names to friendly
-display names (brave-browser → Brave, spotify → Spotify, etc.).
-
-## File system locations
-
-- Settings: `~/.config/wavelinux/config.json` (atomic writes via temp +
-  `os.replace`).
-- App log: `~/.config/wavelinux/wavelinux.log`.
-- Per-effect logs: `~/.config/wavelinux/fx-logs/`.
-- PipeWire client confs we generate:
-  `~/.config/pipewire/wavelinux-fx-*.conf`,
-  `~/.config/pipewire/wavelinux-rnnoise-*.conf`,
-  `~/.config/pipewire/wavelinux-chain-*.conf`.
-- Single-instance lock: `~/.wavelinux.lock`.
-- Autostart: `~/.config/autostart/wavelinux.desktop`.
-
-## Target distro / runtime
-
-Tested on CachyOS / Arch with KDE. Requires PipeWire ≥ 0.3 with
-WirePlumber, `pipewire-pulse`, `libpulse` (for pactl/parec),
-`swh-plugins`, and the AUR `noise-suppression-for-voice` plugin for
-RNNoise. Optional: `carla` for VST/LV2 hosting via right-click menu.
-
-## CachyOS audio stack (relevant defaults)
-
-- **PipeWire + WirePlumber** is the stock audio stack.
-- Stock WirePlumber configs live in `/usr/share/wireplumber`. User
-  overrides go in `/etc/wireplumber/` or `~/.config/wireplumber/` as
-  `.conf` snippets.
-- **Bluetooth profile auto-switching is ON by default**:
-  `bluetooth.autoswitch-to-headset-profile = true`. The moment any
-  client opens an input stream on a Bluetooth device, WirePlumber
-  flips it from A2DP → HSP/HFP. The high-fidelity A2DP **sink
-  disappears** while the headset profile is active. Disable per-user
-  with `wpctl settings --save bluetooth.autoswitch-to-headset-profile
-  false`.
-- Initial profile after pairing: `a2dp-sink` by default.
-- Diagnostic command (CachyOS FAQ):
-  `journalctl --user -u pipewire -u pipewire-pulse -u wireplumber -b 0`.
-
-## Git conventions
-
-- Default branch: `master`.
-- All work goes directly on `master` or is merged via PR into `master`.
-
-## What has been done (PR history, most recent first)
-
-### PR #25 — App routing rework + update checker fixes
-- Reworked app identity chain to 10-step priority system (GIO desktop
-  file → sandbox → reverse-DNS → .desktop index → binary table → PID
-  walk → fallbacks). First match wins, no more multi-pass.
-- Added `_resolve_via_gio_env` — reads GIO_LAUNCHED_DESKTOP_FILE from
-  process tree, survives Electron/Chromium renderer subprocesses.
-- Added `_identify_via_desktop` — cached .desktop file index lookup.
-- Added `_BINARY_DISPLAY_NAMES` table for native app resolution
-  (spotify → Spotify, brave-browser → Brave, etc.).
-- Grouped system/notification sounds under permanent "System Sounds"
-  bucket (canberra, paplay, kdialog, plasma-pa, etc.).
-- Every sink-input now guaranteed visible — "Audio Stream #N" fallback
-  prevents silent drops.
-- Hostname filtering — streams resolving to machine hostname are hidden.
-- Fixed update checker: replaced QTimer.singleShot-from-thread with
-  queue.SimpleQueue + QTimer polling (fixes "stuck on checking").
-- Fixed AppRoutingRow X button: self.window() inside QDialog returned
-  the dialog, not WaveLinuxWindow — now passes explicit main_win ref.
-- Fixed live app detection: refresh runs when settings dialog is open
-  even if main window is hidden to tray.
-- Filtered "Media Stream #N" phantom entries from app_routing on save
-  and load.
-
-### PR #24 — In-app update checker + native stream fixes
-- Added in-app update checker polling GitHub releases API.
-- Fixed `/proc/<pid>/exe` (not comm) for long binary names.
-- Seeded node.id from pw-dump pw_id so native PipeWire streams aren't
-  dropped from app routing.
-
-### PR #23 — App routing phantom entries + Spotify + Brave
-- Fixed phantom `#None` entries in app routing.
-- Fixed Spotify misidentification (native/AUR package).
-- Fixed Brave and Ferdium not appearing in app routing.
-
-### PR #22 — Mic input filter + internal FX node hiding
-- Actually filter mic input from app routing list.
-- Hide internal WaveLinux FX nodes from user-facing lists.
-
-### PRs #19–21 — App routing detection rewrite
-- Rewrote app routing detection to use pw-dump as primary source.
-- Resolved app streams to real names instead of collapsing to "Audio
-  Src" / "Audio Source".
-- Normalized generic-name comparisons (case-insensitive, whitespace/
-  hyphen-insensitive) so all variations of "audio src" are filtered.
-
-### PRs #15–18 — Widget scaling
-- Channel strips scale with window height (not just width).
-- Reduced wasted padding in header, audio sources, and master panel.
-- Strips shrink proportionally before horizontal scroll activates.
-
-### PR #14 — Comment cleanup
-- Trimmed narrative/journal-style comments, tightened docstrings.
-
-### PR #13 — FX chain fixes
-- Fixed limiter self-monitor routing bug.
-- Fixed LADSPA port-name mismatches.
-- Fixed SC4 compressor stereo channel handling.
-
-### PRs #10–12 — Unified FX chain + audit pass
-- Unified per-channel filter-chain: one `pipewire -c` process per
-  channel regardless of how many effects are enabled.
-- Moved Clipguard from master-bus to per-mic limiter effect.
-- BT locked to A2DP for session duration.
-- Hostname normalizer + persistent forget-blocklist.
-- Full 4-tier audit pass (critical → low fixes).
-
-## What is explicitly NOT planned
-
-Stream Deck integration, drag-and-drop reorder, true Wayland global
-hotkeys, ducking (no usable PipeWire sidechain primitive), Flatpak
-manifest. See ROADMAP.md "Explicitly not planned".
+- Two master buses: Monitor + Stream
+- Stream bus exposed as `WaveLinux-Stream` for OBS
+- Per-channel MON/STR controls
+- App routing by resolved app identity with persistence
+- Per-channel effects in one PipeWire filter-chain process

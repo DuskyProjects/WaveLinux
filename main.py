@@ -38,7 +38,6 @@ _UPDATE_FILES = ["main.py", "pipewire_engine.py", "wavelinux_theme.py"]
 _RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire"]
 
 
-# ── In-app updater ───────────────────────────────────────────────
 def _parse_version(v):
     """Return a comparable tuple from a semver string like '1.2.3' or 'v1.2.3'."""
     v = v.lstrip('v').strip()
@@ -49,14 +48,7 @@ def _parse_version(v):
 
 
 class UpdateChecker:
-    """Runs version checks and downloads on a daemon thread.
-
-    Results are put into a SimpleQueue and retrieved by the Qt main
-    thread via poll(). This avoids QTimer.singleShot from non-Qt threads
-    which is unreliable in PyQt6.
-
-    Queue items are tuples: ('result', tag) | ('error', msg) | ('progress', filename, done, total)
-    """
+    """Background updater using queue polling from the Qt thread."""
 
     _API_URL  = (f"https://api.github.com/"
                  f"repos/{_GITHUB_OWNER}/{_GITHUB_REPO}/releases/latest")
@@ -86,8 +78,6 @@ class UpdateChecker:
             return self._q.get_nowait()
         except queue.Empty:
             return None
-
-    # ── internals ──────────────────────────────────────────────────
 
     def _fetch_json(self, url):
         req = urllib.request.Request(url, headers={"User-Agent": "WaveLinux-Updater"})
@@ -202,11 +192,8 @@ class UpdateChecker:
                     self._q.put(('progress', filename, done, total))
 
 
-# ── Per-channel peak meter (VU) ───────────────────────────────────
 class MeterWorker(QObject):
-    """Spawns `parec` against a source and emits a normalized peak
-    (0.0..1.0) every ~50 ms. One worker per visible channel strip.
-    The process dies cleanly on .stop()."""
+    """Emit normalized channel peaks from `parec`."""
 
     peak = pyqtSignal(float)
 
@@ -215,8 +202,6 @@ class MeterWorker(QObject):
         self.source_name = source_name
         self._proc = None
         self._buf = bytearray()
-        # ~40 Hz updates (25 ms window). Smooth enough for a proper VU feel
-        # without spamming the UI; parec's own chunking keeps this cheap.
         self._sample_bytes = 48000 * 2 // 40
         self._last_peak = 0.0
 

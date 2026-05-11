@@ -1,7 +1,4 @@
-"""
-PipeWire Engine — handles all audio routing, virtual sinks, volume control,
-multiple output mixes, effects chains, and RNNoise noise suppression.
-"""
+"""PipeWire audio routing and effects engine for WaveLinux."""
 
 import subprocess
 import json
@@ -37,7 +34,7 @@ class AudioNode:
 
 
 class OutputMix:
-    """Represents one output mix (e.g. Monitor, Stream, Discord, VOD)."""
+    """Output mix model (Monitor, Stream, etc.)."""
     def __init__(self, name, sink_module_id=None, sink_name=None):
         self.name = name
         self.sink_name = sink_name  # PipeWire sink name
@@ -52,9 +49,7 @@ class OutputMix:
 
 
 class EngineSnapshot:
-    """One-shot cache of pactl/pw-dump outputs, built at the top of a
-    refresh tick so a single tick runs each heavy subprocess at most once.
-    Write paths re-query directly to avoid acting on stale data."""
+    """Per-refresh cache for expensive pactl/pw-dump reads."""
 
     __slots__ = ("modules_text", "short_modules_text", "sink_inputs_text",
                  "sinks_text", "nodes", "sinks", "_loopback_index",
@@ -76,8 +71,6 @@ class EngineSnapshot:
 class PipeWireEngine:
     """Full-featured PipeWire audio engine."""
 
-    # Common LADSPA search paths across distros. We additionally honour
-    # $LADSPA_PATH (colon-separated, like PATH) at probe time.
     _LADSPA_PATHS = (
         "/usr/lib/ladspa",
         "/usr/lib64/ladspa",
@@ -95,49 +88,15 @@ class PipeWireEngine:
         self.rnnoise_processes = {}      # channel_key -> subprocess
         self.loopback_modules = {}       # "mix_name->hw_name" -> module id
         self.submix_loopbacks = {}       # "node_id->mix_name" -> module id
-        # Source token used when each submix loopback was created. Lets
-        # `route_input_to_submix` notice when an FX toggle changes a mic's
-        # source (raw mic ↔ FX bus output) and rebuild the loopback.
         self.submix_sources = {}         # "node_id->mix_name" -> source_token
-        # Per-channel FX chain. Keyed by stable PipeWire node.name so it
-        # survives PipeWire restarts.
         self.channel_fx = {}             # node_name -> {effects, params, procs,
                                          #               source, capture_target,
                                          #               safe_key}
-
-        # FX chain rebuilds run on a background thread so the UI stays
-        # responsive. While one is in flight the engine's view of the
-        # world (channel_fx, submix_sources, default source, pactl
-        # source-output routing) is briefly inconsistent — a refresh
-        # tick observing that mid-rebuild will unload the working
-        # submix loopback and silence audio. Callers gate on
-        # `is_fx_rebuilding()` to defer their refresh until the
-        # rebuild has stamped a coherent state.
         self._fx_rebuild_count = 0
         self._fx_rebuild_lock = threading.Lock()
-
-        # Last vol/mute pushed via set_submix_volume / set_submix_mute,
-        # plus the value applied at loopback creation. Used to re-push
-        # state after operations (notably _move_source_outputs) that
-        # can transiently flip a moved sink-input back to pulse-bridge's
-        # stale default — without this, audio leaks for the gap between
-        # the move and the next refresh tick's sync push.
         self.submix_state_cache = {}    # "node_id->mix_name" -> {'vol', 'mute'}
-
-        # Probe LADSPA plugins once at startup; filter-chain silently
-        # fails to start if it references one that isn't installed.
         self.ladspa_plugins = self._probe_ladspa_plugins()
-
-        # Reap orphan `pipewire -c` filter-chain processes from previous
-        # crashes — otherwise their virtual sinks/sources stay alive in
-        # the system audio graph forever.
         self._reap_orphan_fx_processes()
-
-        # Must be set before cleanup() runs — cleanup → unlock_bluetooth_autoswitch
-        # reads this attribute. The previous order initialised it AFTER
-        # cleanup, relying on a `try/except AttributeError` swallow that
-        # would mask any real failure mode any future contributor adds
-        # to that path.
         self._bt_autoswitch_overridden = False
         self.cleanup()
         self.lock_bluetooth_to_a2dp()
@@ -155,14 +114,6 @@ class PipeWireEngine:
             )
         except Exception:
             pass
-
-    # ── Bluetooth profile lock ─────────────────────────────────────
-    #
-    # WirePlumber 0.5+ defaults `bluetooth.autoswitch-to-headset-profile`
-    # to true, which flips a BT device from A2DP to HSP/HFP the moment any
-    # client opens its mic. The A2DP sink disappears for the duration. We
-    # disable that autoswitch (volatile, no `--save`) so the headset stays
-    # visible as a stereo output the whole time WaveLinux is running.
 
     def lock_bluetooth_to_a2dp(self):
         """Disable WirePlumber's A2DP↔HSP autoswitch for this session.
