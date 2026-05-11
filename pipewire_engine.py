@@ -8,7 +8,6 @@ import signal
 import re
 import socket
 import time
-import threading
 import logging
 
 _LOG_PATH = os.path.expanduser("~/.config/wavelinux/wavelinux.log")
@@ -92,8 +91,6 @@ class PipeWireEngine:
         self.channel_fx = {}             # node_name -> {effects, params, procs,
                                          #               source, capture_target,
                                          #               safe_key}
-        self._fx_rebuild_count = 0
-        self._fx_rebuild_lock = threading.Lock()
         self.submix_state_cache = {}    # "node_id->mix_name" -> {'vol', 'mute'}
         self.ladspa_plugins = self._probe_ladspa_plugins()
         self._reap_orphan_fx_processes()
@@ -208,21 +205,22 @@ class PipeWireEngine:
                         return full
         return None
 
+    _EFFECT_REQUIREMENTS = {
+        'rnnoise': ('librnnoise_ladspa',),
+        'compressor': ('sc4m_1916',),
+        'gate': ('gate_1410',),
+        # highpass, eq, and limiter use PipeWire's builtin nodes
+        # (biquad / linear / clamp) — always available.
+        'highpass': (),
+        'eq': (),
+        'limiter': (),
+    }
+
     def effect_available(self, effect_id):
         """Return True if the filter-chain backend for this effect has
         everything it needs on disk. Keeps the FX UI from offering things
         that will silently fail at spawn time."""
-        requirements = {
-            'rnnoise':    ('librnnoise_ladspa',),
-            'compressor': ('sc4m_1916',),
-            'gate':       ('gate_1410',),
-            # highpass, eq, and limiter use PipeWire's builtin nodes
-            # (biquad / linear / clamp) — always available.
-            'highpass':   (),
-            'eq':         (),
-            'limiter':    (),
-        }
-        needed = requirements.get(effect_id, ())
+        needed = self._EFFECT_REQUIREMENTS.get(effect_id, ())
         return all(self.ladspa_plugin_available(n) for n in needed)
 
     # ── Helpers ─────────────────────────────────────────────────────
@@ -277,42 +275,65 @@ class PipeWireEngine:
 
     def _list_source_outputs_on(self, source_name, exclude_modules=None):
         """Return [source_output_id, ...] for streams currently capturing
-        from `source_name`. Uses `pactl list short source-outputs`, where
-        column 3 is the numeric source id, then resolves to name.
+        from `source_name`.
+
+        Use the live bound source from `pactl list short source-outputs`
+        where column 2 is the current source id on this PipeWire stack.
+        Full `pactl list source-outputs` is still consulted for owner
+        module ids (for exclusions) and as a fallback `target.object`
+        hint when the short source id cannot be resolved back to a name.
 
         If `exclude_modules` is provided, source-outputs whose owner
         module is in that set are skipped — this lets callers protect
         WaveLinux's own loopbacks from being swept up in a bulk move."""
-        out = self._run(['pactl', 'list', 'short', 'source-outputs'])
-        if not out:
+        short = self._run(['pactl', 'list', 'short', 'source-outputs'])
+        full = self._run(['pactl', 'list', 'source-outputs'])
+        if not short or not full:
             return []
+
         id_to_name = self._source_id_to_name()
-
-        excluded = {str(m) for m in (exclude_modules or ()) if m is not None}
-        skip_so_ids = set()
-        if excluded:
-            full = self._run(['pactl', 'list', 'source-outputs']) or ''
-            current_so = None
-            for line in full.splitlines():
-                stripped = line.strip()
-                if stripped.startswith('Source Output #'):
-                    current_so = stripped.split('#', 1)[1].strip()
-                elif current_so and stripped.startswith('Owner Module:'):
-                    owner = stripped.split(':', 1)[1].strip()
-                    if owner in excluded:
-                        skip_so_ids.add(current_so)
-
-        ids = []
-        for line in out.splitlines():
+        current_by_so = {}
+        for line in short.splitlines():
             parts = line.split('\t')
-            if len(parts) < 3:
+            if len(parts) < 2:
                 continue
             so_id = parts[0].strip()
-            src_id = parts[2].strip()
-            if so_id in skip_so_ids:
+            src_id = parts[1].strip()
+            current_by_so[so_id] = id_to_name.get(src_id)
+
+        excluded = {str(m) for m in (exclude_modules or ()) if m is not None}
+        ids = []
+        current_so = None
+        current_owner = None
+        current_target = None
+
+        def flush():
+            if not current_so:
+                return
+            if current_owner in excluded:
+                return
+            live_source = current_by_so.get(current_so)
+            if live_source == source_name or current_target == source_name:
+                ids.append(current_so)
+
+        for line in full.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('Source Output #'):
+                flush()
+                current_so = stripped.split('#', 1)[1].strip()
+                current_owner = None
+                current_target = None
                 continue
-            if id_to_name.get(src_id) == source_name:
-                ids.append(so_id)
+            if current_so is None:
+                continue
+            if stripped.startswith('Owner Module:'):
+                current_owner = stripped.split(':', 1)[1].strip()
+                continue
+            if 'target.object =' in stripped:
+                current_target = stripped.split('=', 1)[1].strip().strip('"')
+                continue
+
+        flush()
         return ids
 
     def _move_source_outputs(self, from_source, to_source, exclude_modules=None):
@@ -328,9 +349,40 @@ class PipeWireEngine:
         that silences the chain entirely."""
         if not from_source or not to_source or from_source == to_source:
             return
+        if not self._wait_source_visible(to_source):
+            logging.warning(
+                f"Destination source {to_source} never became visible; "
+                f"skipping move-source-output from {from_source}"
+            )
+            return
         for sid in self._list_source_outputs_on(
                 from_source, exclude_modules=exclude_modules):
-            self._run(['pactl', 'move-source-output', sid, to_source])
+            self._move_source_output_with_retry(sid, from_source, to_source)
+
+    def _wait_source_visible(self, source_name, attempts=20, delay=0.05):
+        if not source_name:
+            return False
+        for _ in range(max(1, int(attempts))):
+            if source_name in self._source_id_to_name().values():
+                return True
+            time.sleep(max(0.0, float(delay)))
+        return False
+
+    def _move_source_output_with_retry(self, source_output_id, from_source, to_source,
+                                       attempts=20, delay=0.05):
+        source_output_id = str(source_output_id).strip()
+        if not source_output_id:
+            return False
+        for _ in range(max(1, int(attempts))):
+            self._run(['pactl', 'move-source-output', source_output_id, to_source])
+            if source_output_id not in self._list_source_outputs_on(from_source):
+                return True
+            time.sleep(max(0.0, float(delay)))
+        logging.warning(
+            f"Source output {source_output_id} stayed on {from_source} "
+            f"after move attempt to {to_source}"
+        )
+        return False
 
     # ── Per-refresh snapshot ───────────────────────────────────────
 
@@ -723,59 +775,67 @@ class PipeWireEngine:
         # matches the current routing (FX state hasn't changed), keep it.
         known = self.submix_loopbacks.get(key)
         known_source = self.submix_sources.get(key)
-        if known and known_source == source_id and self._module_is_alive(known, short_text=short):
+        known_alive = bool(
+            known and self._module_is_alive(known, short_text=short)
+        )
+        if known_alive and known_source == source_id:
             return True
-        # Otherwise drop the stale entry. If the source changed (FX flip),
-        # actively unload the module so we don't leave dangling audio.
-        if known:
-            if known_source != source_id:
-                self._run(['pactl', 'unload-module', str(known)])
-            self.submix_loopbacks.pop(key, None)
-            self.submix_sources.pop(key, None)
-            # Drop the cache entry too so the next loopback's initial_state
-            # push (or the caller's sync push) populates it cleanly,
-            # rather than letting `_reapply_submix_state_cache` push the
-            # old loopback's last-known state at a freshly-loaded
-            # sink-input that the user may have meant to start in a
-            # different state.
-            self.submix_state_cache.pop(key, None)
 
         existing = self._find_loopback_for(source_id, mix.sink_name, snap=snap)
-        if existing:
-            self.submix_loopbacks[key] = existing
-            self.submix_sources[key] = source_id
-            return True
+        target_module = str(existing) if existing else None
+        if not target_module:
+            target_module = self._run([
+                'pactl', 'load-module', 'module-loopback',
+                f'source={source_id}',
+                f'sink={mix.sink_name}',
+                'latency_msec=20',
+                'adjust_time=0'
+            ])
+            if not target_module:
+                # Keep the last known-good route instead of tearing it down
+                # and leaving the mix silent when PipeWire is mid-churn.
+                if known_alive:
+                    return True
+                return False
+            self.invalidate_snapshot()
 
-        out = self._run([
-            'pactl', 'load-module', 'module-loopback',
-            f'source={source_id}',
-            f'sink={mix.sink_name}',
-            'latency_msec=20',
-            'adjust_time=0'
-        ])
-        if not out:
-            return False
-        self.submix_loopbacks[key] = out
+        self.submix_loopbacks[key] = target_module
         self.submix_sources[key] = source_id
-        # Apply caller-provided saved state immediately. The sink-input
-        # may not be enumerable in the very first `pactl list sink-inputs`
-        # tick after load — wait briefly so we don't fall through to
-        # pulse-bridge's mute=0 default.
-        if initial_state is not None:
-            si = self._sink_input_for_module(out)
-            if si is None:
-                for _ in range(20):
-                    time.sleep(0.005)
-                    si = self._sink_input_for_module(out)
-                    if si is not None:
-                        break
-            if si is not None:
-                vol = self._clamp(initial_state.get('vol', 1.0))
-                mute = bool(initial_state.get('mute', False))
-                pct = max(0, min(int(round(vol * 100)), 100))
-                self._run(['pactl', 'set-sink-input-volume', si, f'{pct}%'])
-                self._run(['pactl', 'set-sink-input-mute', si, '1' if mute else '0'])
-                self.submix_state_cache[key] = {'vol': vol, 'mute': mute}
+        if target_module != str(known or ""):
+            state = dict(initial_state or self.submix_state_cache.get(key, {}) or {})
+            if state:
+                if self._apply_loopback_state(target_module, state):
+                    self.submix_state_cache[key] = {
+                        'vol': self._clamp(state.get('vol', 1.0)),
+                        'mute': bool(state.get('mute', False)),
+                    }
+            if known and str(known) != str(target_module):
+                logging.warning(
+                    f"[FX-DEBUG] route_input_to_submix({key}): source changed "
+                    f"'{known_source}' -> '{source_id}', replacing module {known} with {target_module}"
+                )
+                self._run(['pactl', 'unload-module', str(known)])
+                self.invalidate_snapshot()
+        return True
+
+    def _apply_loopback_state(self, module_id, state):
+        """Push volume/mute onto a loopback sink-input once it becomes visible."""
+        if not module_id or not state:
+            return False
+        si = self._sink_input_for_module(module_id)
+        if si is None:
+            for _ in range(20):
+                time.sleep(0.005)
+                si = self._sink_input_for_module(module_id)
+                if si is not None:
+                    break
+        if si is None:
+            return False
+        vol = self._clamp(state.get('vol', 1.0))
+        mute = bool(state.get('mute', False))
+        pct = max(0, min(int(round(vol * 100)), 100))
+        self._run(['pactl', 'set-sink-input-volume', si, f'{pct}%'])
+        self._run(['pactl', 'set-sink-input-mute', si, '1' if mute else '0'])
         return True
 
     def _build_loopback_index(self, modules_text):
@@ -1099,16 +1159,22 @@ class PipeWireEngine:
         mix = self.output_mixes.get(mix_name)
         if not mix:
             return False
-        # Remove old loopback if exists
-        for key in list(self.loopback_modules.keys()):
-            if key.startswith(mix_name + '->'):
-                self._run(['pactl', 'unload-module', self.loopback_modules[key]])
-                del self.loopback_modules[key]
+        current_key = f'{mix_name}->{hw_sink_name}'
+        short = self._run(['pactl', 'list', 'short', 'modules']) or ''
+        existing_mod = self.loopback_modules.get(current_key)
+        if existing_mod and self._module_is_alive(existing_mod, short_text=short):
+            mix.hardware_output = hw_sink_name
+            return True
 
         # Retry briefly — picked sink may not be visible yet (BT mid-profile
         # negotiation, USB still enumerating).
         out = None
+        adopted = self._find_loopback_for(f'{mix.sink_name}.monitor', hw_sink_name)
+        if adopted:
+            out = str(adopted)
         for attempt in range(8):
+            if out:
+                break
             if self._sink_visible(hw_sink_name):
                 out = self._run([
                     'pactl', 'load-module', 'module-loopback',
@@ -1128,8 +1194,15 @@ class PipeWireEngine:
             )
             return False
 
-        key = f'{mix_name}->{hw_sink_name}'
-        self.loopback_modules[key] = out
+        for key in list(self.loopback_modules.keys()):
+            if not key.startswith(mix_name + '->'):
+                continue
+            if str(self.loopback_modules[key]) == str(out):
+                continue
+            self._run(['pactl', 'unload-module', str(self.loopback_modules[key])])
+            del self.loopback_modules[key]
+
+        self.loopback_modules[current_key] = out
         mix.hardware_output = hw_sink_name
         # Force the new sink-input to 100%/unmuted — pulse-bridge can
         # apply a stale per-app-per-sink rule that defaults it to 0%.
@@ -1233,6 +1306,13 @@ class PipeWireEngine:
                 current = {}
             elif stripped.startswith('Sink:') and current_index is not None:
                 current['_sink_id'] = stripped.split(':', 1)[1].strip()
+            elif stripped.startswith('Volume:') and current_index is not None:
+                match = re.search(r'/\s*(\d+)%', stripped)
+                if match:
+                    try:
+                        current['volume'] = int(match.group(1)) / 100.0
+                    except ValueError:
+                        pass
             elif '=' in stripped and current_index is not None:
                 parts = stripped.split('=', 1)
                 if len(parts) == 2:
@@ -1802,6 +1882,106 @@ class PipeWireEngine:
         "zoom": "Zoom",
     }
 
+    _MULTIPROCESS_CHILD_BINARIES = {
+        "chrome",
+        "chromium",
+        "chromium-browser",
+        "firefox",
+        "firefox-bin",
+        "renderer",
+        "zygote",
+        "utility",
+        "gpu-process",
+        "plugin-host",
+        "webkitwebprocess",
+    }
+    _WINDOW_IDENTITY_KEYS = (
+        "application.id",
+        "pipewire.access.portal.app_id",
+        "xdg.portal.app_id",
+        "window.app_id",
+        "window.x11.wm_class",
+        "window.x11.instance",
+        "window.class",
+        "application.icon_name",
+    )
+    _TEXT_IDENTITY_KEYS = (
+        "application.display_name",
+        "application.name",
+        "node.description",
+        "node.nick",
+        "node.name",
+        "media.name",
+    )
+    _WINDOW_TITLE_KEYS = (
+        "window.title",
+        "window.name",
+        "media.title",
+    )
+
+    @classmethod
+    def _normalize_app_route_token(cls, value):
+        if value is None:
+            return ""
+        return re.sub(r'[^a-z0-9._:+-]+', '-', str(value).strip().lower()).strip('-')
+
+    @classmethod
+    def _make_app_route_key(cls, prefix, value):
+        token = cls._normalize_app_route_token(value)
+        if not token:
+            return None
+        return f"{prefix}:{token}"
+
+    @classmethod
+    def _sanitize_app_label(cls, value):
+        if value is None:
+            return None
+        label = str(value).strip()
+        if not label:
+            return None
+        mapped = cls._BINARY_DISPLAY_NAMES.get(label.lower())
+        if mapped:
+            return mapped
+        if '.' in label and ' ' not in label and len(label.split('.')) >= 2:
+            known = cls._KNOWN_APP_IDS.get(label.lower())
+            if known:
+                return known
+        label = label.replace('_', ' ').replace('-', ' ').strip()
+        if label and label.islower():
+            return label.title()
+        return label
+
+    @classmethod
+    def display_name_for_app_id(cls, app_id):
+        if not app_id:
+            return "Unknown App"
+        if app_id == cls.SYSTEM_SOUNDS_BUCKET:
+            return cls.SYSTEM_SOUNDS_BUCKET
+        if ':' not in app_id:
+            return cls._sanitize_app_label(app_id) or app_id
+        kind, raw = app_id.split(':', 1)
+        if kind == "app":
+            return cls._canonicalize_app_id(raw) or cls._sanitize_app_label(raw) or raw
+        if kind == "snap":
+            return raw.replace('-', ' ').replace('_', ' ').title()
+        if kind == "stream":
+            return f"Audio Stream #{raw}"
+        return cls._sanitize_app_label(raw) or raw.replace('.', ' ').strip() or app_id
+
+    @classmethod
+    def is_legacy_stream_label(cls, value):
+        return isinstance(value, str) and value.startswith(("Media Stream #", "Audio Stream #"))
+
+    @classmethod
+    def is_persistent_app_id(cls, app_id):
+        if not app_id:
+            return False
+        if app_id == cls.SYSTEM_SOUNDS_BUCKET:
+            return True
+        if cls.is_legacy_stream_label(app_id):
+            return False
+        return not str(app_id).startswith("stream:")
+
     @staticmethod
     def _proc_exe_basename(pid):
         """Resolve /proc/<pid>/exe to its basename. Unlike /proc/<pid>/comm
@@ -1815,6 +1995,128 @@ class PipeWireEngine:
         except OSError:
             return ''
         return os.path.basename(exe) if exe else ''
+
+    @staticmethod
+    def _proc_comm(pid):
+        if not pid:
+            return ''
+        try:
+            with open(f"/proc/{pid}/comm", "r") as f:
+                return f.read().strip()
+        except OSError:
+            return ''
+
+    @staticmethod
+    def _parent_pid(pid):
+        try:
+            with open(f"/proc/{pid}/status", "r") as f:
+                for line in f:
+                    if line.startswith("PPid:"):
+                        return line.split()[1]
+        except OSError:
+            return None
+        return None
+
+    def _pid_lineage(self, pid, limit=10):
+        if not pid:
+            return []
+        out = []
+        seen = set()
+        cur = str(pid)
+        for _ in range(limit):
+            if not cur or cur in seen or cur == "0":
+                break
+            seen.add(cur)
+            out.append(cur)
+            cur = self._parent_pid(cur)
+        return out
+
+    @staticmethod
+    def _split_identity_tokens(raw):
+        if raw is None:
+            return []
+        text = str(raw).strip()
+        if not text:
+            return []
+        parts = [text]
+        parts.extend(p.strip() for p in re.split(r'[;,]', text) if p.strip())
+        out = []
+        seen = set()
+        for part in parts:
+            low = part.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            out.append(part)
+        return out
+
+    @classmethod
+    def _identity_candidate(cls, app_id, display_name, score, source):
+        if not app_id or not display_name:
+            return None
+        return {
+            "app_id": app_id,
+            "app_name": display_name,
+            "score": int(score),
+            "source": source,
+        }
+
+    @classmethod
+    def _candidate_from_raw(cls, prefix, raw_value, display_name, score, source):
+        app_id = cls._make_app_route_key(prefix, raw_value)
+        label = display_name or cls.display_name_for_app_id(app_id)
+        return cls._identity_candidate(app_id, label, score, source)
+
+    def _stream_identity_candidate(self, current, display_name, score, source):
+        stream_id = (
+            current.get("node.id")
+            or current.get("index")
+            or current.get("pid")
+            or current.get("application.process.id")
+        )
+        if not stream_id:
+            return None
+        return self._identity_candidate(
+            self._make_app_route_key("stream", stream_id),
+            display_name,
+            score,
+            source,
+        )
+
+    def _window_title_identity_label(self, raw):
+        title = str(raw).strip()
+        if not title:
+            return None
+        lowered = title.lower()
+        if re.search(r'https?://|www\.|[a-z0-9-]+\.(?:com|org|net|io|gg|tv)\b', lowered):
+            return None
+        if any(sep in title for sep in (" - ", " | ", " — ", " :: ", " • ")):
+            return None
+        label = self._sanitize_app_label(title)
+        if not label or self._is_generic_name(label) or self.name_matches_host(label):
+            return None
+        if len(label) > 80:
+            return None
+        return label
+
+    def _generic_title_context(self, current):
+        for key in ("application.id", "window.app_id", "application.display_name", "application.name"):
+            raw = (current.get(key) or "").strip()
+            if raw and not self._is_generic_name(raw) and not self.name_matches_host(raw):
+                return False
+        for key in ("application.process.binary", "node.name", "media.name"):
+            raw = (current.get(key) or "").strip().lower()
+            if not raw:
+                continue
+            norm = self._normalize_app_name(raw)
+            if (
+                self._is_generic_name(raw)
+                or raw in self._MULTIPROCESS_CHILD_BINARIES
+                or raw in {"chrome", "chromium", "chromium-browser", "electron", "wine", "wine64", "launcher", "helper"}
+                or norm in {"chrome", "chromium", "electron", "renderer", "utility", "plugin host", "audio stream", "unknown"}
+            ):
+                return True
+        return False
 
     def _app_name_from_pid(self, pid):
         """Best-effort process-name lookup, skipping wrapper binaries.
@@ -1942,6 +2244,355 @@ class PipeWireEngine:
             cur = ppid
         return None
 
+    def _gio_identity_candidate(self, pid):
+        for depth, cur in enumerate(self._pid_lineage(pid)):
+            env = self._read_proc_env(cur)
+            desktop_path = env.get("GIO_LAUNCHED_DESKTOP_FILE")
+            if not desktop_path or not os.path.isfile(desktop_path):
+                continue
+            name, _exec, _hidden = self._parse_desktop_file(desktop_path)
+            if not name:
+                continue
+            desktop_id = os.path.splitext(os.path.basename(desktop_path))[0]
+            return self._candidate_from_raw(
+                "desktop",
+                desktop_id,
+                name,
+                130 - depth,
+                "gio-desktop",
+            )
+        return None
+
+    def _sandbox_identity_candidate(self, pid):
+        if not pid:
+            return None
+        for depth, cur in enumerate(self._pid_lineage(pid)):
+            env = self._read_proc_env(cur)
+            flatpak_id = env.get("FLATPAK_ID")
+            if not flatpak_id:
+                try:
+                    with open(f"/proc/{cur}/root/.flatpak-info", "r") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith("name=") or line.startswith("application="):
+                                flatpak_id = line.split("=", 1)[1].strip()
+                                break
+                except OSError:
+                    pass
+            if flatpak_id:
+                return self._candidate_from_raw(
+                    "app",
+                    flatpak_id,
+                    self._canonicalize_app_id(flatpak_id),
+                    126 - depth,
+                    "flatpak",
+                )
+
+            snap_name = env.get("SNAP_INSTANCE_NAME") or env.get("SNAP_NAME")
+            if snap_name:
+                return self._candidate_from_raw(
+                    "snap",
+                    snap_name,
+                    snap_name.replace('-', ' ').replace('_', ' ').title(),
+                    122 - depth,
+                    "snap-env",
+                )
+
+            cgroup = self._read_proc_cgroup(cur)
+            matchers = (
+                (r'app-flatpak-([A-Za-z0-9_.+-]+?)-\d+\.scope', "app", self._canonicalize_app_id, 124, "flatpak-cgroup"),
+                (r'app-([A-Za-z0-9_.+-]+?)\.slice', "app", self._canonicalize_app_id, 116, "app-slice"),
+                (r'snap\.([A-Za-z0-9_-]+)', "snap", lambda v: v.replace('-', ' ').replace('_', ' ').title(), 114, "snap-cgroup"),
+            )
+            for pattern, prefix, display_fn, score, source in matchers:
+                match = re.search(pattern, cgroup)
+                if not match:
+                    continue
+                raw = match.group(1)
+                return self._candidate_from_raw(
+                    prefix,
+                    raw,
+                    display_fn(raw),
+                    score - depth,
+                    source,
+                )
+
+            for env_key in ("GTK_APPLICATION_ID", "APP_ID", "XDG_CURRENT_DESKTOP_APP"):
+                raw = env.get(env_key)
+                if raw:
+                    return self._candidate_from_raw(
+                        "app",
+                        raw,
+                        self._canonicalize_app_id(raw),
+                        118 - depth,
+                        env_key.lower(),
+                    )
+
+            cmdline = self._read_proc_cmdline(cur)
+            if cmdline:
+                for idx, token in enumerate(cmdline[:-1]):
+                    if os.path.basename(token).lower() == "flatpak":
+                        candidate = cmdline[idx + 1]
+                        if candidate == "run" and idx + 2 < len(cmdline):
+                            candidate = cmdline[idx + 2]
+                        if '.' in candidate and not candidate.startswith('-'):
+                            return self._candidate_from_raw(
+                                "app",
+                                candidate,
+                                self._canonicalize_app_id(candidate),
+                                112 - depth,
+                                "flatpak-cmdline",
+                            )
+                mount_match = re.search(r'/tmp/\.mount_([^/]+)', cmdline[0])
+                if mount_match:
+                    stripped = re.sub(r'[A-Za-z0-9]{4,8}$', '', mount_match.group(1)).rstrip('_-.')
+                    if stripped:
+                        return self._candidate_from_raw(
+                            "path",
+                            stripped,
+                            stripped.replace('_', ' ').replace('-', ' ').title(),
+                            92 - depth,
+                            "appimage",
+                        )
+        return None
+
+    def _window_identity_candidates(self, current):
+        candidates = []
+        for key in self._WINDOW_IDENTITY_KEYS:
+            raw = current.get(key)
+            if not raw:
+                continue
+            if key in {"application.id", "pipewire.access.portal.app_id", "xdg.portal.app_id"}:
+                base_score = 116
+            elif key == "window.app_id":
+                base_score = 108
+            else:
+                base_score = 96
+            for token in self._split_identity_tokens(raw):
+                low = token.lower()
+                if '.' in token:
+                    candidates.append(self._candidate_from_raw(
+                        "app",
+                        token,
+                        self._canonicalize_app_id(token),
+                        base_score,
+                        key,
+                    ))
+                mapped = self._BINARY_DISPLAY_NAMES.get(low)
+                if mapped:
+                    candidates.append(self._candidate_from_raw(
+                        "binary",
+                        token,
+                        mapped,
+                        base_score - 2,
+                        key,
+                    ))
+                elif not self._is_generic_name(token) and not self.name_matches_host(token):
+                    candidates.append(self._candidate_from_raw(
+                        "wmclass",
+                        token,
+                        self._sanitize_app_label(token),
+                        base_score - 10,
+                        key,
+                    ))
+        return [candidate for candidate in candidates if candidate]
+
+    def _binary_identity_candidates(self, pid, current):
+        candidates = []
+        current_binary = (current.get('application.process.binary') or '').strip()
+        if current_binary:
+            mapped = self._BINARY_DISPLAY_NAMES.get(current_binary.lower())
+            if mapped:
+                candidates.append(self._candidate_from_raw(
+                    "binary",
+                    current_binary,
+                    mapped,
+                    88,
+                    "application.process.binary",
+                ))
+            elif not self._is_generic_name(current_binary):
+                candidates.append(self._candidate_from_raw(
+                    "binary",
+                    current_binary,
+                    current_binary,
+                    70,
+                    "application.process.binary",
+                ))
+
+        index = self._desktop_app_index() or {}
+        wrapper_set = self._EXEC_WRAPPERS | {
+            "bwrap", "python", "python3", "flatpak", "snap", "snap-confine",
+        }
+        for depth, cur in enumerate(self._pid_lineage(pid)):
+            raw_candidates = [
+                self._proc_exe_basename(cur),
+                self._proc_comm(cur),
+            ]
+            cmdline = self._read_proc_cmdline(cur)
+            if cmdline:
+                raw_candidates.append(os.path.basename(cmdline[0]))
+            seen = set()
+            for raw in raw_candidates:
+                if not raw:
+                    continue
+                low = raw.lower()
+                if low in seen or low in wrapper_set:
+                    continue
+                seen.add(low)
+                mapped = self._BINARY_DISPLAY_NAMES.get(low)
+                score_penalty = depth * 2
+                if low in self._MULTIPROCESS_CHILD_BINARIES:
+                    score_penalty += 22
+                if low in index:
+                    candidates.append(self._candidate_from_raw(
+                        "binary",
+                        low,
+                        index[low],
+                        104 - score_penalty,
+                        f"desktop-index:{depth}",
+                    ))
+                if mapped:
+                    candidates.append(self._candidate_from_raw(
+                        "binary",
+                        low,
+                        mapped,
+                        100 - score_penalty,
+                        f"binary-map:{depth}",
+                    ))
+                elif not self._is_generic_name(raw):
+                    candidates.append(self._candidate_from_raw(
+                        "binary",
+                        low,
+                        raw,
+                        74 - score_penalty,
+                        f"binary:{depth}",
+                    ))
+        return [candidate for candidate in candidates if candidate]
+
+    def _path_identity_candidate(self, pid):
+        for depth, cur in enumerate(self._pid_lineage(pid)):
+            current_name = self._proc_exe_basename(cur) or self._proc_comm(cur)
+            title = self._infer_name_from_exe(cur, current_name=current_name)
+            if title and not self._is_generic_name(title) and not self.name_matches_host(title):
+                return self._candidate_from_raw(
+                    "path",
+                    title,
+                    title,
+                    94 - depth,
+                    "exe-path",
+                )
+        return None
+
+    def _text_identity_candidates(self, current):
+        candidates = []
+        for key in self._TEXT_IDENTITY_KEYS:
+            raw = (current.get(key) or '').strip()
+            if not raw:
+                continue
+            if self.name_matches_host(raw):
+                continue
+            if key == "application.name":
+                mapped = self._BINARY_DISPLAY_NAMES.get(raw.lower())
+                if mapped:
+                    candidates.append(self._candidate_from_raw(
+                        "name",
+                        raw,
+                        mapped,
+                        89 if not self._is_generic_name(raw) else 68,
+                        key,
+                    ))
+            if self._is_generic_name(raw):
+                continue
+            if key == "application.display_name":
+                score = 92
+            elif key == "application.name":
+                score = 89
+            elif key.startswith("application."):
+                score = 72
+            else:
+                score = 56
+            candidates.append(self._candidate_from_raw(
+                "name",
+                raw,
+                self._sanitize_app_label(raw),
+                score,
+                key,
+            ))
+        title_score = 90 if self._generic_title_context(current) else 72
+        for key in self._WINDOW_TITLE_KEYS:
+            raw = (current.get(key) or '').strip()
+            if not raw:
+                continue
+            label = self._window_title_identity_label(raw)
+            if not label:
+                continue
+            candidate = self._stream_identity_candidate(
+                current,
+                label,
+                title_score - (6 if key == "media.title" else 0),
+                key,
+            )
+            if candidate:
+                candidates.append(candidate)
+        return [candidate for candidate in candidates if candidate]
+
+    def _stream_fallback_identity(self, current):
+        stream_id = str(current.get('node.id') or current.get('index') or current.get('pid') or '?')
+        display = None
+        for key in ("application.name", "node.description", "node.name", "media.name"):
+            raw = (current.get(key) or '').strip()
+            if raw and not self.name_matches_host(raw):
+                display = self._sanitize_app_label(raw)
+                break
+        if not display:
+            display = f"Audio Stream #{stream_id}"
+        return {
+            "app_id": self._make_app_route_key("stream", stream_id),
+            "app_name": display,
+            "source": "fallback",
+        }
+
+    def _resolve_app_identity(self, current):
+        if self._is_system_sound_stream(current):
+            return {
+                "app_id": self.SYSTEM_SOUNDS_BUCKET,
+                "app_name": self.SYSTEM_SOUNDS_BUCKET,
+                "source": "system-sounds",
+            }
+
+        pid = current.get('pid') or current.get('application.process.id')
+        candidates = []
+        for candidate in (
+            self._gio_identity_candidate(pid),
+            self._sandbox_identity_candidate(pid),
+            self._path_identity_candidate(pid),
+        ):
+            if candidate:
+                candidates.append(candidate)
+        candidates.extend(self._window_identity_candidates(current))
+        candidates.extend(self._binary_identity_candidates(pid, current))
+        candidates.extend(self._text_identity_candidates(current))
+
+        best_by_id = {}
+        for candidate in candidates:
+            if not candidate:
+                continue
+            key = candidate["app_id"]
+            existing = best_by_id.get(key)
+            rank = (candidate["score"], len(candidate["app_name"]))
+            if existing is None or rank > (existing["score"], len(existing["app_name"])):
+                best_by_id[key] = candidate
+
+        if not best_by_id:
+            return self._stream_fallback_identity(current)
+
+        best = max(best_by_id.values(), key=lambda item: (item["score"], len(item["app_name"])))
+        return {
+            "app_id": best["app_id"],
+            "app_name": best["app_name"],
+            "source": best["source"],
+        }
+
     def _process_sink_input(self, current, entries, sink_id_to_name):
         # Resolve sink name
         sink_id = current.get('sink_id')
@@ -1957,115 +2608,11 @@ class PipeWireEngine:
         if 'wavelinux_mix' in media_name:
             return
 
-        # Bucket system / notification sounds under one entry.
-        if self._is_system_sound_stream(current):
-            current['app_name'] = self.SYSTEM_SOUNDS_BUCKET
-            current['_is_system_sound'] = True
-            entries.append(current)
-            return
-
-        pid = current.get('pid') or current.get('application.process.id')
-
-        # ── Identity chain — first match wins ───────────────────────
-        # 1. GIO_LAUNCHED_DESKTOP_FILE (KDE/GNOME): reads the launching
-        #    .desktop file straight off the process tree. Survives
-        #    Electron/Chromium renderer subprocesses.
-        name = self._resolve_via_gio_env(pid)
-
-        # 2. Sandbox detection (Flatpak / Snap).
-        if not name:
-            name = self._identify_sandboxed_app(pid)
-
-        # 3. Reverse-DNS app IDs and icon names. Run each through both
-        #    the binary table (for things like "brave-browser-origin")
-        #    and the reverse-DNS canonicaliser.
-        if not name:
-            for key in ('flatpak.app_id', 'pipewire.access.portal.app_id',
-                        'application.id', 'application.icon_name'):
-                raw_val = current.get(key)
-                if not raw_val:
-                    continue
-                display = self._BINARY_DISPLAY_NAMES.get(raw_val.lower())
-                if display:
-                    name = display
-                    break
-                mapped = self._canonicalize_app_id(raw_val)
-                if mapped and not self._is_generic_name(mapped):
-                    name = mapped
-                    break
-
-        # 4. .desktop index lookup via PID's binary basename.
-        if not name:
-            name = self._identify_via_desktop(pid)
-
-        # 5. application.name (skip if generic).
-        if not name:
-            raw = (current.get('application.name') or '').strip()
-            if raw and not self._is_generic_name(raw):
-                name = self._BINARY_DISPLAY_NAMES.get(raw.lower(), raw)
-
-        # 6. application.process.binary.
-        if not name:
-            raw = (current.get('application.process.binary') or '').strip()
-            if raw:
-                disp = self._BINARY_DISPLAY_NAMES.get(raw.lower())
-                if disp:
-                    name = disp
-                elif not self._is_generic_name(raw):
-                    name = raw
-
-        # 7. PID walk: exe basename + comm + ppid chain. Already handles
-        #    the binary table internally.
-        if not name:
-            proc_name = self._app_name_from_pid(pid)
-            if proc_name and not self._is_generic_name(proc_name):
-                name = self._infer_name_from_exe(pid, proc_name) or proc_name
-
-        # 8. Direct property fallbacks. `node.description` / `node.name`
-        #    almost always contain SOMETHING for a real audio stream;
-        #    we'd rather show "Audio Output" than skip the row.
-        if not name:
-            for key in ('snap.name', 'application.display_name',
-                        'node.description', 'node.nick',
-                        'node.name', 'media.name'):
-                val = (current.get(key) or '').strip()
-                if val and not self._is_generic_name(val):
-                    name = val
-                    break
-
-        # 9. Last resort: use ANY non-empty descriptor, even a generic
-        #    one. We want every sink-input on the screen so the user can
-        #    route it — silent dropping is what causes the "no app shows
-        #    up for YouTube" complaint.
-        if not name:
-            for key in ('node.description', 'node.name', 'media.name',
-                        'application.name'):
-                val = (current.get(key) or '').strip()
-                if val:
-                    name = val
-                    break
-
-        # 10. Truly nothing — give it an ID-based name so it's at least
-        #     visible. node.id is seeded from pw_id upstream so this is
-        #     always defined for streams found via pw-dump.
-        if not name:
-            node_id = current.get('node.id') or current.get('index') or '?'
-            name = f"Audio Stream #{node_id}"
-
-        # ── Cleanup ────────────────────────────────────────────────
-        # Strip reverse-DNS prefixes (org.mozilla.firefox → firefox)
-        if '.' in name and ' ' not in name and len(name.split('.')) >= 2:
-            name = name.rsplit('.', 1)[-1]
-        name = name.replace('-', ' ').replace('_', ' ').strip()
-        if name and name.islower():
-            name = name.title()
-
-        # Drop streams whose final name is literally the hostname.
-        host = self._host_aliases()
-        if name and host and self._normalize_for_host_match(name) in host:
-            return
-
-        current['app_name'] = name or "Unknown App"
+        identity = self._resolve_app_identity(current)
+        current['app_id'] = identity["app_id"]
+        current['app_name'] = identity["app_name"] or "Unknown App"
+        current['app_identity_source'] = identity.get("source", "")
+        current['_is_system_sound'] = current['app_id'] == self.SYSTEM_SOUNDS_BUCKET
         entries.append(current)
 
     # All volume writes clamp to this — PipeWire allows 1.5 (150%) but
@@ -2424,21 +2971,24 @@ context.modules = [
 
     # ── Built-in Effects via PipeWire filter-chain ─────────────────
 
-    def get_available_effects(self):
-        return [
-            {'id': 'rnnoise', 'name': 'Noise Suppression', 'icon': '🎙️',
-             'desc': 'AI-powered background noise removal'},
-            {'id': 'highpass', 'name': 'High-Pass Filter', 'icon': '🎵',
-             'desc': 'Roll off low rumble (fans, handling noise)'},
-            {'id': 'eq', 'name': '3-Band EQ', 'icon': '🎚️',
-             'desc': 'Shape tone with low shelf / mid peak / high shelf'},
-            {'id': 'compressor', 'name': 'Compressor', 'icon': '📉',
-             'desc': 'Smooth out loud/quiet differences'},
-            {'id': 'gate', 'name': 'Noise Gate', 'icon': '🚪',
-             'desc': 'Cut audio below a threshold'},
-            {'id': 'limiter', 'name': 'Limiter', 'icon': '🛡️',
-             'desc': 'Prevent audio clipping'},
-        ]
+    _AVAILABLE_EFFECTS = (
+        {'id': 'rnnoise', 'name': 'Noise Suppression', 'icon': '🎙️',
+         'desc': 'AI-powered background noise removal'},
+        {'id': 'highpass', 'name': 'High-Pass Filter', 'icon': '🎵',
+         'desc': 'Roll off low rumble (fans, handling noise)'},
+        {'id': 'eq', 'name': '3-Band EQ', 'icon': '🎚️',
+         'desc': 'Shape tone with low shelf / mid peak / high shelf'},
+        {'id': 'compressor', 'name': 'Compressor', 'icon': '📉',
+         'desc': 'Smooth out loud/quiet differences'},
+        {'id': 'gate', 'name': 'Noise Gate', 'icon': '🚪',
+         'desc': 'Cut audio below a threshold'},
+        {'id': 'limiter', 'name': 'Limiter', 'icon': '🛡️',
+         'desc': 'Prevent audio clipping'},
+    )
+
+    @classmethod
+    def get_available_effects(cls):
+        return cls._AVAILABLE_EFFECTS
 
     # Parameter descriptors for the FX UI. Each entry is
     # (pactl_control_key, display_label, min, max, default, suffix).
@@ -2627,6 +3177,8 @@ context.modules = [
 {self._render_control_block(values)}
                     }}
                 ]
+                inputs  = [ "{name}:Input" ]
+                outputs = [ "{name}:Output" ]
 """
 
     def _build_filter_graph(self, effect_id, values):
@@ -2647,6 +3199,8 @@ context.modules = [
 {self._render_control_block(values)}
                     }}
                 ]
+                inputs  = [ "highpass:In" ]
+                outputs = [ "highpass:Out" ]
 """
         if effect_id == 'eq':
             # Three-stage biquad chain: low shelf → mid peaking → high shelf.
@@ -2687,6 +3241,8 @@ context.modules = [
                     {{ output = "eq_low:Out"  input = "eq_mid:In"  }}
                     {{ output = "eq_mid:Out"  input = "eq_high:In" }}
                 ]
+                inputs  = [ "eq_low:In" ]
+                outputs = [ "eq_high:Out" ]
 """
         if effect_id == 'gate':
             return self._ladspa_node('gate', 'gate_1410', 'gate', values)
@@ -2719,6 +3275,8 @@ context.modules = [
                 links = [
                     {{ output = "lim_in:Out" input = "lim_out:In" }}
                 ]
+                inputs  = [ "lim_in:In" ]
+                outputs = [ "lim_out:Out" ]
 """
         return None
 
@@ -2946,7 +3504,7 @@ context.modules = [
 
         return None, None, None, None
 
-    def _build_unified_chain_config(self, safe_key, ordered_effects, params_map):
+    def _build_unified_chain_config(self, safe_key, ordered_effects, params_map, stamp=None):
         """Write the filter-chain config combining all enabled effects in
         one `filter.graph` with explicit inter-stage `links`. Returns
         (config_path, sink_name, source_name, used_effects) or
@@ -2956,6 +3514,7 @@ context.modules = [
 
         all_nodes = []
         all_links = []
+        first_entry = None
         prev_exit = None
         used_effects = []
 
@@ -2969,6 +3528,8 @@ context.modules = [
                     f"in chain for {safe_key}"
                 )
                 continue
+            if first_entry is None:
+                first_entry = entry_port
             all_nodes.append(nodes_text)
             all_links.extend(internal_links)
             if prev_exit is not None:
@@ -2981,8 +3542,11 @@ context.modules = [
         if not used_effects:
             return None, None, None, []
 
-        sink_name = f'wavelinux.fx.{safe_key}.input'
-        source_name = f'wavelinux.fx.{safe_key}.source'
+        last_exit = prev_exit
+
+        stamp_str = f'.{stamp}' if stamp else ''
+        sink_name = f'wavelinux.fx.{safe_key}{stamp_str}.input'
+        source_name = f'wavelinux.fx.{safe_key}{stamp_str}.source'
 
         nodes_block = '\n'.join(all_nodes)
         links_block = '\n                    '.join(all_links) if all_links else ''
@@ -2993,7 +3557,7 @@ context.modules = [
         # plugins don't end up half-connected.
         # `node.virtual` + `priority.session = -1000` demote these nodes
         # in the system audio panels so they don't clutter device pickers.
-        client_id = f'{safe_key}-chain'
+        client_id = f'{safe_key}-chain-{stamp}' if stamp else f'{safe_key}-chain'
         filter_chain_args = f"""{{
             node.description = "_WaveLinux internal: chain ({safe_key})"
             node.nick        = "_WaveLinux-chain"
@@ -3007,6 +3571,8 @@ context.modules = [
                 links = [
                     {links_block}
                 ]
+                inputs = [ "{first_entry}" ]
+                outputs = [ "{last_exit}" ]
             }}
             capture.props = {{
                 node.name           = "{sink_name}"
@@ -3122,16 +3688,21 @@ context.modules = [
             if out:
                 stripped = out.strip().splitlines()[-1].strip()
                 if stripped.isdigit():
+                    # Pulse stream-restore can resurrect a stale muted state
+                    # for loopback sink-inputs keyed by media name
+                    # (`loopback-... input`). If this upstream FX feed starts
+                    # muted, the chain appears "running" but outputs silence.
+                    for _ in range(20):
+                        si = self._sink_input_for_module(stripped)
+                        if si is None:
+                            time.sleep(0.01)
+                            continue
+                        self._run(['pactl', 'set-sink-input-volume', si, '100%'])
+                        self._run(['pactl', 'set-sink-input-mute', si, '0'])
+                        break
                     return stripped
             time.sleep(delay)
         return None
-
-    def is_fx_rebuilding(self):
-        """True while a set_channel_fx / clear_channel_fx call is in
-        flight. Refresh-tick callers consult this so they don't observe
-        the engine mid-mutation and unload the working submix loopback
-        out from under audible audio."""
-        return self._fx_rebuild_count > 0
 
     def set_channel_fx(self, node_name, capture_target, effects, params_map=None):
         """Replace a channel's FX chain with one `pipewire -c` process
@@ -3144,15 +3715,9 @@ context.modules = [
           mic's node.name; for virtual sinks, `f"{sink_name}.monitor"`.
         - `effects`: list of effect ids (reordered to canonical flow).
         - `params_map`: {effect_id: {param_key: value}}."""
-        with self._fx_rebuild_lock:
-            self._fx_rebuild_count += 1
-        try:
-            return self._set_channel_fx_inner(
-                node_name, capture_target, effects, params_map,
-            )
-        finally:
-            with self._fx_rebuild_lock:
-                self._fx_rebuild_count -= 1
+        return self._set_channel_fx_inner(
+            node_name, capture_target, effects, params_map,
+        )
 
     def _set_channel_fx_inner(self, node_name, capture_target, effects, params_map):
         if not node_name:
@@ -3163,17 +3728,22 @@ context.modules = [
         ordered = [fid for fid in self._ordered_chain(effects)
                    if self.effect_available(fid)]
         if not ordered:
-            return None
+            self._clear_channel_fx_inner(node_name)
+            return capture_target
 
         safe_key = self._safe_channel_key(node_name)
+        # Build-first replacement means old and new chains overlap briefly.
+        # They must not share proc keys or PipeWire node names, otherwise
+        # teardown can kill the replacement chain and leak the old one.
+        stamp = int(time.time() * 1000)
 
         config_path, sink_name, source_name, used_effects = \
-            self._build_unified_chain_config(safe_key, ordered, params_map)
+            self._build_unified_chain_config(safe_key, ordered, params_map, stamp)
         if config_path is None or not used_effects:
             return None
 
-        log_path = self._fx_log_path(safe_key, 'chain')
-        proc_key = f'chain_{safe_key}'
+        log_path = self._fx_log_path(safe_key, f'chain_{stamp}')
+        proc_key = f'chain_{safe_key}_{stamp}'
 
         if not self._spawn_fx(config_path, log_path, proc_key):
             logging.warning(
@@ -3181,6 +3751,24 @@ context.modules = [
                 f"see {log_path} for the pipewire stderr."
             )
             return None
+
+        # The filter-chain process can come up before we bind raw capture into
+        # it. We intentionally tear the previous chain down back to the raw
+        # source FIRST, then load the new raw→chain loopback. Overlapping old
+        # and new upstream module-loopbacks on the same mic turned out to be
+        # less stable than a brief raw-mic hop during rebuilds.
+        if old_info:
+            old_src = old_info.get('source', '?')
+            logging.warning(
+                f"[FX-DEBUG] Tearing down old chain: old_source={old_src}, "
+                f"new_source={source_name}, "
+                f"submix_sources_before={dict(self.submix_sources)}"
+            )
+            self._clear_channel_fx_info(old_info, target_source=capture_target)
+            logging.warning(
+                f"[FX-DEBUG] After teardown: submix_sources={dict(self.submix_sources)}, "
+                f"submix_loopbacks={dict(self.submix_loopbacks)}"
+            )
 
         # ONE upstream → chain.input loopback. The chain itself wires its
         # internal nodes via filter.graph links; downstream consumers
@@ -3192,13 +3780,7 @@ context.modules = [
                 f"chain for {node_name} is dangling. Tearing it back down."
             )
             self.stop_rnnoise(proc_key)
-            return None
-
-        # Build-first semantics: only tear down the previous chain after the
-        # replacement chain is alive and wired. This keeps audio flowing if the
-        # new build is slow/flaky and prevents "change FX => silence" regressions.
-        if old_info:
-            self._clear_channel_fx_info(old_info)
+            return capture_target
 
         # Promote the FX virtual source to default + drag existing capture
         # streams onto it. Without this, apps reading the raw mic (Discord,
@@ -3216,20 +3798,16 @@ context.modules = [
             if current_default and current_default != source_name:
                 prev_default = current_default
             self.set_default_source(source_name)
-            self._move_source_outputs(
-                capture_target, source_name, exclude_modules=[lb],
-            )
-            # Mirror the move into our own state. _move_source_outputs has
-            # already pointed the channel's submix loopbacks at the FX
-            # source in pactl, so leaving submix_sources stale would force
-            # the next refresh tick to unload + reload them — that brief
-            # silence is exactly the "audio stops again" symptom users see
-            # right after an FX-apply tick. Limit to entries whose source
-            # is the raw mic, so other channels' submix routes are
-            # untouched.
+            internal_modules = [lb]
             for skey in list(self.submix_sources.keys()):
-                if self.submix_sources.get(skey) == capture_target:
-                    self.submix_sources[skey] = source_name
+                if self.submix_sources.get(skey) != capture_target:
+                    continue
+                mod = self.submix_loopbacks.get(skey)
+                if mod is not None:
+                    internal_modules.append(mod)
+            self._move_source_outputs(
+                capture_target, source_name, exclude_modules=internal_modules,
+            )
             # And re-push our cached vol/mute to every submix sink-input
             # — pulse-bridge can transiently reset a moved sink-input's
             # mute to its stale default, leaking the mic's raw audio
@@ -3260,13 +3838,7 @@ context.modules = [
         filter-chain stages, so we don't leave PipeWire briefly routing
         audio into a sink that's about to disappear (which can wedge
         pipewire-pulse for a beat)."""
-        with self._fx_rebuild_lock:
-            self._fx_rebuild_count += 1
-        try:
-            return self._clear_channel_fx_inner(node_name)
-        finally:
-            with self._fx_rebuild_lock:
-                self._fx_rebuild_count -= 1
+        return self._clear_channel_fx_inner(node_name)
 
     def _clear_channel_fx_inner(self, node_name):
         info = self.channel_fx.pop(node_name, None)
@@ -3274,7 +3846,7 @@ context.modules = [
             return False
         return self._clear_channel_fx_info(info)
 
-    def _clear_channel_fx_info(self, info):
+    def _clear_channel_fx_info(self, info, target_source=None):
         if not info:
             return False
 
@@ -3289,20 +3861,37 @@ context.modules = [
         capture_target = info.get('capture_target') or ''
         prev_default = info.get('prev_default')
         if fx_source and capture_target and not capture_target.endswith('.monitor'):
-            current_default = self.get_default_source()
-            if current_default == fx_source:
-                self.set_default_source(prev_default or capture_target)
-            self._move_source_outputs(
-                fx_source, capture_target,
-                exclude_modules=list(info.get('loopbacks', [])),
-            )
-            # Mirror the move into our own state. After this, the
-            # surviving submix loopbacks read from the raw mic, so
-            # step 1's prefix-match below leaves them alone — that's
-            # what keeps audio uninterrupted through an FX-toggle.
+            dest = target_source or capture_target
+            # Re-home normal app capture streams before the old FX source
+            # disappears, but do NOT move WaveLinux's own loopbacks.
+            # PipeWire can freeze module-loopback source-outputs when they
+            # are moved, so we exclude both the chain's upstream loopback
+            # and any submix loopback currently reading from this FX
+            # source. Step 1 unloads those submix loopbacks so the next
+            # reroute recreates them on the right source cleanly.
+            internal_modules = list(info.get('loopbacks', []))
             for skey in list(self.submix_sources.keys()):
                 if self.submix_sources.get(skey) == fx_source:
-                    self.submix_sources[skey] = capture_target
+                    mod = self.submix_loopbacks.get(skey)
+                    if mod is not None:
+                        internal_modules.append(mod)
+            self._move_source_outputs(
+                fx_source, dest, exclude_modules=internal_modules,
+            )
+
+            # Restore / replace the default source only after dependent
+            # source-outputs have been re-homed. Flipping the default
+            # first lets some live capture streams fall onto whatever
+            # PipeWire thinks the new default should be before our
+            # explicit move runs, which is how a preset-rebuild can
+            # strand the mic on the wrong source until restart.
+            current_default = self.get_default_source()
+            if current_default == fx_source:
+                if target_source:
+                    self.set_default_source(target_source)
+                else:
+                    self.set_default_source(prev_default or capture_target)
+
             # Re-push cached vol/mute — same reasoning as set_channel_fx,
             # so the mic doesn't briefly leak audio while pulse-bridge
             # re-applies its stale default to the just-moved sink-input.
@@ -3312,10 +3901,9 @@ context.modules = [
         # source — virtual-sink chains skip step 0 (no default source
         # to restore), so they reach this point with submix routes
         # still on the chain prefix and need the cleanup.
-        prefix = f'wavelinux.fx.{info.get("safe_key", "")}.'
         for skey in list(self.submix_sources.keys()):
             src = self.submix_sources.get(skey, '')
-            if not src or not src.startswith(prefix):
+            if not src or src != fx_source:
                 continue
             mod_id = self.submix_loopbacks.pop(skey, None)
             self.submix_sources.pop(skey, None)
@@ -3350,70 +3938,10 @@ context.modules = [
     def is_channel_fx_running(self, node_name):
         return self.get_channel_fx_source(node_name) is not None
 
-    def is_channel_effect_active(self, node_name, effect_id):
-        info = self.channel_fx.get(node_name)
-        if not info:
-            return False
-        if effect_id not in info.get('effects', []):
-            return False
-        # Same liveness check as get_channel_fx_source — a dead stage means
-        # the chain is no longer doing what the user thinks it is.
-        return self.get_channel_fx_source(node_name) is not None
-
     def get_channel_effects(self, node_name):
         """Ordered list of effect ids currently running on a channel."""
         info = self.channel_fx.get(node_name)
         return list(info.get('effects', [])) if info else []
-
-    def fx_chain_status(self, node_name):
-        """Diagnostic snapshot of a channel's FX chain. Returns
-        `{effect_id: {'state': 'running' | 'failed' | 'inactive',
-                      'log': <path or None>}}`.
-
-        - 'running'  = stage process alive and loopback exists.
-        - 'failed'   = spawn attempted but the process died.
-        - 'inactive' = effect never enabled (or cleared).
-
-        The FX dialog uses this to red-border failed toggles. The unified
-        chain spawns ONE pipewire process for every enabled effect, so all
-        live effects share the same proc_key — index-mapping into procs
-        used to fall through to 'failed' for every effect after the first
-        because procs has only a single element."""
-        out = {}
-        info = self.channel_fx.get(node_name) or {}
-        live_effects = list(info.get('effects', []))
-        live_procs   = list(info.get('procs', []))
-        safe_key     = info.get('safe_key', self._safe_channel_key(node_name))
-
-        # The unified chain has one shared backing process. Pre-resolve it
-        # once so per-effect status checks all agree on liveness instead of
-        # disagreeing because of ill-defined index → proc mapping.
-        chain_proc_key = live_procs[0] if live_procs else None
-        chain_proc = (self.rnnoise_processes.get(chain_proc_key)
-                      if chain_proc_key else None)
-        chain_alive = chain_proc is not None and chain_proc.poll() is None
-
-        for eid in self.get_available_effects():
-            fid = eid['id']
-            if fid not in live_effects:
-                # Either never enabled, or attempted-and-removed. We can
-                # tell apart by checking the per-stage log on disk.
-                stage_log = None
-                for i, candidate in enumerate(live_effects + [fid]):
-                    candidate_log = self._fx_log_path(safe_key, f'{i}_{fid}')
-                    if os.path.exists(candidate_log):
-                        stage_log = candidate_log
-                        break
-                out[fid] = {'state': 'inactive', 'log': stage_log}
-                continue
-
-            idx = live_effects.index(fid)
-            stage_log = self._fx_log_path(safe_key, f'{idx}_{fid}')
-            out[fid] = {
-                'state': 'running' if chain_alive else 'failed',
-                'log':   stage_log,
-            }
-        return out
 
     def _find_module_by_arg(self, pattern, modules_text=None):
         """Find a pactl module ID whose argument list contains `pattern`
