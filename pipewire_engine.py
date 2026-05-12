@@ -155,25 +155,63 @@ class PipeWireEngine:
             return True
         return False
 
+    @staticmethod
+    def _env_flag_enabled(name, *, environ=None):
+        env = os.environ if environ is None else environ
+        return env.get(name, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
     @classmethod
-    def _ladspa_roots(cls):
+    def _bundled_ladspa_entries(cls, *, environ=None):
+        env = os.environ if environ is None else environ
+        return [
+            p for p in env.get("WAVELINUX_BUNDLED_LADSPA_PATH", "").split(":") if p
+        ]
+
+    @classmethod
+    def _ladspa_env_entries(cls, *, environ=None):
+        """Return sanitized non-bundled LADSPA_PATH entries.
+
+        AppImage runtimes may inject their own `usr/lib/ladspa` into
+        `LADSPA_PATH`. That must stay opt-in, otherwise the packaged app
+        silently shadows host plugins and FX chains fail to spawn.
+        """
+        env = os.environ if environ is None else environ
+        env_entries = [p for p in env.get("LADSPA_PATH", "").split(":") if p]
+        bundled_entries = cls._bundled_ladspa_entries(environ=env)
+        bundled_keys = {os.path.normpath(path) for path in bundled_entries}
+        env_entries = [
+            path for path in env_entries
+            if os.path.normpath(path) not in bundled_keys
+        ]
+
+        deduped = []
+        seen = set()
+        for path in env_entries:
+            key = os.path.normpath(path)
+            if key in seen:
+                continue
+            deduped.append(path)
+            seen.add(key)
+        return deduped
+
+    @classmethod
+    def _ladspa_roots(cls, *, environ=None):
         """Return LADSPA search roots with host paths first.
 
         AppImage-bundled LADSPA paths are opt-in because the plugins are
         loaded by the host PipeWire daemon, not by the WaveLinux process.
         """
         roots = []
-        env_path = os.environ.get("LADSPA_PATH", "")
-        roots.extend(p for p in env_path.split(":") if p)
+        roots.extend(cls._ladspa_env_entries(environ=environ))
         roots.extend(cls._LADSPA_PATHS)
-        if os.environ.get("WAVELINUX_ENABLE_BUNDLED_LADSPA", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            bundled = os.environ.get("WAVELINUX_BUNDLED_LADSPA_PATH", "")
-            roots.extend(p for p in bundled.split(":") if p)
+        env = os.environ if environ is None else environ
+        if cls._env_flag_enabled("WAVELINUX_ENABLE_BUNDLED_LADSPA", environ=env):
+            roots.extend(cls._bundled_ladspa_entries(environ=env))
         deduped = []
         seen = set()
         for root in roots:
@@ -182,6 +220,26 @@ class PipeWireEngine:
             deduped.append(root)
             seen.add(root)
         return deduped
+
+    @classmethod
+    def _pipewire_spawn_env(cls, *, environ=None):
+        env = dict(os.environ if environ is None else environ)
+        ladspa_entries = cls._ladspa_env_entries(environ=env)
+        if cls._env_flag_enabled("WAVELINUX_ENABLE_BUNDLED_LADSPA", environ=env):
+            ladspa_entries.extend(cls._bundled_ladspa_entries(environ=env))
+        deduped = []
+        seen = set()
+        for path in ladspa_entries:
+            key = os.path.normpath(path)
+            if key in seen:
+                continue
+            deduped.append(path)
+            seen.add(key)
+        if ladspa_entries:
+            env["LADSPA_PATH"] = ":".join(deduped)
+        else:
+            env.pop("LADSPA_PATH", None)
+        return env
 
     @classmethod
     def _probe_ladspa_plugins(cls):
@@ -3143,11 +3201,13 @@ context.modules = [
             ).stdout.strip() or 'unknown'
         except Exception:
             pw_ver = 'unknown'
+        spawn_env = self._pipewire_spawn_env()
         header = (
             f"# WaveLinux FX spawn {key}\n"
             f"# pipewire --version: {pw_ver}\n"
             f"# config path:        {config_path}\n"
-            f"# LADSPA_PATH env:    {os.environ.get('LADSPA_PATH', '')}\n"
+            f"# raw LADSPA_PATH:    {os.environ.get('LADSPA_PATH', '')}\n"
+            f"# effective LADSPA_PATH: {spawn_env.get('LADSPA_PATH', '')}\n"
             f"# ──────── config ─────────\n"
             f"{rendered_config}"
             f"\n# ──────── pipewire stderr/stdout ────────\n"
@@ -3168,6 +3228,7 @@ context.modules = [
             proc = subprocess.Popen(
                 ['pipewire', '-c', config_path],
                 stdout=log_file, stderr=log_file,
+                env=spawn_env,
             )
         except FileNotFoundError:
             logging.error("`pipewire` binary not found — cannot spawn filter chain")

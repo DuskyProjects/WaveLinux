@@ -26,6 +26,7 @@ from PyQt6.QtGui import QFont, QIcon, QAction, QDesktopServices
 
 from audio_runtime import AudioRuntimeAdapter, AudioRuntimeController
 from distribution import (
+    APP_DESKTOP_ID,
     DESKTOP_FILENAME,
     desktop_exec_command,
     install_current_appimage,
@@ -3510,7 +3511,7 @@ class WaveLinuxWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("WaveLinux")
-    app.setDesktopFileName(DESKTOP_FILENAME)
+    app.setDesktopFileName(APP_DESKTOP_ID)
     app.setStyleSheet(STYLESHEET)
 
     # Try to use a nice font

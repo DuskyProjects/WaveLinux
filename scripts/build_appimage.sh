@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build/appimage"
 DIST_DIR="${ROOT_DIR}/dist"
 APPDIR="${BUILD_DIR}/AppDir"
-PYINSTALLER="${PYINSTALLER:-pyinstaller}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 APPIMAGETOOL="${APPIMAGETOOL:-${BUILD_DIR}/appimagetool-x86_64.AppImage}"
 APPIMAGETOOL_URL="${APPIMAGETOOL_URL:-https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage}"
 WAVELINUX_VERSION="${WAVELINUX_VERSION:-$(awk -F'\"' '/^APP_VERSION = / { print $2; exit }' "${ROOT_DIR}/main.py")}"
@@ -16,6 +16,22 @@ if [ -z "${WAVELINUX_VERSION}" ]; then
 fi
 OUTPUT_APPIMAGE="${DIST_DIR}/WaveLinux-${WAVELINUX_VERSION}-x86_64.AppImage"
 WAVELINUX_BUNDLE_LADSPA="${WAVELINUX_BUNDLE_LADSPA:-0}"
+
+require_build_modules() {
+    local missing=()
+    local module
+    for module in PyInstaller PyQt6; do
+        if ! env -u PYTHONPATH "${PYTHON_BIN}" -c "import ${module}" >/dev/null 2>&1; then
+            missing+=("${module}")
+        fi
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        echo "Build interpreter ${PYTHON_BIN} is missing required modules: ${missing[*]}" >&2
+        echo "Install them into the same interpreter, e.g.:" >&2
+        echo "  ${PYTHON_BIN} -m pip install PyInstaller PyQt6" >&2
+        exit 1
+    fi
+}
 
 bundle_optional_fx() {
     local target_dir="$1"
@@ -53,11 +69,13 @@ download_appimagetool() {
     fi
 }
 
+require_build_modules
+
 rm -rf "${ROOT_DIR}/build" "${ROOT_DIR}/dist/WaveLinux" "${APPDIR}"
 mkdir -p "${DIST_DIR}" "${BUILD_DIR}"
 
 cd "${ROOT_DIR}"
-"${PYINSTALLER}" --noconfirm --clean WaveLinux.spec
+env -u PYTHONPATH "${PYTHON_BIN}" -m PyInstaller --noconfirm --clean WaveLinux.spec
 
 mkdir -p "${APPDIR}/usr/lib/wavelinux"
 cp -a "${DIST_DIR}/WaveLinux/." "${APPDIR}/usr/lib/wavelinux/"

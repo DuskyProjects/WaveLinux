@@ -101,6 +101,13 @@ python3 -m pip install PyInstaller PyQt6
 ./scripts/build_appimage.sh
 ```
 
+If you build from a virtualenv, point the script at that exact interpreter so
+`PyInstaller` and `PyQt6` come from the same environment:
+
+```bash
+PYTHON_BIN=/path/to/venv/bin/python ./scripts/build_appimage.sh
+```
+
 Artifacts are written to `dist/`:
 
 - `WaveLinux-<version>-x86_64.AppImage`
