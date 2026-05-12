@@ -80,6 +80,10 @@ class PipeWireEngine:
         os.path.expanduser("~/.ladspa"),
         os.path.expanduser("~/.local/lib/ladspa"),
     )
+    _BT_SINK_FAMILY_RE = re.compile(
+        r'^(bluez_output\.[0-9A-Fa-f]{2}(?:[_:-][0-9A-Fa-f]{2}){5})(?:\..+)?$',
+        re.IGNORECASE,
+    )
 
     def __init__(self):
         self.virtual_sink_modules = {}   # safe_name -> pactl module id
@@ -259,7 +263,41 @@ class PipeWireEngine:
         their own settings. Returns True on success."""
         if not source_name:
             return False
-        return self._run(['pactl', 'set-default-source', source_name]) is not None
+        resolved = self.resolve_source_name(source_name) or source_name
+        return self._run(['pactl', 'set-default-source', resolved]) is not None
+
+    @staticmethod
+    def _source_name_aliases(source_name):
+        source_name = str(source_name or "").strip()
+        if not source_name:
+            return []
+        aliases = [source_name]
+        if source_name.startswith("output."):
+            aliases.append(source_name[len("output."):])
+        else:
+            aliases.append(f"output.{source_name}")
+        return list(dict.fromkeys(alias for alias in aliases if alias))
+
+    def resolve_source_name(self, source_name, snap=None):
+        """Resolve a persisted source token to the currently visible source name.
+
+        Pulse virtual sources often surface as `output.<requested_name>`
+        even when the module argument was `source_name=<requested_name>`.
+        """
+        wanted = self._source_name_aliases(source_name)
+        if not wanted:
+            return None
+        visible = set()
+        if snap is not None:
+            visible.update(
+                node.name for node in getattr(snap, "nodes", [])
+                if getattr(node, "media_class", "") == "Audio/Source"
+            )
+        visible.update(self._source_id_to_name().values())
+        for candidate in wanted:
+            if candidate in visible:
+                return candidate
+        return None
 
     def _source_id_to_name(self):
         """Build {source_id: source_name} from `pactl list short sources`."""
@@ -302,6 +340,10 @@ class PipeWireEngine:
             current_by_so[so_id] = id_to_name.get(src_id)
 
         excluded = {str(m) for m in (exclude_modules or ()) if m is not None}
+        wanted_names = set(self._source_name_aliases(source_name))
+        resolved_name = self.resolve_source_name(source_name)
+        if resolved_name:
+            wanted_names.add(resolved_name)
         ids = []
         current_so = None
         current_owner = None
@@ -313,7 +355,7 @@ class PipeWireEngine:
             if current_owner in excluded:
                 return
             live_source = current_by_so.get(current_so)
-            if live_source == source_name or current_target == source_name:
+            if live_source in wanted_names or current_target in wanted_names:
                 ids.append(current_so)
 
         for line in full.splitlines():
@@ -349,7 +391,8 @@ class PipeWireEngine:
         that silences the chain entirely."""
         if not from_source or not to_source or from_source == to_source:
             return
-        if not self._wait_source_visible(to_source):
+        resolved_to_source = self._wait_source_visible(to_source)
+        if not resolved_to_source:
             logging.warning(
                 f"Destination source {to_source} never became visible; "
                 f"skipping move-source-output from {from_source}"
@@ -357,7 +400,7 @@ class PipeWireEngine:
             return
         for sid in self._list_source_outputs_on(
                 from_source, exclude_modules=exclude_modules):
-            self._move_source_output_with_retry(sid, from_source, to_source)
+            self._move_source_output_with_retry(sid, from_source, resolved_to_source)
 
     def _source_output_locations(self):
         """Return {source_output_id: source_name} from short pactl state."""
@@ -391,7 +434,12 @@ class PipeWireEngine:
             return True
         if not from_source or not to_source or from_source == to_source:
             return True
-        if not self._wait_source_visible(to_source, attempts=attempts, delay=delay):
+        resolved_to_source = self._wait_source_visible(
+            to_source,
+            attempts=attempts,
+            delay=delay,
+        )
+        if not resolved_to_source:
             logging.warning(
                 f"Destination source {to_source} never became visible; "
                 f"skipping targeted move-source-output from {from_source}"
@@ -401,9 +449,9 @@ class PipeWireEngine:
         for so_id in wanted:
             moved = False
             for _ in range(max(1, int(attempts))):
-                self._run(['pactl', 'move-source-output', so_id, to_source])
+                self._run(['pactl', 'move-source-output', so_id, resolved_to_source])
                 current = self._source_output_locations().get(so_id)
-                if current is None or current == to_source:
+                if current is None or current == resolved_to_source:
                     moved = True
                     break
                 time.sleep(max(0.0, float(delay)))
@@ -415,8 +463,9 @@ class PipeWireEngine:
         if not source_name:
             return False
         for _ in range(max(1, int(attempts))):
-            if source_name in self._source_id_to_name().values():
-                return True
+            resolved = self.resolve_source_name(source_name)
+            if resolved:
+                return resolved
             time.sleep(max(0.0, float(delay)))
         return False
 
@@ -768,6 +817,37 @@ class PipeWireEngine:
         return [n for n in self.get_all_nodes(snap)
                 if n.media_class == 'Audio/Sink'
                 and not self._is_internal_node_name(n.name)]
+
+    @classmethod
+    def stable_sink_id(cls, sink_name):
+        sink_name = str(sink_name or "").strip()
+        if not sink_name:
+            return ""
+        match = cls._BT_SINK_FAMILY_RE.match(sink_name)
+        if match:
+            return match.group(1).lower().replace('-', '_').replace(':', '_')
+        return sink_name
+
+    def resolve_hardware_sink_name(self, sink_name, snap=None):
+        """Resolve a persisted hardware sink token to a currently visible sink.
+
+        This keeps Bluetooth routes alive across profile/name churn like
+        `bluez_output.<mac>.1` ↔ `.2`.
+        """
+        sink_name = str(sink_name or "").strip()
+        if not sink_name:
+            return None
+        all_sinks = self.get_all_sinks(snap=snap)
+        names = [sink["name"] for sink in all_sinks if sink.get("name")]
+        if sink_name in names:
+            return sink_name
+        wanted = self.stable_sink_id(sink_name)
+        if not wanted:
+            return None
+        for name in names:
+            if self.stable_sink_id(name) == wanted:
+                return name
+        return None
 
     def get_hardware_inputs(self, snap=None):
         return [n for n in self.get_all_nodes(snap)
@@ -1208,7 +1288,7 @@ class PipeWireEngine:
         can pick it up as a dedicated recording device (e.g. 'WaveLinux-Stream')."""
         _, safe_name = self._sanitize_channel_name(name)
         sink_name = f"wavelinux_mix_{safe_name}"
-        source_name = f"wavelinux_src_{safe_name}"
+        requested_source_name = f"wavelinux_src_{safe_name}"
         description = self._branding_label(name)
 
         # 1. The thing apps play *to*.
@@ -1220,11 +1300,11 @@ class PipeWireEngine:
         # 2. Dedicated recording source so OBS / browsers see a named device
         # instead of a generic "Monitor of null sink". Whitespace-free
         # description values so pactl's sink_properties parser can't fumble.
-        src_module_id = self._find_module_by_arg(f"source_name={source_name}")
+        src_module_id = self._find_module_by_arg(f"source_name={requested_source_name}")
         if not src_module_id:
             src_module_id = self._run([
                 'pactl', 'load-module', 'module-virtual-source',
-                f'source_name={source_name}',
+                f'source_name={requested_source_name}',
                 f'master={sink_name}.monitor',
                 (
                     f"source_properties="
@@ -1237,6 +1317,11 @@ class PipeWireEngine:
                     f"device.class=sound"
                 ),
             ])
+        source_name = (
+            self._wait_source_visible(requested_source_name, attempts=20, delay=0.05)
+            or self.resolve_source_name(requested_source_name)
+            or requested_source_name
+        )
 
         mix = OutputMix(name, sink_module_id=sink_module_id, sink_name=sink_name)
         mix.source_name = source_name
@@ -1278,27 +1363,38 @@ class PipeWireEngine:
         mix = self.output_mixes.get(mix_name)
         if not mix:
             return False
-        current_key = f'{mix_name}->{hw_sink_name}'
+        resolved_sink = self.resolve_hardware_sink_name(hw_sink_name)
+        current_key = f'{mix_name}->{resolved_sink or hw_sink_name}'
         short = self._run(['pactl', 'list', 'short', 'modules']) or ''
         existing_mod = self.loopback_modules.get(current_key)
-        if existing_mod and self._module_is_alive(existing_mod, short_text=short):
-            mix.hardware_output = hw_sink_name
+        if (existing_mod
+                and self._module_is_alive(existing_mod, short_text=short)
+                and self._wait_sink_input_for_module(existing_mod, attempts=2, delay=0.01)):
+            mix.hardware_output = resolved_sink or hw_sink_name
             return True
 
         # Retry briefly — picked sink may not be visible yet (BT mid-profile
         # negotiation, USB still enumerating).
         out = None
-        adopted = self._find_loopback_for(f'{mix.sink_name}.monitor', hw_sink_name)
-        if adopted:
-            out = str(adopted)
-        for attempt in range(8):
+        adopted = None
+        candidate_sink = resolved_sink
+        if candidate_sink:
+            adopted = self._find_loopback_for(f'{mix.sink_name}.monitor', candidate_sink)
+            if adopted and self._wait_sink_input_for_module(adopted, attempts=2, delay=0.01):
+                out = str(adopted)
+        for attempt in range(12):
             if out:
                 break
-            if self._sink_visible(hw_sink_name):
+            candidate_sink = self.resolve_hardware_sink_name(hw_sink_name)
+            if candidate_sink:
+                adopted = self._find_loopback_for(f'{mix.sink_name}.monitor', candidate_sink)
+                if adopted and self._wait_sink_input_for_module(adopted, attempts=2, delay=0.01):
+                    out = str(adopted)
+                    break
                 out = self._run([
                     'pactl', 'load-module', 'module-loopback',
                     f'source={mix.sink_name}.monitor',
-                    f'sink={hw_sink_name}',
+                    f'sink={candidate_sink}',
                     'latency_msec=20',
                     'adjust_time=0',
                 ])
@@ -1313,19 +1409,31 @@ class PipeWireEngine:
             )
             return False
 
+        candidate_mod = str(out)
+        if not self._wait_sink_input_for_module(candidate_mod):
+            if candidate_mod != str(existing_mod or ""):
+                self._run(['pactl', 'unload-module', candidate_mod])
+            logging.warning(
+                f"route_mix_to_hardware: loopback module {candidate_mod} "
+                f"never produced a sink-input for {mix_name}"
+            )
+            return False
+
         for key in list(self.loopback_modules.keys()):
             if not key.startswith(mix_name + '->'):
                 continue
-            if str(self.loopback_modules[key]) == str(out):
+            if str(self.loopback_modules[key]) == candidate_mod:
                 continue
             self._run(['pactl', 'unload-module', str(self.loopback_modules[key])])
             del self.loopback_modules[key]
 
-        self.loopback_modules[current_key] = out
-        mix.hardware_output = hw_sink_name
+        resolved_sink = candidate_sink or resolved_sink or hw_sink_name
+        current_key = f'{mix_name}->{resolved_sink}'
+        self.loopback_modules[current_key] = candidate_mod
+        mix.hardware_output = resolved_sink
         # Force the new sink-input to 100%/unmuted — pulse-bridge can
         # apply a stale per-app-per-sink rule that defaults it to 0%.
-        si = self._sink_input_for_module(out)
+        si = self._sink_input_for_module(candidate_mod)
         if si is not None:
             self._run(['pactl', 'set-sink-input-volume', si, '100%'])
             self._run(['pactl', 'set-sink-input-mute',   si, '0'])
@@ -1363,6 +1471,38 @@ class PipeWireEngine:
                 return current_si
             elif 'module.id =' in stripped and f'"{mid}"' in stripped:
                 return current_si
+        return None
+
+    def _wait_sink_input_for_module(self, module_id, attempts=20, delay=0.05):
+        if not module_id:
+            return None
+        for _ in range(max(1, int(attempts))):
+            si = self._sink_input_for_module(module_id)
+            if si is not None:
+                return si
+            time.sleep(max(0.0, float(delay)))
+        return None
+
+    def get_live_mix_hardware_route(self, mix_name, snap=None):
+        mix = self.output_mixes.get(mix_name)
+        if not mix or not getattr(mix, "hardware_output", None):
+            return None
+        resolved_sink = self.resolve_hardware_sink_name(mix.hardware_output, snap=snap)
+        if not resolved_sink:
+            return None
+        current_key = f'{mix_name}->{resolved_sink}'
+        short = snap.short_modules_text if snap is not None else None
+        existing_mod = self.loopback_modules.get(current_key)
+        if (existing_mod
+                and self._module_is_alive(existing_mod, short_text=short)
+                and self._wait_sink_input_for_module(existing_mod, attempts=2, delay=0.01)):
+            return resolved_sink
+        adopted = self._find_loopback_for(f'{mix.sink_name}.monitor', resolved_sink, snap=snap)
+        if (adopted
+                and self._module_is_alive(adopted, short_text=short)
+                and self._wait_sink_input_for_module(adopted, attempts=2, delay=0.01)):
+            self.loopback_modules[current_key] = str(adopted)
+            return resolved_sink
         return None
 
     def full_audio_reset(self):
@@ -3850,6 +3990,107 @@ context.modules = [
             message='FX chain cleared',
         )
 
+    def _fx_proxy_names(self, safe_key):
+        return (
+            f"wavelinux.fx.{safe_key}.sink",
+            f"wavelinux.fx.{safe_key}.source",
+        )
+
+    def _ensure_fx_proxy(self, safe_key):
+        """Create or reuse the stable internal source that external apps read."""
+        sink_name, requested_source_name = self._fx_proxy_names(safe_key)
+        sink_module_id = self._find_module_by_arg(f"sink_name={sink_name}")
+        if sink_module_id is None:
+            sink_module_id = self._run([
+                'pactl', 'load-module', 'module-null-sink',
+                f'sink_name={sink_name}',
+                (
+                    "sink_properties="
+                    "device.description=_WaveLinux-FX-Sink "
+                    "node.description=_WaveLinux-FX-Sink "
+                    "node.nick=_WaveLinux-FX-Sink "
+                    "media.name=_WaveLinux-FX-Sink "
+                    "application.name=_WaveLinux-FX-Sink "
+                    "media.class=Audio/Sink"
+                ),
+            ])
+            if sink_module_id:
+                self._run(['pactl', 'set-sink-mute', sink_name, '0'])
+                self._run(['pactl', 'set-sink-volume', sink_name, '100%'])
+                self.invalidate_snapshot()
+        if sink_module_id is None:
+            return None
+
+        source_module_id = self._find_module_by_arg(f"source_name={requested_source_name}")
+        if source_module_id is None:
+            source_module_id = self._run([
+                'pactl', 'load-module', 'module-virtual-source',
+                f'source_name={requested_source_name}',
+                f'master={sink_name}.monitor',
+                (
+                    "source_properties="
+                    "device.description=_WaveLinux-FX-Source "
+                    "node.description=_WaveLinux-FX-Source "
+                    "node.nick=_WaveLinux-FX-Source "
+                    "media.name=_WaveLinux-FX-Source "
+                    "application.name=_WaveLinux-FX-Source "
+                    "media.class=Audio/Source "
+                    "device.class=sound"
+                ),
+            ])
+            if source_module_id:
+                self.invalidate_snapshot()
+        if source_module_id is None:
+            if sink_module_id is not None:
+                self._run(['pactl', 'unload-module', str(sink_module_id)])
+            return None
+        source_name = (
+            self._wait_source_visible(requested_source_name, attempts=20, delay=0.05)
+            or self.resolve_source_name(requested_source_name)
+        )
+        if not source_name:
+            if source_module_id is not None:
+                self._run(['pactl', 'unload-module', str(source_module_id)])
+            if sink_module_id is not None:
+                self._run(['pactl', 'unload-module', str(sink_module_id)])
+            self.invalidate_snapshot()
+            return None
+        return {
+            'sink_name': sink_name,
+            'sink_module_id': str(sink_module_id),
+            'source_name': source_name,
+            'source_request_name': requested_source_name,
+            'source_module_id': str(source_module_id),
+        }
+
+    def _destroy_fx_proxy(self, info):
+        source_module_id = info.get('proxy_source_module_id')
+        sink_module_id = info.get('proxy_sink_module_id')
+        source_name = info.get('proxy_source_name')
+        source_request_name = info.get('proxy_source_request_name')
+        sink_name = info.get('proxy_sink_name')
+
+        if source_module_id is None:
+            for candidate in (
+                    source_request_name,
+                    source_name,
+                    str(source_name or "").removeprefix("output."),
+            ):
+                if not candidate:
+                    continue
+                source_module_id = self._find_module_by_arg(f"source_name={candidate}")
+                if source_module_id is not None:
+                    break
+        if sink_module_id is None and sink_name:
+            sink_module_id = self._find_module_by_arg(f"sink_name={sink_name}")
+
+        if source_module_id is not None:
+            self._run(['pactl', 'unload-module', str(source_module_id)])
+        if sink_module_id is not None:
+            self._run(['pactl', 'unload-module', str(sink_module_id)])
+        if source_module_id is not None or sink_module_id is not None:
+            self.invalidate_snapshot()
+
     def _build_fx_stage_config(self, safe_key, idx, effect_id, params):
         """Per-stage filter-chain builder. Superseded by
         `_build_unified_chain_config` — kept so an out-of-tree import
@@ -3948,10 +4189,9 @@ context.modules = [
     def set_channel_fx(self, node_name, capture_target, effects, params_map=None):
         """Apply a channel FX chain.
 
-        Prefers inline live patching on the managed PipeWire node so
-        parameter/preset changes do not require consumer rerouting. Falls
-        back to the older spawned filter-chain path when inline patching
-        is unavailable for the target."""
+        Effects are exposed through a stable WaveLinux-owned source while
+        active, so app capture, default-mic routing, and WaveLinux's own
+        monitor path all hear the same processed signal."""
         return self._set_channel_fx_inner(
             node_name, capture_target, effects, params_map,
         )
@@ -4005,16 +4245,19 @@ context.modules = [
                 target_source=capture_target,
             )
 
-        inline_result = self._apply_inline_channel_fx(
-            node_name,
-            capture_target,
-            ordered,
-            params_map,
-        )
-        if inline_result is not None:
-            return inline_result
-
         old_info = dict(self.channel_fx.get(node_name) or {})
+        if self._is_inline_fx_info(old_info):
+            try:
+                self._clear_inline_channel_fx(node_name, old_info)
+            finally:
+                self.channel_fx.pop(node_name, None)
+            old_info = {}
+
+        reuse_proxy = bool(
+            old_info.get('mode') == 'proxy'
+            and old_info.get('proxy_sink_name')
+            and old_info.get('proxy_source_name')
+        )
         effective_source = old_info.get('source') or capture_target
         if not effective_source:
             return self._fx_result(
@@ -4025,6 +4268,12 @@ context.modules = [
             )
 
         safe_key = self._safe_channel_key(node_name)
+        proxy = {
+            'sink_name': old_info.get('proxy_sink_name'),
+            'sink_module_id': old_info.get('proxy_sink_module_id'),
+            'source_name': old_info.get('proxy_source_name') or old_info.get('source'),
+            'source_module_id': old_info.get('proxy_source_module_id'),
+        } if reuse_proxy else None
         stamp = int(time.time() * 1000)
         config_path, sink_name, source_name, used_effects = \
             self._build_unified_chain_config(safe_key, ordered, params_map, stamp)
@@ -4053,21 +4302,25 @@ context.modules = [
         mic_cutover = bool(capture_target and not capture_target.endswith('.monitor'))
         default_before = self.get_default_source() if mic_cutover else None
         prev_default = old_info.get('prev_default')
-        if prev_default is None and mic_cutover and default_before and default_before != source_name:
+        if prev_default is None and mic_cutover and default_before:
             prev_default = default_before
 
-        binding_snapshot = self._snapshot_submix_bindings(effective_source)
-        exclude_modules = list(old_info.get('loopbacks', []))
-        for binding in binding_snapshot.values():
-            old_module_id = binding.get('module_id')
-            if old_module_id is not None:
-                exclude_modules.append(old_module_id)
-        external_source_outputs = self.snapshot_external_source_outputs(
-            effective_source,
-            exclude_modules=exclude_modules,
-        )
+        binding_snapshot = {}
+        external_source_outputs = []
+        if not reuse_proxy:
+            binding_snapshot = self._snapshot_submix_bindings(effective_source)
+            exclude_modules = list(old_info.get('loopbacks', []))
+            for binding in binding_snapshot.values():
+                old_module_id = binding.get('module_id')
+                if old_module_id is not None:
+                    exclude_modules.append(old_module_id)
+            external_source_outputs = self.snapshot_external_source_outputs(
+                effective_source,
+                exclude_modules=exclude_modules,
+            )
 
         lb = None
+        proxy_feed = None
         replacements = {}
         default_changed = False
         failure_stage = None
@@ -4082,75 +4335,113 @@ context.modules = [
                 failure_stage = 'upstream_loopback'
                 raise RuntimeError('candidate upstream loopback failed')
 
-            for key, binding in binding_snapshot.items():
-                module_id = self._create_submix_replacement(
-                    source_name,
-                    binding['mix_name'],
-                    initial_state=binding.get('state') or {},
-                )
-                if module_id is None:
-                    failure_stage = f"submix_{binding['mix_name'].lower()}"
-                    raise RuntimeError(f"replacement submix loopback failed for {binding['mix_name']}")
-                replacements[key] = {
-                    'mix_name': binding['mix_name'],
-                    'module_id': module_id,
-                    'old_module_id': binding.get('module_id'),
-                    'state': dict(binding.get('state', {}) or {}),
-                }
+            if proxy is None:
+                proxy = self._ensure_fx_proxy(safe_key)
+                if proxy is None:
+                    failure_stage = 'proxy_create'
+                    raise RuntimeError('stable FX source could not be created')
+
+            proxy_feed = self._load_loopback_module(
+                source_name,
+                proxy['sink_name'],
+            )
+            if proxy_feed is None or not self._module_is_alive(proxy_feed):
+                failure_stage = 'proxy_feed'
+                raise RuntimeError('processed signal could not be attached to the stable FX source')
+
+            if not reuse_proxy:
+                for key, binding in binding_snapshot.items():
+                    module_id = self._create_submix_replacement(
+                        proxy['source_name'],
+                        binding['mix_name'],
+                        initial_state=binding.get('state') or {},
+                    )
+                    if module_id is None:
+                        failure_stage = f"submix_{binding['mix_name'].lower()}"
+                        raise RuntimeError(f"replacement submix loopback failed for {binding['mix_name']}")
+                    replacements[key] = {
+                        'mix_name': binding['mix_name'],
+                        'module_id': module_id,
+                        'old_module_id': binding.get('module_id'),
+                        'state': dict(binding.get('state', {}) or {}),
+                    }
 
             if mic_cutover:
-                self.set_default_source(source_name)
-                default_changed = True
-                if not self._move_known_source_outputs(
+                if default_before != proxy['source_name']:
+                    self.set_default_source(proxy['source_name'])
+                    default_changed = True
+                if not reuse_proxy and not self._move_known_source_outputs(
                         external_source_outputs,
                         effective_source,
-                        source_name):
+                        proxy['source_name']):
                     failure_stage = 'source_output_move'
-                    raise RuntimeError('source-output move to candidate source failed')
-                if self.get_default_source() != source_name:
+                    raise RuntimeError('source-output move to stable FX source failed')
+                if self.get_default_source() != proxy['source_name']:
                     failure_stage = 'default_source'
-                    raise RuntimeError('default source did not switch to candidate source')
+                    raise RuntimeError('default source did not switch to the stable FX source')
 
             self.channel_fx[node_name] = {
+                'mode': 'proxy',
                 'effects': list(used_effects),
                 'params': {
                     fid: dict(params_map.get(fid, {}))
                     for fid in used_effects
                 },
                 'procs': [proc_key],
-                'loopbacks': [lb],
-                'source': source_name,
+                'loopbacks': [lb, proxy_feed],
+                'source': proxy['source_name'],
+                'active_chain_source': source_name,
+                'active_chain_sink': sink_name,
                 'capture_target': capture_target,
                 'safe_key': safe_key,
                 'prev_default': prev_default,
+                'proxy_sink_name': proxy['sink_name'],
+                'proxy_sink_module_id': proxy['sink_module_id'],
+                'proxy_source_name': proxy['source_name'],
+                'proxy_source_request_name': proxy.get('source_request_name'),
+                'proxy_source_module_id': proxy['source_module_id'],
             }
-            self._commit_submix_replacements(replacements, new_source=source_name)
+            if replacements:
+                self._commit_submix_replacements(
+                    replacements,
+                    new_source=proxy['source_name'],
+                )
             if old_info:
                 self._teardown_fx_plumbing(old_info)
             self.invalidate_snapshot()
             return self._fx_result(
                 True,
-                active_source=source_name,
-                kept_source=source_name,
+                active_source=proxy['source_name'],
+                kept_source=proxy['source_name'],
                 message='FX chain active',
             )
         except Exception as exc:
             if default_changed and default_before:
                 self.set_default_source(default_before)
-            if source_name and effective_source:
+            if not reuse_proxy and proxy and effective_source:
                 self._move_known_source_outputs(
                     external_source_outputs,
-                    source_name,
+                    proxy['source_name'],
                     effective_source,
                 )
             self._unload_submix_replacements(replacements)
+            if proxy_feed is not None:
+                self._run(['pactl', 'unload-module', str(proxy_feed)])
             if lb is not None:
                 self._run(['pactl', 'unload-module', str(lb)])
             self.stop_rnnoise(proc_key)
+            if not reuse_proxy and proxy:
+                self._destroy_fx_proxy({
+                    'proxy_sink_name': proxy.get('sink_name'),
+                    'proxy_sink_module_id': proxy.get('sink_module_id'),
+                    'proxy_source_name': proxy.get('source_name'),
+                    'proxy_source_request_name': proxy.get('source_request_name'),
+                    'proxy_source_module_id': proxy.get('source_module_id'),
+                })
             self.invalidate_snapshot()
             return self._fx_result(
                 False,
-                kept_source=effective_source,
+                kept_source=proxy['source_name'] if reuse_proxy and proxy else effective_source,
                 rolled_back=True,
                 failure_stage=failure_stage or 'cutover',
                 message=str(exc),
@@ -4199,6 +4490,109 @@ context.modules = [
 
         if self._is_inline_fx_info(info):
             return self._clear_inline_channel_fx(node_name, info)
+
+        if info.get('mode') == 'proxy' and info.get('proxy_sink_name'):
+            proxy_source = info.get('proxy_source_name') or info.get('source')
+            proxy_sink = info.get('proxy_sink_name')
+            capture_target = info.get('capture_target') or ''
+            dest_source = target_source or capture_target
+            if not proxy_source or not proxy_sink or not dest_source:
+                self.channel_fx.pop(node_name, None)
+                return self._fx_result(
+                    True,
+                    kept_source=dest_source,
+                    message='FX chain state was incomplete',
+                )
+
+            binding_snapshot = self._snapshot_submix_bindings(proxy_source)
+            external_source_outputs = self.snapshot_external_source_outputs(
+                proxy_source,
+            )
+            mic_cutover = bool(capture_target and not capture_target.endswith('.monitor'))
+            default_before = self.get_default_source() if mic_cutover else None
+            replacement_default = target_source or info.get('prev_default') or capture_target
+            replacements = {}
+            replacement_feed = None
+            default_changed = False
+            failure_stage = None
+
+            try:
+                replacement_feed = self._load_loopback_module(dest_source, proxy_sink)
+                if replacement_feed is None or not self._module_is_alive(replacement_feed):
+                    failure_stage = 'proxy_feed'
+                    raise RuntimeError('raw source could not be rebound to the stable FX source')
+
+                for key, binding in binding_snapshot.items():
+                    module_id = self._create_submix_replacement(
+                        dest_source,
+                        binding['mix_name'],
+                        initial_state=binding.get('state') or {},
+                    )
+                    if module_id is None:
+                        failure_stage = f"submix_{binding['mix_name'].lower()}"
+                        raise RuntimeError(f"replacement submix loopback failed for {binding['mix_name']}")
+                    replacements[key] = {
+                        'mix_name': binding['mix_name'],
+                        'module_id': module_id,
+                        'old_module_id': binding.get('module_id'),
+                        'state': dict(binding.get('state', {}) or {}),
+                    }
+
+                if mic_cutover:
+                    if not self._move_known_source_outputs(
+                            external_source_outputs,
+                            proxy_source,
+                            dest_source):
+                        failure_stage = 'source_output_move'
+                        raise RuntimeError('source-output move off stable FX source failed')
+                    if default_before == proxy_source and replacement_default:
+                        self.set_default_source(replacement_default)
+                        default_changed = True
+                        if self.get_default_source() != replacement_default:
+                            failure_stage = 'default_source'
+                            raise RuntimeError('default source did not restore correctly')
+
+                self.channel_fx.pop(node_name, None)
+                if replacements:
+                    self._commit_submix_replacements(replacements, new_source=dest_source)
+                else:
+                    for skey in list(self.submix_sources.keys()):
+                        if self.submix_sources.get(skey) != proxy_source:
+                            continue
+                        mod_id = self.submix_loopbacks.pop(skey, None)
+                        self.submix_sources.pop(skey, None)
+                        if mod_id is not None:
+                            self._run(['pactl', 'unload-module', str(mod_id)])
+                self._teardown_fx_plumbing(info)
+                if replacement_feed is not None:
+                    self._run(['pactl', 'unload-module', str(replacement_feed)])
+                self._destroy_fx_proxy(info)
+                self.invalidate_snapshot()
+                return self._fx_result(
+                    True,
+                    kept_source=dest_source,
+                    message='FX chain cleared',
+                )
+            except Exception as exc:
+                if default_changed and default_before:
+                    self.set_default_source(default_before)
+                self._move_known_source_outputs(
+                    external_source_outputs,
+                    dest_source,
+                    proxy_source,
+                )
+                self._unload_submix_replacements(replacements)
+                if replacement_feed is not None:
+                    self._run(['pactl', 'unload-module', str(replacement_feed)])
+                self.invalidate_snapshot()
+                return self._fx_result(
+                    False,
+                    active_source=proxy_source,
+                    kept_source=proxy_source,
+                    rolled_back=True,
+                    failure_stage=failure_stage or 'cutover',
+                    message=str(exc),
+                )
 
         fx_source = info.get('source')
         capture_target = info.get('capture_target') or ''

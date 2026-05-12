@@ -13,12 +13,29 @@ from audio_runtime.models import (
     RuntimeChannelView,
     SetCardProfile,
     SetChannelFx,
+    SetMixHardwareRoute,
     SetSubmixState,
 )
 from audio_runtime.planner import RuntimePlanner
 
 
 class RuntimePlannerTests(unittest.TestCase):
+    def test_set_mix_hardware_route_treats_rotated_bluetooth_sink_names_as_same_device(self):
+        planner = RuntimePlanner()
+        desired = DesiredState(mixes={"Monitor": MixSpec(name="Monitor")})
+        observed = ObservedState(
+            mix_hardware_routes={"Monitor": "bluez_output.AA_BB_CC_DD_EE_FF.2"}
+        )
+        intent = SetMixHardwareRoute(
+            mix_name="Monitor",
+            sink_name="bluez_output.AA_BB_CC_DD_EE_FF.1",
+        )
+
+        planner.apply_intent(desired, intent)
+        actions = planner.reconcile(desired, observed, intent)
+
+        self.assertEqual(actions, [])
+
     def test_set_channel_fx_creates_apply_action_when_chain_missing(self):
         planner = RuntimePlanner()
         desired = DesiredState()

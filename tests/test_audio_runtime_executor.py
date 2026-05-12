@@ -42,6 +42,14 @@ class FakeEngine:
         self.mute_calls = []
         self.default_source_calls = []
         self.cleared = False
+        self.submix_loopbacks = {}
+        self.submix_sources = {}
+        self.channel_fx = {
+            "mic": {
+                "effects": ["rnnoise"],
+                "params": {},
+            }
+        }
         self.fx_apply_result = {
             "success": True,
             "active_source": "wavelinux.fx.mic.source",
@@ -60,6 +68,34 @@ class FakeEngine:
 
     def get_virtual_sinks(self, snap=None):
         return []
+
+    def get_all_sinks(self, snap=None):
+        return []
+
+    def get_sink_inputs(self, snap=None):
+        return []
+
+    def snapshot_sink_inputs_by_owner(self, snap=None):
+        return {}
+
+    def get_default_source(self):
+        return "mic"
+
+    def get_channel_fx_source(self, node_name, snap=None):
+        return "wavelinux.fx.mic.source"
+
+    def get_channel_effects(self, node_name):
+        return ["rnnoise"]
+
+    def get_live_mix_hardware_route(self, mix_name, snap=None):
+        return getattr(self.output_mixes.get(mix_name), "hardware_output", None)
+
+    def get_sink_volume_by_name(self, sink_name, snap=None):
+        return 1.0, False
+
+    @staticmethod
+    def friendly_name(name):
+        return name
 
     def apply_channel_fx_transaction(self, node_name, capture_target, effects, params_map=None):
         self.last_fx = (node_name, capture_target, list(effects), dict(params_map))
@@ -234,6 +270,15 @@ class RuntimeExecutorTests(unittest.TestCase):
         self.assertIs(result, observed)
         self.assertEqual(result.mic_inputs[0].monitor_volume, 0.33)
         self.assertTrue(result.mic_inputs[0].monitor_mute)
+
+    def test_observe_uses_fx_source_for_meter_when_effects_are_active(self):
+        executor = RuntimeExecutor(FakeAdapter(FakeEngine()), DummyDiagnostics())
+        desired = self._desired()
+
+        observed = executor.observe(desired)
+
+        self.assertEqual(len(observed.mic_inputs), 1)
+        self.assertEqual(observed.mic_inputs[0].meter_source, "wavelinux.fx.mic.source")
 
     def test_check_invariants_reports_missing_submix_route(self):
         desired = DesiredState(selected_mic="mic")

@@ -61,7 +61,10 @@ class RuntimeExecutor:
                     for effect_id, values in (info.get("params", {}) or {}).items()
                 }
             for mix_name, mix in engine.output_mixes.items():
-                observed.mix_hardware_routes[mix_name] = getattr(mix, "hardware_output", None)
+                observed.mix_hardware_routes[mix_name] = engine.get_live_mix_hardware_route(
+                    mix_name,
+                    snap=snap,
+                )
                 master_volume, _ = engine.get_sink_volume_by_name(mix.sink_name, snap=snap)
                 observed.mix_master_volumes[mix_name] = master_volume
             observed.mic_inputs = [
@@ -572,18 +575,19 @@ class RuntimeExecutor:
             float(str_default.get("vol", 1.0)),
             bool(str_default.get("mute", False)),
         )
+        fx_source = observed.fx_sources_by_channel.get(node_name)
         if is_mic:
             label = engine.friendly_name(node.description)
             channel_type = "Microphone"
             icon = "🎤"
             capture_target = node_name
-            meter_source = node_name
+            meter_source = fx_source or node_name
         else:
             label = node_name.replace("wavelinux_", "").replace("_", " ").title()
             channel_type = "Virtual"
             icon = "🎵"
             capture_target = f"{node_name}.monitor"
-            meter_source = capture_target
+            meter_source = fx_source or capture_target
         return RuntimeChannelView(
             node_id=node_id,
             name=node_name,

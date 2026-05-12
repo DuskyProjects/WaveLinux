@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from .models import (
     Action,
     AppRouteSpec,
@@ -25,6 +27,25 @@ from .models import (
 
 class RuntimePlanner:
     """Translate desired-state changes into side-effect actions."""
+
+    _BT_SINK_FAMILY_RE = re.compile(
+        r'^(bluez_output\.[0-9A-Fa-f]{2}(?:[_:-][0-9A-Fa-f]{2}){5})(?:\..+)?$',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _canonical_sink_name(cls, sink_name):
+        sink_name = str(sink_name or "").strip()
+        if not sink_name:
+            return ""
+        match = cls._BT_SINK_FAMILY_RE.match(sink_name)
+        if match:
+            return match.group(1).lower().replace('-', '_').replace(':', '_')
+        return sink_name
+
+    @classmethod
+    def _sink_names_match(cls, left, right):
+        return cls._canonical_sink_name(left) == cls._canonical_sink_name(right)
 
     def apply_intent(self, desired_state, intent):
         if isinstance(intent, SetChannelFx):
@@ -148,7 +169,7 @@ class RuntimePlanner:
             })]
         if isinstance(intent, SetMixHardwareRoute):
             current = observed_state.mix_hardware_routes.get(intent.mix_name)
-            if current != intent.sink_name:
+            if not self._sink_names_match(current, intent.sink_name):
                 return [Action("set_mix_hardware_route", {
                     "mix_name": intent.mix_name,
                     "sink_name": intent.sink_name,
@@ -203,7 +224,7 @@ class RuntimePlanner:
             if mix_name not in observed_mix_names:
                 actions.append(Action("ensure_output_mix", {"mix_name": mix_name}))
             current_hw = observed_state.mix_hardware_routes.get(mix_name)
-            if current_hw != mix.hardware_sink:
+            if not self._sink_names_match(current_hw, mix.hardware_sink):
                 actions.append(Action("set_mix_hardware_route", {
                     "mix_name": mix_name,
                     "sink_name": mix.hardware_sink,

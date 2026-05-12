@@ -39,7 +39,7 @@ from wavelinux_theme import STYLESHEET
 
 import struct
 
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 _GITHUB_OWNER = "DuskyProjects"
 _GITHUB_REPO  = "WaveLinux"
 _RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire", "pw-cli"]
@@ -1527,6 +1527,7 @@ class WaveLinuxWindow(QMainWindow):
         self.runtime.view_state_changed.connect(self._on_runtime_view_state)
         self.runtime.fx_status_changed.connect(self._on_runtime_fx_status)
         self._runtime_view_state = None
+        self._shutting_down = False
         # ── State ──
         self.channel_widgets = {}   # node_id -> ChannelStrip
         self.app_widgets = {}       # app_id -> AppRoutingRow
@@ -1554,8 +1555,10 @@ class WaveLinuxWindow(QMainWindow):
         self._visible_strip_ids = ()
         self._app_widget_order = ()
         self._monitor_sink_fp = ()
+        self._desired_mix_hw = {"Monitor": None, "Stream": None}
         self.config_path = os.path.expanduser("~/.config/wavelinux/config.json")
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        self._runtime_pid_path = os.path.expanduser("~/.config/wavelinux/runtime.pid")
         
         # Backstop poll. `pactl subscribe` drives most refreshes; this
         # only fires when an event was missed.
@@ -1623,17 +1626,68 @@ class WaveLinuxWindow(QMainWindow):
     def _run_startup_preflight(self):
         """Check for required runtime binaries and surface a clear warning."""
         missing = [cmd for cmd in _RUNTIME_DEPS if shutil.which(cmd) is None]
-        if not missing:
+        if missing:
+            msg = (
+                "Missing required audio/runtime tools:\n"
+                f"  {', '.join(missing)}\n\n"
+                "WaveLinux can start, but routing/meter/update features may fail.\n"
+                "Install PipeWire + WirePlumber + PulseAudio compatibility tools first.\n"
+                "If you're using the AppImage, these tools still need to exist on the host OS."
+            )
+            logging.warning(msg.replace("\n", " "))
+            QMessageBox.warning(self, "WaveLinux dependency check", msg)
+        self._recover_unclean_runtime_state()
+        self._write_runtime_pid()
+
+    @staticmethod
+    def _pid_is_alive(pid):
+        try:
+            os.kill(int(pid), 0)
+        except (OSError, ValueError, TypeError):
+            return False
+        return True
+
+    def _recover_unclean_runtime_state(self):
+        pid_path = getattr(self, "_runtime_pid_path", "")
+        if not pid_path or not os.path.exists(pid_path):
             return
-        msg = (
-            "Missing required audio/runtime tools:\n"
-            f"  {', '.join(missing)}\n\n"
-            "WaveLinux can start, but routing/meter/update features may fail.\n"
-            "Install PipeWire + WirePlumber + PulseAudio compatibility tools first.\n"
-            "If you're using the AppImage, these tools still need to exist on the host OS."
+        try:
+            with open(pid_path, "r") as fh:
+                previous_pid = fh.read().strip()
+        except OSError:
+            previous_pid = ""
+        if not previous_pid or previous_pid == str(os.getpid()):
+            return
+        if self._pid_is_alive(previous_pid):
+            return
+        logging.warning(
+            "Detected stale WaveLinux runtime from pid %s; resetting audio graph",
+            previous_pid,
         )
-        logging.warning(msg.replace("\n", " "))
-        QMessageBox.warning(self, "WaveLinux dependency check", msg)
+        try:
+            self.runtime.full_audio_reset_sync()
+        except Exception as exc:
+            logging.error(f"Startup stale-state reset failed: {exc}")
+
+    def _write_runtime_pid(self):
+        pid_path = getattr(self, "_runtime_pid_path", "")
+        if not pid_path:
+            return
+        try:
+            with open(pid_path, "w") as fh:
+                fh.write(str(os.getpid()))
+        except OSError as exc:
+            logging.warning(f"Could not write runtime pid file {pid_path}: {exc}")
+
+    def _clear_runtime_pid(self):
+        pid_path = getattr(self, "_runtime_pid_path", "")
+        if not pid_path:
+            return
+        try:
+            if os.path.exists(pid_path):
+                os.remove(pid_path)
+        except OSError as exc:
+            logging.warning(f"Could not clear runtime pid file {pid_path}: {exc}")
 
     def _open_settings(self):
         self._refresh_hidden_list()
@@ -1876,6 +1930,8 @@ class WaveLinuxWindow(QMainWindow):
 
     def _restart_app(self):
         self.save_config()
+        self._shutting_down = True
+        self._clear_runtime_pid()
         self.runtime.cleanup_sync()
         self.runtime.shutdown()
         command = launch_command()
@@ -2101,8 +2157,12 @@ class WaveLinuxWindow(QMainWindow):
         return specs
 
     def _sync_runtime_persistent_state(self):
-        monitor_hw = self.mon_out_combo.currentData() if hasattr(self, "mon_out_combo") else None
-        stream_hw = self.str_out_combo.currentData() if hasattr(self, "str_out_combo") else None
+        monitor_hw = self._desired_mix_hw.get("Monitor")
+        stream_hw = self._desired_mix_hw.get("Stream")
+        if monitor_hw is None and hasattr(self, "mon_out_combo"):
+            monitor_hw = self.mon_out_combo.currentData()
+        if stream_hw is None and hasattr(self, "str_out_combo"):
+            stream_hw = self.str_out_combo.currentData()
         self.runtime.sync_persistent_state(
             selected_mic=self.selected_mic,
             submix_state=self.submix_state,
@@ -2200,6 +2260,8 @@ class WaveLinuxWindow(QMainWindow):
         self._event_refresh_timer.start()
 
     def _on_event_proc_error(self, err):
+        if self._shutting_down:
+            return
         logging.warning(f"pactl subscribe error: {err}")
 
     @staticmethod
@@ -2552,6 +2614,7 @@ class WaveLinuxWindow(QMainWindow):
             self.runtime.set_mix_volume(mix_name, vol)
 
     def _on_mix_out_change(self, mix_name, hw_sink_name):
+        self._desired_mix_hw[mix_name] = hw_sink_name
         self.runtime.set_mix_hardware_route(mix_name, hw_sink_name)
         self.schedule_save()
 
@@ -2821,7 +2884,9 @@ class WaveLinuxWindow(QMainWindow):
         combo = self.mon_out_combo
         if not combo.view().isVisible():
             current_hw = getattr(view.mixes.get("Monitor"), "hardware_sink", None)
+            desired_hw = self._desired_mix_hw.get("Monitor")
             current_data = combo.currentData()
+            combo_updated = False
             sink_fp = tuple(
                 (sink.name, sink.display_name)
                 for sink in (getattr(view, "sinks", []) or [])
@@ -2834,18 +2899,22 @@ class WaveLinuxWindow(QMainWindow):
                 combo.addItem("None", None)
                 for sink_name, display_name in sink_fp:
                     combo.addItem(display_name, sink_name)
-                idx = combo.findData(current_hw)
+                idx = combo.findData(desired_hw)
                 if idx < 0:
                     idx = combo.findData(current_data)
+                if idx < 0 and desired_hw is None:
+                    idx = combo.findData(current_hw)
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
+                    combo_updated = True
                 combo.blockSignals(False)
-            elif current_hw != current_data:
-                idx = combo.findData(current_hw)
+            elif desired_hw != current_data:
+                idx = combo.findData(desired_hw)
                 if idx >= 0 and idx != combo.currentIndex():
                     combo.blockSignals(True)
                     combo.setCurrentIndex(idx)
                     combo.blockSignals(False)
+                    combo_updated = True
 
         mon_mix = view.mixes.get("Monitor")
         if mon_mix and not self.mon_master_slider.isSliderDown():
@@ -3027,6 +3096,8 @@ class WaveLinuxWindow(QMainWindow):
                 # we call it explicitly exactly once.
                 mon_hw = conf.get('monitor_hw') or self.engine.get_default_sink()
                 str_hw = conf.get('stream_hw')
+                self._desired_mix_hw["Monitor"] = mon_hw
+                self._desired_mix_hw["Stream"] = str_hw
                 for combo, mix_name, hw in (
                     (self.mon_out_combo, "Monitor", mon_hw),
                     (self.str_out_combo, "Stream", str_hw),
@@ -3082,8 +3153,8 @@ class WaveLinuxWindow(QMainWindow):
         # been replaced by the per-mic `limiter` effect.
         conf = {
             'schema_version': 1,
-            'monitor_hw': self.mon_out_combo.currentData(),
-            'stream_hw': self.str_out_combo.currentData(),
+            'monitor_hw': self._desired_mix_hw.get("Monitor"),
+            'stream_hw': self._desired_mix_hw.get("Stream"),
             'channels': self.virtual_channels,
             'selected_mic': self.selected_mic,
             'submixes': self.submix_state,
@@ -3412,6 +3483,7 @@ class WaveLinuxWindow(QMainWindow):
     def _quit_app(self):
         """Cleanly save state, unload all modules, and exit."""
         logging.info("Shutting down WaveLinux...")
+        self._shutting_down = True
         self.refresh_timer.stop()
         self._save_timer.stop()
         self._event_refresh_timer.stop()
@@ -3423,12 +3495,14 @@ class WaveLinuxWindow(QMainWindow):
         if proc is not None and proc.state() != QProcess.ProcessState.NotRunning:
             proc.kill()
             proc.waitForFinished(500)
+        self._clear_runtime_pid()
         self.runtime.full_audio_reset_sync()
         self.runtime.shutdown()
         logging.info("Audio reset complete. Exiting.")
         QApplication.instance().quit()
 
     def _cleanup_before_exit(self):
+        self._clear_runtime_pid()
         self.runtime.cleanup_sync()
 
 
