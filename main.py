@@ -39,7 +39,7 @@ from wavelinux_theme import STYLESHEET
 
 import struct
 
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.4"
 _GITHUB_OWNER = "DuskyProjects"
 _GITHUB_REPO  = "WaveLinux"
 _RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire", "pw-cli"]
@@ -1755,9 +1755,9 @@ class WaveLinuxWindow(QMainWindow):
         probed = len(self.engine.ladspa_plugins)
         ladspa_lbl = QLabel(
             f"LADSPA plugins detected: {probed}\n"
-            f"Paths searched: $LADSPA_PATH + /usr/lib/ladspa, /usr/lib64/ladspa, "
-            f"/usr/local/lib/ladspa, /usr/lib/x86_64-linux-gnu/ladspa, "
-            f"~/.ladspa, ~/.local/lib/ladspa."
+            f"Paths searched: $LADSPA_PATH + standard host LADSPA directories.\n"
+            f"AppImage bundled LADSPA is disabled by default; opt in with "
+            f"WAVELINUX_ENABLE_BUNDLED_LADSPA=1."
         )
         ladspa_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
         ladspa_lbl.setWordWrap(True)

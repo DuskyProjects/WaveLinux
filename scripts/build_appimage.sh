@@ -15,6 +15,7 @@ if [ -z "${WAVELINUX_VERSION}" ]; then
     exit 1
 fi
 OUTPUT_APPIMAGE="${DIST_DIR}/WaveLinux-${WAVELINUX_VERSION}-x86_64.AppImage"
+WAVELINUX_BUNDLE_LADSPA="${WAVELINUX_BUNDLE_LADSPA:-0}"
 
 bundle_optional_fx() {
     local target_dir="$1"
@@ -68,7 +69,9 @@ install -Dm644 "${ROOT_DIR}/icon.png" "${APPDIR}/wavelinux.png"
 install -Dm644 "${ROOT_DIR}/packaging/appimage/wavelinux.appdata.xml" \
     "${APPDIR}/usr/share/metainfo/io.github.duskyprojects.WaveLinux.appdata.xml"
 
-bundle_optional_fx "${APPDIR}/usr/lib/ladspa"
+if [ "${WAVELINUX_BUNDLE_LADSPA}" = "1" ]; then
+    bundle_optional_fx "${APPDIR}/usr/lib/ladspa"
+fi
 download_appimagetool
 
 ARCH=x86_64 "${APPIMAGETOOL}" --appimage-extract-and-run "${APPDIR}" "${OUTPUT_APPIMAGE}"

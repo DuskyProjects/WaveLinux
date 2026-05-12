@@ -156,11 +156,37 @@ class PipeWireEngine:
         return False
 
     @classmethod
-    def _probe_ladspa_plugins(cls):
-        """Return a set of LADSPA plugin names (sans .so) found on disk.
-        Honours $LADSPA_PATH plus common distro locations."""
+    def _ladspa_roots(cls):
+        """Return LADSPA search roots with host paths first.
+
+        AppImage-bundled LADSPA paths are opt-in because the plugins are
+        loaded by the host PipeWire daemon, not by the WaveLinux process.
+        """
+        roots = []
         env_path = os.environ.get("LADSPA_PATH", "")
-        roots = [p for p in env_path.split(":") if p] + list(cls._LADSPA_PATHS)
+        roots.extend(p for p in env_path.split(":") if p)
+        roots.extend(cls._LADSPA_PATHS)
+        if os.environ.get("WAVELINUX_ENABLE_BUNDLED_LADSPA", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            bundled = os.environ.get("WAVELINUX_BUNDLED_LADSPA_PATH", "")
+            roots.extend(p for p in bundled.split(":") if p)
+        deduped = []
+        seen = set()
+        for root in roots:
+            if root in seen:
+                continue
+            deduped.append(root)
+            seen.add(root)
+        return deduped
+
+    @classmethod
+    def _probe_ladspa_plugins(cls):
+        """Return a set of LADSPA plugin names (sans .so) found on disk."""
+        roots = cls._ladspa_roots()
         found = set()
         for root in roots:
             try:
@@ -189,8 +215,7 @@ class PipeWireEngine:
         not found. Filter-chain accepts a bare plugin name but using the
         absolute path eliminates a class of "plugin not found" failures on
         systems where the .so lives in a non-standard directory."""
-        env_path = os.environ.get("LADSPA_PATH", "")
-        roots = [p for p in env_path.split(":") if p] + list(self._LADSPA_PATHS)
+        roots = self._ladspa_roots()
         target_lower = name.lower()
         for root in roots:
             try:

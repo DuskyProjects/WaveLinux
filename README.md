@@ -46,7 +46,9 @@ chmod +x WaveLinux-*.AppImage
 
 4. Inside WaveLinux, open `Settings -> Updates` and use `Install This AppImage` if you want a desktop launcher copied into `~/.local/bin` and `~/.local/share/applications`.
 
-Optional LADSPA FX are bundled into the AppImage when they are present on the release builder. WaveLinux still falls back to the host `LADSPA_PATH` and standard distro plugin locations.
+WaveLinux uses host LADSPA plugins for FX by default, even in the AppImage. This is intentional: PipeWire loads those plugins from the host side, so AppImage-bundled LADSPA copies are less reliable across distros.
+
+If you explicitly want to try bundled LADSPA plugins in a custom build, set `WAVELINUX_BUNDLE_LADSPA=1` when building and `WAVELINUX_ENABLE_BUNDLED_LADSPA=1` at runtime.
 
 ## Source Checkout Install
 
