@@ -39,7 +39,7 @@ from wavelinux_theme import STYLESHEET
 
 import struct
 
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 _GITHUB_OWNER = "DuskyProjects"
 _GITHUB_REPO  = "WaveLinux"
 _RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire", "pw-cli"]
