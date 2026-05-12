@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=WaveLinux
+Comment=PipeWire Audio Router & Mixer
+Exec=WaveLinux
+Icon=wavelinux
+Type=Application
+Categories=AudioVideo;Audio;Mixer;
+Keywords=audio;mixer;pipewire;routing;
+StartupNotify=true

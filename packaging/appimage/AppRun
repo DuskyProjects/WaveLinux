@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+if [ -d "${HERE}/usr/lib/ladspa" ]; then
+    if [ -n "${LADSPA_PATH:-}" ]; then
+        export LADSPA_PATH="${HERE}/usr/lib/ladspa:${LADSPA_PATH}"
+    else
+        export LADSPA_PATH="${HERE}/usr/lib/ladspa"
+    fi
+fi
+
+exec "${HERE}/usr/lib/wavelinux/WaveLinux" "$@"

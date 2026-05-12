@@ -1,6 +1,6 @@
 # Maintainer: WaveLinux contributors <https://github.com/excalprimeacct-gif/WaveLinux>
 pkgname=wavelinux
-pkgver=0.2.0
+pkgver=2.0.1
 pkgrel=1
 pkgdesc="Elgato Wave Link–style PipeWire mixer for Linux (virtual channels, Monitor/Stream buses, per-channel FX)"
 arch=('any')
@@ -29,8 +29,18 @@ package() {
   # App sources live under /usr/share/wavelinux.
   install -d "$pkgdir/usr/share/wavelinux"
   install -Dm644 main.py            "$pkgdir/usr/share/wavelinux/main.py"
+  install -Dm644 distribution.py    "$pkgdir/usr/share/wavelinux/distribution.py"
   install -Dm644 pipewire_engine.py "$pkgdir/usr/share/wavelinux/pipewire_engine.py"
   install -Dm644 wavelinux_theme.py "$pkgdir/usr/share/wavelinux/wavelinux_theme.py"
+  install -Dm644 tray_icon.png      "$pkgdir/usr/share/wavelinux/tray_icon.png"
+  install -d "$pkgdir/usr/share/wavelinux/audio_runtime"
+  install -Dm644 audio_runtime/__init__.py    "$pkgdir/usr/share/wavelinux/audio_runtime/__init__.py"
+  install -Dm644 audio_runtime/adapter.py     "$pkgdir/usr/share/wavelinux/audio_runtime/adapter.py"
+  install -Dm644 audio_runtime/controller.py  "$pkgdir/usr/share/wavelinux/audio_runtime/controller.py"
+  install -Dm644 audio_runtime/diagnostics.py "$pkgdir/usr/share/wavelinux/audio_runtime/diagnostics.py"
+  install -Dm644 audio_runtime/executor.py    "$pkgdir/usr/share/wavelinux/audio_runtime/executor.py"
+  install -Dm644 audio_runtime/models.py      "$pkgdir/usr/share/wavelinux/audio_runtime/models.py"
+  install -Dm644 audio_runtime/planner.py     "$pkgdir/usr/share/wavelinux/audio_runtime/planner.py"
   install -Dm644 icon.png           "$pkgdir/usr/share/icons/hicolor/512x512/apps/wavelinux.png"
   install -Dm644 README.md          "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 ROADMAP.md         "$pkgdir/usr/share/doc/$pkgname/ROADMAP.md"

@@ -1,3 +1,5 @@
-#!/bin/bash
-cd "$(dirname "$0")"
-python3 main.py
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "${SCRIPT_DIR}/main.py" "$@"

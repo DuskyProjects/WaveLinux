@@ -1,0 +1,72 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-appimage:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            desktop-file-utils \
+            file \
+            libegl1 \
+            libgl1 \
+            libglib2.0-0 \
+            patchelf \
+            squashfs-tools \
+            swh-plugins \
+            zsync
+          sudo apt-get install -y librnnoise-ladspa || true
+
+      - name: Install Python build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install PyInstaller PyQt6
+
+      - name: Run syntax checks
+        run: |
+          python -m py_compile \
+            main.py \
+            distribution.py \
+            pipewire_engine.py \
+            wavelinux_theme.py \
+            audio_runtime/*.py
+
+      - name: Run test suite
+        run: python -m unittest discover -s tests
+
+      - name: Build AppImage
+        run: ./scripts/build_appimage.sh
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wavelinux-appimage
+          path: |
+            dist/*.AppImage
+            dist/sha256sums.txt
+
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.AppImage
+            dist/sha256sums.txt

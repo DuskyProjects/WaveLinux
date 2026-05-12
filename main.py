@@ -9,10 +9,8 @@ import sys
 import os
 import re
 import time
-import tempfile
 import threading
 import queue
-import hashlib
 import urllib.request
 import urllib.error
 
@@ -23,20 +21,28 @@ from PyQt6.QtWidgets import (
     QMenu, QInputDialog, QProgressBar, QSizePolicy, QTabWidget,
     QSpinBox, QCheckBox
 )
-from PyQt6.QtCore import Qt, QTimer, QLockFile, QProcess, pyqtSignal, QObject, QEvent
-from PyQt6.QtGui import QFont, QIcon, QAction
+from PyQt6.QtCore import Qt, QTimer, QLockFile, QProcess, pyqtSignal, QObject, QEvent, QUrl
+from PyQt6.QtGui import QFont, QIcon, QAction, QDesktopServices
 
 from audio_runtime import AudioRuntimeAdapter, AudioRuntimeController
+from distribution import (
+    DESKTOP_FILENAME,
+    desktop_exec_command,
+    install_current_appimage,
+    installed_appimage_path,
+    is_running_in_appimage,
+    launch_command,
+    resource_path,
+)
 from pipewire_engine import PipeWireEngine
 from wavelinux_theme import STYLESHEET
 
 import struct
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 _GITHUB_OWNER = "excalprimeacct-gif"
 _GITHUB_REPO  = "WaveLinux"
-_UPDATE_FILES = ["main.py", "pipewire_engine.py", "wavelinux_theme.py"]
-_RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire"]
+_RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire", "pw-cli"]
 
 
 def _parse_version(v):
@@ -49,26 +55,19 @@ def _parse_version(v):
 
 
 class UpdateChecker:
-    """Background updater using queue polling from the Qt thread."""
+    """Background release checker using queue polling from the Qt thread."""
 
     _API_URL  = (f"https://api.github.com/"
                  f"repos/{_GITHUB_OWNER}/{_GITHUB_REPO}/releases/latest")
-    _RAW_BASE = (f"https://raw.githubusercontent.com/"
-                 f"{_GITHUB_OWNER}/{_GITHUB_REPO}")
-    _CHECKSUMS_FILE = "sha256sums.txt"
+    _RELEASES_URL = f"https://github.com/{_GITHUB_OWNER}/{_GITHUB_REPO}/releases"
 
-    def __init__(self, app_dir):
-        self._app_dir = app_dir
-        self._q       = queue.SimpleQueue()
-        self._cancel  = threading.Event()
+    def __init__(self):
+        self._q = queue.SimpleQueue()
+        self._cancel = threading.Event()
 
     def check(self):
         self._cancel.clear()
         threading.Thread(target=self._do_check, daemon=True).start()
-
-    def download(self, tag):
-        self._cancel.clear()
-        threading.Thread(target=self._do_download, args=(tag,), daemon=True).start()
 
     def cancel(self):
         self._cancel.set()
@@ -88,11 +87,14 @@ class UpdateChecker:
     def _do_check(self):
         try:
             data = self._fetch_json(self._API_URL)
+            if self._cancel.is_set():
+                return
             tag = data.get("tag_name", "").lstrip('v')
+            release_url = data.get("html_url") or self._RELEASES_URL
             if not tag:
                 self._q.put(('error', "GitHub returned no release tag — has a release been published yet?"))
                 return
-            self._q.put(('result', tag))
+            self._q.put(('result', tag, release_url))
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 self._q.put(('error', "No releases published yet on GitHub."))
@@ -102,95 +104,6 @@ class UpdateChecker:
             self._q.put(('error', f"Network error: {e.reason}"))
         except Exception as e:
             self._q.put(('error', f"Check failed: {e}"))
-
-    def _do_download(self, tag):
-        tmp_dir = tempfile.mkdtemp(prefix="wavelinux-update-")
-        try:
-            expected = self._fetch_checksums(tag)
-            if not expected:
-                self._q.put(('error', "Release is missing sha256sums.txt; refusing insecure update."))
-                return
-            for filename in _UPDATE_FILES:
-                if self._cancel.is_set():
-                    self._q.put(('cancelled',))
-                    return
-                url = f"{self._RAW_BASE}/v{tag}/{filename}"
-                dest = os.path.join(tmp_dir, filename)
-                self._download_file(url, dest, filename)
-                got = self._sha256_file(dest)
-                want = expected.get(filename)
-                if not want:
-                    self._q.put(('error', f"sha256sums.txt missing entry for {filename}; refusing update."))
-                    return
-                if got.lower() != want.lower():
-                    self._q.put(('error', f"Checksum mismatch for {filename}; refusing update."))
-                    return
-                if self._cancel.is_set():
-                    self._q.put(('cancelled',))
-                    return
-
-            for filename in _UPDATE_FILES:
-                src = os.path.join(tmp_dir, filename)
-                dst = os.path.join(self._app_dir, filename)
-                if not os.path.exists(src):
-                    continue
-                try:
-                    if os.path.exists(dst):
-                        shutil.copy2(dst, dst + ".bak")
-                    os.replace(src, dst)
-                except OSError as e:
-                    self._q.put(('error', f"Could not replace {filename}: {e}"))
-                    return
-
-            self._q.put(('progress', '__done__', 0, 0))
-        except Exception as e:
-            self._q.put(('error', f"Download failed: {e}"))
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    def _fetch_checksums(self, tag):
-        url = f"{self._RAW_BASE}/v{tag}/{self._CHECKSUMS_FILE}"
-        req = urllib.request.Request(url, headers={"User-Agent": "WaveLinux-Updater"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-        out = {}
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            digest = parts[0].strip()
-            filename = parts[-1].strip().lstrip("*")
-            if filename in _UPDATE_FILES:
-                out[filename] = digest
-        return out
-
-    @staticmethod
-    def _sha256_file(path):
-        h = hashlib.sha256()
-        with open(path, "rb") as fh:
-            while True:
-                chunk = fh.read(65536)
-                if not chunk:
-                    break
-                h.update(chunk)
-        return h.hexdigest()
-
-    def _download_file(self, url, dest, filename):
-        req = urllib.request.Request(url, headers={"User-Agent": "WaveLinux-Updater"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            done  = 0
-            with open(dest, "wb") as fh:
-                while not self._cancel.is_set():
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    done += len(chunk)
-                    self._q.put(('progress', filename, done, total))
 
 
 class MeterWorker(QObject):
@@ -583,7 +496,7 @@ class FXSelectionDialog(QDialog):
             toggle_btn.setEnabled(False)
             toggle_btn.setToolTip(
                 "LADSPA plugin not installed.\n"
-                "rnnoise needs noise-suppression-for-voice (AUR); "
+                "rnnoise needs librnnoise_ladspa; "
                 "compressor/gate/limiter need swh-plugins. "
                 "highpass uses PipeWire's built-in biquad."
             )
@@ -1324,7 +1237,7 @@ class ChannelStrip(QFrame):
         except FileNotFoundError:
             QMessageBox.information(
                 self, "Carla not found",
-                "Install Carla (e.g. `sudo pacman -S carla`) to host VST3 / "
+                "Install Carla from your distro or upstream package source to host VST3 / "
                 "LV2 plugins. WaveLinux bridges to Carla rather than hosting "
                 "those plugin formats directly."
             )
@@ -1594,9 +1507,8 @@ class WaveLinuxWindow(QMainWindow):
         self.resize(1200, 720)
         
         # Set app icon and tray icon.
-        assets_dir = os.path.dirname(os.path.abspath(__file__))
-        app_icon_path = os.path.join(assets_dir, "icon.png")
-        tray_icon_path = os.path.join(assets_dir, "tray_icon.png")
+        app_icon_path = resource_path("icon.png")
+        tray_icon_path = resource_path("tray_icon.png")
 
         if os.path.exists(app_icon_path):
             app_icon = QIcon(app_icon_path)
@@ -1717,7 +1629,8 @@ class WaveLinuxWindow(QMainWindow):
             "Missing required audio/runtime tools:\n"
             f"  {', '.join(missing)}\n\n"
             "WaveLinux can start, but routing/meter/update features may fail.\n"
-            "Install PipeWire + WirePlumber + PulseAudio compatibility tools first."
+            "Install PipeWire + WirePlumber + PulseAudio compatibility tools first.\n"
+            "If you're using the AppImage, these tools still need to exist on the host OS."
         )
         logging.warning(msg.replace("\n", " "))
         QMessageBox.warning(self, "WaveLinux dependency check", msg)
@@ -1725,6 +1638,7 @@ class WaveLinuxWindow(QMainWindow):
     def _open_settings(self):
         self._refresh_hidden_list()
         self._refresh_advanced_tab()
+        self._refresh_update_tab()
         self.settings_dialog.show()
         self.settings_dialog.raise_()
 
@@ -1834,38 +1748,32 @@ class WaveLinuxWindow(QMainWindow):
         self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
         layout.addWidget(self._update_status_lbl)
 
-        self._update_progress = QProgressBar()
-        self._update_progress.setRange(0, 100)
-        self._update_progress.setValue(0)
-        self._update_progress.setVisible(False)
-        self._update_progress.setTextVisible(True)
-        self._update_progress.setStyleSheet(
-            "QProgressBar { background: #1a1a2e; border: 1px solid #3a3a5c;"
-            " border-radius: 4px; color: #e0e0ee; text-align: center; }"
-            "QProgressBar::chunk { background: #00d4aa; border-radius: 3px; }"
-        )
-        layout.addWidget(self._update_progress)
-
         btn_row = QHBoxLayout()
         self._check_update_btn = QPushButton("Check for Updates")
         self._check_update_btn.setObjectName("showHiddenBtn")
         self._check_update_btn.clicked.connect(self._check_for_updates)
         btn_row.addWidget(self._check_update_btn)
 
-        self._apply_update_btn = QPushButton("Download and Apply Update")
-        self._apply_update_btn.setObjectName("addBtn")
-        self._apply_update_btn.setVisible(False)
-        self._apply_update_btn.clicked.connect(self._download_and_apply_update)
-        btn_row.addWidget(self._apply_update_btn)
+        self._open_release_btn = QPushButton("Open Releases Page")
+        self._open_release_btn.setObjectName("addBtn")
+        self._open_release_btn.clicked.connect(self._open_release_page)
+        btn_row.addWidget(self._open_release_btn)
+
+        if is_running_in_appimage():
+            self._install_appimage_btn = QPushButton()
+            self._install_appimage_btn.setObjectName("showHiddenBtn")
+            self._install_appimage_btn.clicked.connect(self._install_running_appimage)
+            btn_row.addWidget(self._install_appimage_btn)
+        else:
+            self._install_appimage_btn = None
 
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
         note = QLabel(
-            "Updates replace main.py, pipewire_engine.py, and wavelinux_theme.py.\n"
-            "For safety, the release must include sha256sums.txt and all file checksums must match.\n"
-            "The old files are backed up with a .bak extension.\n"
-            "A restart is required after applying an update."
+            "WaveLinux now uses notify-only updates.\n"
+            "Use GitHub releases to download the latest AppImage or source package.\n"
+            "Packaged installs should be updated by replacing the AppImage or using your distro package manager."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #5a5a72; font-size: 11px;")
@@ -1876,10 +1784,8 @@ class WaveLinuxWindow(QMainWindow):
 
     def _check_for_updates(self):
         self._check_update_btn.setEnabled(False)
-        self._apply_update_btn.setVisible(False)
         self._update_status_lbl.setText("Checking for updates…")
         self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
-        self._update_progress.setVisible(False)
 
         # Cancel any in-flight checker so we don't end up with two
         # threads racing into the same queue.
@@ -1887,8 +1793,7 @@ class WaveLinuxWindow(QMainWindow):
         if prev is not None:
             prev.cancel()
 
-        app_dir = os.path.dirname(os.path.abspath(__file__))
-        self._updater = UpdateChecker(app_dir=app_dir)
+        self._updater = UpdateChecker()
         self._updater.check()
         # Poll the result queue every 200 ms on the Qt thread — avoids
         # calling QTimer.singleShot from a non-Qt thread which is unreliable.
@@ -1917,19 +1822,14 @@ class WaveLinuxWindow(QMainWindow):
             kind = item[0]
             if kind == 'result':
                 self._update_poll_timer.stop()
-                self._handle_update_result(item[1])
+                self._handle_update_result(item[1], item[2])
             elif kind == 'error':
                 self._update_poll_timer.stop()
                 self._handle_update_error(item[1])
-            elif kind == 'progress':
-                _, filename, done, total = item
-                self._handle_update_progress(filename, done, total)
-            elif kind == 'cancelled':
-                self._update_poll_timer.stop()
-                self._handle_update_cancelled()
 
-    def _handle_update_result(self, latest_tag):
+    def _handle_update_result(self, latest_tag, release_url):
         self._check_update_btn.setEnabled(True)
+        self._pending_update_url = release_url
         current = _parse_version(APP_VERSION)
         latest  = _parse_version(latest_tag)
         if latest > current:
@@ -1937,82 +1837,49 @@ class WaveLinuxWindow(QMainWindow):
                 f"Update available: v{latest_tag}  (current: v{APP_VERSION})"
             )
             self._update_status_lbl.setStyleSheet("color: #00d4aa; font-size: 12px; font-weight: bold;")
-            self._apply_update_btn.setVisible(True)
             self._pending_update_tag = latest_tag
             self._show_notification(
                 "WaveLinux Update Available",
-                f"Version {latest_tag} is available. Open Settings → Updates to apply.",
+                f"Version {latest_tag} is available. Open Settings → Updates to download it.",
             )
         else:
             self._update_status_lbl.setText(f"You're up to date! (v{APP_VERSION})")
             self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
-            self._apply_update_btn.setVisible(False)
-
-
-    def _handle_update_cancelled(self):
-        self._check_update_btn.setEnabled(True)
-        self._apply_update_btn.setEnabled(True)
-        self._update_progress.setVisible(False)
-        self._update_status_lbl.setText("Update cancelled.")
-        self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
 
     def _handle_update_error(self, message):
         self._check_update_btn.setEnabled(True)
-        self._apply_update_btn.setVisible(False)
-        self._update_progress.setVisible(False)
         self._update_status_lbl.setText(f"Error: {message}")
         self._update_status_lbl.setStyleSheet("color: #e05050; font-size: 12px;")
 
-    def _download_and_apply_update(self):
-        tag = getattr(self, '_pending_update_tag', None)
-        if not tag:
-            return
-        updater = getattr(self, '_updater', None)
-        if updater is None:
-            app_dir = os.path.dirname(os.path.abspath(__file__))
-            updater = UpdateChecker(app_dir=app_dir)
-            self._updater = updater
-        self._apply_update_btn.setEnabled(False)
-        self._check_update_btn.setEnabled(False)
-        self._update_progress.setValue(0)
-        self._update_progress.setVisible(True)
-        self._update_status_lbl.setText("Downloading update…")
-        self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
-        updater.download(tag)
-        # Reuse the poll timer for download progress
-        if not getattr(self, '_update_poll_timer', None):
-            self._update_poll_timer = QTimer(self)
-            self._update_poll_timer.setInterval(200)
-            self._update_poll_timer.timeout.connect(self._poll_updater)
-        self._update_poll_timer.start()
+    def _open_release_page(self):
+        url = getattr(self, "_pending_update_url", None) or UpdateChecker._RELEASES_URL
+        QDesktopServices.openUrl(QUrl(url))
 
-    def _handle_update_progress(self, filename, done, total):
-        if filename == "__done__":
-            self._update_progress.setValue(100)
-            self._update_progress.setVisible(False)
-            self._apply_update_btn.setVisible(False)
-            self._check_update_btn.setEnabled(True)
-            self._update_status_lbl.setText(
-                "Update applied! Restart WaveLinux for the new version to take effect."
+    def _install_running_appimage(self):
+        try:
+            result = install_current_appimage()
+        except Exception as exc:
+            QMessageBox.warning(
+                self.settings_dialog,
+                "AppImage install failed",
+                str(exc),
             )
-            self._update_status_lbl.setStyleSheet("color: #00d4aa; font-size: 12px; font-weight: bold;")
-            yn = QMessageBox.question(
-                self.settings_dialog, "Update Applied",
-                "Update applied successfully. Restart WaveLinux now?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if yn == QMessageBox.StandardButton.Yes:
-                self._restart_app()
             return
-        pct = int(done * 100 / total) if total > 0 else 0
-        self._update_progress.setValue(pct)
-        self._update_status_lbl.setText(f"Downloading {os.path.basename(filename)}… {pct}%")
+        self._refresh_update_tab()
+        QMessageBox.information(
+            self.settings_dialog,
+            "AppImage installed",
+            "WaveLinux installed this AppImage for desktop use.\n\n"
+            f"Launcher: {result.wrapper_path}\n"
+            f"Desktop file: {result.desktop_path}",
+        )
 
     def _restart_app(self):
         self.save_config()
         self.runtime.cleanup_sync()
         self.runtime.shutdown()
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        command = launch_command()
+        os.execv(command[0], command + sys.argv[1:])
 
     def _check_for_updates_bg(self):
         """Silent background check 30 s after startup."""
@@ -2020,8 +1887,7 @@ class WaveLinuxWindow(QMainWindow):
         if prev is not None:
             prev.cancel()
 
-        app_dir = os.path.dirname(os.path.abspath(__file__))
-        self._bg_updater = UpdateChecker(app_dir=app_dir)
+        self._bg_updater = UpdateChecker()
         self._bg_updater.check()
         # Reuse the bg poll timer if one already exists rather than
         # constructing a fresh QTimer each call.
@@ -2045,12 +1911,21 @@ class WaveLinuxWindow(QMainWindow):
         self._bg_poll_timer.stop()
         if item[0] == 'result':
             tag = item[1]
+            self._pending_update_url = item[2]
             if _parse_version(tag) > _parse_version(APP_VERSION):
                 self._pending_update_tag = tag
                 self._show_notification(
                     "WaveLinux Update Available",
-                    f"Version {tag} is ready. Open Settings → Updates to apply.",
+                    f"Version {tag} is available. Open Settings → Updates to download it.",
                 )
+
+    def _refresh_update_tab(self):
+        btn = getattr(self, "_install_appimage_btn", None)
+        if btn is not None:
+            installed = os.path.exists(installed_appimage_path())
+            btn.setText(
+                "Reinstall This AppImage" if installed else "Install This AppImage"
+            )
 
     def _refresh_advanced_tab(self):
         # Called when the dialog opens so values reflect any recent change.
@@ -2076,6 +1951,7 @@ class WaveLinuxWindow(QMainWindow):
                 f"Recover degraded channels ({n})" if n
                 else "Recover degraded channels"
             )
+        self._refresh_update_tab()
 
     def _restore_forgotten_apps(self):
         """Clear the persistent ✕ blocklist so apps the user has clicked
@@ -3399,7 +3275,7 @@ class WaveLinuxWindow(QMainWindow):
 
     @property
     def autostart_path(self):
-        return os.path.expanduser("~/.config/autostart/wavelinux.desktop")
+        return os.path.expanduser(f"~/.config/autostart/{DESKTOP_FILENAME}")
 
     def is_autostart_enabled(self):
         return os.path.exists(self.autostart_path)
@@ -3413,12 +3289,12 @@ class WaveLinuxWindow(QMainWindow):
                 pass
             return
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        main_path = os.path.abspath(__file__)
+        exec_cmd = desktop_exec_command()
         contents = (
             "[Desktop Entry]\n"
             "Type=Application\n"
             "Name=WaveLinux\n"
-            f"Exec=python3 {main_path}\n"
+            f"Exec={exec_cmd}\n"
             "Icon=wavelinux\n"
             "X-GNOME-Autostart-enabled=true\n"
             "NoDisplay=false\n"
@@ -3560,6 +3436,7 @@ class WaveLinuxWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("WaveLinux")
+    app.setDesktopFileName(DESKTOP_FILENAME)
     app.setStyleSheet(STYLESHEET)
 
     # Try to use a nice font
