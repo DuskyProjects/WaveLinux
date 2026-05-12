@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 APP_NAME = "WaveLinux"
-APP_DESKTOP_ID = "io.github.excalprimeacct_gif.WaveLinux"
+APP_DESKTOP_ID = "io.github.duskyprojects.WaveLinux"
 APPIMAGE_FILENAME = "WaveLinux.AppImage"
 WRAPPER_FILENAME = "wavelinux"
 DESKTOP_FILENAME = f"{APP_DESKTOP_ID}.desktop"

@@ -5,12 +5,14 @@ set -euo pipefail
 
 CONFIG_DIR="$HOME/.config/wavelinux"
 PIPEWIRE_FX_DIR="$HOME/.config/pipewire"
-DESKTOP_FILE="$HOME/.local/share/applications/io.github.excalprimeacct_gif.WaveLinux.desktop"
+DESKTOP_FILE="$HOME/.local/share/applications/io.github.duskyprojects.WaveLinux.desktop"
 LEGACY_DESKTOP_FILE="$HOME/.local/share/applications/wavelinux.desktop"
+PREVIOUS_DESKTOP_FILE="$HOME/.local/share/applications/io.github.excalprimeacct_gif.WaveLinux.desktop"
 ICON_FILE="$HOME/.local/share/icons/hicolor/512x512/apps/wavelinux.png"
 LOCK_FILE="$HOME/.wavelinux.lock"
-AUTOSTART_FILE="$HOME/.config/autostart/io.github.excalprimeacct_gif.WaveLinux.desktop"
+AUTOSTART_FILE="$HOME/.config/autostart/io.github.duskyprojects.WaveLinux.desktop"
 LEGACY_AUTOSTART_FILE="$HOME/.config/autostart/wavelinux.desktop"
+PREVIOUS_AUTOSTART_FILE="$HOME/.config/autostart/io.github.excalprimeacct_gif.WaveLinux.desktop"
 WRAPPER_FILE="$HOME/.local/bin/wavelinux"
 APPIMAGE_FILE="$HOME/.local/bin/WaveLinux.AppImage"
 REMOVE_ARCH_DEPS=0
@@ -64,10 +66,12 @@ echo "→ Removing desktop launchers and icons..."
 rm -f \
     "$DESKTOP_FILE" \
     "$LEGACY_DESKTOP_FILE" \
+    "$PREVIOUS_DESKTOP_FILE" \
     "$ICON_FILE" \
     "$LOCK_FILE" \
     "$AUTOSTART_FILE" \
     "$LEGACY_AUTOSTART_FILE" \
+    "$PREVIOUS_AUTOSTART_FILE" \
     "$WRAPPER_FILE" \
     "$APPIMAGE_FILE"
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true

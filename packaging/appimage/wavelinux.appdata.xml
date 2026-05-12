@@ -1,19 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.excalprimeacct_gif.WaveLinux</id>
+  <id>io.github.duskyprojects.WaveLinux</id>
   <name>WaveLinux</name>
   <summary>PipeWire audio router and mixer for Linux</summary>
   <metadata_license>MIT</metadata_license>
   <project_license>MIT</project_license>
-  <developer id="excalprimeacct-gif.github.io">
+  <developer id="duskyprojects.github.io">
     <name>WaveLinux contributors</name>
   </developer>
-  <launchable type="desktop-id">io.github.excalprimeacct_gif.WaveLinux.desktop</launchable>
+  <launchable type="desktop-id">io.github.duskyprojects.WaveLinux.desktop</launchable>
   <description>
     <p>
       WaveLinux is a Wave Link-style PipeWire mixer with Monitor and Stream
       buses, per-app routing, virtual channels, and live per-channel FX.
     </p>
   </description>
-  <url type="homepage">https://github.com/excalprimeacct-gif/WaveLinux</url>
+  <url type="homepage">https://github.com/DuskyProjects/WaveLinux</url>
 </component>

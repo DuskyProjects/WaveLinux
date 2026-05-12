@@ -9,7 +9,7 @@ PYINSTALLER="${PYINSTALLER:-pyinstaller}"
 APPIMAGETOOL="${APPIMAGETOOL:-${BUILD_DIR}/appimagetool-x86_64.AppImage}"
 APPIMAGETOOL_URL="${APPIMAGETOOL_URL:-https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage}"
 WAVELINUX_VERSION="${WAVELINUX_VERSION:-$(awk -F'\"' '/^APP_VERSION = / { print $2; exit }' "${ROOT_DIR}/main.py")}"
-DESKTOP_ID="io.github.excalprimeacct_gif.WaveLinux.desktop"
+DESKTOP_ID="io.github.duskyprojects.WaveLinux.desktop"
 if [ -z "${WAVELINUX_VERSION}" ]; then
     echo "Could not determine APP_VERSION from main.py" >&2
     exit 1
@@ -66,7 +66,7 @@ install -Dm644 "${ROOT_DIR}/packaging/appimage/wavelinux.desktop" \
     "${APPDIR}/usr/share/applications/${DESKTOP_ID}"
 install -Dm644 "${ROOT_DIR}/icon.png" "${APPDIR}/wavelinux.png"
 install -Dm644 "${ROOT_DIR}/packaging/appimage/wavelinux.appdata.xml" \
-    "${APPDIR}/usr/share/metainfo/io.github.excalprimeacct_gif.WaveLinux.appdata.xml"
+    "${APPDIR}/usr/share/metainfo/io.github.duskyprojects.WaveLinux.appdata.xml"
 
 bundle_optional_fx "${APPDIR}/usr/lib/ladspa"
 download_appimagetool

@@ -53,7 +53,7 @@ Optional LADSPA FX are bundled into the AppImage when they are present on the re
 For development or running directly from a git checkout:
 
 ```bash
-git clone https://github.com/excalprimeacct-gif/WaveLinux.git
+git clone https://github.com/DuskyProjects/WaveLinux.git
 cd WaveLinux
 ./install.sh
 ```

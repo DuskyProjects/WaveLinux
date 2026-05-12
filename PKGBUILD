@@ -1,10 +1,10 @@
-# Maintainer: WaveLinux contributors <https://github.com/excalprimeacct-gif/WaveLinux>
+# Maintainer: WaveLinux contributors <https://github.com/DuskyProjects/WaveLinux>
 pkgname=wavelinux
 pkgver=2.0.1
 pkgrel=1
 pkgdesc="Elgato Wave Link–style PipeWire mixer for Linux (virtual channels, Monitor/Stream buses, per-channel FX)"
 arch=('any')
-url="https://github.com/excalprimeacct-gif/WaveLinux"
+url="https://github.com/DuskyProjects/WaveLinux"
 license=('MIT')
 depends=(
   'python'
@@ -20,7 +20,7 @@ optdepends=(
   'noise-suppression-for-voice: RNNoise filter-chain backend (AUR)'
 )
 makedepends=('git')
-source=("git+https://github.com/excalprimeacct-gif/WaveLinux.git#tag=v$pkgver")
+source=("git+https://github.com/DuskyProjects/WaveLinux.git#tag=v$pkgver")
 sha256sums=('SKIP')
 
 package() {

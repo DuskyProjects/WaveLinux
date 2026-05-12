@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DESKTOP_FILE="$HOME/.local/share/applications/io.github.excalprimeacct_gif.WaveLinux.desktop"
+DESKTOP_FILE="$HOME/.local/share/applications/io.github.duskyprojects.WaveLinux.desktop"
 ICON_DIR="$HOME/.local/share/icons/hicolor/512x512/apps"
 BIN_DIR="$HOME/.local/bin"
 WRAPPER="$BIN_DIR/wavelinux"
