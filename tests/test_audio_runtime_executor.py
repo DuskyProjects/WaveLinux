@@ -37,12 +37,20 @@ class FakeEngine:
             "Monitor": SimpleNamespace(sink_name="wavelinux_mix_monitor"),
             "Stream": SimpleNamespace(sink_name="wavelinux_mix_stream"),
         }
-        self.fx_running = True
         self.route_calls = []
         self.volume_calls = []
         self.mute_calls = []
         self.default_source_calls = []
         self.cleared = False
+        self.fx_apply_result = {
+            "success": True,
+            "active_source": "wavelinux.fx.mic.source",
+            "message": "FX chain active",
+        }
+        self.fx_clear_result = {
+            "success": True,
+            "message": "FX chain cleared",
+        }
 
     def create_snapshot(self, force=False):
         return object()
@@ -53,16 +61,13 @@ class FakeEngine:
     def get_virtual_sinks(self, snap=None):
         return []
 
-    def set_channel_fx(self, node_name, capture_target, effects, params_map):
+    def apply_channel_fx_transaction(self, node_name, capture_target, effects, params_map=None):
         self.last_fx = (node_name, capture_target, list(effects), dict(params_map))
-        return "wavelinux.fx.mic.source"
+        return dict(self.fx_apply_result)
 
-    def is_channel_fx_running(self, node_name):
-        return self.fx_running
-
-    def clear_channel_fx(self, node_name):
+    def clear_channel_fx_transaction(self, node_name):
         self.cleared = True
-        self.fx_running = False
+        return dict(self.fx_clear_result)
 
     def route_input_to_submix(self, node_id, node_name, media_class, mix_name,
                               snap=None, initial_state=None):
@@ -98,7 +103,7 @@ class RuntimeExecutorTests(unittest.TestCase):
             },
         )
 
-    def test_apply_channel_fx_restores_submix_routes_before_success(self):
+    def test_apply_channel_fx_uses_transaction_result(self):
         engine = FakeEngine()
         executor = RuntimeExecutor(FakeAdapter(engine), DummyDiagnostics())
         desired = self._desired()
@@ -114,16 +119,40 @@ class RuntimeExecutorTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            engine.route_calls,
-            [
-                ("55", "mic", "Audio/Source", "Monitor", {"vol": 0.4, "mute": True}),
-                ("55", "mic", "Audio/Source", "Stream", {"vol": 0.9, "mute": False}),
-            ],
+            engine.last_fx,
+            ("mic", "mic", ["rnnoise"], {}),
         )
+        self.assertEqual(engine.route_calls, [])
         self.assertEqual(engine.volume_calls, [])
         self.assertEqual(engine.mute_calls, [])
 
-    def test_clear_channel_fx_restores_submix_routes_after_success(self):
+    def test_apply_channel_fx_emits_degraded_on_failed_transaction(self):
+        engine = FakeEngine()
+        engine.fx_apply_result = {
+            "success": False,
+            "failure_stage": "source_output_move",
+            "message": "source-output move to candidate source failed",
+        }
+        executor = RuntimeExecutor(FakeAdapter(engine), DummyDiagnostics())
+        desired = self._desired()
+        statuses = []
+
+        executor.observe = lambda desired_state: ObservedState()
+        executor._apply_channel_fx(
+            {
+                "node_name": "mic",
+                "capture_target": "mic",
+                "fx_spec": desired.channels["mic"].fx,
+            },
+            desired,
+            status_callback=statuses.append,
+        )
+
+        self.assertEqual(statuses[-1].state, "degraded")
+        self.assertIn("source_output_move", statuses[-1].message)
+        self.assertIn("source-output move to candidate source failed", statuses[-1].message)
+
+    def test_clear_channel_fx_uses_transaction_result(self):
         engine = FakeEngine()
         executor = RuntimeExecutor(FakeAdapter(engine), DummyDiagnostics())
         desired = self._desired()
@@ -135,9 +164,7 @@ class RuntimeExecutorTests(unittest.TestCase):
         )
 
         self.assertTrue(engine.cleared)
-        self.assertEqual(len(engine.route_calls), 2)
-        self.assertEqual(engine.route_calls[0][3], "Monitor")
-        self.assertEqual(engine.route_calls[1][3], "Stream")
+        self.assertEqual(engine.route_calls, [])
 
     def test_set_default_source_calls_engine(self):
         engine = FakeEngine()

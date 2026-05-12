@@ -470,15 +470,20 @@ class FXSelectionDialog(QDialog):
         self._pending_fx_generation = 0
         self._runtime_inflight = False
         self._pending_close = False
+        self._initial_effects_list = list(self._saved_effects_list)
+        self._initial_effect_params = {
+            effect_id: dict(values)
+            for effect_id, values in self._saved_effect_params.items()
+        }
+        self._inflight_effects_list = []
+        self._inflight_effect_params = {}
         if self.runtime is not None:
             self.runtime.fx_status_changed.connect(self._on_runtime_fx_status)
 
-        # Debounce param-driven rebuilds — 150ms feels live but doesn't
-        # respawn the chain on every pixel of slider drag.
         self._param_timer = QTimer(self)
         self._param_timer.setSingleShot(True)
-        self._param_timer.setInterval(150)
-        self._param_timer.timeout.connect(self._rebuild_chain)
+        self._param_timer.setInterval(120)
+        self._param_timer.timeout.connect(self._commit_live_patch)
 
         root = QVBoxLayout(self)
         root.setSpacing(12)
@@ -488,7 +493,7 @@ class FXSelectionDialog(QDialog):
         title.setStyleSheet("font-size: 18px; font-weight: bold; color: #fff;")
         root.addWidget(title)
 
-        desc = QLabel("Processing is applied per-channel. Parameters save automatically.")
+        desc = QLabel("Processing is live per-channel. Parameters save automatically.")
         desc.setStyleSheet("color: #8b8b9e; font-size: 11px;")
         root.addWidget(desc)
 
@@ -525,12 +530,9 @@ class FXSelectionDialog(QDialog):
         return p
 
     def _on_done(self):
-        # Flush any pending debounced rebuild so a slider tweak that
-        # finished within the last 150 ms isn't lost on close.
         if self._param_timer.isActive():
             self._param_timer.stop()
-            self._rebuild_chain()
-
+            self._commit_live_patch()
         if self._runtime_inflight:
             self.close_btn.setText("Applying...")
             self.close_btn.setEnabled(False)
@@ -700,9 +702,8 @@ class FXSelectionDialog(QDialog):
             out[key] = val
         return out
 
-    # Toggle, preset pick, and slider drag all funnel through
-    # `_rebuild_chain` to respawn the channel's filter-chain with the
-    # current ON-set + parameter values.
+    # Toggle, preset pick, and slider drag all feed the live-patch path.
+    # The dialog debounces those edits so rapid churn stays last-write-wins.
 
     def _active_effect_ids(self):
         """Return the effect ids whose toggle buttons are currently ON,
@@ -723,27 +724,44 @@ class FXSelectionDialog(QDialog):
             out[fid] = self._collect_params(fid)
         return out
 
-    def _rebuild_chain(self):
-        """Spawn / replace the channel's FX chain to match the dialog's
-        current toggle + slider state, then ask the main window to re-route
-        submix loopbacks through the new bus."""
+    def _has_pending_changes(self, wanted=None, params_map=None):
+        wanted = list(wanted if wanted is not None else self._active_effect_ids())
+        params_map = dict(params_map if params_map is not None else self._all_params_map())
+        normalized = {
+            fid: dict(values)
+            for fid, values in params_map.items()
+            if values
+        }
+        return (
+            wanted != list(self._initial_effects_list)
+            or normalized != self._initial_effect_params
+        )
+
+    def _queue_live_patch(self):
         if self.runtime is None:
-            QMessageBox.warning(
-                self,
-                "Audio runtime unavailable",
-                "WaveLinux's audio runtime is not available, so effects "
-                "cannot be applied right now.",
-            )
+            return
+        self._param_timer.start()
+
+    def _commit_live_patch(self):
+        if self.runtime is None:
+            return
+        if self._runtime_inflight:
+            self._param_timer.start()
             return
         wanted = self._active_effect_ids()
         params_map = self._all_params_map()
-        
-        # Persist on the main-window state objects so a restart re-applies.
+        if not self._has_pending_changes(wanted, params_map):
+            return
         self._save_chain_state(wanted, params_map)
-        
         self._start_fx_worker(wanted, params_map)
 
     def _start_fx_worker(self, wanted, params_map):
+        self._inflight_effects_list = list(wanted or [])
+        self._inflight_effect_params = {
+            fid: dict(vals)
+            for fid, vals in (params_map or {}).items()
+            if vals
+        }
         if wanted:
             self._pending_fx_generation = self.runtime.set_channel_fx(
                 self.node_name, self.capture_target, wanted, params_map
@@ -762,19 +780,41 @@ class FXSelectionDialog(QDialog):
                 return
         self._runtime_inflight = status.state in {"building", "cutover_pending", "clearing"}
         if status.state == "degraded":
-            QMessageBox.warning(
-                self,
-                "Effects rebuild failed",
-                "WaveLinux could not apply one or more effects.\n\n"
-                f"{status.message}"
-            )
+                QMessageBox.warning(
+                    self,
+                    "Effects rebuild failed",
+                    "WaveLinux could not apply one or more effects.\n\n"
+                    f"{status.message}"
+                )
         if status.state not in {"building", "cutover_pending", "clearing"}:
             self.close_btn.setText("Apply")
             self.close_btn.setEnabled(True)
             self._refresh_toggle_status()
-            if self._pending_close:
+            if status.state in {"active", "idle"}:
+                self._initial_effects_list = list(self._inflight_effects_list)
+                self._initial_effect_params = {
+                    fid: dict(vals)
+                    for fid, vals in self._inflight_effect_params.items()
+                }
+                has_more_changes = self._has_pending_changes()
+                if has_more_changes:
+                    self._queue_live_patch()
+            if self._pending_close and status.state in {"active", "idle"} and not has_more_changes:
                 self._pending_close = False
                 self.accept()
+            elif status.state == "degraded":
+                self._pending_close = False
+
+    def reject(self):
+        if self._param_timer.isActive():
+            self._param_timer.stop()
+            self._commit_live_patch()
+        if self._runtime_inflight:
+            self._pending_close = True
+            self.close_btn.setText("Applying...")
+            self.close_btn.setEnabled(False)
+            return
+        super().reject()
 
     def closeEvent(self, event):
         if self.runtime is None:
@@ -847,11 +887,10 @@ class FXSelectionDialog(QDialog):
         btn.setText("ON" if btn.isChecked() else "OFF")
         if frame:
             frame.setVisible(btn.isChecked())
-        # Debounced — _on_done flushes any pending rebuild on close.
-        self._param_timer.start()
+        self._queue_live_patch()
 
     def _apply_preset(self, effect_id, values):
-        """Snap the effect's sliders to a labelled preset and respawn."""
+        """Snap the effect's sliders to a labelled preset and live-patch it."""
         sliders = self._param_sliders.get(effect_id, {})
         for key, (slider, value_lbl) in sliders.items():
             if key not in values:
@@ -865,8 +904,7 @@ class FXSelectionDialog(QDialog):
             slider.blockSignals(False)
             suffix = slider.property("psuffix") or ""
             value_lbl.setText(self._fmt_value(target, suffix))
-        # Debounced — _on_done flushes any pending rebuild on close.
-        self._param_timer.start()
+        self._queue_live_patch()
 
     def _on_param_changed(self, effect_id, slider, value_lbl):
         pmin = float(slider.property("pmin"))
@@ -874,8 +912,7 @@ class FXSelectionDialog(QDialog):
         suffix = slider.property("psuffix") or ""
         val = pmin + (pmax - pmin) * (slider.value() / 1000.0)
         value_lbl.setText(self._fmt_value(val, suffix))
-        # Debounced — _on_done flushes any pending rebuild on close.
-        self._param_timer.start()
+        self._queue_live_patch()
 
 
 # ── Channel Strip Widget ───────────────────────────────────────────

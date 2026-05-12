@@ -359,6 +359,58 @@ class PipeWireEngine:
                 from_source, exclude_modules=exclude_modules):
             self._move_source_output_with_retry(sid, from_source, to_source)
 
+    def _source_output_locations(self):
+        """Return {source_output_id: source_name} from short pactl state."""
+        short = self._run(['pactl', 'list', 'short', 'source-outputs'])
+        if not short:
+            return {}
+        id_to_name = self._source_id_to_name()
+        locations = {}
+        for line in short.splitlines():
+            parts = line.split('\t')
+            if len(parts) < 2:
+                continue
+            so_id = parts[0].strip()
+            src_id = parts[1].strip()
+            if not so_id:
+                continue
+            locations[so_id] = id_to_name.get(src_id)
+        return locations
+
+    def snapshot_external_source_outputs(self, source_name, exclude_modules=None):
+        """Capture the current external source-outputs on `source_name`."""
+        return list(self._list_source_outputs_on(
+            source_name,
+            exclude_modules=exclude_modules,
+        ))
+
+    def _move_known_source_outputs(self, source_output_ids, from_source, to_source,
+                                   attempts=20, delay=0.05):
+        """Move a known set of source-output ids and verify they rebind."""
+        if not source_output_ids:
+            return True
+        if not from_source or not to_source or from_source == to_source:
+            return True
+        if not self._wait_source_visible(to_source, attempts=attempts, delay=delay):
+            logging.warning(
+                f"Destination source {to_source} never became visible; "
+                f"skipping targeted move-source-output from {from_source}"
+            )
+            return False
+        wanted = {str(so_id).strip() for so_id in source_output_ids if str(so_id).strip()}
+        for so_id in wanted:
+            moved = False
+            for _ in range(max(1, int(attempts))):
+                self._run(['pactl', 'move-source-output', so_id, to_source])
+                current = self._source_output_locations().get(so_id)
+                if current is None or current == to_source:
+                    moved = True
+                    break
+                time.sleep(max(0.0, float(delay)))
+            if not moved:
+                return False
+        return True
+
     def _wait_source_visible(self, source_name, attempts=20, delay=0.05):
         if not source_name:
             return False
@@ -383,6 +435,73 @@ class PipeWireEngine:
             f"after move attempt to {to_source}"
         )
         return False
+
+    def _snapshot_submix_bindings(self, source_name):
+        """Capture current submix loopbacks reading from `source_name`."""
+        bindings = {}
+        for key, current_source in list(self.submix_sources.items()):
+            if current_source != source_name:
+                continue
+            _, _, mix_name = key.partition('->')
+            bindings[key] = {
+                'mix_name': mix_name,
+                'module_id': self.submix_loopbacks.get(key),
+                'state': dict(self.submix_state_cache.get(key, {}) or {}),
+            }
+        return bindings
+
+    def _load_loopback_module(self, source_name, sink_name, latency_msec=20):
+        out = self._run([
+            'pactl', 'load-module', 'module-loopback',
+            f'source={source_name}',
+            f'sink={sink_name}',
+            f'latency_msec={int(latency_msec)}',
+            'adjust_time=0',
+        ])
+        if not out:
+            return None
+        stripped = out.strip().splitlines()[-1].strip()
+        if not stripped.isdigit():
+            return None
+        return stripped
+
+    def _create_submix_replacement(self, source_name, mix_name, initial_state=None):
+        mix = self.output_mixes.get(mix_name)
+        if not mix or not mix.sink_name:
+            return None
+        module_id = self._find_loopback_for(source_name, mix.sink_name)
+        if module_id is None:
+            module_id = self._load_loopback_module(source_name, mix.sink_name)
+            if module_id is None:
+                return None
+            self.invalidate_snapshot()
+        module_id = str(module_id)
+        if not self._module_is_alive(module_id):
+            return None
+        state = dict(initial_state or {})
+        if state and not self._apply_loopback_state(module_id, state):
+            return None
+        return module_id
+
+    def _commit_submix_replacements(self, replacements, *, new_source):
+        """Swap submix bookkeeping to replacement loopbacks."""
+        for key, binding in replacements.items():
+            self.submix_loopbacks[key] = binding['module_id']
+            self.submix_sources[key] = new_source
+            state = dict(binding.get('state', {}) or {})
+            if state:
+                self.submix_state_cache[key] = {
+                    'vol': self._clamp(state.get('vol', 1.0)),
+                    'mute': bool(state.get('mute', False)),
+                }
+        for binding in replacements.values():
+            old_module = binding.get('old_module_id')
+            new_module = binding.get('module_id')
+            if old_module is None or str(old_module) == str(new_module):
+                continue
+            self._run(['pactl', 'unload-module', str(old_module)])
+        if replacements:
+            self.invalidate_snapshot()
 
     # ── Per-refresh snapshot ───────────────────────────────────────
 
@@ -753,7 +872,7 @@ class PipeWireEngine:
 
         # The "true" source token: FX chain output if the channel has any
         # effects running, otherwise the raw mic / sink-monitor.
-        fx_source = self.get_channel_fx_source(node_name)
+        fx_source = self.get_channel_fx_source(node_name, snap=snap)
         if fx_source:
             source_id = fx_source
         elif media_class == 'Audio/Sink':
@@ -3504,14 +3623,8 @@ context.modules = [
 
         return None, None, None, None
 
-    def _build_unified_chain_config(self, safe_key, ordered_effects, params_map, stamp=None):
-        """Write the filter-chain config combining all enabled effects in
-        one `filter.graph` with explicit inter-stage `links`. Returns
-        (config_path, sink_name, source_name, used_effects) or
-        (None, None, None, []) if nothing was renderable."""
-        config_dir = os.path.expanduser('~/.config/pipewire')
-        os.makedirs(config_dir, exist_ok=True)
-
+    def _build_unified_filter_graph(self, ordered_effects, params_map):
+        """Render a filter.graph body suitable for runtime live updates."""
         all_nodes = []
         all_links = []
         first_entry = None
@@ -3525,7 +3638,7 @@ context.modules = [
             if nodes_text is None:
                 logging.warning(
                     f"Skipping unknown / unavailable effect {effect_id} "
-                    f"in chain for {safe_key}"
+                    "in live filter graph"
                 )
                 continue
             if first_entry is None:
@@ -3539,17 +3652,43 @@ context.modules = [
             prev_exit = exit_port
             used_effects.append(effect_id)
 
-        if not used_effects:
-            return None, None, None, []
+        if not used_effects or first_entry is None or prev_exit is None:
+            return None, []
 
-        last_exit = prev_exit
+        nodes_block = '\n'.join(all_nodes)
+        links_block = '\n                    '.join(all_links) if all_links else ''
+        graph = (
+            "{\n"
+            "    nodes = ["
+            f"{nodes_block}\n"
+            "    ]\n"
+            "    links = [\n"
+            f"        {links_block}\n"
+            "    ]\n"
+            f"    inputs = [ \"{first_entry}\" ]\n"
+            f"    outputs = [ \"{prev_exit}\" ]\n"
+            "}"
+        )
+        return graph, used_effects
+
+    def _build_unified_chain_config(self, safe_key, ordered_effects, params_map, stamp=None):
+        """Write the filter-chain config combining all enabled effects in
+        one `filter.graph` with explicit inter-stage `links`. Returns
+        (config_path, sink_name, source_name, used_effects) or
+        (None, None, None, []) if nothing was renderable."""
+        config_dir = os.path.expanduser('~/.config/pipewire')
+        os.makedirs(config_dir, exist_ok=True)
+
+        graph_text, used_effects = self._build_unified_filter_graph(
+            ordered_effects,
+            params_map,
+        )
+        if graph_text is None or not used_effects:
+            return None, None, None, []
 
         stamp_str = f'.{stamp}' if stamp else ''
         sink_name = f'wavelinux.fx.{safe_key}{stamp_str}.input'
         source_name = f'wavelinux.fx.{safe_key}{stamp_str}.source'
-
-        nodes_block = '\n'.join(all_nodes)
-        links_block = '\n                    '.join(all_links) if all_links else ''
 
         # `node.always-process` prevents the chain from suspending mid-
         # construction (which would race the upstream loopback's bind).
@@ -3565,15 +3704,7 @@ context.modules = [
             node.virtual     = true
             priority.session = -1000
             priority.driver  = -1000
-            filter.graph = {{
-                nodes = [{nodes_block}
-                ]
-                links = [
-                    {links_block}
-                ]
-                inputs = [ "{first_entry}" ]
-                outputs = [ "{last_exit}" ]
-            }}
+            filter.graph = {graph_text}
             capture.props = {{
                 node.name           = "{sink_name}"
                 node.description    = "_WaveLinux internal: chain input"
@@ -3608,6 +3739,116 @@ context.modules = [
             f.write(config)
         os.replace(tmp_path, config_path)
         return config_path, sink_name, source_name, used_effects
+
+    @staticmethod
+    def _is_inline_fx_info(info):
+        return bool(info and info.get('mode') == 'inline')
+
+    def _find_inline_fx_target(self, node_name, snap=None):
+        snap = snap or self.create_snapshot(force=True)
+        for node in self.get_hardware_inputs(snap=snap):
+            if node.name == node_name:
+                return {
+                    'node_id': str(node.pw_id),
+                    'node_name': node.name,
+                    'media_class': node.media_class,
+                    'capture_target': node.name,
+                    'source_name': node.name,
+                }
+        try:
+            virtual_nodes = self.get_virtual_sinks(snap=snap)
+        except AttributeError:
+            virtual_nodes = []
+        for node in virtual_nodes:
+            if node.name == node_name:
+                return {
+                    'node_id': str(node.pw_id),
+                    'node_name': node.name,
+                    'media_class': node.media_class,
+                    'capture_target': f"{node.name}.monitor",
+                    'source_name': f"{node.name}.monitor",
+                }
+        return None
+
+    def _set_node_filter_graph(self, node_id, graph_text):
+        node_id = str(node_id or "").strip()
+        if not node_id:
+            return False
+        graph_value = graph_text or ""
+        param_text = (
+            '{ params = [ '
+            '"audioconvert.filter-graph.disable" false '
+            '"audioconvert.filter-graph" '
+            f'{json.dumps(graph_value)}'
+            ' ] }'
+        )
+        out = self._run(['pw-cli', 's', node_id, 'Props', param_text], timeout=3)
+        return out is not None
+
+    def _apply_inline_channel_fx(self, node_name, capture_target, ordered, params_map):
+        old_info = self.channel_fx.get(node_name) or {}
+        if old_info and not self._is_inline_fx_info(old_info):
+            return None
+        target = self._find_inline_fx_target(node_name)
+        if not target:
+            return None
+        graph_text, used_effects = self._build_unified_filter_graph(ordered, params_map)
+        if graph_text is None or not used_effects:
+            return self._fx_result(
+                False,
+                kept_source=target['source_name'],
+                failure_stage='config_build',
+                message='No renderable effects were available for this chain',
+            )
+        if not self._set_node_filter_graph(target['node_id'], graph_text):
+            return self._fx_result(
+                False,
+                kept_source=target['source_name'],
+                failure_stage='inline_set_param',
+                message='PipeWire rejected the live filter-graph update',
+            )
+        self.channel_fx[node_name] = {
+            'mode': 'inline',
+            'effects': list(used_effects),
+            'params': {
+                fid: dict(params_map.get(fid, {}))
+                for fid in used_effects
+            },
+            'procs': [],
+            'loopbacks': [],
+            'source': target['source_name'],
+            'capture_target': capture_target or target['capture_target'],
+            'safe_key': self._safe_channel_key(node_name),
+            'node_id': target['node_id'],
+        }
+        self.invalidate_snapshot()
+        return self._fx_result(
+            True,
+            active_source=target['source_name'],
+            kept_source=target['source_name'],
+            message='FX chain active',
+        )
+
+    def _clear_inline_channel_fx(self, node_name, info):
+        target = self._find_inline_fx_target(node_name)
+        node_id = (target or {}).get('node_id') or info.get('node_id')
+        source_name = (target or {}).get('source_name') or info.get('source') or info.get('capture_target')
+        if not self._set_node_filter_graph(node_id, ""):
+            return self._fx_result(
+                False,
+                kept_source=source_name,
+                active_source=source_name,
+                rolled_back=True,
+                failure_stage='inline_clear',
+                message='PipeWire rejected the live filter-graph clear',
+            )
+        self.channel_fx.pop(node_name, None)
+        self.invalidate_snapshot()
+        return self._fx_result(
+            True,
+            kept_source=source_name,
+            message='FX chain cleared',
+        )
 
     def _build_fx_stage_config(self, safe_key, idx, effect_id, params):
         """Per-stage filter-chain builder. Superseded by
@@ -3705,131 +3946,215 @@ context.modules = [
         return None
 
     def set_channel_fx(self, node_name, capture_target, effects, params_map=None):
-        """Replace a channel's FX chain with one `pipewire -c` process
-        running every enabled effect in a single `filter.graph`. Returns
-        the chain's virtual source node.name, or None on failure.
+        """Apply a channel FX chain.
 
-        - `node_name`: stable PipeWire node.name. State is keyed by this
-          so chains survive a PipeWire restart.
-        - `capture_target`: source for the chain's input. For mics, the
-          mic's node.name; for virtual sinks, `f"{sink_name}.monitor"`.
-        - `effects`: list of effect ids (reordered to canonical flow).
-        - `params_map`: {effect_id: {param_key: value}}."""
+        Prefers inline live patching on the managed PipeWire node so
+        parameter/preset changes do not require consumer rerouting. Falls
+        back to the older spawned filter-chain path when inline patching
+        is unavailable for the target."""
         return self._set_channel_fx_inner(
             node_name, capture_target, effects, params_map,
         )
 
     def _set_channel_fx_inner(self, node_name, capture_target, effects, params_map):
-        if not node_name:
+        result = self.apply_channel_fx_transaction(
+            node_name,
+            capture_target,
+            effects,
+            params_map=params_map,
+        )
+        if not result.get('success'):
             return None
-        params_map = params_map or {}
-        old_info = self.channel_fx.get(node_name)
+        return result.get('active_source')
 
+    @staticmethod
+    def _fx_result(success, *, active_source=None, kept_source=None,
+                   rolled_back=False, failure_stage=None, message=""):
+        return {
+            'success': bool(success),
+            'active_source': active_source,
+            'kept_source': kept_source,
+            'rolled_back': bool(rolled_back),
+            'failure_stage': failure_stage,
+            'message': message or "",
+        }
+
+    def _teardown_fx_plumbing(self, info):
+        for mod_id in info.get('loopbacks', []):
+            self._run(['pactl', 'unload-module', str(mod_id)])
+        for pk in info.get('procs', []):
+            self.stop_rnnoise(pk)
+
+    def _unload_submix_replacements(self, replacements):
+        for binding in replacements.values():
+            module_id = binding.get('module_id')
+            if module_id is not None:
+                self._run(['pactl', 'unload-module', str(module_id)])
+
+    def apply_channel_fx_transaction(self, node_name, capture_target, effects, params_map=None):
+        """Transactionally replace a channel FX chain without dropping audio."""
+        if not node_name:
+            return self._fx_result(False, failure_stage='precondition', message='Missing channel name')
+
+        params_map = params_map or {}
         ordered = [fid for fid in self._ordered_chain(effects)
                    if self.effect_available(fid)]
         if not ordered:
-            self._clear_channel_fx_inner(node_name)
-            return capture_target
+            return self.clear_channel_fx_transaction(
+                node_name,
+                target_source=capture_target,
+            )
+
+        inline_result = self._apply_inline_channel_fx(
+            node_name,
+            capture_target,
+            ordered,
+            params_map,
+        )
+        if inline_result is not None:
+            return inline_result
+
+        old_info = dict(self.channel_fx.get(node_name) or {})
+        effective_source = old_info.get('source') or capture_target
+        if not effective_source:
+            return self._fx_result(
+                False,
+                kept_source=None,
+                failure_stage='precondition',
+                message='Missing capture target for FX chain',
+            )
 
         safe_key = self._safe_channel_key(node_name)
-        # Build-first replacement means old and new chains overlap briefly.
-        # They must not share proc keys or PipeWire node names, otherwise
-        # teardown can kill the replacement chain and leak the old one.
         stamp = int(time.time() * 1000)
-
         config_path, sink_name, source_name, used_effects = \
             self._build_unified_chain_config(safe_key, ordered, params_map, stamp)
         if config_path is None or not used_effects:
-            return None
+            return self._fx_result(
+                False,
+                kept_source=effective_source,
+                failure_stage='config_build',
+                message='No renderable effects were available for this chain',
+            )
 
         log_path = self._fx_log_path(safe_key, f'chain_{stamp}')
         proc_key = f'chain_{safe_key}_{stamp}'
-
         if not self._spawn_fx(config_path, log_path, proc_key):
             logging.warning(
                 f"Unified FX chain failed to spawn for {node_name}; "
                 f"see {log_path} for the pipewire stderr."
             )
-            return None
-
-        # The filter-chain process can come up before we bind raw capture into
-        # it. We intentionally tear the previous chain down back to the raw
-        # source FIRST, then load the new raw→chain loopback. Overlapping old
-        # and new upstream module-loopbacks on the same mic turned out to be
-        # less stable than a brief raw-mic hop during rebuilds.
-        if old_info:
-            old_src = old_info.get('source', '?')
-            logging.warning(
-                f"[FX-DEBUG] Tearing down old chain: old_source={old_src}, "
-                f"new_source={source_name}, "
-                f"submix_sources_before={dict(self.submix_sources)}"
-            )
-            self._clear_channel_fx_info(old_info, target_source=capture_target)
-            logging.warning(
-                f"[FX-DEBUG] After teardown: submix_sources={dict(self.submix_sources)}, "
-                f"submix_loopbacks={dict(self.submix_loopbacks)}"
+            return self._fx_result(
+                False,
+                kept_source=effective_source,
+                failure_stage='spawn',
+                message=f'FX chain failed to spawn; see {log_path}',
             )
 
-        # ONE upstream → chain.input loopback. The chain itself wires its
-        # internal nodes via filter.graph links; downstream consumers
-        # (submix loopbacks) bind to the chain's source.
-        lb = self._wait_load_loopback(capture_target, sink_name)
-        if lb is None:
-            logging.warning(
-                f"FX capture loopback {capture_target} → {sink_name} failed; "
-                f"chain for {node_name} is dangling. Tearing it back down."
+        mic_cutover = bool(capture_target and not capture_target.endswith('.monitor'))
+        default_before = self.get_default_source() if mic_cutover else None
+        prev_default = old_info.get('prev_default')
+        if prev_default is None and mic_cutover and default_before and default_before != source_name:
+            prev_default = default_before
+
+        binding_snapshot = self._snapshot_submix_bindings(effective_source)
+        exclude_modules = list(old_info.get('loopbacks', []))
+        for binding in binding_snapshot.values():
+            old_module_id = binding.get('module_id')
+            if old_module_id is not None:
+                exclude_modules.append(old_module_id)
+        external_source_outputs = self.snapshot_external_source_outputs(
+            effective_source,
+            exclude_modules=exclude_modules,
+        )
+
+        lb = None
+        replacements = {}
+        default_changed = False
+        failure_stage = None
+
+        try:
+            if not self._wait_source_visible(source_name):
+                failure_stage = 'candidate_source'
+                raise RuntimeError('candidate source did not appear')
+
+            lb = self._wait_load_loopback(capture_target, sink_name)
+            if lb is None:
+                failure_stage = 'upstream_loopback'
+                raise RuntimeError('candidate upstream loopback failed')
+
+            for key, binding in binding_snapshot.items():
+                module_id = self._create_submix_replacement(
+                    source_name,
+                    binding['mix_name'],
+                    initial_state=binding.get('state') or {},
+                )
+                if module_id is None:
+                    failure_stage = f"submix_{binding['mix_name'].lower()}"
+                    raise RuntimeError(f"replacement submix loopback failed for {binding['mix_name']}")
+                replacements[key] = {
+                    'mix_name': binding['mix_name'],
+                    'module_id': module_id,
+                    'old_module_id': binding.get('module_id'),
+                    'state': dict(binding.get('state', {}) or {}),
+                }
+
+            if mic_cutover:
+                self.set_default_source(source_name)
+                default_changed = True
+                if not self._move_known_source_outputs(
+                        external_source_outputs,
+                        effective_source,
+                        source_name):
+                    failure_stage = 'source_output_move'
+                    raise RuntimeError('source-output move to candidate source failed')
+                if self.get_default_source() != source_name:
+                    failure_stage = 'default_source'
+                    raise RuntimeError('default source did not switch to candidate source')
+
+            self.channel_fx[node_name] = {
+                'effects': list(used_effects),
+                'params': {
+                    fid: dict(params_map.get(fid, {}))
+                    for fid in used_effects
+                },
+                'procs': [proc_key],
+                'loopbacks': [lb],
+                'source': source_name,
+                'capture_target': capture_target,
+                'safe_key': safe_key,
+                'prev_default': prev_default,
+            }
+            self._commit_submix_replacements(replacements, new_source=source_name)
+            if old_info:
+                self._teardown_fx_plumbing(old_info)
+            self.invalidate_snapshot()
+            return self._fx_result(
+                True,
+                active_source=source_name,
+                kept_source=source_name,
+                message='FX chain active',
             )
+        except Exception as exc:
+            if default_changed and default_before:
+                self.set_default_source(default_before)
+            if source_name and effective_source:
+                self._move_known_source_outputs(
+                    external_source_outputs,
+                    source_name,
+                    effective_source,
+                )
+            self._unload_submix_replacements(replacements)
+            if lb is not None:
+                self._run(['pactl', 'unload-module', str(lb)])
             self.stop_rnnoise(proc_key)
-            return capture_target
-
-        # Promote the FX virtual source to default + drag existing capture
-        # streams onto it. Without this, apps reading the raw mic (Discord,
-        # Zoom, OBS-via-mic-picker) bypass the chain entirely and still
-        # hear ambient noise. `prev_default` is captured BEFORE we flip so
-        # teardown can restore exactly what the user had. The upstream
-        # loopback (`lb`, raw_mic → chain.input) is excluded from the
-        # move — otherwise it gets re-pointed at the chain's own output
-        # and feeds the chain into itself, killing the audio.
-        prev_default = None
-        if capture_target and not capture_target.endswith('.monitor'):
-            current_default = self.get_default_source()
-            # Don't overwrite a save from another channel's chain — only
-            # the first chain captures the user-facing default.
-            if current_default and current_default != source_name:
-                prev_default = current_default
-            self.set_default_source(source_name)
-            internal_modules = [lb]
-            for skey in list(self.submix_sources.keys()):
-                if self.submix_sources.get(skey) != capture_target:
-                    continue
-                mod = self.submix_loopbacks.get(skey)
-                if mod is not None:
-                    internal_modules.append(mod)
-            self._move_source_outputs(
-                capture_target, source_name, exclude_modules=internal_modules,
+            self.invalidate_snapshot()
+            return self._fx_result(
+                False,
+                kept_source=effective_source,
+                rolled_back=True,
+                failure_stage=failure_stage or 'cutover',
+                message=str(exc),
             )
-            # And re-push our cached vol/mute to every submix sink-input
-            # — pulse-bridge can transiently reset a moved sink-input's
-            # mute to its stale default, leaking the mic's raw audio
-            # for the gap before the next sync push lands.
-            self._reapply_submix_state_cache()
-
-        self.channel_fx[node_name] = {
-            'effects':   list(used_effects),
-            'params':    {fid: dict(params_map.get(fid, {}))
-                          for fid in used_effects},
-            'procs':     [proc_key],
-            'loopbacks': [lb],
-            'source':    source_name,
-            'capture_target': capture_target,
-            'safe_key':  safe_key,
-            'prev_default': prev_default,
-        }
-        # We just changed pactl's view of the world — drop the cache so the
-        # next refresh tick observes the new chain without waiting up to
-        # 250 ms for the snapshot TTL.
-        self.invalidate_snapshot()
-        return source_name
 
     def clear_channel_fx(self, node_name):
         """Tear down the FX chain on a channel. Idempotent. Order matters:
@@ -3841,91 +4166,149 @@ context.modules = [
         return self._clear_channel_fx_inner(node_name)
 
     def _clear_channel_fx_inner(self, node_name):
-        info = self.channel_fx.pop(node_name, None)
-        if not info:
-            return False
-        return self._clear_channel_fx_info(info)
+        result = self.clear_channel_fx_transaction(node_name)
+        return bool(result.get('success'))
 
     def _clear_channel_fx_info(self, info, target_source=None):
         if not info:
             return False
-
-        # 0. Restore the default source and re-route every source-output
-        # off the FX source BEFORE we kill it. Apps (Discord, Zoom, OBS)
-        # hand back to the raw mic; the submix loopbacks (Monitor,
-        # Stream) re-point at the raw mic too, so they stay alive across
-        # the rebuild and audio keeps flowing without an unload+reload
-        # gap. The chain.input upstream loopback is excluded — it's
-        # about to be unloaded in step 2 anyway.
+        for node_name, current in list(self.channel_fx.items()):
+            if current is info:
+                result = self.clear_channel_fx_transaction(
+                    node_name,
+                    target_source=target_source,
+                )
+                return bool(result.get('success'))
         fx_source = info.get('source')
-        capture_target = info.get('capture_target') or ''
-        prev_default = info.get('prev_default')
-        if fx_source and capture_target and not capture_target.endswith('.monitor'):
-            dest = target_source or capture_target
-            # Re-home normal app capture streams before the old FX source
-            # disappears, but do NOT move WaveLinux's own loopbacks.
-            # PipeWire can freeze module-loopback source-outputs when they
-            # are moved, so we exclude both the chain's upstream loopback
-            # and any submix loopback currently reading from this FX
-            # source. Step 1 unloads those submix loopbacks so the next
-            # reroute recreates them on the right source cleanly.
-            internal_modules = list(info.get('loopbacks', []))
-            for skey in list(self.submix_sources.keys()):
-                if self.submix_sources.get(skey) == fx_source:
-                    mod = self.submix_loopbacks.get(skey)
-                    if mod is not None:
-                        internal_modules.append(mod)
-            self._move_source_outputs(
-                fx_source, dest, exclude_modules=internal_modules,
-            )
-
-            # Restore / replace the default source only after dependent
-            # source-outputs have been re-homed. Flipping the default
-            # first lets some live capture streams fall onto whatever
-            # PipeWire thinks the new default should be before our
-            # explicit move runs, which is how a preset-rebuild can
-            # strand the mic on the wrong source until restart.
-            current_default = self.get_default_source()
-            if current_default == fx_source:
-                if target_source:
-                    self.set_default_source(target_source)
-                else:
-                    self.set_default_source(prev_default or capture_target)
-
-            # Re-push cached vol/mute — same reasoning as set_channel_fx,
-            # so the mic doesn't briefly leak audio while pulse-bridge
-            # re-applies its stale default to the just-moved sink-input.
-            self._reapply_submix_state_cache()
-
-        # 1. Drop any submix loopbacks still pinned to this chain's
-        # source — virtual-sink chains skip step 0 (no default source
-        # to restore), so they reach this point with submix routes
-        # still on the chain prefix and need the cleanup.
         for skey in list(self.submix_sources.keys()):
-            src = self.submix_sources.get(skey, '')
-            if not src or src != fx_source:
+            if self.submix_sources.get(skey) != fx_source:
                 continue
             mod_id = self.submix_loopbacks.pop(skey, None)
             self.submix_sources.pop(skey, None)
-            self.submix_state_cache.pop(skey, None)
             if mod_id is not None:
                 self._run(['pactl', 'unload-module', str(mod_id)])
-
-        # 2. Unload the chain's own inter-stage wiring loopbacks.
-        for mod_id in info.get('loopbacks', []):
-            self._run(['pactl', 'unload-module', str(mod_id)])
-
-        # 3. Kill the filter-chain stage processes.
-        for pk in info.get('procs', []):
-            self.stop_rnnoise(pk)
+        self._teardown_fx_plumbing(info)
         self.invalidate_snapshot()
         return True
 
-    def get_channel_fx_source(self, node_name):
-        """Return the final FX virtual source for a channel, or None."""
+    def clear_channel_fx_transaction(self, node_name, target_source=None):
+        """Transactionally clear a channel FX chain without dropping audio."""
+        info = self.channel_fx.get(node_name)
+        if not info:
+            return self._fx_result(True, kept_source=target_source, message='FX chain already cleared')
+
+        if self._is_inline_fx_info(info):
+            return self._clear_inline_channel_fx(node_name, info)
+
+        fx_source = info.get('source')
+        capture_target = info.get('capture_target') or ''
+        dest_source = target_source or capture_target
+        if not fx_source:
+            self.channel_fx.pop(node_name, None)
+            return self._fx_result(True, kept_source=dest_source, message='FX chain state was incomplete')
+
+        binding_snapshot = self._snapshot_submix_bindings(fx_source)
+        exclude_modules = list(info.get('loopbacks', []))
+        for binding in binding_snapshot.values():
+            old_module_id = binding.get('module_id')
+            if old_module_id is not None:
+                exclude_modules.append(old_module_id)
+        external_source_outputs = self.snapshot_external_source_outputs(
+            fx_source,
+            exclude_modules=exclude_modules,
+        )
+
+        mic_cutover = bool(capture_target and not capture_target.endswith('.monitor'))
+        default_before = self.get_default_source() if mic_cutover else None
+        replacement_default = target_source or info.get('prev_default') or capture_target
+        replacements = {}
+        default_changed = False
+        failure_stage = None
+
+        try:
+            if dest_source:
+                for key, binding in binding_snapshot.items():
+                    module_id = self._create_submix_replacement(
+                        dest_source,
+                        binding['mix_name'],
+                        initial_state=binding.get('state') or {},
+                    )
+                    if module_id is None:
+                        failure_stage = f"submix_{binding['mix_name'].lower()}"
+                        raise RuntimeError(f"replacement submix loopback failed for {binding['mix_name']}")
+                    replacements[key] = {
+                        'mix_name': binding['mix_name'],
+                        'module_id': module_id,
+                        'old_module_id': binding.get('module_id'),
+                        'state': dict(binding.get('state', {}) or {}),
+                    }
+
+            if mic_cutover and dest_source:
+                if not self._move_known_source_outputs(
+                        external_source_outputs,
+                        fx_source,
+                        dest_source):
+                    failure_stage = 'source_output_move'
+                    raise RuntimeError('source-output move off FX source failed')
+                if default_before == fx_source and replacement_default:
+                    self.set_default_source(replacement_default)
+                    default_changed = True
+                    if self.get_default_source() != replacement_default:
+                        failure_stage = 'default_source'
+                        raise RuntimeError('default source did not restore correctly')
+
+            self.channel_fx.pop(node_name, None)
+            if replacements:
+                self._commit_submix_replacements(replacements, new_source=dest_source)
+            else:
+                for skey in list(self.submix_sources.keys()):
+                    if self.submix_sources.get(skey) != fx_source:
+                        continue
+                    mod_id = self.submix_loopbacks.pop(skey, None)
+                    self.submix_sources.pop(skey, None)
+                    if mod_id is not None:
+                        self._run(['pactl', 'unload-module', str(mod_id)])
+            self._teardown_fx_plumbing(info)
+            self.invalidate_snapshot()
+            return self._fx_result(
+                True,
+                kept_source=dest_source,
+                message='FX chain cleared',
+            )
+        except Exception as exc:
+            if default_changed and default_before:
+                self.set_default_source(default_before)
+            if dest_source:
+                self._move_known_source_outputs(
+                    external_source_outputs,
+                    dest_source,
+                    fx_source,
+                )
+            self._unload_submix_replacements(replacements)
+            self.invalidate_snapshot()
+            return self._fx_result(
+                False,
+                active_source=fx_source,
+                kept_source=fx_source,
+                rolled_back=True,
+                failure_stage=failure_stage or 'cutover',
+                message=str(exc),
+            )
+
+    def get_channel_fx_source(self, node_name, snap=None):
+        """Return the effective source carrying a channel's FX output, or None."""
         info = self.channel_fx.get(node_name)
         if not info:
             return None
+        if self._is_inline_fx_info(info):
+            target = self._find_inline_fx_target(node_name, snap=snap)
+            if target is None:
+                self.channel_fx.pop(node_name, None)
+                return None
+            info['node_id'] = target['node_id']
+            info['source'] = target['source_name']
+            info['capture_target'] = target['capture_target']
+            return info.get('source')
         # If any stage's process died, drop the chain so callers re-route
         # the loopback back to the raw mic instead of a dead source.
         for pk in info.get('procs', []):

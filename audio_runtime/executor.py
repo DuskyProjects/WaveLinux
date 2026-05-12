@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-
 from .models import (
     MixSpec,
     ObservedState,
@@ -52,7 +50,10 @@ class RuntimeExecutor:
                 if getattr(node, "media_class", "").startswith("Audio/Source")
             }
             for node_name in tracked_names:
-                observed.fx_sources_by_channel[node_name] = engine.get_channel_fx_source(node_name)
+                observed.fx_sources_by_channel[node_name] = engine.get_channel_fx_source(
+                    node_name,
+                    snap=snap,
+                )
                 observed.fx_effects_by_channel[node_name] = engine.get_channel_effects(node_name)
                 info = engine.channel_fx.get(node_name) or {}
                 observed.fx_params_by_channel[node_name] = {
@@ -275,12 +276,6 @@ class RuntimeExecutor:
         node_name = payload["node_name"]
         capture_target = payload["capture_target"]
         fx_spec = payload["fx_spec"]
-        previous = desired_state.channels.get(node_name)
-        prev_effects = []
-        prev_params = {}
-        if previous is not None:
-            prev_effects = list(previous.fx.effects)
-            prev_params = {k: dict(v) for k, v in previous.fx.params_map.items()}
         self._emit_status(
             status_callback,
             OperationStatus(
@@ -291,15 +286,13 @@ class RuntimeExecutor:
             ),
         )
         with self.adapter.session() as engine:
-            source_name = engine.set_channel_fx(
+            result = engine.apply_channel_fx_transaction(
                 node_name,
                 capture_target,
                 list(fx_spec.effects),
-                fx_spec.params_map,
+                params_map=fx_spec.params_map,
             )
-            verified = bool(source_name and engine.is_channel_fx_running(node_name))
-            if verified:
-                self._restore_channel_submixes(engine, desired_state, node_name)
+        verified = bool(result.get("success"))
         if verified:
             self._emit_status(
                 status_callback,
@@ -311,31 +304,27 @@ class RuntimeExecutor:
                 ),
             )
             return
-        rollback_error = ""
-        with self.adapter.session() as engine:
-            try:
-                if prev_effects:
-                    engine.set_channel_fx(node_name, capture_target, prev_effects, prev_params)
-                else:
-                    engine.clear_channel_fx(node_name)
-            except Exception as exc:
-                rollback_error = str(exc)
         bundle = self.diagnostics.export_failure(
             "fx_apply_verification_failed",
             desired=desired_state,
             observed=self.observe(desired_state),
             actions=[payload],
             health={"channel": node_name},
-            status={"rollback_error": rollback_error},
+            status={"result": dict(result or {})},
         )
+        failure_stage = result.get("failure_stage") or "unknown"
+        message = (result.get("message") or "").strip()
         self._emit_status(
             status_callback,
             OperationStatus(
                 node_name=node_name,
                 state="degraded",
                 generation=fx_spec.generation,
-                message=f"FX rebuild failed; diagnostics: {bundle}",
-                error=rollback_error,
+                message=(
+                    f"FX rebuild failed at {failure_stage}; diagnostics: {bundle}"
+                    + (f" ({message})" if message else "")
+                ),
+                error=message,
             ),
         )
 
@@ -352,25 +341,29 @@ class RuntimeExecutor:
             ),
         )
         with self.adapter.session() as engine:
-            engine.clear_channel_fx(node_name)
-            running = engine.is_channel_fx_running(node_name)
-            if not running:
-                self._restore_channel_submixes(engine, desired_state, node_name)
-        if running:
+            result = engine.clear_channel_fx_transaction(node_name)
+        if not result.get("success"):
             bundle = self.diagnostics.export_failure(
                 "fx_clear_verification_failed",
                 desired=desired_state,
                 observed=self.observe(desired_state),
                 actions=[payload],
                 health={"channel": node_name},
+                status={"result": dict(result or {})},
             )
+            failure_stage = result.get("failure_stage") or "unknown"
+            message = (result.get("message") or "").strip()
             self._emit_status(
                 status_callback,
                 OperationStatus(
                     node_name=node_name,
                     state="degraded",
                     generation=generation,
-                    message=f"FX clear failed; diagnostics: {bundle}",
+                    message=(
+                        f"FX clear failed at {failure_stage}; diagnostics: {bundle}"
+                        + (f" ({message})" if message else "")
+                    ),
+                    error=message,
                 ),
             )
             return
@@ -465,41 +458,6 @@ class RuntimeExecutor:
     def _ensure_virtual_channel(self, payload):
         with self.adapter.session() as engine:
             engine.create_virtual_sink(payload["display_name"])
-
-    def _restore_channel_submixes(self, engine, desired_state, node_name):
-        snap = engine.create_snapshot(force=True)
-        managed = list(engine.get_hardware_inputs(snap=snap))
-        virtual = list(engine.get_virtual_sinks(snap=snap))
-        node = next((item for item in managed if item.name == node_name), None)
-        is_mic = node is not None
-        if node is None:
-            node = next((item for item in virtual if item.name == node_name), None)
-        if node is None:
-            return
-        node_id = str(node.pw_id)
-        for mix_name in ("Monitor", "Stream"):
-            if mix_name not in engine.output_mixes:
-                continue
-            desired = self._desired_submix_state(
-                desired_state,
-                node_name,
-                mix_name,
-                is_mic=is_mic,
-            )
-            routed = False
-            for _ in range(20):
-                routed = engine.route_input_to_submix(
-                    node_id,
-                    node.name,
-                    node.media_class,
-                    mix_name,
-                    initial_state=desired,
-                )
-                if routed:
-                    break
-                time.sleep(0.05)
-            if not routed:
-                continue
 
     @staticmethod
     def _emit_status(callback, status):
