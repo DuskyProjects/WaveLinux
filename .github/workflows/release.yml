@@ -69,16 +69,7 @@ jobs:
         run: |
           APPIMAGE="$(echo dist/*.AppImage)"
           if [ "${GITHUB_REF}" = "${GITHUB_REF#refs/tags/}" ]; then
-            RELEASE_TAG="v$(python - <<'PY'
-import re
-from pathlib import Path
-text = Path('main.py').read_text(encoding='utf-8')
-match = re.search(r'^APP_VERSION = "([^"]+)"', text, re.MULTILINE)
-if not match:
-    raise SystemExit('Could not determine APP_VERSION from main.py')
-print(match.group(1))
-PY
-)"
+            RELEASE_TAG="v$(python -c "import re; from pathlib import Path; text = Path('main.py').read_text(encoding='utf-8'); match = re.search(r'^APP_VERSION = \\\"([^\\\"]+)\\\"', text, re.MULTILINE); print(match.group(1) if match else (_ for _ in ()).throw(SystemExit('Could not determine APP_VERSION from main.py')))")"
           else
             RELEASE_TAG="${GITHUB_REF_NAME}"
           fi
