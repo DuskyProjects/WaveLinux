@@ -138,6 +138,47 @@ class RuntimeControllerStateTests(unittest.TestCase):
         self.assertEqual(intents[0].node_name, "mic")
         self.assertEqual(intents[1].node_name, "voice")
 
+    def test_set_mix_hardware_route_sync_applies_route_immediately(self):
+        calls = []
+
+        class _Engine:
+            def create_output_mix(self, mix_name):
+                calls.append(("create_output_mix", mix_name))
+                return True
+
+            def route_mix_to_hardware(self, mix_name, sink_name):
+                calls.append(("route_mix_to_hardware", mix_name, sink_name))
+                return True
+
+        class _Session:
+            def __enter__(self_inner):
+                return _Engine()
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                return False
+
+        controller = self._controller()
+        controller._worker.state_lock = _Session()
+        controller._worker.desired_state = DesiredState()
+        controller.adapter = SimpleNamespace(session=lambda: _Session())
+        controller.refresh_now = lambda reason: calls.append(("refresh_now", reason))
+
+        result = controller.set_mix_hardware_route_sync("Monitor", "bluez_output.headset")
+
+        self.assertTrue(result)
+        self.assertEqual(
+            calls,
+            [
+                ("create_output_mix", "Monitor"),
+                ("route_mix_to_hardware", "Monitor", "bluez_output.headset"),
+                ("refresh_now", "set-mix-hardware-route:Monitor"),
+            ],
+        )
+        self.assertEqual(
+            controller._worker.desired_state.mixes["Monitor"].hardware_sink,
+            "bluez_output.headset",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

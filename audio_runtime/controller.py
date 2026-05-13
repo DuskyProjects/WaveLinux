@@ -338,6 +338,22 @@ class AudioRuntimeController(QObject):
     def set_mix_hardware_route(self, mix_name, sink_name):
         self.enqueue_intent(SetMixHardwareRoute(mix_name=mix_name, sink_name=sink_name))
 
+    def set_mix_hardware_route_sync(self, mix_name, sink_name):
+        with self._worker.state_lock:
+            mix = self._worker.desired_state.mixes.setdefault(
+                mix_name,
+                MixSpec(name=mix_name),
+            )
+            mix.hardware_sink = sink_name
+            with self.adapter.session() as engine:
+                engine.create_output_mix(mix_name)
+                if sink_name:
+                    out = engine.route_mix_to_hardware(mix_name, sink_name)
+                else:
+                    out = engine.unroute_mix_from_hardware(mix_name)
+        self.refresh_now(f"set-mix-hardware-route:{mix_name}")
+        return out
+
     def set_mix_volume(self, mix_name, volume):
         self.enqueue_intent(SetMixVolume(mix_name=mix_name, volume=float(volume)))
 

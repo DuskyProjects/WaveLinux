@@ -2,7 +2,13 @@ import json
 import tempfile
 import unittest
 
-from main import WaveLinuxWindow
+import os
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PyQt6.QtWidgets import QApplication, QComboBox
+from types import SimpleNamespace
+
+from main import ChannelStrip, WaveLinuxWindow
 
 
 class _DummyCombo:
@@ -17,6 +23,9 @@ class _FakeRuntime:
     def __init__(self):
         self.calls = []
         self.reset_calls = 0
+        self.selected_mic_calls = []
+        self.mix_route_calls = []
+        self.mix_route_sync_calls = []
 
     def sync_persistent_state(self, **kwargs):
         self.calls.append(kwargs)
@@ -24,11 +33,25 @@ class _FakeRuntime:
     def full_audio_reset_sync(self):
         self.reset_calls += 1
 
+    def set_selected_mic(self, node_name):
+        self.selected_mic_calls.append(node_name)
+
+    def set_mix_hardware_route(self, mix_name, sink_name):
+        self.mix_route_calls.append((mix_name, sink_name))
+
+    def set_mix_hardware_route_sync(self, mix_name, sink_name):
+        self.mix_route_sync_calls.append((mix_name, sink_name))
+
 
 class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._app = QApplication.instance() or QApplication([])
+
     def _window(self):
         win = WaveLinuxWindow.__new__(WaveLinuxWindow)
         win.selected_mic = None
+        win._mic_selection_initialized = False
         win.submix_state = {}
         win.active_effects = {}
         win.effect_params = {}
@@ -100,6 +123,91 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
             win._recover_unclean_runtime_state()
 
         self.assertEqual(win.runtime.reset_calls, 0)
+
+    def test_sync_mic_picker_autoselects_once_during_initial_resolution(self):
+        win = self._window()
+        win.runtime = _FakeRuntime()
+        win.engine = type("Engine", (), {"get_default_source": lambda self: "mic_b"})()
+        win.schedule_save = lambda: setattr(win, "_saved", True)
+        win.mic_in_combo = QComboBox()
+        mics = [
+            SimpleNamespace(name="mic_a", description="Mic A"),
+            SimpleNamespace(name="mic_b", description="Mic B"),
+        ]
+
+        win._sync_mic_picker(mics, default_src="mic_b")
+
+        self.assertEqual(win.selected_mic, "mic_b")
+        self.assertTrue(win._mic_selection_initialized)
+        self.assertEqual(win.runtime.selected_mic_calls, ["mic_b"])
+
+    def test_sync_mic_picker_does_not_promote_new_hotplug_after_initial_lock(self):
+        win = self._window()
+        win.runtime = _FakeRuntime()
+        win.engine = type("Engine", (), {"get_default_source": lambda self: "usb_mic"})()
+        win.schedule_save = lambda: setattr(win, "_saved", True)
+        win.selected_mic = "mic_a"
+        win._mic_selection_initialized = True
+        win.mic_in_combo = QComboBox()
+        mics = [
+            SimpleNamespace(name="usb_mic", description="USB Mic"),
+        ]
+
+        win._sync_mic_picker(mics, default_src="usb_mic")
+
+        self.assertEqual(win.selected_mic, "mic_a")
+        self.assertEqual(win.runtime.selected_mic_calls, [])
+        self.assertFalse(win.__dict__.get("_saved", False))
+
+    def test_sync_mic_picker_keeps_saved_selection_during_startup_if_missing(self):
+        win = self._window()
+        win.runtime = _FakeRuntime()
+        win.engine = type("Engine", (), {"get_default_source": lambda self: "usb_mic"})()
+        win.schedule_save = lambda: setattr(win, "_saved", True)
+        win.selected_mic = "mic_a"
+        win._mic_selection_initialized = False
+        win.mic_in_combo = QComboBox()
+        mics = [
+            SimpleNamespace(name="usb_mic", description="USB Mic"),
+        ]
+
+        win._sync_mic_picker(mics, default_src="usb_mic")
+
+        self.assertEqual(win.selected_mic, "mic_a")
+        self.assertTrue(win._mic_selection_initialized)
+        self.assertEqual(win.runtime.selected_mic_calls, [])
+        self.assertFalse(win.__dict__.get("_saved", False))
+
+    def test_set_mix_output_target_uses_sync_runtime_when_requested(self):
+        win = self._window()
+        win.runtime = _FakeRuntime()
+
+        win._set_mix_output_target(
+            "Monitor",
+            "bluez_output.headset",
+            persist=False,
+            update_combo=False,
+            sync_runtime=True,
+        )
+
+        self.assertEqual(win.runtime.mix_route_sync_calls, [("Monitor", "bluez_output.headset")])
+        self.assertEqual(win.runtime.mix_route_calls, [])
+
+    def test_channel_strip_centers_vertical_sliders_with_mute_buttons(self):
+        strip = ChannelStrip("1", "mic", "Digital Microphone", "Microphone", "🎤", engine=None)
+
+        strip.apply_scale(200, 140)
+        strip.show()
+        self._app.processEvents()
+
+        self.assertLessEqual(
+            abs(strip.mon_slider.geometry().center().x() - strip.mon_mute.geometry().center().x()),
+            1,
+        )
+        self.assertLessEqual(
+            abs(strip.str_slider.geometry().center().x() - strip.str_mute.geometry().center().x()),
+            1,
+        )
 
 
 if __name__ == "__main__":

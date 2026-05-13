@@ -175,7 +175,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
             win.runtime.ensure_virtual_channel_calls,
             ["Music", "Voice Chat"],
         )
-        self.assertEqual(win.runtime.set_selected_mic_calls, ["usb_mic"])
+        self.assertEqual(win.runtime.set_selected_mic_calls, [])
         self.assertEqual(
             win.runtime.set_mix_hardware_calls,
             [
@@ -184,6 +184,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(win.runtime.sync_calls), 1)
+        self.assertEqual(win.runtime.sync_calls[0]["selected_mic"], "usb_mic")
         self.assertEqual(win.runtime.sync_calls[0]["app_routing"], {"com.test.player": "wavelinux_music"})
         self.assertEqual(win.runtime.sync_calls[0]["app_volumes"], {"com.test.player": 0.25})
         self.assertTrue(getattr(win, "_scheduled_save", False))
@@ -260,7 +261,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
             win.runtime.remove_virtual_channel_calls,
             [f"wavelinux_{PipeWireEngine._sanitize_channel_name('Old Virtual')[1]}"],
         )
-        self.assertEqual(win.runtime.set_selected_mic_calls, ["usb_mic"])
+        self.assertEqual(win.runtime.set_selected_mic_calls, [])
         self.assertEqual(
             win.runtime.set_mix_hardware_calls,
             [
@@ -269,6 +270,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(win.runtime.sync_calls), 1)
+        self.assertEqual(win.runtime.sync_calls[0]["selected_mic"], "usb_mic")
         self.assertEqual(win.runtime.sync_calls[0]["app_volumes"], {"com.test.player": 0.45})
 
     def test_apply_quick_start_template_sets_channels_mic_and_default_fx(self):

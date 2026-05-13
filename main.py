@@ -1192,13 +1192,13 @@ class ChannelStrip(QFrame):
         self.mon_slider.setValue(100)
         self.mon_slider.setMinimumHeight(140)
         self.mon_slider.valueChanged.connect(self._on_mon_vol)
-        mon_col.addWidget(self.mon_slider, 1)
+        mon_col.addWidget(self.mon_slider, 1, Qt.AlignmentFlag.AlignHCenter)
         self.mon_mute = QPushButton("🎧")
         self.mon_mute.setObjectName("muteBtn")
         self.mon_mute.setFixedSize(28, 28)
         self.mon_mute.setToolTip("Mute in Monitor mix")
         self.mon_mute.clicked.connect(self._on_mon_mute)
-        mon_col.addWidget(self.mon_mute)
+        mon_col.addWidget(self.mon_mute, 0, Qt.AlignmentFlag.AlignHCenter)
         faders_row.addLayout(mon_col)
 
         str_col = QVBoxLayout()
@@ -1216,13 +1216,13 @@ class ChannelStrip(QFrame):
         self.str_slider.setValue(100)
         self.str_slider.setMinimumHeight(140)
         self.str_slider.valueChanged.connect(self._on_str_vol)
-        str_col.addWidget(self.str_slider, 1)
+        str_col.addWidget(self.str_slider, 1, Qt.AlignmentFlag.AlignHCenter)
         self.str_mute = QPushButton("📡")
         self.str_mute.setObjectName("muteBtn")
         self.str_mute.setFixedSize(28, 28)
         self.str_mute.setToolTip("Mute in Stream mix")
         self.str_mute.clicked.connect(self._on_str_mute)
-        str_col.addWidget(self.str_mute)
+        str_col.addWidget(self.str_mute, 0, Qt.AlignmentFlag.AlignHCenter)
         faders_row.addLayout(str_col)
 
         layout.addLayout(faders_row, 1)
@@ -2111,6 +2111,7 @@ class WaveLinuxWindow(QMainWindow):
         # Single-mic mode: one mic strip at a time, picked from the master
         # combo. None → resolved to `pactl get-default-source` on first refresh.
         self.selected_mic = None
+        self._mic_selection_initialized = False
         # State below is keyed by PipeWire node.name (stable across PW
         # restarts). pw_id is only used at the engine boundary.
         self.hidden_nodes = set()
@@ -2904,7 +2905,6 @@ class WaveLinuxWindow(QMainWindow):
 
         selected_mic = snapshot.get("selected_mic") or None
         self.selected_mic = selected_mic
-        self.runtime.set_selected_mic(selected_mic)
 
         scene_nodes = set(snapshot.get("channel_order", []) or [])
         scene_nodes.update(snapshot.get("active_effects", {}).keys())
@@ -5776,11 +5776,15 @@ class WaveLinuxWindow(QMainWindow):
         for mix_name, vol in pending.items():
             self.runtime.set_mix_volume(mix_name, vol)
 
-    def _set_mix_output_target(self, mix_name, hw_sink_name, *, persist=True, update_combo=False):
+    def _set_mix_output_target(self, mix_name, hw_sink_name, *, persist=True, update_combo=False,
+                               sync_runtime=False):
         self._desired_mix_hw[mix_name] = hw_sink_name
         runtime = getattr(self, "runtime", None)
         if runtime is not None:
-            runtime.set_mix_hardware_route(mix_name, hw_sink_name)
+            if sync_runtime and hasattr(runtime, "set_mix_hardware_route_sync"):
+                runtime.set_mix_hardware_route_sync(mix_name, hw_sink_name)
+            else:
+                runtime.set_mix_hardware_route(mix_name, hw_sink_name)
         if update_combo:
             combo_name = "mon_out_combo" if mix_name == "Monitor" else "str_out_combo"
             combo = getattr(self, combo_name, None)
@@ -5823,9 +5827,16 @@ class WaveLinuxWindow(QMainWindow):
         `pactl get-default-source` when nothing's saved yet."""
         combo = self.mic_in_combo
         mic_names = {m.name for m in mics}
-        # Resolve a stale or unset selected_mic (unplugged device, fresh
-        # launch) to the system default if available, else the first mic.
-        if mics and (not self.selected_mic or self.selected_mic not in mic_names):
+        if self.selected_mic:
+            self._mic_selection_initialized = True
+
+        # Resolve the mic only when no saved/user-chosen selection exists.
+        # If a selection is already present but temporarily missing from the
+        # observed device list, keep it pinned instead of silently promoting
+        # a newly connected/default mic into the active selection.
+        if (not self.selected_mic) and mics and (
+            not getattr(self, "_mic_selection_initialized", False)
+        ):
             if default_src is None:
                 default_src = (
                     self.engine.get_default_source()
@@ -5836,10 +5847,11 @@ class WaveLinuxWindow(QMainWindow):
             else:
                 self.selected_mic = mics[0].name
             self.runtime.set_selected_mic(self.selected_mic)
+            self._mic_selection_initialized = True
             self.schedule_save()
 
         mic_fp = tuple((m.name, m.description or '') for m in mics)
-        if getattr(self, '_mic_combo_fp', None) != mic_fp:
+        if self.__dict__.get('_mic_combo_fp') != mic_fp:
             self._mic_combo_fp = mic_fp
             combo.blockSignals(True)
             combo.clear()
@@ -6144,6 +6156,7 @@ class WaveLinuxWindow(QMainWindow):
         if new_mic == self.selected_mic:
             return
         self.selected_mic = new_mic
+        self._mic_selection_initialized = True
         self.runtime.set_selected_mic(new_mic)
         self.schedule_save()
         self._refresh()
@@ -6310,8 +6323,6 @@ class WaveLinuxWindow(QMainWindow):
         self._selected_setup_template = str(conf.get('quick_start_template') or "")
         self.channel_order = self._dedupe_names(conf.get('channel_order', []) or [])
         self.selected_mic = conf.get('selected_mic') or None
-        if runtime is not None:
-            runtime.set_selected_mic(self.selected_mic)
         self.effect_params = conf.get('effect_params', {}) or {}
         self.active_effects = {
             k: list(v) for k, v in (conf.get('active_effects', {}) or {}).items()
@@ -6360,8 +6371,12 @@ class WaveLinuxWindow(QMainWindow):
         )
         mon_hw = conf.get('monitor_hw') or default_sink
         str_hw = conf.get('stream_hw')
-        self._set_mix_output_target("Monitor", mon_hw, persist=False, update_combo=True)
-        self._set_mix_output_target("Stream", str_hw, persist=False, update_combo=True)
+        self._set_mix_output_target(
+            "Monitor", mon_hw, persist=False, update_combo=True, sync_runtime=True
+        )
+        self._set_mix_output_target(
+            "Stream", str_hw, persist=False, update_combo=True, sync_runtime=True
+        )
         self._sync_runtime_persistent_state()
 
     def load_config(self):
@@ -6375,7 +6390,9 @@ class WaveLinuxWindow(QMainWindow):
             self.runtime.ensure_output_mix_sync("Stream")
             def_sink = self.engine.get_default_sink()
             if def_sink:
-                self._set_mix_output_target("Monitor", def_sink, persist=False, update_combo=True)
+                self._set_mix_output_target(
+                    "Monitor", def_sink, persist=False, update_combo=True, sync_runtime=True
+                )
             self._seed_default_channels()
             self.save_config()
             return

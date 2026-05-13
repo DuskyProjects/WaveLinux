@@ -539,6 +539,78 @@ class RuntimePlannerTests(unittest.TestCase):
         ensure_actions = [action for action in actions if action.kind == "ensure_submix_route"]
         self.assertEqual(len(ensure_actions), 2)
 
+    def test_refresh_now_removes_non_selected_mic_routing_and_fx(self):
+        planner = RuntimePlanner()
+        desired = DesiredState(
+            selected_mic="usb_mic",
+            channels={
+                "built_in_mic": ChannelSpec(
+                    node_name="built_in_mic",
+                    capture_target="built_in_mic",
+                    fx=FxSpec(effects=["rnnoise"], generation=4),
+                ),
+                "usb_mic": ChannelSpec(
+                    node_name="usb_mic",
+                    capture_target="usb_mic",
+                ),
+            },
+        )
+        observed = ObservedState(
+            mic_inputs=[
+                RuntimeChannelView(
+                    node_id="55",
+                    name="built_in_mic",
+                    description="Built-in Mic",
+                    media_class="Audio/Source",
+                    label="Built-in Mic",
+                    channel_type="Microphone",
+                    icon="mic",
+                    is_mic=True,
+                    capture_target="built_in_mic",
+                    meter_source="wavelinux.fx.built_in_mic.source",
+                ),
+                RuntimeChannelView(
+                    node_id="77",
+                    name="usb_mic",
+                    description="USB Mic",
+                    media_class="Audio/Source",
+                    label="USB Mic",
+                    channel_type="Microphone",
+                    icon="mic",
+                    is_mic=True,
+                    capture_target="usb_mic",
+                    meter_source="usb_mic",
+                ),
+            ],
+            submix_owner_by_channel={
+                "built_in_mic": {"Monitor": "11", "Stream": "12"},
+            },
+            fx_sources_by_channel={
+                "built_in_mic": "wavelinux.fx.built_in_mic.source",
+                "usb_mic": None,
+            },
+            fx_effects_by_channel={
+                "built_in_mic": ["rnnoise"],
+                "usb_mic": [],
+            },
+        )
+
+        actions = planner.reconcile(desired, observed, RefreshNow("tick"))
+
+        remove_actions = [
+            action for action in actions
+            if action.kind == "remove_node_routing"
+        ]
+        clear_actions = [
+            action for action in actions
+            if action.kind == "clear_channel_fx"
+        ]
+        self.assertEqual(len(remove_actions), 1)
+        self.assertEqual(remove_actions[0].payload["node_id"], "55")
+        self.assertEqual(len(clear_actions), 1)
+        self.assertEqual(clear_actions[0].payload["node_name"], "built_in_mic")
+        self.assertEqual(clear_actions[0].payload["generation"], 4)
+
     def test_refresh_now_clears_unwanted_fx_for_managed_channel(self):
         planner = RuntimePlanner()
         desired = DesiredState(

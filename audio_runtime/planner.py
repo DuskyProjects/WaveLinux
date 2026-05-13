@@ -343,6 +343,24 @@ class RuntimePlanner:
                     "source_name": expected_default,
                 }))
 
+        for mic_view in observed_state.mic_inputs:
+            if mic_view.name == selected_mic:
+                continue
+            route_owners = observed_state.submix_owner_by_channel.get(mic_view.name, {})
+            if any(route_owners.get(mix_name) for mix_name in ("Monitor", "Stream")):
+                actions.append(Action("remove_node_routing", {
+                    "node_id": str(mic_view.node_id),
+                }))
+            if observed_state.fx_sources_by_channel.get(mic_view.name):
+                generation = int(
+                    getattr(desired_state.channels.get(mic_view.name), "fx", FxSpec()).generation
+                )
+                actions.append(Action("clear_channel_fx", {
+                    "node_name": mic_view.name,
+                    "generation": generation,
+                }))
+                cleared_fx.add(mic_view.name)
+
         for node_name, old_node_id in observed_state.stale_channel_ids.items():
             actions.append(Action("remove_node_routing", {
                 "node_id": str(old_node_id),
