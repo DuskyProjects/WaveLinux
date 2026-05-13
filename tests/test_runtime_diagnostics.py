@@ -39,6 +39,32 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
             self.assertTrue(os.path.exists(second))
             self.assertTrue(os.path.exists(third))
 
+    def test_prune_exports_breaks_equal_mtime_ties_by_filename(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            names = [
+                "runtime-failure-20260101-000000-000000001.json",
+                "runtime-failure-20260101-000000-000000002.json",
+                "runtime-failure-20260101-000000-000000003.json",
+            ]
+            paths = []
+            for name in names:
+                path = os.path.join(tmpdir, name)
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("{}")
+                os.utime(path, (10, 10))
+                paths.append(path)
+
+            RuntimeDiagnostics(root_dir=tmpdir, max_exports=2)
+
+            kept = sorted(name for name in os.listdir(tmpdir) if name.endswith(".json"))
+            self.assertEqual(
+                kept,
+                [
+                    "runtime-failure-20260101-000000-000000002.json",
+                    "runtime-failure-20260101-000000-000000003.json",
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

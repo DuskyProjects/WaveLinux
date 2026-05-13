@@ -73,7 +73,7 @@ class RuntimeDiagnostics:
         limit = self.max_exports if limit is None else max(0, int(limit))
         exports = sorted(
             self.root_dir.glob("runtime-failure-*.json"),
-            key=lambda item: item.stat().st_mtime,
+            key=lambda item: (item.stat().st_mtime_ns, item.name),
             reverse=True,
         )
         for old in exports[limit:]:
