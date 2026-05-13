@@ -14,6 +14,7 @@ WaveLinux is now AppImage-first for end users.
 
 - The release AppImage is the primary multi-distro build for Arch, Fedora, Ubuntu, and other XDG desktops.
 - In-app AppImage updates now verify a signed GitHub release manifest, validate the downloaded checksum, smoke-test the new AppImage, then install it into `~/.local/bin`.
+- Package-managed installs can still check for verified releases, but they do not replace themselves with an AppImage in place; update those through your package manager.
 - Host PipeWire tools are still required even when using the AppImage.
 
 ## Host Requirements

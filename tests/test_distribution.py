@@ -13,6 +13,38 @@ class DistributionTests(unittest.TestCase):
             path = distribution.current_appimage_path()
         self.assertEqual(path, "/tmp/WaveLinux.AppImage")
 
+    def test_runtime_mode_detects_appimage(self):
+        with mock.patch.dict(os.environ, {"APPIMAGE": "/tmp/WaveLinux.AppImage"}, clear=False):
+            mode = distribution.runtime_mode()
+        self.assertEqual(mode.kind, "appimage")
+        self.assertTrue(mode.allows_self_update)
+
+    def test_runtime_mode_detects_source_checkout(self):
+        mode = distribution.runtime_mode(
+            frozen=False,
+            argv=["/home/dusky/Projects/WaveLinux/main.py"],
+        )
+        self.assertEqual(mode.kind, "source")
+        self.assertTrue(mode.allows_self_update)
+
+    def test_runtime_mode_detects_local_bundle_under_home(self):
+        mode = distribution.runtime_mode(
+            home="/home/tester",
+            frozen=True,
+            executable="/home/tester/Downloads/WaveLinux/WaveLinux",
+        )
+        self.assertEqual(mode.kind, "bundle")
+        self.assertTrue(mode.allows_self_update)
+
+    def test_runtime_mode_detects_package_managed_binary(self):
+        mode = distribution.runtime_mode(
+            home="/home/tester",
+            frozen=True,
+            executable="/usr/bin/wavelinux",
+        )
+        self.assertEqual(mode.kind, "package")
+        self.assertFalse(mode.allows_self_update)
+
     def test_launch_command_uses_current_source_tree(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             cmd = distribution.launch_command()

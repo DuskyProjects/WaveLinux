@@ -62,6 +62,14 @@ class LauncherRepairResult:
     removed_entries: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class RuntimeMode:
+    kind: str
+    running_path: str
+    allows_self_update: bool
+    update_channel: str
+
+
 def app_root() -> str:
     """Return the directory that contains bundled resources."""
     if getattr(sys, "frozen", False):
@@ -74,6 +82,21 @@ def app_root() -> str:
 
 def resource_path(*parts: str) -> str:
     return os.path.join(app_root(), *parts)
+
+
+def current_runtime_path(*, environ=None, argv=None, executable=None,
+                         frozen=None) -> str:
+    appimage = current_appimage_path(environ=environ, argv=argv)
+    if appimage:
+        return appimage
+    is_frozen = bool(getattr(sys, "frozen", False) if frozen is None else frozen)
+    if is_frozen:
+        path = executable or sys.executable
+        return os.path.abspath(path)
+    args = argv if argv is not None else sys.argv
+    if args:
+        return os.path.abspath(args[0])
+    return resource_path("main.py")
 
 
 def current_appimage_path(*, environ=None, argv=None) -> str | None:
@@ -91,6 +114,51 @@ def current_appimage_path(*, environ=None, argv=None) -> str | None:
 
 def is_running_in_appimage(*, environ=None, argv=None) -> bool:
     return current_appimage_path(environ=environ, argv=argv) is not None
+
+
+def runtime_mode(*, home=None, environ=None, argv=None, executable=None,
+                 frozen=None) -> RuntimeMode:
+    running_path = current_runtime_path(
+        environ=environ,
+        argv=argv,
+        executable=executable,
+        frozen=frozen,
+    )
+    if current_appimage_path(environ=environ, argv=argv):
+        return RuntimeMode(
+            kind="appimage",
+            running_path=running_path,
+            allows_self_update=True,
+            update_channel="appimage",
+        )
+    is_frozen = bool(getattr(sys, "frozen", False) if frozen is None else frozen)
+    if not is_frozen:
+        return RuntimeMode(
+            kind="source",
+            running_path=running_path,
+            allows_self_update=True,
+            update_channel="appimage",
+        )
+
+    home_dir = os.path.expanduser("~") if home is None else os.path.abspath(home)
+    normalized = os.path.abspath(running_path)
+    user_prefixes = (
+        os.path.join(home_dir, ".local"),
+        home_dir,
+    )
+    if normalized.startswith(tuple(os.path.abspath(prefix) + os.sep for prefix in user_prefixes)):
+        return RuntimeMode(
+            kind="bundle",
+            running_path=normalized,
+            allows_self_update=True,
+            update_channel="appimage",
+        )
+    return RuntimeMode(
+        kind="package",
+        running_path=normalized,
+        allows_self_update=False,
+        update_channel="package-manager",
+    )
 
 
 def installed_appimage_path(*, home=None) -> str:

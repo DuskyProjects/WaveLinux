@@ -37,6 +37,12 @@ class WaveLinuxHealthTests(unittest.TestCase):
         win._recent_recovery_status = {}
         win._last_update_issue = None
         win._channel_label = lambda node_name: node_name
+        win._current_runtime_mode = lambda: SimpleNamespace(
+            kind="appimage",
+            running_path="/tmp/WaveLinux.AppImage",
+            allows_self_update=True,
+            update_channel="appimage",
+        )
         return win
 
     def test_collect_health_issues_includes_runtime_install_update_and_fx(self):
@@ -130,6 +136,33 @@ class WaveLinuxHealthTests(unittest.TestCase):
         recovered = next(issue for issue in issues if issue.code == "fx.channel_recovered")
         self.assertEqual(recovered.severity, "info")
         self.assertIn("Automatic recovery completed", recovered.detail)
+
+    def test_collect_health_issues_skips_missing_appimage_for_package_mode(self):
+        win = self._window()
+        win._current_runtime_mode = lambda: SimpleNamespace(
+            kind="package",
+            running_path="/usr/bin/wavelinux",
+            allows_self_update=False,
+            update_channel="package-manager",
+        )
+
+        issues = win._collect_health_issues(
+            preflight={"deps": {}, "issue_details": []},
+            state=SimpleNamespace(
+                appimage_missing=True,
+                installed_appimage_path="/tmp/WaveLinux.AppImage",
+                wrapper_mismatch=False,
+                wrapper_exists=False,
+                wrapper_path="/tmp/wavelinux",
+                wrapper_target=None,
+                desktop_exists=False,
+                desktop_mismatch=False,
+                desktop_path="/tmp/io.github.duskyprojects.WaveLinux.desktop",
+                stale_launcher_entries=(),
+            ),
+        )
+
+        self.assertNotIn("install.appimage_missing", {issue.code for issue in issues})
 
 
 if __name__ == "__main__":

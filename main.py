@@ -27,6 +27,7 @@ from audio_runtime import AudioRuntimeAdapter, AudioRuntimeController
 from distribution import (
     APP_DESKTOP_ID,
     DESKTOP_FILENAME,
+    current_runtime_path,
     desktop_exec_command,
     install_appimage_file,
     install_current_appimage,
@@ -35,6 +36,7 @@ from distribution import (
     launch_command,
     repair_installed_appimage_launchers,
     resource_path,
+    runtime_mode,
 )
 from health import HealthIssue, RecoveryStatus
 from pipewire_engine import PipeWireEngine
@@ -190,6 +192,7 @@ def startup_preflight_report(*, which=shutil.which, runner=subprocess.run,
 
 def build_self_test_report():
     install = install_state()
+    mode = runtime_mode()
     preflight = startup_preflight_report()
     resources = {
         "icon.png": os.path.exists(resource_path("icon.png")),
@@ -197,13 +200,14 @@ def build_self_test_report():
     }
     running_binary = (
         install.running_appimage_path
-        or (os.path.abspath(sys.executable) if getattr(sys, "frozen", False) else resource_path("main.py"))
+        or current_runtime_path()
     )
     ok = all(resources.values()) and bool(running_binary)
     return {
         "ok": ok,
         "version": APP_VERSION,
         "frozen": bool(getattr(sys, "frozen", False)),
+        "runtime_mode": mode.kind,
         "running_binary": running_binary,
         "running_in_appimage": bool(install.running_appimage_path),
         "resources": resources,
@@ -3050,6 +3054,11 @@ class WaveLinuxWindow(QMainWindow):
         self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
         layout.addWidget(self._update_status_lbl)
 
+        self._update_policy_lbl = QLabel()
+        self._update_policy_lbl.setWordWrap(True)
+        self._update_policy_lbl.setStyleSheet("color: #5a5a72; font-size: 11px;")
+        layout.addWidget(self._update_policy_lbl)
+
         btn_row = QHBoxLayout()
         self._check_update_btn = QPushButton("Check for Updates")
         self._check_update_btn.setObjectName("showHiddenBtn")
@@ -3094,15 +3103,10 @@ class WaveLinuxWindow(QMainWindow):
         self._update_progress.setValue(0)
         layout.addWidget(self._update_progress)
 
-        note = QLabel(
-            "WaveLinux verifies a signed GitHub release manifest, downloads the matching "
-            "AppImage, validates its checksum, runs smoke checks, and only then replaces "
-            "~/.local/bin/WaveLinux.AppImage for you.\n"
-            "If you use a distro package, keep updating through your package manager."
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #5a5a72; font-size: 11px;")
-        layout.addWidget(note)
+        self._update_note_lbl = QLabel()
+        self._update_note_lbl.setWordWrap(True)
+        self._update_note_lbl.setStyleSheet("color: #5a5a72; font-size: 11px;")
+        layout.addWidget(self._update_note_lbl)
 
         layout.addStretch(1)
         return tab
@@ -3165,9 +3169,10 @@ class WaveLinuxWindow(QMainWindow):
         self._last_update_issue = None
         current = _parse_version(APP_VERSION)
         latest  = _parse_version(latest_tag)
+        mode, _description, guidance = self._runtime_mode_detail()
         if latest > current:
             self._pending_update_tag = latest_tag
-            if self._pending_update_asset_url:
+            if self._pending_update_asset_url and mode.allows_self_update:
                 self._last_update_attempt_result = f"Verified update available: v{latest_tag}"
                 self._update_status_lbl.setText(
                     f"Verified update available: v{latest_tag}  (current: v{APP_VERSION})"
@@ -3177,6 +3182,14 @@ class WaveLinuxWindow(QMainWindow):
                     "WaveLinux Update Available",
                     f"Version {latest_tag} is available. Open Settings → Updates to install it.",
                 )
+            elif self._pending_update_asset_url:
+                self._last_update_attempt_result = (
+                    f"Verified release v{latest_tag} is available; update this install through your package manager."
+                )
+                self._update_status_lbl.setText(
+                    f"Verified release v{latest_tag} is available. {guidance}"
+                )
+                self._update_status_lbl.setStyleSheet("color: #d28b26; font-size: 12px;")
             else:
                 self._last_update_attempt_result = f"Verified release v{latest_tag} has no eligible AppImage asset."
                 self._update_status_lbl.setText(
@@ -3216,6 +3229,15 @@ class WaveLinuxWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl(url))
 
     def _download_and_install_update(self):
+        mode, _description, guidance = self._runtime_mode_detail()
+        if not mode.allows_self_update:
+            QMessageBox.information(
+                self.settings_dialog,
+                "Package-managed install",
+                "WaveLinux detected a package-managed install for this runtime.\n\n"
+                f"{guidance}",
+            )
+            return
         progress = getattr(self, "_update_progress", None)
         if progress is not None:
             progress.setVisible(True)
@@ -3453,6 +3475,7 @@ class WaveLinuxWindow(QMainWindow):
             if not isinstance(info, VerifiedReleaseInfo):
                 return
             tag = str(info.version or "").strip()
+            mode, _description, guidance = self._runtime_mode_detail()
             self._pending_verified_release = info
             self._pending_update_url = info.release_url or GITHUB_RELEASES_URL
             self._pending_update_asset_url = info.asset_url or ""
@@ -3465,8 +3488,12 @@ class WaveLinuxWindow(QMainWindow):
                     "WaveLinux Update Available",
                     (
                         f"Version {tag} is available. Open Settings → Updates to install it."
-                        if self._pending_update_asset_url
-                        else f"Version {tag} is available. Open Settings → Updates for details."
+                        if self._pending_update_asset_url and mode.allows_self_update
+                        else (
+                            f"Version {tag} is available. {guidance}"
+                            if self._pending_update_asset_url
+                            else f"Version {tag} is available. Open Settings → Updates for details."
+                        )
                     ),
                 )
         elif item[0] == 'error':
@@ -3477,6 +3504,7 @@ class WaveLinuxWindow(QMainWindow):
     def _refresh_update_tab(self):
         btn = getattr(self, "_install_appimage_btn", None)
         state = install_state()
+        mode, description, guidance = self._runtime_mode_detail()
         if btn is not None:
             btn.setText(
                 "Reinstall This AppImage" if state.installed_appimage_exists else "Install This AppImage"
@@ -3485,7 +3513,11 @@ class WaveLinuxWindow(QMainWindow):
         if download_btn is not None:
             pending_tag = getattr(self, "_pending_update_tag", None)
             pending_asset_url = getattr(self, "_pending_update_asset_url", "") or ""
-            if pending_tag and _parse_version(pending_tag) > _parse_version(APP_VERSION):
+            if not mode.allows_self_update:
+                download_btn.setText("Use Package Manager to Update")
+                download_btn.setEnabled(False)
+                download_btn.setToolTip(guidance)
+            elif pending_tag and _parse_version(pending_tag) > _parse_version(APP_VERSION):
                 download_btn.setText(f"Download && Install v{pending_tag}")
                 download_btn.setEnabled(bool(pending_asset_url))
                 if not pending_asset_url:
@@ -3502,9 +3534,13 @@ class WaveLinuxWindow(QMainWindow):
                 download_btn.setToolTip(
                     "Fetch the latest verified GitHub AppImage and install it to ~/.local/bin/WaveLinux.AppImage."
                 )
+        policy_lbl = getattr(self, "_update_policy_lbl", None)
+        if policy_lbl is not None:
+            policy_lbl.setText(description)
         info_lbl = getattr(self, "_install_state_lbl", None)
         if info_lbl is not None:
             lines = []
+            lines.append(f"Runtime mode: {mode.kind}")
             if state.running_appimage_path:
                 lines.append(f"Running AppImage: {state.running_appimage_path}")
             elif getattr(sys, "frozen", False):
@@ -3534,6 +3570,19 @@ class WaveLinuxWindow(QMainWindow):
         if warning_lbl is not None:
             warning_lbl.setVisible(bool(state.warnings))
             warning_lbl.setText("\n".join(state.warnings))
+        note_lbl = getattr(self, "_update_note_lbl", None)
+        if note_lbl is not None:
+            if mode.allows_self_update:
+                note_lbl.setText(
+                    "WaveLinux verifies a signed GitHub release manifest, downloads the matching "
+                    "AppImage, validates its checksum, runs smoke checks, and only then replaces "
+                    "~/.local/bin/WaveLinux.AppImage for you."
+                )
+            else:
+                note_lbl.setText(
+                    "WaveLinux can still check verified GitHub releases, but this runtime should be "
+                    "updated through your package manager instead of replacing it with an AppImage."
+                )
         repair_btn = getattr(self, "_repair_launcher_btn", None)
         if repair_btn is not None:
             needs_repair = bool(
@@ -3566,12 +3615,39 @@ class WaveLinuxWindow(QMainWindow):
         root_dir = getattr(diagnostics, "root_dir", None)
         return str(root_dir) if root_dir else os.path.expanduser("~/.config/wavelinux/diagnostics")
 
+    def _current_runtime_mode(self):
+        return runtime_mode()
+
+    def _runtime_mode_detail(self):
+        mode = self._current_runtime_mode()
+        details = {
+            "appimage": (
+                "Running from an AppImage. Verified in-app AppImage install/update is enabled.",
+                "Download and install verified AppImages from GitHub releases.",
+            ),
+            "source": (
+                "Running from a source checkout. Verified AppImage install is available if you want a desktop-managed build.",
+                "Keep using source, or install a verified AppImage into ~/.local/bin.",
+            ),
+            "bundle": (
+                "Running from a local bundled binary. Verified AppImage install is available if you want the standard desktop-managed build.",
+                "Install a verified AppImage into ~/.local/bin, or replace this local bundle manually.",
+            ),
+            "package": (
+                "Package-managed install detected. One-click AppImage replacement is disabled for this runtime.",
+                "Update WaveLinux through your distro or package manager.",
+            ),
+        }
+        description, guidance = details.get(
+            mode.kind,
+            ("Unknown runtime mode.", "Update WaveLinux using the mechanism that installed this build."),
+        )
+        return mode, description, guidance
+
     def _running_binary_path(self, state):
         if state.running_appimage_path:
             return state.running_appimage_path
-        if getattr(sys, "frozen", False):
-            return os.path.abspath(sys.executable)
-        return resource_path("main.py")
+        return self._current_runtime_mode().running_path
 
     def _update_issue_title(self, code):
         titles = {
@@ -3694,12 +3770,19 @@ class WaveLinuxWindow(QMainWindow):
     def _collect_health_issues(self, *, preflight=None, state=None):
         preflight = preflight or startup_preflight_report()
         state = state or install_state()
+        mode = self._current_runtime_mode()
         issues = [
             self._health_issue_for_runtime_detail(detail)
             for detail in preflight.get("issue_details", [])
         ]
 
-        if state.appimage_missing:
+        expects_appimage_install = (
+            mode.kind == "appimage"
+            or state.wrapper_exists
+            or state.desktop_exists
+            or bool(state.stale_launcher_entries)
+        )
+        if expects_appimage_install and state.appimage_missing:
             detail = (
                 f"No installed AppImage was found at {state.installed_appimage_path}. "
                 "WaveLinux can still run from source or a package manager, but one-click "
