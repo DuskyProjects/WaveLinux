@@ -284,6 +284,18 @@ class UpdatesTests(unittest.TestCase):
                 desktop = handle.read()
             self.assertIn(f"Exec={result.wrapper_path}", desktop)
 
+    def test_smoke_test_appimage_uses_extract_and_run_env(self):
+        completed = SimpleNamespace(returncode=0, stderr="", stdout="2.0.5\n")
+
+        with mock.patch.object(updates.subprocess, "run", return_value=completed) as run_mock:
+            updates.smoke_test_appimage("/tmp/WaveLinux.AppImage")
+
+        self.assertEqual(run_mock.call_count, 2)
+        for call in run_mock.call_args_list:
+            env = call.kwargs.get("env")
+            self.assertIsNotNone(env)
+            self.assertEqual(env.get("APPIMAGE_EXTRACT_AND_RUN"), "1")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,8 +62,8 @@ jobs:
         run: |
           APPIMAGE="$(echo dist/*.AppImage)"
           chmod +x "$APPIMAGE"
-          "$APPIMAGE" --version
-          "$APPIMAGE" --self-test
+          APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE" --version
+          APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE" --self-test
 
       - name: Build signed release manifest
         run: |

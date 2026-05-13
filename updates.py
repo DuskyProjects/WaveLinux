@@ -308,6 +308,12 @@ def verify_file_sha256(path: str, expected_hex: str) -> None:
         )
 
 
+def _appimage_run_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+    return env
+
+
 def smoke_test_appimage(path: str) -> None:
     commands = (
         [path, "--version"],
@@ -321,6 +327,7 @@ def smoke_test_appimage(path: str) -> None:
                 text=True,
                 timeout=15,
                 check=False,
+                env=_appimage_run_env(),
             )
         except Exception as exc:
             raise UpdateError(
@@ -344,6 +351,7 @@ def _read_appimage_version(path: str) -> str:
             text=True,
             timeout=10,
             check=False,
+            env=_appimage_run_env(),
         )
     except Exception:
         return ""
