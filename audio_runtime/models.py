@@ -68,6 +68,8 @@ class RuntimeChannelView:
     is_mic: bool
     capture_target: str
     meter_source: str
+    source_volume: float = 1.0
+    source_mute: bool = False
     monitor_volume: float = 1.0
     monitor_mute: bool = False
     stream_volume: float = 1.0
@@ -80,6 +82,7 @@ class RuntimeChannelView:
 class RuntimeAppView:
     app_id: str
     app_name: str
+    icon_candidates: list[str] = field(default_factory=list)
     resolved_app_id: str = ""
     resolved_app_name: str = ""
     identity_source: str = ""
@@ -170,6 +173,12 @@ class SetSubmixState:
     volume: float
     mute: bool
     node_name: str = ""
+
+
+@dataclass
+class SetSourceVolume:
+    node_name: str
+    volume: float
 
 
 @dataclass

@@ -10,6 +10,7 @@ from audio_runtime.models import (
     RefreshNow,
     SetCardProfile,
     SetChannelFx,
+    SetSourceVolume,
     SetSubmixState,
 )
 
@@ -48,6 +49,21 @@ class RuntimeWorkerCoalesceTests(unittest.TestCase):
         self.assertEqual(collapsed[0].volume, 0.8)
         self.assertTrue(collapsed[0].mute)
         self.assertEqual(collapsed[1].mix_name, "Stream")
+
+    def test_latest_source_volume_write_wins_per_source(self):
+        worker = AudioRuntimeWorker(DummyAdapter())
+        intents = [
+            SetSourceVolume("mic", 0.4),
+            SetSourceVolume("mic", 0.8),
+            SetSourceVolume("other", 0.6),
+        ]
+
+        collapsed = worker._coalesce(intents)
+
+        self.assertEqual(len(collapsed), 2)
+        self.assertEqual(collapsed[0].node_name, "mic")
+        self.assertEqual(collapsed[0].volume, 0.8)
+        self.assertEqual(collapsed[1].node_name, "other")
 
     def test_latest_route_ensure_wins_per_channel_and_mix(self):
         worker = AudioRuntimeWorker(DummyAdapter())

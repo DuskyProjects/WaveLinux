@@ -21,6 +21,7 @@ from .models import (
     SetMixHardwareRoute,
     SetMixVolume,
     SetSelectedMic,
+    SetSourceVolume,
     SetSubmixState,
 )
 
@@ -90,6 +91,8 @@ class RuntimePlanner:
                     "vol": float(intent.volume),
                     "mute": bool(intent.mute),
                 }
+            return
+        if isinstance(intent, SetSourceVolume):
             return
         if isinstance(intent, EnsureSubmixRoute):
             chan = desired_state.channels.get(intent.node_name)
@@ -166,6 +169,11 @@ class RuntimePlanner:
                 "mix_name": intent.mix_name,
                 "volume": float(intent.volume),
                 "mute": bool(intent.mute),
+            })]
+        if isinstance(intent, SetSourceVolume):
+            return [Action("set_source_volume", {
+                "node_name": intent.node_name,
+                "volume": float(intent.volume),
             })]
         if isinstance(intent, EnsureSubmixRoute):
             return [Action("ensure_submix_route", {

@@ -31,6 +31,7 @@ from .models import (
     SetMixHardwareRoute,
     SetMixVolume,
     SetSelectedMic,
+    SetSourceVolume,
     SetSubmixState,
 )
 from .planner import RuntimePlanner
@@ -112,6 +113,8 @@ class AudioRuntimeWorker(QObject):
             return ("fx", intent.node_name)
         if isinstance(intent, SetSubmixState):
             return ("submix", str(intent.node_id), intent.mix_name)
+        if isinstance(intent, SetSourceVolume):
+            return ("source_volume", intent.node_name)
         if isinstance(intent, EnsureSubmixRoute):
             return ("ensure_submix", str(intent.node_id), intent.mix_name)
         if isinstance(intent, RemoveNodeRouting):
@@ -312,6 +315,12 @@ class AudioRuntimeController(QObject):
             volume=float(volume),
             mute=bool(mute),
             node_name=str(node_name or ""),
+        ))
+
+    def set_source_volume(self, node_name, volume):
+        self.enqueue_intent(SetSourceVolume(
+            node_name=str(node_name or ""),
+            volume=float(volume),
         ))
 
     def ensure_submix_route(self, node_id, node_name, media_class, mix_name, initial_state):

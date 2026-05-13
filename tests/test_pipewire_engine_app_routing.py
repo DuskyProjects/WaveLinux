@@ -1,7 +1,8 @@
 import unittest
+import json
 from unittest.mock import patch
 
-from pipewire_engine import PipeWireEngine
+from pipewire_engine import EngineSnapshot, PipeWireEngine
 
 
 class PipeWireEngineAppRoutingTests(unittest.TestCase):
@@ -256,6 +257,131 @@ class PipeWireEngineAppRoutingTests(unittest.TestCase):
         self.assertEqual(identity["app_name"], "Work Slack")
         self.assertEqual(identity["resolved_app_id"], "app:com.slack.slack")
         self.assertFalse(identity["override_applied"])
+
+    def test_parse_nodes_merges_client_identity_props_into_audio_src_stream(self):
+        engine = self._engine()
+        pw_dump = json.dumps([
+            {
+                "id": 176,
+                "type": "PipeWire:Interface:Client",
+                "info": {
+                    "props": {
+                        "application.name": "spotify",
+                        "application.process.binary": "spotify",
+                    }
+                },
+            },
+            {
+                "id": 234,
+                "type": "PipeWire:Interface:Node",
+                "info": {
+                    "props": {
+                        "media.class": "Stream/Output/Audio",
+                        "node.name": "audio-src",
+                        "media.name": "audio-src",
+                        "client.id": "176",
+                        "object.serial": "117034",
+                    }
+                },
+            },
+        ])
+        engine._run = lambda cmd, timeout=None: pw_dump if cmd == ["pw-dump"] else ""
+
+        nodes = engine._parse_nodes()
+
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].app_name, "spotify")
+        self.assertEqual(nodes[0].props["application.name"], "spotify")
+        self.assertEqual(nodes[0].props["application.process.binary"], "spotify")
+
+    def test_get_sink_inputs_uses_client_identity_for_audio_src_stream(self):
+        engine = self._engine()
+        pw_dump = json.dumps([
+            {
+                "id": 176,
+                "type": "PipeWire:Interface:Client",
+                "info": {
+                    "props": {
+                        "application.name": "spotify",
+                        "application.process.binary": "spotify",
+                        "application.process.id": "203984",
+                    }
+                },
+            },
+            {
+                "id": 234,
+                "type": "PipeWire:Interface:Node",
+                "info": {
+                    "props": {
+                        "media.class": "Stream/Output/Audio",
+                        "node.name": "audio-src",
+                        "media.name": "audio-src",
+                        "client.id": "176",
+                        "object.serial": "117034",
+                    }
+                },
+            },
+        ])
+        engine._run = lambda cmd, timeout=None: pw_dump if cmd == ["pw-dump"] else ""
+        nodes = engine._parse_nodes()
+        snap = EngineSnapshot(
+            sink_inputs_text=(
+                "Sink Input #117034\n"
+                "\tSink: 89634\n"
+                "\tProperties:\n"
+                "\t\tmedia.name = \"audio-src\"\n"
+                "\t\tnode.name = \"audio-src\"\n"
+                "\t\tobject.serial = \"117034\"\n"
+            ),
+            nodes=nodes,
+            sinks=[{"index": "89634", "name": "wavelinux_mix_monitor"}],
+        )
+
+        entries = engine.get_sink_inputs(snap=snap)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["app_name"], "Spotify")
+        self.assertTrue(PipeWireEngine.is_persistent_app_id(entries[0]["app_id"]))
+        self.assertIn("spotify", entries[0]["app_id"])
+        self.assertIn("spotify", entries[0]["app_icon_candidates"])
+        self.assertEqual(entries[0]["index"], "117034")
+        self.assertEqual(entries[0]["sink"], "wavelinux_mix_monitor")
+
+    def test_app_icon_candidates_prefer_canonical_wrapper_before_generic_browser_icon(self):
+        engine = self._engine()
+
+        candidates = engine._app_icon_candidates(
+            {
+                "application.icon_name": "chromium-browser",
+                "application.process.binary": "electron",
+                "application.name": "Chromium",
+            },
+            app_id="path:ferdium",
+            resolved_app_id="path:ferdium",
+            app_name="Ferdium",
+            resolved_app_name="Ferdium",
+        )
+
+        self.assertIn("ferdium", candidates)
+        self.assertIn("chromium-browser", candidates)
+        self.assertLess(candidates.index("ferdium"), candidates.index("chromium-browser"))
+
+    def test_app_icon_candidates_include_brave_desktop_alias(self):
+        engine = self._engine()
+
+        candidates = engine._app_icon_candidates(
+            {
+                "application.icon_name": "brave-browser",
+                "application.process.binary": "brave",
+                "application.name": "Brave",
+            },
+            app_id="binary:brave",
+            resolved_app_id="binary:brave",
+            app_name="Brave",
+            resolved_app_name="Brave",
+        )
+
+        self.assertIn("brave-desktop", candidates)
 
 
 if __name__ == "__main__":

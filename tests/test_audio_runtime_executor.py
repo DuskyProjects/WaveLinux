@@ -40,6 +40,7 @@ class FakeEngine:
         self.route_calls = []
         self.volume_calls = []
         self.mute_calls = []
+        self.source_volume_calls = []
         self.default_source_calls = []
         self.cleared = False
         self.submix_loopbacks = {}
@@ -64,7 +65,10 @@ class FakeEngine:
         return object()
 
     def get_hardware_inputs(self, snap=None):
-        return [AudioNode(55, "mic", "Mic", "Audio/Source")]
+        node = AudioNode(55, "mic", "Mic", "Audio/Source")
+        node.volume = 0.55
+        node.muted = False
+        return [node]
 
     def get_virtual_sinks(self, snap=None):
         return []
@@ -117,6 +121,9 @@ class FakeEngine:
 
     def set_submix_mute(self, node_id, mix_name, mute):
         self.mute_calls.append((node_id, mix_name, mute))
+
+    def set_source_volume_by_name(self, node_name, volume):
+        self.source_volume_calls.append((node_name, volume))
 
     def set_default_source(self, source_name):
         self.default_source_calls.append(source_name)
@@ -370,6 +377,47 @@ class RuntimeExecutorTests(unittest.TestCase):
         self.assertEqual(result.mic_inputs[0].monitor_volume, 0.33)
         self.assertTrue(result.mic_inputs[0].monitor_mute)
 
+    def test_execute_set_source_volume_skips_reobserve_and_updates_view_optimistically(self):
+        engine = FakeEngine()
+        executor = RuntimeExecutor(FakeAdapter(engine), DummyDiagnostics())
+        desired = DesiredState(selected_mic="mic")
+        observed = ObservedState(
+            mic_inputs=[
+                RuntimeChannelView(
+                    node_id="55",
+                    name="mic",
+                    description="Mic",
+                    media_class="Audio/Source",
+                    label="Mic",
+                    channel_type="Microphone",
+                    icon="mic",
+                    is_mic=True,
+                    capture_target="mic",
+                    meter_source="mic",
+                    source_volume=0.55,
+                )
+            ],
+            present_node_names={"mic"},
+        )
+
+        def fail_observe(_desired):
+            raise AssertionError("observe should not run for optimistic source writes")
+
+        executor.observe = fail_observe
+
+        result = executor.execute(
+            [Action("set_source_volume", {
+                "node_name": "mic",
+                "volume": 0.8,
+            })],
+            desired_state=desired,
+            observed_state=observed,
+        )
+
+        self.assertIs(result, observed)
+        self.assertEqual(result.mic_inputs[0].source_volume, 0.8)
+        self.assertEqual(engine.source_volume_calls, [("mic", 0.8)])
+
     def test_observe_uses_fx_source_for_meter_when_effects_are_active(self):
         executor = RuntimeExecutor(FakeAdapter(FakeEngine()), DummyDiagnostics())
         desired = self._desired()
@@ -378,6 +426,7 @@ class RuntimeExecutorTests(unittest.TestCase):
 
         self.assertEqual(len(observed.mic_inputs), 1)
         self.assertEqual(observed.mic_inputs[0].meter_source, "wavelinux.fx.mic.source")
+        self.assertEqual(observed.mic_inputs[0].source_volume, 0.55)
 
     def test_check_invariants_reports_missing_submix_route(self):
         desired = DesiredState(selected_mic="mic")

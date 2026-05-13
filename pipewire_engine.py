@@ -51,20 +51,23 @@ class EngineSnapshot:
     """Per-refresh cache for expensive pactl/pw-dump reads."""
 
     __slots__ = ("modules_text", "short_modules_text", "sink_inputs_text",
-                 "sinks_text", "nodes", "sinks", "_loopback_index",
-                 "_sink_state_by_name", "_sink_descriptions")
+                 "sinks_text", "sources_text", "nodes", "sinks", "_loopback_index",
+                 "_sink_state_by_name", "_sink_descriptions", "_source_state_by_name")
 
     def __init__(self, modules_text="", short_modules_text="",
-                 sink_inputs_text="", sinks_text="", nodes=None, sinks=None):
+                 sink_inputs_text="", sinks_text="", sources_text="",
+                 nodes=None, sinks=None):
         self.modules_text = modules_text or ""
         self.short_modules_text = short_modules_text or ""
         self.sink_inputs_text = sink_inputs_text or ""
         self.sinks_text = sinks_text or ""
+        self.sources_text = sources_text or ""
         self.nodes = nodes or []
         self.sinks = sinks or []
         self._loopback_index = None
         self._sink_state_by_name = None
         self._sink_descriptions = None
+        self._source_state_by_name = None
 
 
 class PipeWireEngine:
@@ -340,6 +343,13 @@ class PipeWireEngine:
         on first launch to pre-populate the master "Microphone Input"
         combo with the same mic the rest of the user's apps default to."""
         return self._run(['pactl', 'get-default-source'])
+
+    def set_default_sink(self, sink_name):
+        """Set the system default playback sink. Returns True on success."""
+        if not sink_name:
+            return False
+        resolved = self.resolve_hardware_sink_name(sink_name) or sink_name
+        return self._run(['pactl', 'set-default-sink', resolved]) is not None
 
     def set_default_source(self, source_name):
         """Set the system default capture source. Apps that follow the
@@ -687,6 +697,7 @@ class PipeWireEngine:
             short_modules_text=self._run(['pactl', 'list', 'short', 'modules']) or "",
             sink_inputs_text=self._run(['pactl', 'list', 'sink-inputs']) or "",
             sinks_text=self._run(['pactl', 'list', 'sinks']) or "",
+            sources_text=self._run(['pactl', 'list', 'sources']) or "",
             nodes=self._parse_nodes(),
             sinks=self._parse_short_sinks(),
         )
@@ -758,6 +769,36 @@ class PipeWireEngine:
             state[curr_name] = (curr_vol, curr_mute)
         return state
 
+    @staticmethod
+    def _parse_sources_state(text):
+        """Parse `pactl list sources` into {source_name: (volume 0..1.0, muted)}."""
+        state = {}
+        curr_name = None
+        curr_vol = None
+        curr_mute = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('Source #'):
+                if curr_name is not None and curr_vol is not None:
+                    state[curr_name] = (curr_vol, curr_mute)
+                curr_name = None
+                curr_vol = None
+                curr_mute = False
+            elif stripped.startswith('Name:'):
+                curr_name = stripped.split(':', 1)[1].strip()
+            elif stripped.startswith('Mute:'):
+                curr_mute = stripped.split(':', 1)[1].strip().lower() == 'yes'
+            elif stripped.startswith('Volume:') and curr_vol is None:
+                m = re.search(r'/\s*(\d+)%', stripped)
+                if m:
+                    try:
+                        curr_vol = int(m.group(1)) / 100.0
+                    except ValueError:
+                        pass
+        if curr_name is not None and curr_vol is not None:
+            state[curr_name] = (curr_vol, curr_mute)
+        return state
+
     def _parse_nodes(self):
         raw = self._run(['pw-dump'], timeout=4)
         if not raw:
@@ -770,11 +811,26 @@ class PipeWireEngine:
         except json.JSONDecodeError:
             logging.warning("pw-dump output was not valid JSON; node graph empty for this tick")
             return []
+        client_props_by_id = {}
+        for obj in data:
+            if obj.get('type') != 'PipeWire:Interface:Client':
+                continue
+            props = obj.get('info', {}).get('props', {}) or {}
+            client_id = obj.get('id')
+            if client_id is None:
+                continue
+            client_props_by_id[str(client_id)] = dict(props)
         nodes = []
         for obj in data:
             if obj.get('type') != 'PipeWire:Interface:Node':
                 continue
-            props = obj.get('info', {}).get('props', {})
+            props = dict(obj.get('info', {}).get('props', {}) or {})
+            client_id = props.get('client.id')
+            client_props = client_props_by_id.get(str(client_id or ""))
+            if client_props:
+                for key, value in client_props.items():
+                    if value and not props.get(key):
+                        props[key] = value
             mc = props.get('media.class', '')
             if not mc.startswith(('Audio/', 'Stream/')):
                 continue
@@ -895,8 +951,15 @@ class PipeWireEngine:
         # virtual nodes spawned by `pipewire -c`). Both must be hidden
         # from device pickers, otherwise the FX chain's own input/output
         # surfaces in the mic / output dropdowns.
-        return (name.startswith('wavelinux_')
-                or name.startswith('wavelinux.'))
+        raw = str(name or "").strip().lower()
+        return raw.startswith((
+            "wavelinux_",
+            "wavelinux.",
+            "output.wavelinux_",
+            "output.wavelinux.",
+            "input.wavelinux_",
+            "input.wavelinux.",
+        ))
 
     def get_hardware_outputs(self, snap=None):
         return [n for n in self.get_all_nodes(snap)
@@ -935,10 +998,17 @@ class PipeWireEngine:
         return None
 
     def get_hardware_inputs(self, snap=None):
-        return [n for n in self.get_all_nodes(snap)
-                if n.media_class == 'Audio/Source'
-                and 'rnnoise' not in n.name.lower()
-                and not self._is_internal_node_name(n.name)]
+        nodes = []
+        for node in self.get_all_nodes(snap):
+            if node.media_class != 'Audio/Source':
+                continue
+            if 'rnnoise' in node.name.lower():
+                continue
+            if self._is_internal_node_name(node.name):
+                continue
+            node.volume, node.muted = self.get_source_volume_by_name(node.name, snap=snap)
+            nodes.append(node)
+        return nodes
 
     def get_virtual_sinks(self, snap=None):
         """User-created WaveLinux channels only (no internal mix/source sinks)."""
@@ -981,6 +1051,34 @@ class PipeWireEngine:
         """wpctl expects numeric IDs; pactl addresses sinks by name."""
         pct = max(0, min(int(round(self._clamp(volume) * 100)), 100))
         self._run(['pactl', 'set-sink-volume', sink_name, f'{pct}%'])
+
+    def set_source_volume_by_name(self, source_name, volume):
+        resolved = self.resolve_source_name(source_name) or source_name
+        pct = max(0, min(int(round(self._clamp(volume) * 100)), 100))
+        self._run(['pactl', 'set-source-volume', resolved, f'{pct}%'])
+
+    def get_source_volume_by_name(self, source_name, snap=None):
+        wanted = self._source_name_aliases(source_name)
+        if not wanted:
+            return 1.0, False
+        if snap is not None:
+            if snap._source_state_by_name is None:
+                snap._source_state_by_name = self._parse_sources_state(snap.sources_text)
+            for candidate in wanted:
+                hit = snap._source_state_by_name.get(candidate)
+                if hit is not None:
+                    return self._clamp(hit[0]), bool(hit[1])
+            return 1.0, False
+
+        out = self._run(['pactl', 'list', 'sources'])
+        if not out:
+            return 1.0, False
+        state = self._parse_sources_state(out)
+        for candidate in wanted:
+            hit = state.get(candidate)
+            if hit is not None:
+                return self._clamp(hit[0]), bool(hit[1])
+        return 1.0, False
 
     def get_sink_volume_by_name(self, sink_name, snap=None):
         if snap is not None:
@@ -1590,9 +1688,84 @@ class PipeWireEngine:
             return resolved_sink
         return None
 
+    def _preferred_hardware_sink_fallback(self, snap=None):
+        current_default = str(self.get_default_sink() or "").strip()
+        resolved_default = self.resolve_hardware_sink_name(current_default, snap=snap)
+        if resolved_default and not self._is_internal_node_name(resolved_default):
+            return resolved_default
+        for mix_name in ("Monitor", "Stream"):
+            mix = self.output_mixes.get(mix_name)
+            candidate = getattr(mix, "hardware_output", None)
+            resolved = self.resolve_hardware_sink_name(candidate, snap=snap)
+            if resolved and not self._is_internal_node_name(resolved):
+                return resolved
+        for node in self.get_hardware_outputs(snap=snap):
+            name = str(getattr(node, "name", "") or "").strip()
+            if name:
+                return name
+        return None
+
+    def _preferred_hardware_source_fallback(self, snap=None):
+        current_default = str(self.get_default_source() or "").strip()
+        resolved_default = self.resolve_source_name(current_default) or current_default
+        if resolved_default and not self._is_internal_node_name(resolved_default):
+            return resolved_default
+        for info in getattr(self, "channel_fx", {}).values():
+            for candidate in (info.get("prev_default"), info.get("capture_target")):
+                resolved = self.resolve_source_name(candidate) or str(candidate or "").strip()
+                if resolved and not self._is_internal_node_name(resolved):
+                    return resolved
+        for node in self.get_hardware_inputs(snap=snap):
+            name = str(getattr(node, "name", "") or "").strip()
+            if name:
+                return name
+        return None
+
+    def _move_app_streams_off_managed_sinks(self, fallback_sink, snap=None):
+        fallback_sink = self.resolve_hardware_sink_name(fallback_sink, snap=snap) or fallback_sink
+        fallback_sink = str(fallback_sink or "").strip()
+        if not fallback_sink or self._is_internal_node_name(fallback_sink):
+            return []
+        moved = []
+        for app in self.get_sink_inputs(snap=snap):
+            sink_name = str(app.get("sink") or "").strip()
+            sink_input_index = str(app.get("index") or "").strip()
+            if not sink_input_index or not sink_name.startswith("wavelinux_"):
+                continue
+            self.move_app_to_sink(sink_input_index, fallback_sink)
+            moved.append((sink_input_index, sink_name, fallback_sink))
+        return moved
+
+    def _restore_physical_defaults_before_reset(self, snap=None):
+        fallback_sink = self._preferred_hardware_sink_fallback(snap=snap)
+        moved = self._move_app_streams_off_managed_sinks(fallback_sink, snap=snap)
+        if moved:
+            logging.info(
+                "Moved %d app streams off managed WaveLinux sinks before reset",
+                len(moved),
+            )
+
+        current_default_sink = str(self.get_default_sink() or "").strip()
+        if current_default_sink and self._is_internal_node_name(current_default_sink) and fallback_sink:
+            self.set_default_sink(fallback_sink)
+
+        current_default_source = str(self.get_default_source() or "").strip()
+        fallback_source = self._preferred_hardware_source_fallback(snap=snap)
+        if current_default_source and self._is_internal_node_name(current_default_source) and fallback_source:
+            self.set_default_source(fallback_source)
+
     def full_audio_reset(self):
         """Emergency cleanup of ALL wavelinux modules."""
         logging.info("Performing full audio reset...")
+        snap = None
+        try:
+            snap = self.create_snapshot(force=True)
+        except Exception:
+            snap = None
+        try:
+            self._restore_physical_defaults_before_reset(snap=snap)
+        except Exception as exc:
+            logging.warning(f"Pre-reset endpoint restore failed: {exc}")
         out = self._run(['pactl', 'list', 'short', 'modules'], timeout=5)
         if out:
             # First unload loopbacks to avoid dependency issues
@@ -1624,8 +1797,10 @@ class PipeWireEngine:
         raw k=v properties plus special keys '_index' (pactl sink-input
         index string) and '_sink_id' (Sink: line value).
 
-        by_node_id is keyed by the PipeWire node.id string so it can be
-        cross-referenced against pw-dump AudioNode.pw_id values.
+        by_node_id is keyed by any sink-input reference pactl exposes
+        (`node.id`, `object.serial`, or the sink-input index itself) so
+        it can be cross-referenced against pw-dump AudioNode values even
+        when pactl omits `node.id` for native PipeWire clients.
         by_index is keyed by the pactl sink-input index string.
         """
         by_node_id = {}
@@ -1639,8 +1814,13 @@ class PipeWireEngine:
             entry = dict(current)
             entry['_index'] = current_index
             by_index[current_index] = entry
-            node_id = current.get('node.id') or current_index
-            by_node_id[str(node_id)] = entry
+            for ref in (
+                current.get('node.id'),
+                current.get('object.serial'),
+                current_index,
+            ):
+                if ref is not None and str(ref).strip():
+                    by_node_id[str(ref).strip()] = entry
 
         for line in text.splitlines():
             stripped = line.strip()
@@ -1679,7 +1859,7 @@ class PipeWireEngine:
         by_node_id, by_index = self._parse_pactl_si_map(si_text)
 
         entries = []
-        seen_pw_ids = set()
+        seen_pactl_refs = set()
 
         # Primary path: pw-dump Stream/Output/Audio nodes give reliable
         # discovery even for native PipeWire clients that may not surface
@@ -1689,15 +1869,24 @@ class PipeWireEngine:
         # property set it needs for name resolution.
         stream_nodes = self.get_app_streams(snap=snap)
         for node in stream_nodes:
-            pw_id_str = str(node.pw_id)
-            seen_pw_ids.add(pw_id_str)
-
             # Merge: pw-dump JSON is authoritative for identity props
             # (application.name, node.description, pid, …). pactl text adds
             # pactl-only fields (sink index, sink id) and fills in any prop
             # that pw-dump didn't carry — but must NOT overwrite a good
             # pw-dump value with a blank/wrong one from the text parser.
-            pactl = by_node_id.get(pw_id_str, {})
+            pactl = {}
+            for ref in (
+                node.props.get('node.id'),
+                node.props.get('object.id'),
+                node.props.get('object.serial'),
+                node.pw_id,
+            ):
+                if ref is None:
+                    continue
+                pactl = by_node_id.get(str(ref), {})
+                if pactl:
+                    seen_pactl_refs.add(str(ref))
+                    break
             current = dict(node.props)          # pw-dump JSON props (authoritative)
             for k, v in pactl.items():
                 if k in ('_index', '_sink_id'):
@@ -1734,7 +1923,7 @@ class PipeWireEngine:
         # (e.g. PulseAudio-compat streams on some PipeWire builds, or
         # entries that appeared between pw-dump and pactl calls).
         for node_id_str, pactl in by_node_id.items():
-            if node_id_str in seen_pw_ids:
+            if node_id_str in seen_pactl_refs:
                 continue
             current = {k: v for k, v in pactl.items()
                        if k not in ('_index', '_sink_id')}
@@ -2225,6 +2414,48 @@ class PipeWireEngine:
         "obs-studio": "OBS Studio",
         "zoom": "Zoom",
     }
+    _BINARY_ICON_NAMES = {
+        # Browsers / wrappers
+        "brave": "brave-desktop",
+        "brave-browser": "brave-desktop",
+        "brave-browser-stable": "brave-desktop",
+        "brave-browser-beta": "brave-browser-beta",
+        "brave-browser-nightly": "brave-browser-nightly",
+        "brave-browser-origin": "brave-browser-origin",
+        "brave-origin": "brave-browser-origin",
+        "google-chrome": "google-chrome",
+        "google-chrome-stable": "google-chrome",
+        "google-chrome-beta": "google-chrome-beta",
+        "google-chrome-unstable": "google-chrome-unstable",
+        "chromium": "chromium",
+        "chromium-browser": "chromium-browser",
+        "firefox": "firefox",
+        "firefox-esr": "firefox-esr",
+        "firefox-developer-edition": "firefox-developer-edition",
+        "librewolf": "librewolf",
+        "ferdium": "ferdium",
+        "ferdi": "ferdi",
+        "hamsket": "hamsket",
+        # Media
+        "spotify": "spotify",
+        "vlc": "vlc",
+        "mpv": "mpv",
+        "rhythmbox": "rhythmbox",
+        "clementine": "clementine",
+        "strawberry": "strawberry",
+        "elisa": "elisa",
+        # Communication
+        "discord": "discord",
+        "vesktop": "vesktop",
+        "webcord": "webcord",
+        "signal-desktop": "signal-desktop",
+        "telegram-desktop": "telegram-desktop",
+        "slack": "slack",
+        # Streaming / video
+        "obs": "obs",
+        "obs-studio": "obs-studio",
+        "zoom": "Zoom",
+    }
 
     _MULTIPROCESS_CHILD_BINARIES = {
         "chrome",
@@ -2268,6 +2499,83 @@ class PipeWireEngine:
         if value is None:
             return ""
         return re.sub(r'[^a-z0-9._:+-]+', '-', str(value).strip().lower()).strip('-')
+
+    @classmethod
+    def _append_icon_candidate(cls, out, seen, value):
+        token = str(value or "").strip()
+        if not token:
+            return
+
+        def add(candidate):
+            candidate = str(candidate or "").strip()
+            if not candidate or candidate in seen:
+                return
+            seen.add(candidate)
+            out.append(candidate)
+
+        add(token)
+        low = token.lower()
+        add(low)
+        mapped = cls._BINARY_ICON_NAMES.get(low)
+        if mapped:
+            add(mapped)
+        normalized = re.sub(r'[^a-z0-9.+-]+', '-', low).strip('-')
+        if normalized:
+            add(normalized)
+            dotted = normalized.replace('.', '-')
+            if dotted != normalized:
+                add(dotted)
+            parts = [part for part in re.split(r'[._-]+', normalized) if part]
+            if parts:
+                add(parts[-1])
+            if len(parts) >= 2:
+                add(f"{parts[-2]}-{parts[-1]}")
+            if len(parts) >= 3:
+                add(f"{parts[-3]}-{parts[-2]}-{parts[-1]}")
+
+    @classmethod
+    def theme_icon_candidates_for_app_id(cls, app_id, fallback_name=None):
+        candidates = []
+        seen = set()
+        raw = str(app_id or "").strip()
+        if raw:
+            cls._append_icon_candidate(candidates, seen, raw)
+            if ":" in raw:
+                _, raw_token = raw.split(":", 1)
+                cls._append_icon_candidate(candidates, seen, raw_token)
+        if fallback_name:
+            cls._append_icon_candidate(candidates, seen, fallback_name)
+        return candidates
+
+    def _app_icon_candidates(self, current, *, app_id="", resolved_app_id="",
+                             app_name="", resolved_app_name=""):
+        candidates = []
+        seen = set()
+        for extra in (
+            app_id,
+            resolved_app_id,
+            app_name,
+            resolved_app_name,
+        ):
+            for candidate in self.theme_icon_candidates_for_app_id(extra):
+                if candidate not in seen:
+                    seen.add(candidate)
+                    candidates.append(candidate)
+        for key in (
+            "application.icon_name",
+            "application.id",
+            "pipewire.access.portal.app_id",
+            "xdg.portal.app_id",
+            "window.app_id",
+            "window.x11.wm_class",
+            "window.x11.instance",
+            "window.class",
+            "application.process.binary",
+            "binary",
+            "application.name",
+        ):
+            self._append_icon_candidate(candidates, seen, current.get(key))
+        return candidates
 
     @classmethod
     def _make_app_route_key(cls, prefix, value):
@@ -3200,6 +3508,13 @@ class PipeWireEngine:
         current['resolved_app_name'] = identity.get("resolved_app_name") or current['app_name']
         current['app_identity_source'] = identity.get("source", "")
         current['app_identity_override_applied'] = bool(identity.get("override_applied"))
+        current['app_icon_candidates'] = self._app_icon_candidates(
+            current,
+            app_id=current['app_id'],
+            resolved_app_id=current['resolved_app_id'],
+            app_name=current['app_name'],
+            resolved_app_name=current['resolved_app_name'],
+        )
         current['_is_system_sound'] = current['app_id'] == self.SYSTEM_SOUNDS_BUCKET
         entries.append(current)
 

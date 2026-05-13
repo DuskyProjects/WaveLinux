@@ -1049,6 +1049,7 @@ class ChannelStrip(QFrame):
         super().__init__(parent)
         self.setObjectName("channelStrip")
         self.setFixedWidth(self._MAX_W)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.node_id = node_id          # PipeWire numeric id (ephemeral)
         self.node_name = node_name      # PipeWire node.name (stable across restarts)
         self.ch_name = name
@@ -1073,11 +1074,18 @@ class ChannelStrip(QFrame):
         self._str_commit_timer.setSingleShot(True)
         self._str_commit_timer.setInterval(40)
         self._str_commit_timer.timeout.connect(self._commit_str_vol)
+        self._src_commit_timer = QTimer(self)
+        self._src_commit_timer.setSingleShot(True)
+        self._src_commit_timer.setInterval(40)
+        self._src_commit_timer.timeout.connect(self._commit_src_vol)
         # Pending values held until the timer fires.
         self._pending_mon_vol = None
         self._pending_str_vol = None
+        self._pending_src_vol = None
+        self._src_muted = False
 
         layout = QVBoxLayout(self)
+        self._root_layout = layout
         layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(4)
@@ -1107,12 +1115,12 @@ class ChannelStrip(QFrame):
         self.customContextMenuRequested.connect(self._show_context_menu)
 
         # Name (click to rename for virtual channels; mics keep their alsa name).
-        name_lbl = QLabel(name)
-        name_lbl.setObjectName("channelName")
-        name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        name_lbl.setWordWrap(True)
-        name_lbl.setMinimumHeight(24)  # allow 2 lines
-        layout.addWidget(name_lbl)
+        self.name_lbl = QLabel(name)
+        self.name_lbl.setObjectName("channelName")
+        self.name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.name_lbl.setWordWrap(True)
+        self.name_lbl.setMinimumHeight(24)  # allow 2 lines
+        layout.addWidget(self.name_lbl)
 
         layout.addSpacing(4)
 
@@ -1125,6 +1133,31 @@ class ChannelStrip(QFrame):
         self.peak_bar.setFixedHeight(5)
         self.peak_bar.setValue(0)
         layout.addWidget(self.peak_bar)
+
+        self.src_slider = None
+        self.src_vol_lbl = None
+        if self.is_mic:
+            src_box = QVBoxLayout()
+            src_box.setContentsMargins(0, 2, 0, 2)
+            src_box.setSpacing(2)
+            src_head = QHBoxLayout()
+            src_head.setContentsMargins(0, 0, 0, 0)
+            src_label = QLabel("MIC")
+            src_label.setObjectName("mixTagMic")
+            src_head.addWidget(src_label)
+            src_head.addStretch()
+            self.src_vol_lbl = QLabel("100%")
+            self.src_vol_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            self.src_vol_lbl.setObjectName("volumeLabel")
+            src_head.addWidget(self.src_vol_lbl)
+            src_box.addLayout(src_head)
+            self.src_slider = QSlider(Qt.Orientation.Horizontal)
+            self.src_slider.setRange(0, 100)
+            self.src_slider.setValue(100)
+            self.src_slider.setToolTip("Hardware mic gain")
+            self.src_slider.valueChanged.connect(self._on_src_vol)
+            src_box.addWidget(self.src_slider)
+            layout.addLayout(src_box)
 
         # Link button: when on, the two mix faders move together.
         link_row = QHBoxLayout()
@@ -1200,21 +1233,46 @@ class ChannelStrip(QFrame):
         self.fx_btn.setVisible(False)
 
     _MIN_W = 120
-    _MAX_W = 180
+    _MAX_W = 280
     _MIN_SLIDER_H = 80
-    _MAX_SLIDER_H = 140
+    _MAX_SLIDER_H = 200
+    _VERT_SLIDER_END_PAD = 12
+    _STRIP_HEIGHT_PAD = 12
+    _WIDTH_SCALE_CAP = 180
 
-    def apply_scale(self, width: int, slider_h: int):
-        """Resize this strip to `width` px and set slider minimum height."""
+    def apply_scale(self, width: int, slider_h: int, *, target_height: int | None = None):
+        """Resize this strip to `width` px and return the desired card height."""
         self.setFixedWidth(width)
-        t = (width - self._MIN_W) / (self._MAX_W - self._MIN_W)
-        t = max(0.0, min(1.0, t))
-        margin = max(4, int(4 + t * 4))
-        self.layout().setContentsMargins(margin, margin, margin, margin)
+        width_t = (width - self._MIN_W) / (self._MAX_W - self._MIN_W)
+        width_t = max(0.0, min(1.0, width_t))
+        control_width_t = (
+            (min(width, self._WIDTH_SCALE_CAP) - self._MIN_W)
+            / (self._WIDTH_SCALE_CAP - self._MIN_W)
+        )
+        control_width_t = max(0.0, min(1.0, control_width_t))
+        height_t = (slider_h - self._MIN_SLIDER_H) / (self._MAX_SLIDER_H - self._MIN_SLIDER_H)
+        height_t = max(0.0, min(1.0, height_t))
+        t = min(control_width_t, height_t)
+        margin = max(3, int(3 + t * 5))
+        self._root_layout.setContentsMargins(margin, margin, margin, margin)
+        self._root_layout.setSpacing(max(2, int(2 + t * 4)))
         spacing = max(6, int(6 + t * 4))
         self._faders_row.setSpacing(spacing)
-        self.mon_slider.setMinimumHeight(slider_h)
-        self.str_slider.setMinimumHeight(slider_h)
+        slider_widget_h = slider_h + self._VERT_SLIDER_END_PAD
+        self.mon_slider.setFixedHeight(slider_widget_h)
+        self.str_slider.setFixedHeight(slider_widget_h)
+        self.name_lbl.setFixedHeight(24)
+        peak_h = max(4, int(4 + t * 2))
+        self.peak_bar.setFixedHeight(peak_h)
+        link_size = max(20, int(20 + t * 4))
+        self.link_btn.setFixedSize(link_size, link_size)
+        mute_size = max(24, int(24 + t * 4))
+        self.mon_mute.setFixedSize(mute_size, mute_size)
+        self.str_mute.setFixedSize(mute_size, mute_size)
+        self._root_layout.activate()
+        desired_h = self._root_layout.sizeHint().height() + self._STRIP_HEIGHT_PAD
+        self.setFixedHeight(target_height if target_height is not None else desired_h)
+        return desired_h
 
     def _stash_submix(self, mix_name, vol, mute):
         win = self._main_window()
@@ -1245,6 +1303,12 @@ class ChannelStrip(QFrame):
         self._mon_commit_timer.start()
         if self.link_btn.isChecked() and self.str_slider.value() != value:
             self.str_slider.setValue(value)
+
+    def _on_src_vol(self, value):
+        if self.src_vol_lbl is not None:
+            self.src_vol_lbl.setText(f"{value}%")
+        self._pending_src_vol = value
+        self._src_commit_timer.start()
 
     def _on_str_vol(self, value):
         self.str_vol_lbl.setText(f"{value}%")
@@ -1289,6 +1353,17 @@ class ChannelStrip(QFrame):
             node_name=self.node_name,
         )
         self._stash_submix("Stream", v / 100.0, self._str_muted)
+
+    def _commit_src_vol(self):
+        v = self._pending_src_vol
+        self._pending_src_vol = None
+        if v is None or not self.node_name:
+            return
+        win = self._main_window()
+        runtime = getattr(win, "runtime", None)
+        if runtime is None or not hasattr(runtime, "set_source_volume"):
+            return
+        runtime.set_source_volume(self.node_name, v / 100.0)
 
     def _apply_mute_style(self, btn, muted):
         if btn == self.mon_mute:
@@ -1505,18 +1580,29 @@ class ChannelStrip(QFrame):
         """Receive a 0..1 peak from the MeterWorker and drive the bar."""
         self.peak_bar.setValue(int(max(0.0, min(peak_01, 1.0)) * 1000))
 
-    def update_from_node(self, mon_vol, mon_mute, str_vol, str_mute, is_hidden):
+    def update_from_node(self, mon_vol, mon_mute, str_vol, str_mute, is_hidden,
+                         source_vol=1.0, source_mute=False):
         """Update strip UI from stored state. `is_hidden` is informational;
         the parent window controls visibility, not this widget."""
         self._mon_muted = mon_mute
         self._str_muted = str_mute
+        self._src_muted = bool(source_mute)
         mon_pct = int(mon_vol * 100)
         str_pct = int(str_vol * 100)
+        src_pct = int(source_vol * 100)
         win = self._main_window()
         is_linked = False
         if hasattr(win, 'submix_state') and self.node_name:
             is_linked = bool(win.submix_state.get(f"{self.node_name}_linked", False))
-        state = (mon_pct, bool(mon_mute), str_pct, bool(str_mute), bool(is_linked))
+        state = (
+            mon_pct,
+            bool(mon_mute),
+            str_pct,
+            bool(str_mute),
+            bool(is_linked),
+            src_pct if self.is_mic else None,
+            bool(source_mute) if self.is_mic else None,
+        )
         if state == self._last_rendered_state:
             return
 
@@ -1528,6 +1614,10 @@ class ChannelStrip(QFrame):
             self.str_slider.blockSignals(True)
             self.str_slider.setValue(str_pct)
             self.str_slider.blockSignals(False)
+        if self.src_slider is not None and self.src_slider.value() != src_pct:
+            self.src_slider.blockSignals(True)
+            self.src_slider.setValue(src_pct)
+            self.src_slider.blockSignals(False)
 
         if self.link_btn.isChecked() != is_linked:
             self.link_btn.blockSignals(True)
@@ -1540,6 +1630,16 @@ class ChannelStrip(QFrame):
         str_text = f"{str_pct}%"
         if self.str_vol_lbl.text() != str_text:
             self.str_vol_lbl.setText(str_text)
+        if self.src_vol_lbl is not None:
+            src_text = f"{src_pct}%"
+            if self.src_vol_lbl.text() != src_text:
+                self.src_vol_lbl.setText(src_text)
+        if self.src_slider is not None:
+            tip = "Hardware mic gain"
+            if source_mute:
+                tip += " (currently muted at the source)"
+            if self.src_slider.toolTip() != tip:
+                self.src_slider.setToolTip(tip)
 
         self._apply_mute_style(self.mon_mute, mon_mute)
         self._apply_mute_style(self.str_mute, str_mute)
@@ -1549,6 +1649,17 @@ class ChannelStrip(QFrame):
 # ── App Routing Row ────────────────────────────────────────────────
 class AppRoutingRow(QWidget):
     """A row showing an app name and a dropdown to choose which sink it goes to."""
+
+    _GENERIC_APP_ICON_CANDIDATES = [
+        "audio-x-generic",
+        "multimedia-player",
+        "applications-multimedia",
+    ]
+    _SYSTEM_ICON_CANDIDATES = [
+        "preferences-system-sound",
+        "audio-volume-high",
+        "audio-card",
+    ]
 
     def __init__(self, app_id, display_name, engine, sinks, main_win=None, parent=None):
         super().__init__(parent)
@@ -1572,7 +1683,7 @@ class AppRoutingRow(QWidget):
 
         self.icon_lbl = QLabel("🎵")
         self.icon_lbl.setObjectName("channelIcon")
-        self.icon_lbl.setFixedWidth(28)
+        self.icon_lbl.setFixedSize(28, 24)
         self.icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.icon_lbl)
         
@@ -1626,6 +1737,29 @@ class AppRoutingRow(QWidget):
         self._app_commit_timer.timeout.connect(self._commit_app_vol)
 
         self.update_state(display_name, [], sinks, None)
+
+    def _set_icon_candidates(self, icon_candidates, *, is_system):
+        ordered = []
+        seen = set()
+        for candidate in list(icon_candidates or []) + (
+            self._SYSTEM_ICON_CANDIDATES if is_system else self._GENERIC_APP_ICON_CANDIDATES
+        ):
+            key = str(candidate or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(key)
+        for candidate in ordered:
+            icon = QIcon.fromTheme(candidate)
+            if icon.isNull():
+                continue
+            self.icon_lbl.clear()
+            self.icon_lbl.setPixmap(icon.pixmap(20, 20))
+            self.icon_lbl.setToolTip(candidate)
+            return
+        self.icon_lbl.clear()
+        self.icon_lbl.setText("🔔" if is_system else "🎵")
+        self.icon_lbl.setToolTip("")
 
     def _on_vol_change(self, value):
         self._pending_app_vol = value
@@ -1713,7 +1847,8 @@ class AppRoutingRow(QWidget):
                      current_volume=None, saved_volume=None,
                      resolved_app_id=None, resolved_app_name=None,
                      identity_source="", override_applied=False,
-                     manual_override_active=False, reset_source_app_id=""):
+                     manual_override_active=False, reset_source_app_id="",
+                     icon_candidates=None):
         self.app_name = display_name or self.app_name
         self._active_indices = active_indices
         self.resolved_app_id = str(resolved_app_id or self.app_id)
@@ -1725,8 +1860,18 @@ class AppRoutingRow(QWidget):
         is_active = len(active_indices) > 0
         is_system = (self.app_id == PipeWireEngine.SYSTEM_SOUNDS_BUCKET)
 
-        if is_system:
-            self.icon_lbl.setText("🔔")
+        derived_icon_candidates = list(icon_candidates or [])
+        for app_token, app_label in (
+            (self.app_id, self.app_name),
+            (self.resolved_app_id, self.resolved_app_name),
+        ):
+            for candidate in PipeWireEngine.theme_icon_candidates_for_app_id(
+                app_token,
+                fallback_name=app_label,
+            ):
+                if candidate not in derived_icon_candidates:
+                    derived_icon_candidates.append(candidate)
+        self._set_icon_candidates(derived_icon_candidates, is_system=is_system)
         label_text = (
             f"{self.app_name} (Idle)" if (is_system and not is_active)
             else f"{self.app_name} (Offline)" if not is_active
@@ -1988,7 +2133,9 @@ class WaveLinuxWindow(QMainWindow):
         # Backstop poll. `pactl subscribe` drives most refreshes; this
         # only fires when an event was missed.
         self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self._refresh)
+        self.refresh_timer.timeout.connect(
+            lambda: self._request_runtime_refresh("periodic-refresh")
+        )
 
         # Coalesce rapid save requests (slider drags).
         self._save_timer = QTimer(self)
@@ -2000,7 +2147,15 @@ class WaveLinuxWindow(QMainWindow):
         self._event_refresh_timer = QTimer(self)
         self._event_refresh_timer.setSingleShot(True)
         self._event_refresh_timer.setInterval(150)
-        self._event_refresh_timer.timeout.connect(self._refresh)
+        self._event_refresh_timer.timeout.connect(
+            lambda: self._request_runtime_refresh("pactl-event")
+        )
+        self._hotplug_refresh_timer = QTimer(self)
+        self._hotplug_refresh_timer.setSingleShot(True)
+        self._hotplug_refresh_timer.setInterval(1800)
+        self._hotplug_refresh_timer.timeout.connect(
+            lambda: self._request_runtime_refresh("hotplug-settle")
+        )
 
         self._setup_ui()
         self._run_startup_preflight()
@@ -2051,6 +2206,11 @@ class WaveLinuxWindow(QMainWindow):
         if self._any_slider_dragging():
             return
         self._refresh_runtime_view()
+
+    def _request_runtime_refresh(self, reason=""):
+        runtime = getattr(self, "runtime", None)
+        if runtime is not None and hasattr(runtime, "refresh_now"):
+            runtime.refresh_now(reason or "runtime-refresh")
 
     def _on_runtime_fx_status(self, status):
         node_name = getattr(status, "node_name", "")
@@ -5210,11 +5370,9 @@ class WaveLinuxWindow(QMainWindow):
             payload = ""
         if payload and not self._should_refresh_for_pactl_event(payload):
             return
-        hidden_to_tray = self.tray is not None and not self.isVisible()
-        settings_open  = self._settings_dialog_visible()
-        if hidden_to_tray and not settings_open:
-            return
         self._event_refresh_timer.start()
+        if payload and self._should_schedule_settle_refresh_for_pactl_event(payload):
+            self._hotplug_refresh_timer.start()
 
     def _on_event_proc_error(self, err):
         if self._shutting_down:
@@ -5240,6 +5398,21 @@ class WaveLinuxWindow(QMainWindow):
             if target in refresh_targets:
                 return True
         return not saw_any
+
+    @staticmethod
+    def _should_schedule_settle_refresh_for_pactl_event(payload):
+        settle_targets = {"sink", "source", "server", "card"}
+        for line in payload.splitlines():
+            text = line.strip().lower()
+            if not text:
+                continue
+            match = re.search(r"\bon\s+([a-z-]+)\b", text)
+            if not match:
+                continue
+            target = match.group(1)
+            if target in settle_targets:
+                return True
+        return False
 
     def _setup_ui(self):
         self._setup_tray()
@@ -5488,9 +5661,10 @@ class WaveLinuxWindow(QMainWindow):
     # ── Responsive strip scaling ────────────────────────────────────
 
     _MIN_STRIP_W = 120
-    _MAX_STRIP_W = 180
+    _MAX_STRIP_W = 280
     _MIN_SLIDER_H = 80
-    _MAX_SLIDER_H = 140
+    _MAX_SLIDER_H = 200
+    _SLIDER_WIDTH_SCALE_CAP = 180
 
     def eventFilter(self, obj, event):
         if obj is self.inputs_scroll.viewport() and event.type() == QEvent.Type.Resize:
@@ -5502,6 +5676,14 @@ class WaveLinuxWindow(QMainWindow):
     # — everything that isn't the slider. Used to back-compute how much
     # vertical room is left for the sliders.
     _STRIP_VERT_OVERHEAD = 170
+    _STRIP_MIN_VIEWPORT_H = 180
+    _STRIP_MAX_VIEWPORT_H = 620
+
+    def resizeEvent(self, event):
+        out = super().resizeEvent(event)
+        if hasattr(self, "inputs_scroll"):
+            self._rescale_strips()
+        return out
 
     def _rescale_strips(self):
         strips = list(self.channel_widgets.values())
@@ -5526,14 +5708,32 @@ class WaveLinuxWindow(QMainWindow):
         # Slider height is the min of the width-driven cap and the
         # height-driven cap so the strip fits in both axes before
         # scrolling kicks in.
-        t = (strip_w - self._MIN_STRIP_W) / (self._MAX_STRIP_W - self._MIN_STRIP_W)
-        slider_h_w = int(self._MIN_SLIDER_H + t * (self._MAX_SLIDER_H - self._MIN_SLIDER_H))
+        width_t = (
+            (min(strip_w, self._SLIDER_WIDTH_SCALE_CAP) - self._MIN_STRIP_W)
+            / (self._SLIDER_WIDTH_SCALE_CAP - self._MIN_STRIP_W)
+        )
+        width_t = max(0.0, min(1.0, width_t))
+        slider_h_w = int(self._MIN_SLIDER_H + width_t * (self._MAX_SLIDER_H - self._MIN_SLIDER_H))
         avail_h = self.inputs_scroll.viewport().height()
-        slider_h_h = avail_h - self._STRIP_VERT_OVERHEAD
+        height_t = (
+            (avail_h - self._STRIP_MIN_VIEWPORT_H)
+            / (self._STRIP_MAX_VIEWPORT_H - self._STRIP_MIN_VIEWPORT_H)
+        )
+        height_t = max(0.0, min(1.0, height_t))
+        slider_h_h = int(
+            self._MIN_SLIDER_H
+            + height_t * (self._MAX_SLIDER_H - self._MIN_SLIDER_H)
+        )
         slider_h = max(self._MIN_SLIDER_H,
                        min(self._MAX_SLIDER_H, slider_h_w, slider_h_h))
-        for strip in strips:
+        desired_heights = [
             strip.apply_scale(strip_w, slider_h)
+            for strip in strips
+        ]
+        target_strip_h = max(desired_heights) if desired_heights else 0
+        for strip in strips:
+            strip.apply_scale(strip_w, slider_h, target_height=target_strip_h)
+        self.inputs_container.adjustSize()
 
     def _refresh(self):
         """Update UI to match PipeWire state without destroying everything.
@@ -5751,6 +5951,8 @@ class WaveLinuxWindow(QMainWindow):
                 float(node.stream_volume),
                 bool(node.stream_mute),
                 is_hidden,
+                source_vol=float(getattr(node, "source_volume", 1.0)),
+                source_mute=bool(getattr(node, "source_mute", False)),
             )
             strip._refresh_fx_indicator(active=getattr(node, "fx_running", False))
             issue = self.channel_runtime_issue(nname)
@@ -5867,6 +6069,7 @@ class WaveLinuxWindow(QMainWindow):
                 override_applied=ctx["override_applied"],
                 manual_override_active=ctx["manual_override_active"],
                 reset_source_app_id=ctx["reset_source_app_id"],
+                icon_candidates=list(getattr(row_identity, "icon_candidates", []) or []),
             )
         for app_id in list(self.app_widgets.keys()):
             if app_id not in all_display_app_ids:

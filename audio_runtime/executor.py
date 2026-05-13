@@ -20,6 +20,7 @@ class RuntimeExecutor:
         "set_app_route",
         "set_app_volume",
         "set_mix_volume",
+        "set_source_volume",
         "set_submix_state",
     }
 
@@ -138,6 +139,8 @@ class RuntimeExecutor:
                 self._set_mix_hardware_route(payload)
             elif kind == "set_mix_volume":
                 self._set_mix_volume(payload)
+            elif kind == "set_source_volume":
+                self._set_source_volume(payload)
             elif kind == "set_default_source":
                 self._set_default_source(payload)
             elif kind == "set_app_route":
@@ -197,6 +200,8 @@ class RuntimeExecutor:
                 RuntimeExecutor._apply_optimistic_submix_state(observed_state, payload)
             elif action.kind == "set_mix_volume":
                 observed_state.mix_master_volumes[payload["mix_name"]] = float(payload["volume"])
+            elif action.kind == "set_source_volume":
+                RuntimeExecutor._apply_optimistic_source_volume(observed_state, payload)
             elif action.kind == "set_app_volume":
                 RuntimeExecutor._apply_optimistic_app_volume(observed_state, payload)
             elif action.kind == "set_app_route":
@@ -217,6 +222,16 @@ class RuntimeExecutor:
             elif mix_name == "Stream":
                 node.stream_volume = volume
                 node.stream_mute = mute
+            break
+
+    @staticmethod
+    def _apply_optimistic_source_volume(observed_state, payload):
+        node_name = str(payload["node_name"])
+        volume = float(payload["volume"])
+        for node in observed_state.mic_inputs:
+            if node.name != node_name:
+                continue
+            node.source_volume = volume
             break
 
     @staticmethod
@@ -430,6 +445,13 @@ class RuntimeExecutor:
             if mix:
                 engine.set_sink_volume_by_name(mix.sink_name, payload["volume"])
 
+    def _set_source_volume(self, payload):
+        node_name = payload.get("node_name")
+        if not node_name:
+            return
+        with self.adapter.session() as engine:
+            engine.set_source_volume_by_name(node_name, payload["volume"])
+
     def _set_default_source(self, payload):
         source_name = payload.get("source_name")
         if not source_name:
@@ -614,6 +636,8 @@ class RuntimeExecutor:
             is_mic=is_mic,
             capture_target=capture_target,
             meter_source=meter_source,
+            source_volume=float(getattr(node, "volume", 1.0)),
+            source_mute=bool(getattr(node, "muted", False)),
             monitor_volume=float(mon_volume),
             monitor_mute=bool(mon_mute),
             stream_volume=float(str_volume),
@@ -637,6 +661,7 @@ class RuntimeExecutor:
         for app in apps:
             app_id = app.get("app_id") or app.get("app_name") or app.get("binary") or "Unknown App"
             app_name = app.get("app_name") or app.get("binary") or app_id
+            icon_candidates = list(app.get("app_icon_candidates") or [])
             resolved_app_id = app.get("resolved_app_id") or app_id
             resolved_app_name = app.get("resolved_app_name") or app_name
             identity_source = app.get("app_identity_source") or ""
@@ -646,6 +671,7 @@ class RuntimeExecutor:
                 view = RuntimeAppView(
                     app_id=app_id,
                     app_name=app_name,
+                    icon_candidates=icon_candidates,
                     resolved_app_id=resolved_app_id,
                     resolved_app_name=resolved_app_name,
                     identity_source=identity_source,
@@ -654,6 +680,9 @@ class RuntimeExecutor:
                 grouped[app_id] = view
             elif app_name and (view.app_name == view.app_id or len(app_name) > len(view.app_name)):
                 view.app_name = app_name
+            for candidate in icon_candidates:
+                if candidate and candidate not in view.icon_candidates:
+                    view.icon_candidates.append(candidate)
             if (
                 resolved_app_name
                 and (

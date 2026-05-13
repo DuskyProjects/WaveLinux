@@ -17,6 +17,7 @@ from audio_runtime.models import (
     SetCardProfile,
     SetChannelFx,
     SetMixHardwareRoute,
+    SetSourceVolume,
     SetSubmixState,
 )
 from audio_runtime.planner import RuntimePlanner
@@ -110,6 +111,20 @@ class RuntimePlannerTests(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].kind, "apply_channel_fx")
         self.assertEqual(actions[0].payload["fx_spec"].generation, 2)
+
+    def test_set_source_volume_returns_runtime_action(self):
+        planner = RuntimePlanner()
+        desired = DesiredState()
+        observed = ObservedState()
+        intent = SetSourceVolume("mic", 0.72)
+
+        planner.apply_intent(desired, intent)
+        actions = planner.reconcile(desired, observed, intent)
+
+        self.assertEqual(actions[0].kind, "set_source_volume")
+        self.assertEqual(actions[0].payload["node_name"], "mic")
+        self.assertEqual(actions[0].payload["volume"], 0.72)
+        self.assertEqual(desired.channels, {})
 
     def test_clear_channel_fx_only_runs_when_source_exists(self):
         planner = RuntimePlanner()

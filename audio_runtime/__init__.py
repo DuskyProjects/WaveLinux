@@ -27,6 +27,7 @@ from .models import (
     SetMixHardwareRoute,
     SetMixVolume,
     SetSelectedMic,
+    SetSourceVolume,
     SetSubmixState,
 )
 
@@ -57,5 +58,6 @@ __all__ = [
     "SetMixHardwareRoute",
     "SetMixVolume",
     "SetSelectedMic",
+    "SetSourceVolume",
     "SetSubmixState",
 ]

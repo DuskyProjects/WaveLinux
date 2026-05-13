@@ -6,6 +6,8 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QIcon, QPixmap
+from PyQt6.QtCore import Qt
 
 from main import AppRoutingRow, WaveLinuxWindow
 from pipewire_engine import PipeWireEngine
@@ -385,6 +387,49 @@ class WaveLinuxMainAppIdentityTests(unittest.TestCase):
         )
         self.assertTrue(system_row.manage_btn.isHidden())
         self.assertTrue(system_row.forget_btn.isHidden())
+
+    def test_app_routing_row_uses_theme_icon_candidates_for_active_and_offline_apps(self):
+        engine = _FakeEngine()
+        sinks = [{"name": "alsa_output.default", "display_name": "Default Output"}]
+        row = AppRoutingRow("binary:spotify", "Spotify", engine, sinks)
+
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(Qt.GlobalColor.green)
+        spotify_icon = QIcon(pixmap)
+
+        def fake_from_theme(name):
+            return spotify_icon if name == "spotify" else QIcon()
+
+        with mock.patch("main.QIcon.fromTheme", side_effect=fake_from_theme):
+            row.update_state(
+                "Spotify",
+                ["42"],
+                sinks,
+                "alsa_output.default",
+                current_volume=0.8,
+                resolved_app_id="binary:spotify",
+                resolved_app_name="Spotify",
+                identity_source="binary",
+                icon_candidates=["spotify"],
+            )
+            self.assertEqual(row.icon_lbl.text(), "")
+            self.assertIsNotNone(row.icon_lbl.pixmap())
+            self.assertFalse(row.icon_lbl.pixmap().isNull())
+
+            offline_row = AppRoutingRow("binary:spotify", "Spotify", engine, sinks)
+            offline_row.update_state(
+                "Spotify",
+                [],
+                sinks,
+                None,
+                saved_volume=0.8,
+                resolved_app_id="binary:spotify",
+                resolved_app_name="Spotify",
+                identity_source="remembered",
+            )
+            self.assertEqual(offline_row.icon_lbl.text(), "")
+            self.assertIsNotNone(offline_row.icon_lbl.pixmap())
+            self.assertFalse(offline_row.icon_lbl.pixmap().isNull())
 
 
 if __name__ == "__main__":

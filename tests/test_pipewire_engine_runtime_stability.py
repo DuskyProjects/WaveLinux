@@ -12,6 +12,7 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         engine.submix_loopbacks = {}
         engine.submix_sources = {}
         engine.submix_state_cache = {}
+        engine.virtual_sink_modules = {}
         engine.channel_fx = {}
         engine.rnnoise_processes = {}
         return engine
@@ -379,6 +380,151 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         self.assertEqual(
             run_calls[0],
             ["pactl", "set-default-source", "output.wavelinux.fx.mic.source"],
+        )
+
+    def test_get_hardware_inputs_reads_source_volume_from_snapshot(self):
+        engine = self._engine()
+        node = AudioNode(55, "mic", "Mic", "Audio/Source")
+        snap = type("Snap", (), {
+            "nodes": [node],
+            "sources_text": "\n".join([
+                "Source #55",
+                "\tName: mic",
+                "\tMute: yes",
+                "\tVolume: front-left: 36045 /  55% / -15.63 dB,   front-right: 36045 /  55% / -15.63 dB",
+            ]),
+            "_source_state_by_name": None,
+        })()
+        engine.get_all_nodes = lambda snap=None: [node]
+        engine._is_internal_node_name = lambda name: False
+
+        inputs = engine.get_hardware_inputs(snap=snap)
+
+        self.assertEqual(len(inputs), 1)
+        self.assertAlmostEqual(inputs[0].volume, 0.55)
+        self.assertTrue(inputs[0].muted)
+
+    def test_get_hardware_inputs_excludes_internal_wavelinux_sources(self):
+        engine = self._engine()
+        real_mic = AudioNode(55, "alsa_input.real_mic", "Mic", "Audio/Source")
+        monitor_src = AudioNode(56, "output.wavelinux_src_monitor", "WaveLinux-Monitor", "Audio/Source")
+        fx_src = AudioNode(57, "output.wavelinux.fx.real_mic.source", "_WaveLinux-FX-Source", "Audio/Source")
+        inline_src = AudioNode(58, "wavelinux.fx.real_mic.source", "_WaveLinux internal: chain output", "Audio/Source")
+        snap = type("Snap", (), {
+            "nodes": [real_mic, monitor_src, fx_src, inline_src],
+            "sources_text": "",
+            "_source_state_by_name": {},
+        })()
+        engine.get_all_nodes = lambda snap=None: [real_mic, monitor_src, fx_src, inline_src]
+
+        inputs = engine.get_hardware_inputs(snap=snap)
+
+        self.assertEqual([node.name for node in inputs], ["alsa_input.real_mic"])
+
+    def test_full_audio_reset_rehomes_app_streams_and_restores_physical_defaults(self):
+        engine = self._engine()
+        engine.output_mixes["Monitor"] = OutputMix("Monitor", sink_name="wavelinux_mix_monitor")
+        engine.output_mixes["Monitor"].hardware_output = "bluez_output.AA_BB_CC_DD_EE_FF.1"
+        engine.channel_fx["mic"] = {"prev_default": "alsa_input.real_mic"}
+
+        calls = []
+        modules_text = "\n".join([
+            "201\tmodule-loopback\tsource=wavelinux_music.monitor sink=wavelinux_mix_monitor",
+            "202\tmodule-null-sink\tsink_name=wavelinux_music",
+        ])
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[:4] == ["pactl", "list", "short", "modules"]:
+                return modules_text
+            return "ok"
+
+        engine._run = fake_run
+        engine.create_snapshot = lambda force=True: object()
+        engine.get_default_sink = lambda: "wavelinux_music"
+        engine.get_default_source = lambda: "output.wavelinux.fx.real_mic.source"
+        engine.resolve_hardware_sink_name = (
+            lambda sink_name, snap=None:
+            "bluez_output.AA_BB_CC_DD_EE_FF.1"
+            if sink_name == "bluez_output.AA_BB_CC_DD_EE_FF.1"
+            else None
+        )
+        engine.resolve_source_name = lambda source_name: source_name
+        engine.get_hardware_outputs = lambda snap=None: [
+            AudioNode(1, "bluez_output.AA_BB_CC_DD_EE_FF.1", "Headphones", "Audio/Sink")
+        ]
+        engine.get_sink_inputs = lambda snap=None: [
+            {"index": "91", "sink": "wavelinux_music"},
+            {"index": "92", "sink": "bluez_output.AA_BB_CC_DD_EE_FF.1"},
+        ]
+        engine.get_hardware_inputs = lambda snap=None: [
+            AudioNode(55, "alsa_input.real_mic", "Mic", "Audio/Source")
+        ]
+
+        engine.full_audio_reset()
+
+        self.assertIn(
+            ["pactl", "move-sink-input", "91", "bluez_output.AA_BB_CC_DD_EE_FF.1"],
+            calls,
+        )
+        self.assertNotIn(
+            ["pactl", "move-sink-input", "92", "bluez_output.AA_BB_CC_DD_EE_FF.1"],
+            calls,
+        )
+        self.assertIn(
+            ["pactl", "set-default-sink", "bluez_output.AA_BB_CC_DD_EE_FF.1"],
+            calls,
+        )
+        self.assertIn(
+            ["pactl", "set-default-source", "alsa_input.real_mic"],
+            calls,
+        )
+        self.assertLess(
+            calls.index(["pactl", "move-sink-input", "91", "bluez_output.AA_BB_CC_DD_EE_FF.1"]),
+            calls.index(["pactl", "unload-module", "202"]),
+        )
+
+    def test_full_audio_reset_keeps_existing_hardware_defaults(self):
+        engine = self._engine()
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[:4] == ["pactl", "list", "short", "modules"]:
+                return ""
+            return "ok"
+
+        engine._run = fake_run
+        engine.create_snapshot = lambda force=True: object()
+        engine.get_default_sink = lambda: "bluez_output.AA_BB_CC_DD_EE_FF.1"
+        engine.get_default_source = lambda: "alsa_input.real_mic"
+        engine.resolve_hardware_sink_name = lambda sink_name, snap=None: sink_name
+        engine.resolve_source_name = lambda source_name: source_name
+        engine.get_hardware_outputs = lambda snap=None: []
+        engine.get_hardware_inputs = lambda snap=None: []
+        engine.get_sink_inputs = lambda snap=None: [
+            {"index": "91", "sink": "bluez_output.AA_BB_CC_DD_EE_FF.1"},
+        ]
+
+        engine.full_audio_reset()
+
+        self.assertFalse(any(cmd[:3] == ["pactl", "move-sink-input", "91"] for cmd in calls))
+        self.assertFalse(any(cmd[:3] == ["pactl", "set-default-sink", "bluez_output.AA_BB_CC_DD_EE_FF.1"] for cmd in calls))
+        self.assertFalse(any(cmd[:3] == ["pactl", "set-default-source", "alsa_input.real_mic"] for cmd in calls))
+
+    def test_set_source_volume_by_name_resolves_virtual_source_alias(self):
+        engine = self._engine()
+        run_calls = []
+        engine._source_id_to_name = lambda: {
+            "1": "output.wavelinux.fx.mic.source",
+        }
+        engine._run = lambda cmd, *args, **kwargs: (run_calls.append(cmd), "ok")[-1]
+
+        engine.set_source_volume_by_name("wavelinux.fx.mic.source", 0.62)
+
+        self.assertEqual(
+            run_calls[0],
+            ["pactl", "set-source-volume", "output.wavelinux.fx.mic.source", "62%"],
         )
 
     def test_clear_channel_fx_clears_inline_filter_graph(self):

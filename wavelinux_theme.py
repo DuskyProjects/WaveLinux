@@ -145,6 +145,12 @@ QLabel#mixTagStr {
     font-weight: 700;
     letter-spacing: 2px;
 }
+QLabel#mixTagMic {
+    color: #ffb020;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
 QLabel#masterMixLabel {
     color: #e0e0ee;
     font-size: 12px;
