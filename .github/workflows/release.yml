@@ -58,6 +58,13 @@ jobs:
       - name: Build AppImage
         run: ./scripts/build_appimage.sh
 
+      - name: Smoke test AppImage
+        run: |
+          APPIMAGE="$(echo dist/*.AppImage)"
+          chmod +x "$APPIMAGE"
+          "$APPIMAGE" --version
+          "$APPIMAGE" --self-test
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:

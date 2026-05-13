@@ -30,9 +30,10 @@ from distribution import (
     DESKTOP_FILENAME,
     desktop_exec_command,
     install_current_appimage,
-    installed_appimage_path,
+    install_state,
     is_running_in_appimage,
     launch_command,
+    repair_installed_appimage_launchers,
     resource_path,
 )
 from pipewire_engine import PipeWireEngine
@@ -53,6 +54,119 @@ def _parse_version(v):
         return tuple(int(x) for x in v.split('.'))
     except ValueError:
         return (0,)
+
+
+def _probe_command(cmd, *, timeout=3, runner=subprocess.run):
+    try:
+        result = runner(
+            list(cmd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return {"ok": False, "error": "missing"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "timeout"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": result.returncode == 0,
+        "returncode": int(result.returncode),
+        "stderr": (result.stderr or "").strip()[:200],
+    }
+
+
+def startup_preflight_report(*, which=shutil.which, runner=subprocess.run,
+                             config_dir=None):
+    config_root = os.path.expanduser("~/.config/wavelinux") if config_dir is None else os.path.abspath(config_dir)
+    deps = {cmd: bool(which(cmd)) for cmd in _RUNTIME_DEPS}
+    missing = [cmd for cmd, present in deps.items() if not present]
+    checks = {}
+    if deps.get("pactl"):
+        checks["pactl_info"] = _probe_command(["pactl", "info"], runner=runner)
+    if deps.get("wpctl"):
+        checks["wpctl_status"] = _probe_command(["wpctl", "status"], runner=runner)
+
+    config_ok = True
+    config_error = ""
+    try:
+        os.makedirs(config_root, exist_ok=True)
+    except OSError as exc:
+        config_ok = False
+        config_error = str(exc)
+
+    issues = []
+    if missing:
+        issues.append(
+            "Missing required audio/runtime tools: " + ", ".join(missing)
+        )
+    pactl_check = checks.get("pactl_info")
+    if pactl_check and not pactl_check.get("ok"):
+        issues.append(
+            "Could not query the PulseAudio compatibility server via `pactl info`."
+        )
+    wpctl_check = checks.get("wpctl_status")
+    if wpctl_check and not wpctl_check.get("ok"):
+        issues.append(
+            "Could not query WirePlumber via `wpctl status`."
+        )
+    if not config_ok:
+        issues.append(f"Could not prepare config directory {config_root}: {config_error}")
+
+    return {
+        "deps": deps,
+        "missing": missing,
+        "checks": checks,
+        "config_dir": config_root,
+        "config_ok": config_ok,
+        "config_error": config_error,
+        "issues": issues,
+    }
+
+
+def build_self_test_report():
+    install = install_state()
+    preflight = startup_preflight_report()
+    resources = {
+        "icon.png": os.path.exists(resource_path("icon.png")),
+        "tray_icon.png": os.path.exists(resource_path("tray_icon.png")),
+    }
+    running_binary = (
+        install.running_appimage_path
+        or (os.path.abspath(sys.executable) if getattr(sys, "frozen", False) else resource_path("main.py"))
+    )
+    ok = all(resources.values()) and bool(running_binary)
+    return {
+        "ok": ok,
+        "version": APP_VERSION,
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "running_binary": running_binary,
+        "running_in_appimage": bool(install.running_appimage_path),
+        "resources": resources,
+        "install_state": {
+            "installed_appimage_exists": install.installed_appimage_exists,
+            "desktop_exists": install.desktop_exists,
+            "wrapper_exists": install.wrapper_exists,
+            "warnings": list(install.warnings),
+        },
+        "preflight": {
+            "missing": list(preflight["missing"]),
+            "issues": list(preflight["issues"]),
+        },
+    }
+
+
+def _handle_cli_args(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--version" in args or "-V" in args:
+        print(APP_VERSION)
+        return 0
+    if "--self-test" in args:
+        report = build_self_test_report()
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report.get("ok") else 1
+    return None
 
 
 class UpdateChecker:
@@ -1626,14 +1740,16 @@ class WaveLinuxWindow(QMainWindow):
 
     def _run_startup_preflight(self):
         """Check for required runtime binaries and surface a clear warning."""
-        missing = [cmd for cmd in _RUNTIME_DEPS if shutil.which(cmd) is None]
-        if missing:
+        report = startup_preflight_report()
+        self._startup_preflight = report
+        issues = list(report.get("issues", ()))
+        if issues:
             msg = (
-                "Missing required audio/runtime tools:\n"
-                f"  {', '.join(missing)}\n\n"
-                "WaveLinux can start, but routing/meter/update features may fail.\n"
-                "Install PipeWire + WirePlumber + PulseAudio compatibility tools first.\n"
-                "If you're using the AppImage, these tools still need to exist on the host OS."
+                "WaveLinux detected one or more runtime issues:\n"
+                + "\n".join(f"  - {issue}" for issue in issues)
+                + "\n\nWaveLinux can still start, but routing, meters, or updates may fail.\n"
+                "Install PipeWire + WirePlumber + PulseAudio compatibility tools on the host OS.\n"
+                "If you're using the AppImage, these tools still need to exist outside the AppImage."
             )
             logging.warning(msg.replace("\n", " "))
             QMessageBox.warning(self, "WaveLinux dependency check", msg)
@@ -1692,10 +1808,53 @@ class WaveLinuxWindow(QMainWindow):
 
     def _open_settings(self):
         self._refresh_hidden_list()
+        self._refresh_system_tab()
         self._refresh_advanced_tab()
         self._refresh_update_tab()
         self.settings_dialog.show()
         self.settings_dialog.raise_()
+
+    def _build_system_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        self._system_summary_lbl = QLabel()
+        self._system_summary_lbl.setWordWrap(True)
+        self._system_summary_lbl.setStyleSheet("color: #e0e0ee; font-size: 13px; font-weight: bold;")
+        layout.addWidget(self._system_summary_lbl)
+
+        self._system_runtime_lbl = QLabel()
+        self._system_runtime_lbl.setWordWrap(True)
+        self._system_runtime_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
+        layout.addWidget(self._system_runtime_lbl)
+
+        self._system_install_lbl = QLabel()
+        self._system_install_lbl.setWordWrap(True)
+        self._system_install_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
+        layout.addWidget(self._system_install_lbl)
+
+        self._system_fx_lbl = QLabel()
+        self._system_fx_lbl.setWordWrap(True)
+        self._system_fx_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
+        layout.addWidget(self._system_fx_lbl)
+
+        btn_row = QHBoxLayout()
+        self._rerun_system_check_btn = QPushButton("Re-run System Check")
+        self._rerun_system_check_btn.setObjectName("showHiddenBtn")
+        self._rerun_system_check_btn.clicked.connect(self._rerun_system_check)
+        btn_row.addWidget(self._rerun_system_check_btn)
+
+        self._repair_launcher_btn = QPushButton("Repair Desktop Launchers")
+        self._repair_launcher_btn.setObjectName("showHiddenBtn")
+        self._repair_launcher_btn.clicked.connect(self._repair_installed_launchers)
+        btn_row.addWidget(self._repair_launcher_btn)
+
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        layout.addStretch(1)
+        return tab
 
     def _build_advanced_tab(self):
         """Settings → Advanced tab. Each control writes through to
@@ -1825,6 +1984,16 @@ class WaveLinuxWindow(QMainWindow):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
+        self._install_state_lbl = QLabel()
+        self._install_state_lbl.setWordWrap(True)
+        self._install_state_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
+        layout.addWidget(self._install_state_lbl)
+
+        self._install_warning_lbl = QLabel()
+        self._install_warning_lbl.setWordWrap(True)
+        self._install_warning_lbl.setStyleSheet("color: #d28b26; font-size: 11px;")
+        layout.addWidget(self._install_warning_lbl)
+
         note = QLabel(
             "WaveLinux now uses notify-only updates.\n"
             "Use GitHub releases to download the latest AppImage or source package.\n"
@@ -1928,6 +2097,45 @@ class WaveLinuxWindow(QMainWindow):
             f"Launcher: {result.wrapper_path}\n"
             f"Desktop file: {result.desktop_path}",
         )
+        self._refresh_system_tab()
+
+    def _repair_installed_launchers(self):
+        state = install_state()
+        try:
+            if state.installed_appimage_exists:
+                result = repair_installed_appimage_launchers()
+                removed = len(result.removed_entries)
+                msg = (
+                    "WaveLinux repaired the canonical desktop launcher files.\n\n"
+                    f"Launcher: {result.wrapper_path}\n"
+                    f"Desktop file: {result.desktop_path}\n"
+                    f"Removed stale launchers: {removed}"
+                )
+            elif is_running_in_appimage():
+                result = install_current_appimage()
+                msg = (
+                    "WaveLinux installed this AppImage and rebuilt its desktop launcher.\n\n"
+                    f"Launcher: {result.wrapper_path}\n"
+                    f"Desktop file: {result.desktop_path}"
+                )
+            else:
+                raise RuntimeError(
+                    "No installed AppImage was found to repair. Run WaveLinux from an AppImage and use Install This AppImage first."
+                )
+        except Exception as exc:
+            QMessageBox.warning(
+                self.settings_dialog,
+                "Launcher repair failed",
+                str(exc),
+            )
+            return
+        self._refresh_system_tab()
+        self._refresh_update_tab()
+        QMessageBox.information(
+            self.settings_dialog,
+            "Desktop launchers repaired",
+            msg,
+        )
 
     def _restart_app(self):
         self.save_config()
@@ -1978,11 +2186,138 @@ class WaveLinuxWindow(QMainWindow):
 
     def _refresh_update_tab(self):
         btn = getattr(self, "_install_appimage_btn", None)
+        state = install_state()
         if btn is not None:
-            installed = os.path.exists(installed_appimage_path())
             btn.setText(
-                "Reinstall This AppImage" if installed else "Install This AppImage"
+                "Reinstall This AppImage" if state.installed_appimage_exists else "Install This AppImage"
             )
+        info_lbl = getattr(self, "_install_state_lbl", None)
+        if info_lbl is not None:
+            lines = []
+            if state.running_appimage_path:
+                lines.append(f"Running AppImage: {state.running_appimage_path}")
+            elif getattr(sys, "frozen", False):
+                lines.append(f"Running binary: {os.path.abspath(sys.executable)}")
+            else:
+                lines.append(f"Running from source: {resource_path('main.py')}")
+            lines.append(
+                "Installed AppImage: "
+                + (state.installed_appimage_path if state.installed_appimage_exists else "not installed")
+            )
+            lines.append(
+                "Desktop launcher: "
+                + (
+                    (state.desktop_exec_target or state.desktop_path)
+                    if state.desktop_exists
+                    else "not installed"
+                )
+            )
+            if state.stale_launcher_entries:
+                stale_names = ", ".join(
+                    os.path.basename(entry.path)
+                    for entry in state.stale_launcher_entries[:3]
+                )
+                lines.append(f"Extra launchers: {stale_names}")
+            info_lbl.setText("\n".join(lines))
+        warning_lbl = getattr(self, "_install_warning_lbl", None)
+        if warning_lbl is not None:
+            warning_lbl.setVisible(bool(state.warnings))
+            warning_lbl.setText("\n".join(state.warnings))
+        repair_btn = getattr(self, "_repair_launcher_btn", None)
+        if repair_btn is not None:
+            needs_repair = bool(
+                state.warnings
+                or state.stale_launcher_entries
+                or (
+                    state.installed_appimage_exists
+                    and (
+                        not state.wrapper_exists
+                        or not state.desktop_exists
+                        or state.wrapper_target != os.path.abspath(state.installed_appimage_path)
+                        or state.desktop_exec_target not in {
+                            os.path.abspath(state.wrapper_path),
+                            state.wrapper_path,
+                        }
+                    )
+                )
+            )
+            repair_btn.setEnabled(needs_repair or is_running_in_appimage())
+
+    def _refresh_system_tab(self):
+        preflight = startup_preflight_report()
+        self._startup_preflight = preflight
+        state = install_state()
+
+        summary_lbl = getattr(self, "_system_summary_lbl", None)
+        runtime_lbl = getattr(self, "_system_runtime_lbl", None)
+        install_lbl = getattr(self, "_system_install_lbl", None)
+        fx_lbl = getattr(self, "_system_fx_lbl", None)
+        if not all((summary_lbl, runtime_lbl, install_lbl, fx_lbl)):
+            return
+
+        if preflight["issues"] or state.warnings:
+            summary_lbl.setText("System check found issues that can affect launch, routing, or desktop integration.")
+            summary_lbl.setStyleSheet("color: #d28b26; font-size: 13px; font-weight: bold;")
+        else:
+            summary_lbl.setText("System check passed. Host tools, install state, and FX backend look healthy.")
+            summary_lbl.setStyleSheet("color: #00d4aa; font-size: 13px; font-weight: bold;")
+
+        runtime_lines = [
+            "Host runtime:",
+            "  Tools present: "
+            + ", ".join(sorted(cmd for cmd, present in preflight["deps"].items() if present)),
+        ]
+        if preflight["missing"]:
+            runtime_lines.append("  Missing tools: " + ", ".join(preflight["missing"]))
+        for key in ("pactl_info", "wpctl_status"):
+            check = preflight["checks"].get(key)
+            if check is None:
+                continue
+            status = "ok" if check.get("ok") else f"failed ({check.get('error') or check.get('returncode')})"
+            runtime_lines.append(f"  {key}: {status}")
+        runtime_lines.append(f"  Config dir: {preflight['config_dir']}")
+        if preflight["issues"]:
+            runtime_lines.append("  Issues:")
+            runtime_lines.extend(f"    - {issue}" for issue in preflight["issues"])
+        runtime_lbl.setText("\n".join(runtime_lines))
+
+        install_lines = ["Install state:"]
+        if state.running_appimage_path:
+            install_lines.append(f"  Running AppImage: {state.running_appimage_path}")
+        elif getattr(sys, "frozen", False):
+            install_lines.append(f"  Running binary: {os.path.abspath(sys.executable)}")
+        else:
+            install_lines.append(f"  Running from source: {resource_path('main.py')}")
+        install_lines.append(
+            "  Installed AppImage: "
+            + (state.installed_appimage_path if state.installed_appimage_exists else "not installed")
+        )
+        install_lines.append("  Wrapper target: " + (state.wrapper_target or "not installed"))
+        install_lines.append("  Desktop target: " + (state.desktop_exec_target or "not installed"))
+        if state.stale_launcher_entries:
+            install_lines.append("  Extra launchers:")
+            install_lines.extend(f"    - {entry.path}" for entry in state.stale_launcher_entries)
+        if state.warnings:
+            install_lines.append("  Warnings:")
+            install_lines.extend(f"    - {warning}" for warning in state.warnings)
+        install_lbl.setText("\n".join(install_lines))
+
+        fx_lbl.setText(
+            "\n".join([
+                "FX backend:",
+                f"  LADSPA plugins detected: {len(getattr(self.engine, 'ladspa_plugins', set()) or set())}",
+                "  Bundled LADSPA remains opt-in with WAVELINUX_ENABLE_BUNDLED_LADSPA=1.",
+            ])
+        )
+
+    def _rerun_system_check(self):
+        self._refresh_system_tab()
+        self._refresh_update_tab()
+        QMessageBox.information(
+            self.settings_dialog,
+            "System check complete",
+            "WaveLinux refreshed its host-runtime and install-state checks.",
+        )
 
     def _refresh_advanced_tab(self):
         # Called when the dialog opens so values reflect any recent change.
@@ -2445,7 +2780,7 @@ class WaveLinuxWindow(QMainWindow):
 
         bottom_container.addWidget(out_frame, 1)
 
-        # Settings dialog — tabbed (Apps / Hidden / Advanced).
+        # Settings dialog — tabbed (Apps / Hidden / System / Advanced / Updates).
         self.settings_dialog = QDialog(self)
         self.settings_dialog.setWindowTitle("WaveLinux Settings")
         self.settings_dialog.setMinimumSize(640, 480)
@@ -2488,6 +2823,9 @@ class WaveLinuxWindow(QMainWindow):
         self.hidden_list_layout.setSpacing(4)
         hidden_layout.addWidget(self.hidden_list_container, 1)
         tabs.addTab(hidden_tab, "Hidden")
+
+        # — System tab —
+        tabs.addTab(self._build_system_tab(), "System")
 
         # — Advanced tab —
         tabs.addTab(self._build_advanced_tab(), "Advanced")
@@ -3508,7 +3846,10 @@ class WaveLinuxWindow(QMainWindow):
 
 
 # ── Entry Point ────────────────────────────────────────────────────
-def main():
+def main(argv=None):
+    cli_exit = _handle_cli_args(argv)
+    if cli_exit is not None:
+        return cli_exit
     app = QApplication(sys.argv)
     app.setApplicationName("WaveLinux")
     app.setDesktopFileName(APP_DESKTOP_ID)
@@ -3523,7 +3864,7 @@ def main():
     lock_file = QLockFile(lock_path)
     if not lock_file.tryLock(100):
         print("WaveLinux is already running.")
-        sys.exit(0)
+        return 0
 
     window = WaveLinuxWindow()
     window.show()
@@ -3531,8 +3872,8 @@ def main():
     # Ensure cleanup on standard application quit
     app.aboutToQuit.connect(window._cleanup_before_exit)
 
-    sys.exit(app.exec())
+    return app.exec()
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

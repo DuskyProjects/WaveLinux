@@ -13,13 +13,16 @@ import time
 class RuntimeDiagnostics:
     """Persist small, high-signal diagnostic bundles for failed runtime ops."""
 
-    def __init__(self, root_dir: str | None = None, max_commands: int = 300):
+    def __init__(self, root_dir: str | None = None, max_commands: int = 300,
+                 max_exports: int = 30):
         if root_dir is None:
             root_dir = "~/.config/wavelinux/diagnostics"
         self.root_dir = Path(root_dir).expanduser()
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self._commands = deque(maxlen=max_commands)
         self._state_snapshots = deque(maxlen=30)
+        self.max_exports = max(1, int(max_exports))
+        self._prune_exports()
 
     def record_command(self, cmd, timeout, duration_ms, stdout, success):
         stdout_preview = ""
@@ -44,8 +47,10 @@ class RuntimeDiagnostics:
 
     def export_failure(self, reason: str, *, desired=None, observed=None,
                        actions=None, health=None, status=None) -> str:
+        self._prune_exports(limit=max(0, self.max_exports - 1))
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        path = self.root_dir / f"runtime-failure-{stamp}.json"
+        nanos = time.time_ns() % 1_000_000_000
+        path = self.root_dir / f"runtime-failure-{stamp}-{nanos:09d}.json"
         bundle = {
             "reason": reason,
             "timestamp": time.time(),
@@ -58,10 +63,24 @@ class RuntimeDiagnostics:
             "recent_snapshots": list(self._state_snapshots),
         }
         path.write_text(json.dumps(bundle, indent=2, sort_keys=True))
+        self._prune_exports()
         return str(path)
 
     def latest_commands(self):
         return list(self._commands)
+
+    def _prune_exports(self, *, limit: int | None = None):
+        limit = self.max_exports if limit is None else max(0, int(limit))
+        exports = sorted(
+            self.root_dir.glob("runtime-failure-*.json"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        for old in exports[limit:]:
+            try:
+                old.unlink()
+            except OSError:
+                continue
 
     @classmethod
     def _to_jsonable(cls, value: Any):
