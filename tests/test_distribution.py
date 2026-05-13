@@ -79,6 +79,28 @@ class DistributionTests(unittest.TestCase):
                 desktop = handle.read()
             self.assertIn(f"Exec={result.wrapper_path}", desktop)
 
+    def test_install_source_checkout_writes_source_launcher_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = os.path.join(tmpdir, "WaveLinux")
+            os.makedirs(source_dir, exist_ok=True)
+            with open(os.path.join(source_dir, "main.py"), "w", encoding="utf-8") as handle:
+                handle.write("print('ok')\n")
+            with open(os.path.join(source_dir, "icon.png"), "wb") as handle:
+                handle.write(b"icon")
+
+            result = distribution.install_source_checkout(source_dir, home=tmpdir)
+
+            self.assertTrue(os.path.exists(result.wrapper_path))
+            self.assertTrue(os.path.exists(result.desktop_path))
+            self.assertTrue(os.path.exists(result.icon_path))
+            with open(result.wrapper_path, "r", encoding="utf-8") as handle:
+                wrapper = handle.read()
+            self.assertIn(f'SOURCE_DIR="{source_dir}"', wrapper)
+            self.assertIn('exec python3 "$SOURCE_DIR/main.py" "$@"', wrapper)
+            with open(result.desktop_path, "r", encoding="utf-8") as handle:
+                desktop = handle.read()
+            self.assertIn(f"Exec={result.wrapper_path}", desktop)
+
     def test_install_appimage_file_writes_launcher_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             download_dir = os.path.join(tmpdir, "downloads")
@@ -142,6 +164,91 @@ class DistributionTests(unittest.TestCase):
             self.assertTrue(state.wrapper_mismatch)
             self.assertTrue(state.appimage_missing)
             self.assertIn("Installed wrapper points at an unexpected AppImage path.", state.warnings)
+
+    def test_install_state_accepts_source_wrapper(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = os.path.join(tmpdir, "WaveLinux")
+            os.makedirs(source_dir, exist_ok=True)
+            with open(os.path.join(source_dir, "main.py"), "w", encoding="utf-8") as handle:
+                handle.write("print('ok')\n")
+
+            wrapper_path = distribution.installed_wrapper_path(home=tmpdir)
+            os.makedirs(os.path.dirname(wrapper_path), exist_ok=True)
+            with open(wrapper_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "#!/bin/sh\n"
+                    f'SOURCE_DIR="{source_dir}"\n'
+                    'exec python3 "$SOURCE_DIR/main.py" "$@"\n'
+                )
+
+            desktop_path = distribution.installed_desktop_path(home=tmpdir)
+            os.makedirs(os.path.dirname(desktop_path), exist_ok=True)
+            with open(desktop_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "[Desktop Entry]\n"
+                    "Name=WaveLinux\n"
+                    f"Exec={wrapper_path}\n"
+                    "Type=Application\n"
+                )
+
+            state = distribution.install_state(home=tmpdir)
+
+            self.assertEqual(state.wrapper_mode, "source")
+            self.assertEqual(state.wrapper_source_dir, source_dir)
+            self.assertFalse(state.wrapper_mismatch)
+            self.assertTrue(state.appimage_missing)
+            self.assertEqual(state.warnings, ())
+
+    def test_install_state_warns_when_source_wrapper_checkout_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wrapper_path = distribution.installed_wrapper_path(home=tmpdir)
+            os.makedirs(os.path.dirname(wrapper_path), exist_ok=True)
+            with open(wrapper_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "#!/bin/sh\n"
+                    'SOURCE_DIR="/tmp/missing-wavelinux"\n'
+                    'exec python3 "$SOURCE_DIR/main.py" "$@"\n'
+                )
+
+            state = distribution.install_state(home=tmpdir)
+
+            self.assertEqual(state.wrapper_mode, "source")
+            self.assertIn("Installed source wrapper points at a missing WaveLinux checkout.", state.warnings)
+
+    def test_repair_source_checkout_launchers_rewrites_canonical_files_and_removes_stale(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = os.path.join(tmpdir, "WaveLinux")
+            os.makedirs(source_dir, exist_ok=True)
+            with open(os.path.join(source_dir, "main.py"), "w", encoding="utf-8") as handle:
+                handle.write("print('ok')\n")
+            with open(os.path.join(source_dir, "icon.png"), "wb") as handle:
+                handle.write(b"icon")
+
+            result = distribution.install_source_checkout(source_dir, home=tmpdir)
+
+            stale_path = os.path.join(
+                tmpdir,
+                ".local",
+                "share",
+                "applications",
+                "wavelinux-legacy.desktop",
+            )
+            with open(stale_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "[Desktop Entry]\n"
+                    "Name=WaveLinux\n"
+                    'Exec="/opt/old/WaveLinux.AppImage"\n'
+                    "Type=Application\n"
+                )
+
+            repaired = distribution.repair_source_checkout_launchers(source_dir, home=tmpdir)
+
+            self.assertEqual(repaired.source_dir, source_dir)
+            self.assertIn(stale_path, repaired.removed_entries)
+            self.assertFalse(os.path.exists(stale_path))
+            with open(result.wrapper_path, "r", encoding="utf-8") as handle:
+                wrapper = handle.read()
+            self.assertIn(f'SOURCE_DIR="{source_dir}"', wrapper)
 
     def test_repair_installed_appimage_launchers_rewrites_canonical_files_and_removes_stale(self):
         with tempfile.TemporaryDirectory() as tmpdir:

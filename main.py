@@ -31,9 +31,11 @@ from distribution import (
     desktop_exec_command,
     install_appimage_file,
     install_current_appimage,
+    install_current_source_checkout,
     install_state,
     is_running_in_appimage,
     launch_command,
+    repair_current_source_checkout_launchers,
     repair_installed_appimage_launchers,
     resource_path,
     runtime_mode,
@@ -3075,13 +3077,10 @@ class WaveLinuxWindow(QMainWindow):
         self._download_update_btn.clicked.connect(self._download_and_install_update)
         btn_row.addWidget(self._download_update_btn)
 
-        if is_running_in_appimage():
-            self._install_appimage_btn = QPushButton()
-            self._install_appimage_btn.setObjectName("showHiddenBtn")
-            self._install_appimage_btn.clicked.connect(self._install_running_appimage)
-            btn_row.addWidget(self._install_appimage_btn)
-        else:
-            self._install_appimage_btn = None
+        self._install_runtime_btn = QPushButton()
+        self._install_runtime_btn.setObjectName("showHiddenBtn")
+        self._install_runtime_btn.clicked.connect(self._install_current_runtime_launcher)
+        btn_row.addWidget(self._install_runtime_btn)
 
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -3373,30 +3372,63 @@ class WaveLinuxWindow(QMainWindow):
         self._refresh_update_tab()
         self._refresh_system_tab()
 
-    def _install_running_appimage(self):
+    def _install_current_runtime_launcher(self):
+        mode = self._current_runtime_mode()
         try:
-            result = install_current_appimage()
+            if mode.kind == "appimage":
+                result = install_current_appimage()
+                title = "AppImage installed"
+                message = (
+                    "WaveLinux installed this AppImage for desktop use.\n\n"
+                    f"Launcher: {result.wrapper_path}\n"
+                    f"Desktop file: {result.desktop_path}"
+                )
+            elif mode.kind == "source":
+                result = install_current_source_checkout()
+                title = "Source launcher installed"
+                message = (
+                    "WaveLinux installed a launcher for this source checkout.\n\n"
+                    f"Source: {result.source_dir}\n"
+                    f"Launcher: {result.wrapper_path}\n"
+                    f"Desktop file: {result.desktop_path}"
+                )
+            else:
+                QMessageBox.information(
+                    self.settings_dialog,
+                    "Launcher install unavailable",
+                    "This runtime mode does not support installing the current binary as a desktop launcher.",
+                )
+                return
         except Exception as exc:
             QMessageBox.warning(
                 self.settings_dialog,
-                "AppImage install failed",
+                "Launcher install failed",
                 str(exc),
             )
             return
         self._refresh_update_tab()
         QMessageBox.information(
             self.settings_dialog,
-            "AppImage installed",
-            "WaveLinux installed this AppImage for desktop use.\n\n"
-            f"Launcher: {result.wrapper_path}\n"
-            f"Desktop file: {result.desktop_path}",
+            title,
+            message,
         )
         self._refresh_system_tab()
 
     def _repair_installed_launchers(self):
         state = install_state()
+        mode = self._current_runtime_mode()
         try:
-            if state.installed_appimage_exists:
+            if state.wrapper_mode == "source" or mode.kind == "source":
+                result = repair_current_source_checkout_launchers()
+                removed = len(result.removed_entries)
+                msg = (
+                    "WaveLinux rebuilt the source-checkout desktop launcher.\n\n"
+                    f"Source: {result.source_dir}\n"
+                    f"Launcher: {result.wrapper_path}\n"
+                    f"Desktop file: {result.desktop_path}\n"
+                    f"Removed stale launchers: {removed}"
+                )
+            elif state.installed_appimage_exists:
                 result = repair_installed_appimage_launchers()
                 removed = len(result.removed_entries)
                 msg = (
@@ -3502,13 +3534,22 @@ class WaveLinuxWindow(QMainWindow):
             self._last_update_attempt_result = f"Background update check failed: {self._last_update_issue.get('message') or 'unknown error'}"
 
     def _refresh_update_tab(self):
-        btn = getattr(self, "_install_appimage_btn", None)
+        btn = getattr(self, "_install_runtime_btn", None)
         state = install_state()
         mode, description, guidance = self._runtime_mode_detail()
         if btn is not None:
-            btn.setText(
-                "Reinstall This AppImage" if state.installed_appimage_exists else "Install This AppImage"
-            )
+            if mode.kind == "appimage":
+                btn.setVisible(True)
+                btn.setText(
+                    "Reinstall This AppImage" if state.installed_appimage_exists else "Install This AppImage"
+                )
+                btn.setToolTip("Install the currently running AppImage into ~/.local/bin and refresh its desktop launcher.")
+            elif mode.kind == "source":
+                btn.setVisible(True)
+                btn.setText("Reinstall This Source Checkout")
+                btn.setToolTip("Install or refresh the desktop launcher for the current source checkout.")
+            else:
+                btn.setVisible(False)
         download_btn = getattr(self, "_download_update_btn", None)
         if download_btn is not None:
             pending_tag = getattr(self, "_pending_update_tag", None)
@@ -3541,6 +3582,16 @@ class WaveLinuxWindow(QMainWindow):
         if info_lbl is not None:
             lines = []
             lines.append(f"Runtime mode: {mode.kind}")
+            if state.wrapper_mode == "source":
+                lines.append(
+                    "Installed launcher mode: source checkout"
+                    + (
+                        f" ({state.wrapper_source_dir})"
+                        if state.wrapper_source_dir else ""
+                    )
+                )
+            elif state.wrapper_mode == "appimage":
+                lines.append("Installed launcher mode: AppImage")
             if state.running_appimage_path:
                 lines.append(f"Running AppImage: {state.running_appimage_path}")
             elif getattr(sys, "frozen", False):
@@ -3589,11 +3640,11 @@ class WaveLinuxWindow(QMainWindow):
                 state.warnings
                 or state.stale_launcher_entries
                 or (
-                    state.installed_appimage_exists
+                    state.wrapper_mode == "appimage" and state.installed_appimage_exists
                     and (
                         not state.wrapper_exists
                         or not state.desktop_exists
-                        or state.wrapper_target != os.path.abspath(state.installed_appimage_path)
+                        or state.wrapper_mismatch
                         or state.desktop_exec_target not in {
                             os.path.abspath(state.wrapper_path),
                             state.wrapper_path,
@@ -3771,6 +3822,9 @@ class WaveLinuxWindow(QMainWindow):
         preflight = preflight or startup_preflight_report()
         state = state or install_state()
         mode = self._current_runtime_mode()
+        wrapper_mode = getattr(state, "wrapper_mode", "unknown")
+        wrapper_source_dir = getattr(state, "wrapper_source_dir", None)
+        warnings = tuple(getattr(state, "warnings", ()) or ())
         issues = [
             self._health_issue_for_runtime_detail(detail)
             for detail in preflight.get("issue_details", [])
@@ -3778,11 +3832,11 @@ class WaveLinuxWindow(QMainWindow):
 
         expects_appimage_install = (
             mode.kind == "appimage"
-            or state.wrapper_exists
-            or state.desktop_exists
-            or bool(state.stale_launcher_entries)
+            or wrapper_mode == "appimage"
+            or (getattr(state, "desktop_exists", False) and wrapper_mode != "source")
+            or bool(getattr(state, "stale_launcher_entries", ()))
         )
-        if expects_appimage_install and state.appimage_missing:
+        if expects_appimage_install and getattr(state, "appimage_missing", False):
             detail = (
                 f"No installed AppImage was found at {state.installed_appimage_path}. "
                 "WaveLinux can still run from source or a package manager, but one-click "
@@ -3797,7 +3851,7 @@ class WaveLinuxWindow(QMainWindow):
                 secondary_action="Re-run check",
                 context={"path": state.installed_appimage_path},
             ))
-        if state.wrapper_mismatch:
+        if getattr(state, "wrapper_mismatch", False):
             issues.append(HealthIssue(
                 code="install.wrapper_mismatch",
                 severity="warning",
@@ -3811,8 +3865,25 @@ class WaveLinuxWindow(QMainWindow):
                 secondary_action="Re-run check",
                 context={"path": state.wrapper_path, "target": state.wrapper_target or ""},
             ))
-        if state.desktop_mismatch or state.stale_launcher_entries:
-            stale_paths = "\n".join(entry.path for entry in state.stale_launcher_entries)
+        if (
+            wrapper_mode == "source"
+            and any("source wrapper points at a missing WaveLinux checkout" in warning for warning in warnings)
+        ):
+            issues.append(HealthIssue(
+                code="install.wrapper_mismatch",
+                severity="warning",
+                title="Installed source launcher points at a missing checkout",
+                detail=(
+                    f"The source launcher wrapper at {state.wrapper_path} points at "
+                    f"{wrapper_source_dir or 'a missing checkout'}.\n"
+                    "Re-run install.sh from the current checkout, or install a verified AppImage."
+                ),
+                primary_action="Repair launchers",
+                secondary_action="Re-run check",
+                context={"path": state.wrapper_path, "source_dir": wrapper_source_dir or ""},
+            ))
+        if getattr(state, "desktop_mismatch", False) or getattr(state, "stale_launcher_entries", ()):
+            stale_paths = "\n".join(entry.path for entry in getattr(state, "stale_launcher_entries", ()))
             detail = (
                 f"The canonical desktop entry at {state.desktop_path} does not match the "
                 "current install state."
