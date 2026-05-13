@@ -59,7 +59,7 @@ from wavelinux_theme import STYLESHEET
 
 import struct
 
-APP_VERSION = "2.0.6"
+APP_VERSION = "2.0.7"
 _RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire", "pw-cli"]
 _RUNTIME_HEALTH_MESSAGES = {
     "submix_monitor_missing": "Monitor route is missing.",

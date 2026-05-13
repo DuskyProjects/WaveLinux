@@ -151,10 +151,10 @@ Expected release assets:
 Recommended updater validation path:
 
 1. Start from an installed `2.0.4` AppImage.
-2. Publish signed `v2.0.6`.
-3. Open installed `2.0.4`, then use `Settings -> Updates -> Download && Install v2.0.6`.
+2. Publish signed `v2.0.7`.
+3. Open installed `2.0.4`, then use `Settings -> Updates -> Download && Install v2.0.7`.
 4. Confirm `~/.local/bin/WaveLinux.AppImage.bak` exists after install.
-5. Restart into `2.0.6`.
+5. Restart into `2.0.7`.
 6. Use `Restore Previous AppImage` if you need to roll back, then restart again.
 
 Testing-only updater source overrides:
