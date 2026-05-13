@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLabel, QSlider, QPushButton, QFrame, QScrollArea, QDialog,
     QDialogButtonBox, QComboBox, QMessageBox, QSystemTrayIcon,
     QMenu, QInputDialog, QProgressBar, QSizePolicy, QTabWidget,
+    QFileDialog,
     QSpinBox, QCheckBox
 )
 from PyQt6.QtCore import Qt, QTimer, QLockFile, QProcess, pyqtSignal, QObject, QEvent, QUrl
@@ -58,6 +59,26 @@ _RUNTIME_HEALTH_MESSAGES = {
     "duplicate_fx_source": "Multiple channels are sharing the same FX source.",
     "default_source_expected_fx_missing": "The selected mic's FX source is missing.",
     "default_source_mismatch": "The selected mic is not the current default source.",
+}
+_QUICK_START_TEMPLATES = {
+    "laptop_mic": {
+        "title": "Laptop Mic",
+        "description": "Lean setup for a built-in microphone with voice cleanup and a compact starter layout.",
+        "channels": ["Music", "Browser", "Voice Chat"],
+        "mic_effects": ["rnnoise", "limiter"],
+    },
+    "usb_interface": {
+        "title": "USB Interface",
+        "description": "Balanced setup for a USB mic or interface with a simple routing layout and light protection.",
+        "channels": ["Music", "Game", "Voice Chat"],
+        "mic_effects": ["limiter"],
+    },
+    "streaming_obs": {
+        "title": "Streaming / OBS",
+        "description": "Streaming-oriented layout with separate content channels and a fuller default voice chain.",
+        "channels": ["Game", "Music", "Browser", "Voice Chat", "Alerts"],
+        "mic_effects": ["rnnoise", "compressor", "limiter"],
+    },
 }
 
 
@@ -1770,6 +1791,10 @@ class WaveLinuxWindow(QMainWindow):
         # the ✕ button sticks across re-syntheses.
         self.forgotten_apps = set()  # {app_id}
         self.virtual_channels = []   # list of display names
+        self.scenes = {}             # scene name -> saved snapshot
+        self._onboarding_completed = True
+        self._selected_setup_template = ""
+        self._show_first_run_setup = False
         # Single-mic mode: one mic strip at a time, picked from the master
         # combo. None → resolved to `pactl get-default-source` on first refresh.
         self.selected_mic = None
@@ -1812,6 +1837,8 @@ class WaveLinuxWindow(QMainWindow):
         self._run_startup_preflight()
         self.load_config()
         self._refresh()
+        if self._show_first_run_setup:
+            QTimer.singleShot(400, self._open_quick_start_setup)
         # 5s backstop interval — subscribe-driven refreshes carry the
         # real-time signal; this just catches missed events.
         self.refresh_timer.start(5000)
@@ -2120,6 +2147,7 @@ class WaveLinuxWindow(QMainWindow):
             logging.warning(f"Could not clear runtime pid file {pid_path}: {exc}")
 
     def _open_settings(self):
+        self._refresh_scenes_tab()
         self._refresh_hidden_list()
         self._refresh_system_tab()
         self._refresh_advanced_tab()
@@ -2168,6 +2196,523 @@ class WaveLinuxWindow(QMainWindow):
         layout.addLayout(btn_row)
         layout.addStretch(1)
         return tab
+
+    def _build_scenes_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("SCENES")
+        title.setObjectName("sectionLabel")
+        layout.addWidget(title)
+
+        desc = QLabel(
+            "Save a full routing snapshot and restore it later. Scenes capture "
+            "virtual channels, output targets, app routing, levels, FX chains, "
+            "and effect parameters."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #8b8b9e; font-size: 11px;")
+        layout.addWidget(desc)
+
+        pick_row = QHBoxLayout()
+        pick_row.addWidget(QLabel("Saved scene:"))
+        self._scene_combo = QComboBox()
+        self._scene_combo.currentIndexChanged.connect(self._on_scene_selection_change)
+        pick_row.addWidget(self._scene_combo, 1)
+        layout.addLayout(pick_row)
+
+        self._scene_summary_lbl = QLabel("No saved scenes yet.")
+        self._scene_summary_lbl.setWordWrap(True)
+        self._scene_summary_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
+        layout.addWidget(self._scene_summary_lbl)
+
+        btn_row = QHBoxLayout()
+        self._apply_scene_btn = QPushButton("Apply Scene")
+        self._apply_scene_btn.setObjectName("addBtn")
+        self._apply_scene_btn.clicked.connect(self._apply_selected_scene)
+        btn_row.addWidget(self._apply_scene_btn)
+
+        self._save_scene_btn = QPushButton("Save Current As…")
+        self._save_scene_btn.setObjectName("showHiddenBtn")
+        self._save_scene_btn.clicked.connect(self._save_current_scene_as)
+        btn_row.addWidget(self._save_scene_btn)
+
+        self._overwrite_scene_btn = QPushButton("Update Selected")
+        self._overwrite_scene_btn.setObjectName("showHiddenBtn")
+        self._overwrite_scene_btn.clicked.connect(self._overwrite_selected_scene)
+        btn_row.addWidget(self._overwrite_scene_btn)
+
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        edit_row = QHBoxLayout()
+        self._rename_scene_btn = QPushButton("Rename")
+        self._rename_scene_btn.setObjectName("showHiddenBtn")
+        self._rename_scene_btn.clicked.connect(self._rename_selected_scene)
+        edit_row.addWidget(self._rename_scene_btn)
+
+        self._delete_scene_btn = QPushButton("Delete")
+        self._delete_scene_btn.setObjectName("removeBtn")
+        self._delete_scene_btn.clicked.connect(self._delete_selected_scene)
+        edit_row.addWidget(self._delete_scene_btn)
+
+        edit_row.addStretch()
+        layout.addLayout(edit_row)
+        layout.addStretch(1)
+        return tab
+
+    @staticmethod
+    def _dedupe_names(values):
+        seen = set()
+        ordered = []
+        for value in values or ():
+            if not isinstance(value, str):
+                continue
+            clean = re.sub(r"\s+", " ", value).strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            ordered.append(clean)
+        return ordered
+
+    @staticmethod
+    def _scene_owner_from_key(key):
+        if not isinstance(key, str) or "_" not in key:
+            return str(key or "")
+        return key.rsplit("_", 1)[0]
+
+    def _capture_scene_snapshot(self):
+        submixes = {}
+        for key, value in (self.submix_state or {}).items():
+            if not isinstance(key, str):
+                continue
+            if isinstance(value, dict):
+                submixes[key] = {
+                    "vol": float(value.get("vol", 1.0)),
+                    "mute": bool(value.get("mute", False)),
+                }
+            elif key.endswith("_linked"):
+                submixes[key] = bool(value)
+        return {
+            "saved_at": int(time.time()),
+            "selected_mic": self.selected_mic or None,
+            "monitor_hw": self._desired_mix_hw.get("Monitor"),
+            "stream_hw": self._desired_mix_hw.get("Stream"),
+            "virtual_channels": list(self._dedupe_names(self.virtual_channels)),
+            "channel_order": self._dedupe_names(self.channel_order),
+            "submixes": submixes,
+            "app_routing": {
+                k: v for k, v in (self.app_routing or {}).items()
+                if PipeWireEngine.is_persistent_app_id(k)
+            },
+            "active_effects": {
+                k: list(v) for k, v in (self.active_effects or {}).items()
+                if isinstance(k, str) and isinstance(v, list)
+            },
+            "effect_params": {
+                node_name: {
+                    effect_id: dict(values)
+                    for effect_id, values in (effects or {}).items()
+                    if isinstance(effect_id, str) and isinstance(values, dict)
+                }
+                for node_name, effects in (self.effect_params or {}).items()
+                if isinstance(node_name, str) and isinstance(effects, dict)
+            },
+        }
+
+    @classmethod
+    def _normalize_scene_snapshot(cls, raw):
+        if not isinstance(raw, dict):
+            return None
+        submixes = {}
+        for key, value in (raw.get("submixes", {}) or {}).items():
+            if not isinstance(key, str):
+                continue
+            if isinstance(value, dict):
+                submixes[key] = {
+                    "vol": float(value.get("vol", 1.0)),
+                    "mute": bool(value.get("mute", False)),
+                }
+            elif key.endswith("_linked"):
+                submixes[key] = bool(value)
+        effect_params = {}
+        for node_name, effects in (raw.get("effect_params", {}) or {}).items():
+            if not isinstance(node_name, str) or not isinstance(effects, dict):
+                continue
+            clean_effects = {}
+            for effect_id, values in effects.items():
+                if isinstance(effect_id, str) and isinstance(values, dict):
+                    clean_effects[effect_id] = {
+                        str(param): float(val)
+                        for param, val in values.items()
+                        if isinstance(param, str) and isinstance(val, (int, float))
+                    }
+            effect_params[node_name] = clean_effects
+        active_effects = {
+            node_name: [str(effect_id) for effect_id in effects if isinstance(effect_id, str)]
+            for node_name, effects in (raw.get("active_effects", {}) or {}).items()
+            if isinstance(node_name, str) and isinstance(effects, list)
+        }
+        return {
+            "saved_at": int(raw.get("saved_at") or time.time()),
+            "selected_mic": raw.get("selected_mic") or None,
+            "monitor_hw": raw.get("monitor_hw"),
+            "stream_hw": raw.get("stream_hw"),
+            "virtual_channels": cls._dedupe_names(raw.get("virtual_channels", []) or []),
+            "channel_order": cls._dedupe_names(raw.get("channel_order", []) or []),
+            "submixes": submixes,
+            "app_routing": {
+                k: v for k, v in (raw.get("app_routing", {}) or {}).items()
+                if isinstance(k, str) and PipeWireEngine.is_persistent_app_id(k)
+            },
+            "active_effects": active_effects,
+            "effect_params": effect_params,
+        }
+
+    @classmethod
+    def _normalize_scene_library(cls, raw):
+        if not isinstance(raw, dict):
+            return {}
+        scenes = {}
+        for name, snapshot in raw.items():
+            if not isinstance(name, str):
+                continue
+            clean_name = re.sub(r"\s+", " ", name).strip()
+            if not clean_name:
+                continue
+            normalized = cls._normalize_scene_snapshot(snapshot)
+            if normalized is not None:
+                scenes[clean_name] = normalized
+        return scenes
+
+    def _selected_scene_name(self):
+        combo = getattr(self, "_scene_combo", None)
+        if combo is None or combo.count() <= 0:
+            return ""
+        return (combo.currentData() or combo.currentText() or "").strip()
+
+    def _scene_summary_text(self, snapshot):
+        snapshot = self._normalize_scene_snapshot(snapshot)
+        if not snapshot:
+            return "No saved scenes yet."
+        saved_at = int(snapshot.get("saved_at") or 0)
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(saved_at)) if saved_at else "unknown"
+        selected_mic = snapshot.get("selected_mic") or "system default mic"
+        return (
+            f"Saved {stamp} · mic: {selected_mic} · "
+            f"channels: {len(snapshot.get('virtual_channels', []))} · "
+            f"routes: {len(snapshot.get('app_routing', {}))} · "
+            f"FX chains: {len(snapshot.get('active_effects', {}))}"
+        )
+
+    def _on_scene_selection_change(self, _index):
+        self._refresh_scenes_tab()
+
+    def _refresh_scenes_tab(self, selected_name=None):
+        combo = getattr(self, "_scene_combo", None)
+        summary_lbl = getattr(self, "_scene_summary_lbl", None)
+        if combo is None or summary_lbl is None:
+            return
+        current = (selected_name or combo.currentData() or combo.currentText() or "").strip()
+        names = list(self.scenes.keys())
+        combo.blockSignals(True)
+        combo.clear()
+        for name in names:
+            combo.addItem(name, name)
+        if current:
+            idx = combo.findData(current)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+        selected = self._selected_scene_name()
+        snapshot = self.scenes.get(selected)
+        summary_lbl.setText(self._scene_summary_text(snapshot))
+        has_scene = bool(snapshot)
+        for attr in (
+            "_apply_scene_btn",
+            "_overwrite_scene_btn",
+            "_rename_scene_btn",
+            "_delete_scene_btn",
+        ):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setEnabled(has_scene)
+
+    def _apply_scene_snapshot(self, snapshot, *, scene_name=""):
+        snapshot = self._normalize_scene_snapshot(snapshot)
+        if snapshot is None:
+            return False
+        scene_virtuals = list(snapshot.get("virtual_channels", []))
+        existing_virtuals = [name for name in self.virtual_channels if name not in scene_virtuals]
+        self.virtual_channels = scene_virtuals + existing_virtuals
+        for name in scene_virtuals:
+            self.runtime.ensure_virtual_channel_sync(name)
+
+        selected_mic = snapshot.get("selected_mic") or None
+        self.selected_mic = selected_mic
+        self.runtime.set_selected_mic(selected_mic)
+
+        scene_nodes = set(snapshot.get("channel_order", []) or [])
+        scene_nodes.update(snapshot.get("active_effects", {}).keys())
+        scene_nodes.update(snapshot.get("effect_params", {}).keys())
+        scene_nodes.update(
+            self._scene_owner_from_key(key)
+            for key in (snapshot.get("submixes", {}) or {}).keys()
+        )
+        if selected_mic:
+            scene_nodes.add(selected_mic)
+
+        self.submix_state = {
+            key: value
+            for key, value in self.submix_state.items()
+            if self._scene_owner_from_key(key) not in scene_nodes
+        }
+        self.submix_state.update(snapshot.get("submixes", {}))
+
+        self.active_effects = {
+            key: value
+            for key, value in self.active_effects.items()
+            if key not in scene_nodes
+        }
+        self.active_effects.update(snapshot.get("active_effects", {}))
+
+        self.effect_params = {
+            key: value
+            for key, value in self.effect_params.items()
+            if key not in scene_nodes
+        }
+        self.effect_params.update(snapshot.get("effect_params", {}))
+
+        self.app_routing = dict(snapshot.get("app_routing", {}))
+        scene_order = list(snapshot.get("channel_order", []))
+        self.channel_order = scene_order + [
+            name for name in self.channel_order
+            if name not in scene_order
+        ]
+        self._desired_mix_hw["Monitor"] = snapshot.get("monitor_hw")
+        self._desired_mix_hw["Stream"] = snapshot.get("stream_hw")
+        self.runtime.set_mix_hardware_route("Monitor", snapshot.get("monitor_hw"))
+        self.runtime.set_mix_hardware_route("Stream", snapshot.get("stream_hw"))
+        self._sync_runtime_persistent_state()
+        self.schedule_save()
+        if hasattr(self, "_refresh_hidden_list"):
+            self._refresh_hidden_list()
+        if hasattr(self, "_refresh_advanced_tab"):
+            self._refresh_advanced_tab()
+        if hasattr(self, "_refresh_scenes_tab"):
+            self._refresh_scenes_tab(scene_name or self._selected_scene_name())
+        if hasattr(self, "_refresh"):
+            self._refresh()
+        label = scene_name or "scene"
+        self.status_lbl.setText(f"Applied {label}")
+        return True
+
+    def _save_current_scene_as(self):
+        current_name = self._selected_scene_name()
+        text, ok = QInputDialog.getText(
+            self.settings_dialog,
+            "Save Scene",
+            "Scene name:",
+            text=current_name,
+        )
+        if not ok:
+            return
+        name = re.sub(r"\s+", " ", text).strip()
+        if not name:
+            return
+        if name in self.scenes:
+            yn = QMessageBox.question(
+                self.settings_dialog,
+                "Overwrite Scene",
+                f"Replace the existing scene '{name}'?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if yn != QMessageBox.StandardButton.Yes:
+                return
+        self.scenes[name] = self._capture_scene_snapshot()
+        self.save_config()
+        self._refresh_scenes_tab(name)
+        self.status_lbl.setText(f"Saved scene: {name}")
+
+    def _overwrite_selected_scene(self):
+        name = self._selected_scene_name()
+        if not name:
+            return
+        self.scenes[name] = self._capture_scene_snapshot()
+        self.save_config()
+        self._refresh_scenes_tab(name)
+        self.status_lbl.setText(f"Updated scene: {name}")
+
+    def _apply_selected_scene(self):
+        name = self._selected_scene_name()
+        if not name:
+            return
+        self._apply_scene_snapshot(self.scenes.get(name), scene_name=name)
+
+    def _rename_selected_scene(self):
+        current = self._selected_scene_name()
+        if not current:
+            return
+        text, ok = QInputDialog.getText(
+            self.settings_dialog,
+            "Rename Scene",
+            "Scene name:",
+            text=current,
+        )
+        if not ok:
+            return
+        new_name = re.sub(r"\s+", " ", text).strip()
+        if not new_name or new_name == current:
+            return
+        if new_name in self.scenes:
+            yn = QMessageBox.question(
+                self.settings_dialog,
+                "Replace Scene",
+                f"Replace the existing scene '{new_name}'?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if yn != QMessageBox.StandardButton.Yes:
+                return
+        snapshot = self.scenes.pop(current)
+        self.scenes[new_name] = snapshot
+        self.save_config()
+        self._refresh_scenes_tab(new_name)
+        self.status_lbl.setText(f"Renamed scene: {new_name}")
+
+    def _delete_selected_scene(self):
+        name = self._selected_scene_name()
+        if not name:
+            return
+        yn = QMessageBox.question(
+            self.settings_dialog,
+            "Delete Scene",
+            f"Delete the scene '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if yn != QMessageBox.StandardButton.Yes:
+            return
+        self.scenes.pop(name, None)
+        self.save_config()
+        self._refresh_scenes_tab()
+        self.status_lbl.setText(f"Deleted scene: {name}")
+
+    def _preferred_setup_mic(self):
+        if self.selected_mic:
+            return self.selected_mic
+        view = getattr(self, "_runtime_view_state", None)
+        default_source = getattr(view, "default_source", None) if view is not None else None
+        if default_source:
+            return default_source
+        mics = list(getattr(view, "mic_inputs", []) or []) if view is not None else []
+        if mics:
+            return getattr(mics[0], "name", "") or None
+        engine = getattr(self, "engine", None)
+        if engine is not None and hasattr(engine, "get_default_source"):
+            return engine.get_default_source()
+        return None
+
+    def _apply_quick_start_template(self, template_id):
+        template = _QUICK_START_TEMPLATES.get(template_id)
+        if template is None:
+            return False
+        template_channels = list(template.get("channels", []) or [])
+        self.virtual_channels = self._dedupe_names(template_channels + list(self.virtual_channels))
+        template_order = []
+        for display_name in template_channels:
+            _, safe = PipeWireEngine._sanitize_channel_name(display_name)
+            template_order.append(f"wavelinux_{safe}")
+        self.channel_order = self._dedupe_names(template_order + list(self.channel_order))
+        for display_name in template_channels:
+            self.runtime.ensure_virtual_channel_sync(display_name)
+
+        selected_mic = self._preferred_setup_mic()
+        if selected_mic:
+            self.selected_mic = selected_mic
+            self.runtime.set_selected_mic(selected_mic)
+            self.active_effects[selected_mic] = list(template.get("mic_effects", []) or [])
+
+        default_sink = self.engine.get_default_sink() if hasattr(self.engine, "get_default_sink") else None
+        if default_sink:
+            self._set_mix_output_target("Monitor", default_sink, persist=False, update_combo=True)
+        self._selected_setup_template = template_id
+        self._onboarding_completed = True
+        self._show_first_run_setup = False
+        self._sync_runtime_persistent_state()
+        self.schedule_save()
+        self._refresh()
+        self.status_lbl.setText(f"Applied quick start: {template['title']}")
+        return True
+
+    def _open_quick_start_setup(self):
+        first_run = bool(self._show_first_run_setup and not self._onboarding_completed)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Quick Start Setup")
+        dlg.setMinimumWidth(480)
+        dlg.setStyleSheet(STYLESHEET)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("QUICK START")
+        title.setObjectName("sectionLabel")
+        layout.addWidget(title)
+
+        intro = QLabel(
+            "Pick a starter template. You can run this again later from Settings to reshape channels and default mic FX."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #8b8b9e; font-size: 11px;")
+        layout.addWidget(intro)
+
+        combo = QComboBox()
+        for template_id, meta in _QUICK_START_TEMPLATES.items():
+            combo.addItem(meta["title"], template_id)
+        if self._selected_setup_template:
+            idx = combo.findData(self._selected_setup_template)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        layout.addWidget(combo)
+
+        desc_lbl = QLabel()
+        desc_lbl.setWordWrap(True)
+        desc_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
+        layout.addWidget(desc_lbl)
+
+        def _sync_desc():
+            template = _QUICK_START_TEMPLATES.get(combo.currentData(), {})
+            channels = ", ".join(template.get("channels", []) or []) or "None"
+            mic_fx = ", ".join(template.get("mic_effects", []) or []) or "None"
+            desc_lbl.setText(
+                f"{template.get('description', '').strip()}\n\n"
+                f"Starter channels: {channels}\n"
+                f"Mic FX: {mic_fx}"
+            )
+
+        combo.currentIndexChanged.connect(_sync_desc)
+        _sync_desc()
+
+        buttons = QDialogButtonBox()
+        apply_btn = buttons.addButton("Apply Template", QDialogButtonBox.ButtonRole.AcceptRole)
+        skip_text = "Skip for now" if first_run else "Cancel"
+        skip_btn = buttons.addButton(skip_text, QDialogButtonBox.ButtonRole.RejectRole)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        apply_btn.setDefault(True)
+        skip_btn.setAutoDefault(False)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            if first_run:
+                self._onboarding_completed = True
+                self._show_first_run_setup = False
+                self.save_config()
+                self.status_lbl.setText("Quick start skipped")
+            return
+        if self._apply_quick_start_template(combo.currentData()):
+            self.save_config()
 
     def _build_advanced_tab(self):
         """Settings → Advanced tab. Each control writes through to
@@ -2218,10 +2763,35 @@ class WaveLinuxWindow(QMainWindow):
         self.autostart_check.toggled.connect(self.set_autostart)
         layout.addWidget(self.autostart_check)
 
+        quick_start_btn = QPushButton("Quick Start Setup…")
+        quick_start_btn.setObjectName("showHiddenBtn")
+        quick_start_btn.clicked.connect(self._open_quick_start_setup)
+        layout.addWidget(quick_start_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
         profiles_btn = QPushButton("Sound Card Profiles…")
         profiles_btn.setObjectName("showHiddenBtn")
         profiles_btn.clicked.connect(self._open_card_profiles)
         layout.addWidget(profiles_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        _heading("CONFIG")
+        config_btn_row = QHBoxLayout()
+        import_config_btn = QPushButton("Import Full Config…")
+        import_config_btn.setObjectName("showHiddenBtn")
+        import_config_btn.setToolTip(
+            "Replace the current WaveLinux configuration with a saved JSON export."
+        )
+        import_config_btn.clicked.connect(self._import_full_config)
+        config_btn_row.addWidget(import_config_btn)
+
+        export_config_btn = QPushButton("Export Full Config…")
+        export_config_btn.setObjectName("showHiddenBtn")
+        export_config_btn.setToolTip(
+            "Save the current WaveLinux configuration, scenes, routing, and FX state to JSON."
+        )
+        export_config_btn.clicked.connect(self._export_full_config)
+        config_btn_row.addWidget(export_config_btn)
+        config_btn_row.addStretch()
+        layout.addLayout(config_btn_row)
 
         # LADSPA / diagnostics
         _heading("DIAGNOSTICS")
@@ -3163,6 +3733,9 @@ class WaveLinuxWindow(QMainWindow):
         hidden_layout.addWidget(self.hidden_list_container, 1)
         tabs.addTab(hidden_tab, "Hidden")
 
+        # — Scenes tab —
+        tabs.addTab(self._build_scenes_tab(), "Scenes")
+
         # — System tab —
         tabs.addTab(self._build_system_tab(), "System")
 
@@ -3291,10 +3864,27 @@ class WaveLinuxWindow(QMainWindow):
         for mix_name, vol in pending.items():
             self.runtime.set_mix_volume(mix_name, vol)
 
-    def _on_mix_out_change(self, mix_name, hw_sink_name):
+    def _set_mix_output_target(self, mix_name, hw_sink_name, *, persist=True, update_combo=False):
         self._desired_mix_hw[mix_name] = hw_sink_name
-        self.runtime.set_mix_hardware_route(mix_name, hw_sink_name)
-        self.schedule_save()
+        runtime = getattr(self, "runtime", None)
+        if runtime is not None:
+            runtime.set_mix_hardware_route(mix_name, hw_sink_name)
+        if update_combo:
+            combo_name = "mon_out_combo" if mix_name == "Monitor" else "str_out_combo"
+            combo = getattr(self, combo_name, None)
+            if combo is not None and hasattr(combo, "blockSignals"):
+                combo.blockSignals(True)
+                try:
+                    idx = combo.findData(hw_sink_name) if hasattr(combo, "findData") else -1
+                    if idx >= 0 and hasattr(combo, "setCurrentIndex"):
+                        combo.setCurrentIndex(idx)
+                finally:
+                    combo.blockSignals(False)
+        if persist:
+            self.schedule_save()
+
+    def _on_mix_out_change(self, mix_name, hw_sink_name):
+        self._set_mix_output_target(mix_name, hw_sink_name, persist=True, update_combo=False)
 
     def _apply_pending_clipguard_migration(self):
         """Rewrite the legacy master-bus `clipguard: true` flag as a
@@ -3660,15 +4250,159 @@ class WaveLinuxWindow(QMainWindow):
                 if name not in self.virtual_channels:
                     self.virtual_channels.append(name)
 
+    def _serialize_config(self):
+        scenes = self.__dict__.get('scenes', {})
+        return {
+            'schema_version': 1,
+            'monitor_hw': self._desired_mix_hw.get("Monitor"),
+            'stream_hw': self._desired_mix_hw.get("Stream"),
+            'channels': list(self.virtual_channels),
+            'scenes': self._normalize_scene_library(scenes),
+            'onboarding_completed': bool(self.__dict__.get('_onboarding_completed', True)),
+            'quick_start_template': self.__dict__.get('_selected_setup_template', ""),
+            'selected_mic': self.selected_mic,
+            'submixes': dict(self.submix_state),
+            'hidden': sorted(self.hidden_nodes),
+            'app_routing': {
+                k: v for k, v in self.app_routing.items()
+                if PipeWireEngine.is_persistent_app_id(k)
+            },
+            'channel_order': list(self.channel_order),
+            'effect_params': self.effect_params,
+            'active_effects': self.active_effects,
+            'app_last_seen': {
+                k: v for k, v in self.app_last_seen.items()
+                if PipeWireEngine.is_persistent_app_id(k)
+            },
+            'app_display_names': {
+                k: v for k, v in self.app_display_names.items()
+                if PipeWireEngine.is_persistent_app_id(k)
+            },
+            'app_prune_days': self.app_prune_days,
+            'forgotten_apps': sorted(
+                name for name in self.forgotten_apps
+                if PipeWireEngine.is_persistent_app_id(name)
+            ),
+        }
+
+    @staticmethod
+    def _write_config_file(path, payload):
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(payload, f, indent=4)
+        os.replace(tmp, path)
+
+    def _apply_config_dict(self, conf, *, remove_missing_virtuals=False):
+        if not isinstance(conf, dict):
+            raise ValueError("WaveLinux config must be a JSON object.")
+        runtime = getattr(self, "runtime", None)
+        engine = getattr(self, "engine", None)
+        previous_virtuals = list(self.__dict__.get("virtual_channels", []) or [])
+        self.submix_state = self._migrate_submix_state(conf.get('submixes', {}))
+        self.hidden_nodes = self._migrate_hidden_nodes(conf.get('hidden', []))
+        self.app_routing = {
+            k: v for k, v in (conf.get('app_routing', {}) or {}).items()
+            if PipeWireEngine.is_persistent_app_id(k)
+        }
+        self.app_last_seen = {
+            k: int(v) for k, v in (conf.get('app_last_seen', {}) or {}).items()
+            if isinstance(k, str) and isinstance(v, (int, float))
+            and PipeWireEngine.is_persistent_app_id(k)
+        }
+        self.app_display_names = {
+            k: v for k, v in (conf.get('app_display_names', {}) or {}).items()
+            if isinstance(k, str) and isinstance(v, str) and PipeWireEngine.is_persistent_app_id(k)
+        }
+        self.app_prune_days = int(conf.get('app_prune_days', self.app_prune_days) or 14)
+        self.forgotten_apps = {
+            name for name in (conf.get('forgotten_apps', []) or [])
+            if isinstance(name, str) and PipeWireEngine.is_persistent_app_id(name)
+        }
+        for name in list(self.app_routing.keys()):
+            if PipeWireEngine.name_matches_host(name):
+                self.app_routing.pop(name, None)
+        for name in list(self.app_last_seen.keys()):
+            if PipeWireEngine.name_matches_host(name):
+                self.app_last_seen.pop(name, None)
+                self.app_display_names.pop(name, None)
+        for app_id in set(self.app_routing) | set(self.app_last_seen) | set(self.forgotten_apps):
+            self.app_display_names.setdefault(
+                app_id,
+                PipeWireEngine.display_name_for_app_id(app_id),
+            )
+        self._prune_stale_apps()
+        self.virtual_channels = self._dedupe_names(conf.get('channels', []) or [])
+        self.scenes = self._normalize_scene_library(conf.get('scenes', {}))
+        self._onboarding_completed = bool(conf.get('onboarding_completed', True))
+        self._selected_setup_template = str(conf.get('quick_start_template') or "")
+        self.channel_order = self._dedupe_names(conf.get('channel_order', []) or [])
+        self.selected_mic = conf.get('selected_mic') or None
+        if runtime is not None:
+            runtime.set_selected_mic(self.selected_mic)
+        self.effect_params = conf.get('effect_params', {}) or {}
+        self.active_effects = {
+            k: list(v) for k, v in (conf.get('active_effects', {}) or {}).items()
+            if isinstance(v, list)
+        }
+
+        _comp_key_remap = {
+            'threshold_db':  'Threshold level (dB)',
+            'ratio':         'Ratio (1:n)',
+            'attack_ms':     'Attack time (ms)',
+            'release_ms':    'Release time (ms)',
+            'makeup_gain_db':'Makeup gain (dB)',
+        }
+        for _node_params in self.effect_params.values():
+            _comp = _node_params.get('compressor')
+            if not isinstance(_comp, dict):
+                continue
+            for _old, _new in _comp_key_remap.items():
+                if _old in _comp and _new not in _comp:
+                    _comp[_new] = _comp.pop(_old)
+                elif _old in _comp:
+                    _comp.pop(_old, None)
+
+        if runtime is not None:
+            runtime.ensure_output_mix_sync("Monitor")
+            runtime.ensure_output_mix_sync("Stream")
+
+        self._pending_clipguard_migration = bool(conf.get('clipguard'))
+        if self._pending_clipguard_migration and self.selected_mic:
+            self._apply_pending_clipguard_migration()
+
+        if remove_missing_virtuals and runtime is not None:
+            for name in previous_virtuals:
+                if name in self.virtual_channels:
+                    continue
+                _, safe = PipeWireEngine._sanitize_channel_name(name)
+                runtime.remove_virtual_channel_sync(f"wavelinux_{safe}")
+        if runtime is not None:
+            for name in self.virtual_channels:
+                runtime.ensure_virtual_channel_sync(name)
+
+        default_sink = (
+            engine.get_default_sink()
+            if engine is not None and hasattr(engine, "get_default_sink")
+            else None
+        )
+        mon_hw = conf.get('monitor_hw') or default_sink
+        str_hw = conf.get('stream_hw')
+        self._set_mix_output_target("Monitor", mon_hw, persist=False, update_combo=True)
+        self._set_mix_output_target("Stream", str_hw, persist=False, update_combo=True)
+        self._sync_runtime_persistent_state()
+
     def load_config(self):
         if not os.path.exists(self.config_path):
             # First launch — set up the standard mixes, route Monitor to
             # the system default, and seed starter channels.
+            self._onboarding_completed = False
+            self._selected_setup_template = ""
+            self._show_first_run_setup = True
             self.runtime.ensure_output_mix_sync("Monitor")
             self.runtime.ensure_output_mix_sync("Stream")
             def_sink = self.engine.get_default_sink()
             if def_sink:
-                self._on_mix_out_change("Monitor", def_sink)
+                self._set_mix_output_target("Monitor", def_sink, persist=False, update_combo=True)
             self._seed_default_channels()
             self.save_config()
             return
@@ -3676,115 +4410,7 @@ class WaveLinuxWindow(QMainWindow):
         try:
             with open(self.config_path, 'r') as f:
                 conf = json.load(f)
-                self.submix_state = self._migrate_submix_state(conf.get('submixes', {}))
-                self.hidden_nodes = self._migrate_hidden_nodes(conf.get('hidden', []))
-                self.app_routing = {
-                    k: v for k, v in (conf.get('app_routing', {}) or {}).items()
-                    if PipeWireEngine.is_persistent_app_id(k)
-                }
-                self.app_last_seen = {
-                    k: int(v) for k, v in (conf.get('app_last_seen', {}) or {}).items()
-                    if isinstance(k, str) and isinstance(v, (int, float))
-                    and PipeWireEngine.is_persistent_app_id(k)
-                }
-                self.app_display_names = {
-                    k: v for k, v in (conf.get('app_display_names', {}) or {}).items()
-                    if isinstance(k, str) and isinstance(v, str) and PipeWireEngine.is_persistent_app_id(k)
-                }
-                self.app_prune_days = int(conf.get('app_prune_days', self.app_prune_days) or 14)
-                # Persistent ✕ blocklist. Set for O(1) membership.
-                self.forgotten_apps = {
-                    name for name in (conf.get('forgotten_apps', []) or [])
-                    if isinstance(name, str) and PipeWireEngine.is_persistent_app_id(name)
-                }
-                # Purge host-named ghosts from older configs whose engine
-                # filter didn't normalise whitespace.
-                for name in list(self.app_routing.keys()):
-                    if PipeWireEngine.name_matches_host(name):
-                        self.app_routing.pop(name, None)
-                for name in list(self.app_last_seen.keys()):
-                    if PipeWireEngine.name_matches_host(name):
-                        self.app_last_seen.pop(name, None)
-                        self.app_display_names.pop(name, None)
-                for app_id in set(self.app_routing) | set(self.app_last_seen) | set(self.forgotten_apps):
-                    self.app_display_names.setdefault(
-                        app_id,
-                        PipeWireEngine.display_name_for_app_id(app_id),
-                    )
-                self._prune_stale_apps()
-                self.virtual_channels = conf.get('channels', [])
-                self.channel_order = conf.get('channel_order', []) or []
-                # Single-mic mode: which mic the user picked in the master
-                # "Microphone Input" combo. None means "use system default";
-                # the refresh path resolves None to `pactl get-default-source`
-                # the first time it runs.
-                self.selected_mic = conf.get('selected_mic') or None
-                self.runtime.set_selected_mic(self.selected_mic)
-                self.effect_params = conf.get('effect_params', {}) or {}
-                self.active_effects = {
-                    k: list(v) for k, v in (conf.get('active_effects', {}) or {}).items()
-                    if isinstance(v, list)
-                }
-
-                # Saved FX intent is reconciled by the runtime controller
-                # worker against the observed graph.
-
-                # Migrate compressor keys from pre-rewrite snake_case
-                # (`threshold_db` etc.) to sc4m's real LADSPA port names.
-                _comp_key_remap = {
-                    'threshold_db':  'Threshold level (dB)',
-                    'ratio':         'Ratio (1:n)',
-                    'attack_ms':     'Attack time (ms)',
-                    'release_ms':    'Release time (ms)',
-                    'makeup_gain_db':'Makeup gain (dB)',
-                }
-                for _node_params in self.effect_params.values():
-                    _comp = _node_params.get('compressor')
-                    if not isinstance(_comp, dict):
-                        continue
-                    for _old, _new in _comp_key_remap.items():
-                        if _old in _comp and _new not in _comp:
-                            _comp[_new] = _comp.pop(_old)
-                        elif _old in _comp:
-                            _comp.pop(_old, None)
-
-                # Create standard mixes (always needed)
-                self.runtime.ensure_output_mix_sync("Monitor")
-                self.runtime.ensure_output_mix_sync("Stream")
-
-                # Legacy master-bus Clipguard → per-mic limiter migration.
-                # `selected_mic` may not be resolved yet here, so we just
-                # stash the intent and `_refresh` applies it once the
-                # picker has landed.
-                self._pending_clipguard_migration = bool(conf.get('clipguard'))
-                if self._pending_clipguard_migration and self.selected_mic:
-                    self._apply_pending_clipguard_migration()
-
-                # Recreate virtual channels
-                for name in self.virtual_channels:
-                    self.runtime.ensure_virtual_channel_sync(name)
-                    
-                # Restore output mix hardware routing. Block the combo signals
-                # so setCurrentIndex doesn't also trigger the change handler —
-                # we call it explicitly exactly once.
-                mon_hw = conf.get('monitor_hw') or self.engine.get_default_sink()
-                str_hw = conf.get('stream_hw')
-                self._desired_mix_hw["Monitor"] = mon_hw
-                self._desired_mix_hw["Stream"] = str_hw
-                for combo, mix_name, hw in (
-                    (self.mon_out_combo, "Monitor", mon_hw),
-                    (self.str_out_combo, "Stream", str_hw),
-                ):
-                    if not hw:
-                        continue
-                    combo.blockSignals(True)
-                    idx = combo.findData(hw)
-                    if idx >= 0:
-                        combo.setCurrentIndex(idx)
-                    combo.blockSignals(False)
-                    self._on_mix_out_change(mix_name, hw)
-                self._sync_runtime_persistent_state()
-
+            self._apply_config_dict(conf, remove_missing_virtuals=True)
         except Exception as e:
             logging.error(f"Error loading config: {e}")
 
@@ -3824,38 +4450,96 @@ class WaveLinuxWindow(QMainWindow):
     def save_config(self):
         # `clipguard` (legacy master-bus flag) is not written — it's
         # been replaced by the per-mic `limiter` effect.
-        conf = {
-            'schema_version': 1,
-            'monitor_hw': self._desired_mix_hw.get("Monitor"),
-            'stream_hw': self._desired_mix_hw.get("Stream"),
-            'channels': self.virtual_channels,
-            'selected_mic': self.selected_mic,
-            'submixes': self.submix_state,
-            'hidden': list(self.hidden_nodes),
-            'app_routing': {k: v for k, v in self.app_routing.items()
-                            if PipeWireEngine.is_persistent_app_id(k)},
-            'channel_order': self.channel_order,
-            'effect_params': self.effect_params,
-            'active_effects': self.active_effects,
-            'app_last_seen': {k: v for k, v in self.app_last_seen.items()
-                              if PipeWireEngine.is_persistent_app_id(k)},
-            'app_display_names': {
-                k: v for k, v in self.app_display_names.items()
-                if PipeWireEngine.is_persistent_app_id(k)
-            },
-            'app_prune_days': self.app_prune_days,
-            'forgotten_apps': sorted(
-                name for name in self.forgotten_apps
-                if PipeWireEngine.is_persistent_app_id(name)
-            ),
-        }
         try:
-            tmp = self.config_path + '.tmp'
-            with open(tmp, 'w') as f:
-                json.dump(conf, f, indent=4)
-            os.replace(tmp, self.config_path)
+            self._write_config_file(self.config_path, self._serialize_config())
         except Exception as e:
             logging.error(f"Error saving config: {e}")
+
+    def _backup_current_config(self):
+        if not os.path.exists(self.config_path):
+            return ""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup_path = f"{self.config_path}.{stamp}.bak"
+        shutil.copy2(self.config_path, backup_path)
+        return backup_path
+
+    def _export_full_config(self):
+        default_name = os.path.join(
+            os.path.dirname(self.config_path),
+            f"wavelinux-export-{time.strftime('%Y%m%d-%H%M%S')}.json",
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self.settings_dialog,
+            "Export WaveLinux Config",
+            default_name,
+            "JSON Files (*.json)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            self._write_config_file(path, self._serialize_config())
+        except Exception as exc:
+            QMessageBox.warning(
+                self.settings_dialog,
+                "Config export failed",
+                str(exc),
+            )
+            return
+        self.status_lbl.setText("Config exported")
+        QMessageBox.information(
+            self.settings_dialog,
+            "Config exported",
+            f"Saved WaveLinux config to:\n{path}",
+        )
+
+    def _import_full_config(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self.settings_dialog,
+            "Import WaveLinux Config",
+            os.path.dirname(self.config_path),
+            "JSON Files (*.json)",
+        )
+        if not path:
+            return
+        yn = QMessageBox.question(
+            self.settings_dialog,
+            "Import WaveLinux Config",
+            "Replace the current WaveLinux configuration with the selected file?\n\n"
+            "This overwrites scenes, routing, FX, and saved app state.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if yn != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            with open(path, "r") as fh:
+                payload = json.load(fh)
+            backup_path = self._backup_current_config()
+            self._apply_config_dict(payload, remove_missing_virtuals=True)
+            self.save_config()
+        except Exception as exc:
+            QMessageBox.warning(
+                self.settings_dialog,
+                "Config import failed",
+                str(exc),
+            )
+            return
+        self._refresh_scenes_tab()
+        self._refresh_hidden_list()
+        self._refresh_advanced_tab()
+        self._refresh_system_tab()
+        self._refresh_update_tab()
+        self._refresh()
+        self.status_lbl.setText("Config imported")
+        msg = f"Imported WaveLinux config from:\n{path}"
+        if backup_path:
+            msg += f"\n\nBackup of the previous config:\n{backup_path}"
+        QMessageBox.information(
+            self.settings_dialog,
+            "Config imported",
+            msg,
+        )
 
 
 
