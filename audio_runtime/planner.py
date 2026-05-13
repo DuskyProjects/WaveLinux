@@ -48,6 +48,15 @@ class RuntimePlanner:
     def _sink_names_match(cls, left, right):
         return cls._canonical_sink_name(left) == cls._canonical_sink_name(right)
 
+    @staticmethod
+    def _fx_params_match(current_params, wanted_params, effect_ids):
+        current_params = current_params or {}
+        wanted_params = wanted_params or {}
+        for effect_id in effect_ids:
+            if (current_params.get(effect_id) or {}) != (wanted_params.get(effect_id) or {}):
+                return False
+        return True
+
     def apply_intent(self, desired_state, intent):
         if isinstance(intent, SetChannelFx):
             chan = desired_state.channels.get(intent.node_name)
@@ -131,7 +140,7 @@ class RuntimePlanner:
             }
             current_params = observed_state.fx_params_by_channel.get(intent.node_name, {})
             if (current_effects != wanted_effects
-                    or current_params != wanted_params
+                    or not self._fx_params_match(current_params, wanted_params, wanted_effects)
                     or not current_source):
                 return [Action("apply_channel_fx", {
                     "node_name": intent.node_name,
@@ -294,7 +303,11 @@ class RuntimePlanner:
                     for key, vals in chan_spec.fx.params_map.items()
                 }
                 if (current_effects != list(chan_spec.fx.effects)
-                        or current_params != wanted_params
+                        or not self._fx_params_match(
+                            current_params,
+                            wanted_params,
+                            list(chan_spec.fx.effects),
+                        )
                         or not current_source):
                     actions.append(Action("apply_channel_fx", {
                         "node_name": channel.name,

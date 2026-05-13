@@ -276,6 +276,68 @@ class RuntimePlannerTests(unittest.TestCase):
         self.assertEqual(len(apply_actions), 1)
         self.assertEqual(apply_actions[0].payload["fx_spec"].generation, 5)
 
+    def test_refresh_now_ignores_saved_params_for_disabled_effects(self):
+        planner = RuntimePlanner()
+        desired = DesiredState(
+            selected_mic="mic",
+            channels={
+                "mic": ChannelSpec(
+                    node_name="mic",
+                    capture_target="mic",
+                    fx=FxSpec(
+                        effects=["compressor", "gate", "limiter"],
+                        params_map={
+                            "rnnoise": {"VAD Threshold (%)": 25.0},
+                            "highpass": {"Freq": 80.0},
+                            "eq": {"High Gain": 1.5},
+                            "compressor": {"Threshold level (dB)": -16.02},
+                            "gate": {"Threshold (dB)": -40.0},
+                            "limiter": {"Limit (dB)": -0.5},
+                        },
+                        generation=6,
+                    ),
+                )
+            },
+        )
+        observed = ObservedState(
+            mic_inputs=[
+                RuntimeChannelView(
+                    node_id="55",
+                    name="mic",
+                    description="USB Mic",
+                    media_class="Audio/Source",
+                    label="USB Mic",
+                    channel_type="Microphone",
+                    icon="mic",
+                    is_mic=True,
+                    capture_target="mic",
+                    meter_source="wavelinux.fx.mic.source",
+                )
+            ],
+            fx_sources_by_channel={"mic": "wavelinux.fx.mic.source"},
+            fx_effects_by_channel={"mic": ["compressor", "gate", "limiter"]},
+            fx_params_by_channel={
+                "mic": {
+                    "compressor": {"Threshold level (dB)": -16.02},
+                    "gate": {"Threshold (dB)": -40.0},
+                    "limiter": {"Limit (dB)": -0.5},
+                }
+            },
+            submix_owner_by_channel={"mic": {"Monitor": "11", "Stream": "12"}},
+            submix_live_by_channel={"mic": {"Monitor": True, "Stream": True}},
+            submix_source_by_channel={
+                "mic": {
+                    "Monitor": "wavelinux.fx.mic.source",
+                    "Stream": "wavelinux.fx.mic.source",
+                }
+            },
+            default_source="wavelinux.fx.mic.source",
+        )
+
+        actions = planner.reconcile(desired, observed, RefreshNow("tick"))
+
+        self.assertNotIn("apply_channel_fx", [action.kind for action in actions])
+
     def test_refresh_now_recreates_missing_virtual_channel(self):
         planner = RuntimePlanner()
         desired = DesiredState(

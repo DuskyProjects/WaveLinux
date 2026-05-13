@@ -269,6 +269,46 @@ class RuntimeExecutorTests(unittest.TestCase):
 
         self.assertEqual(health["mic"], "fx_params_mismatch")
 
+    def test_check_invariants_ignores_saved_params_for_disabled_effects(self):
+        desired = DesiredState(
+            selected_mic="mic",
+            channels={
+                "mic": ChannelSpec(
+                    node_name="mic",
+                    fx=FxSpec(
+                        effects=["compressor", "gate", "limiter"],
+                        params_map={
+                            "rnnoise": {"VAD Threshold (%)": 25.0},
+                            "highpass": {"Freq": 80.0},
+                            "eq": {"High Gain": 1.5},
+                            "compressor": {"Threshold level (dB)": -16.02},
+                            "gate": {"Threshold (dB)": -40.0},
+                            "limiter": {"Limit (dB)": -0.5},
+                        },
+                        generation=3,
+                    ),
+                )
+            },
+        )
+        observed = ObservedState(
+            present_node_names={"mic"},
+            default_source="wavelinux.fx.mic.source",
+            fx_sources_by_channel={"mic": "wavelinux.fx.mic.source"},
+            fx_effects_by_channel={"mic": ["compressor", "gate", "limiter"]},
+            fx_params_by_channel={
+                "mic": {
+                    "compressor": {"Threshold level (dB)": -16.02},
+                    "gate": {"Threshold (dB)": -40.0},
+                    "limiter": {"Limit (dB)": -0.5},
+                }
+            },
+            source_names={"wavelinux.fx.mic.source"},
+        )
+
+        health = RuntimeExecutor._check_invariants(desired, observed)
+
+        self.assertNotIn("mic", health)
+
     def test_execute_without_actions_reuses_observed_state(self):
         executor = RuntimeExecutor(FakeAdapter(FakeEngine()), DummyDiagnostics())
         desired = DesiredState()

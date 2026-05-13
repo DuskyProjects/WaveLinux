@@ -509,7 +509,10 @@ class RuntimeExecutor:
                 health.setdefault(node_name, "fx_effects_not_visible")
             elif fx_effects != desired_effects:
                 health.setdefault(node_name, "fx_effects_mismatch")
-            elif observed_params != desired_params:
+            elif any(
+                (desired_params.get(effect_id) or {}) != (observed_params.get(effect_id) or {})
+                for effect_id in desired_effects
+            ):
                 health.setdefault(node_name, "fx_params_mismatch")
             if fx_source not in observed_state.source_names:
                 health.setdefault(node_name, "fx_source_not_present")
