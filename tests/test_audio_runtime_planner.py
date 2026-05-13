@@ -500,6 +500,61 @@ class RuntimePlannerTests(unittest.TestCase):
         ensure_actions = [action for action in actions if action.kind == "ensure_submix_route"]
         self.assertEqual(ensure_actions, [])
 
+    def test_refresh_now_reapplies_saved_submix_state_when_live_volume_or_mute_drifted(self):
+        planner = RuntimePlanner()
+        desired = DesiredState(
+            virtual_channels={"wavelinux_music": "Music"},
+            channels={
+                "wavelinux_music": ChannelSpec(
+                    node_name="wavelinux_music",
+                    capture_target="wavelinux_music.monitor",
+                    submix_state={"Stream": {"vol": 0.3, "mute": True}},
+                )
+            },
+        )
+        observed = ObservedState(
+            virtual_channels=[
+                RuntimeChannelView(
+                    node_id="55",
+                    name="wavelinux_music",
+                    description="Music",
+                    media_class="Audio/Sink",
+                    label="Music",
+                    channel_type="Virtual",
+                    icon="music",
+                    is_mic=False,
+                    capture_target="wavelinux_music.monitor",
+                    meter_source="wavelinux_music.monitor",
+                    monitor_volume=1.0,
+                    monitor_mute=False,
+                    stream_volume=1.0,
+                    stream_mute=False,
+                )
+            ],
+            submix_owner_by_channel={"wavelinux_music": {"Monitor": "11", "Stream": "12"}},
+            submix_live_by_channel={"wavelinux_music": {"Monitor": True, "Stream": True}},
+            submix_source_by_channel={
+                "wavelinux_music": {
+                    "Monitor": "wavelinux_music.monitor",
+                    "Stream": "wavelinux_music.monitor",
+                }
+            },
+        )
+
+        actions = planner.reconcile(desired, observed, RefreshNow("tick"))
+
+        submix_actions = [action for action in actions if action.kind == "set_submix_state"]
+        self.assertEqual(len(submix_actions), 1)
+        self.assertEqual(
+            submix_actions[0].payload,
+            {
+                "node_id": "55",
+                "mix_name": "Stream",
+                "volume": 0.3,
+                "mute": True,
+            },
+        )
+
     def test_refresh_now_rebuilds_submix_route_when_source_is_stale(self):
         planner = RuntimePlanner()
         desired = DesiredState(

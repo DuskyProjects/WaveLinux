@@ -12,6 +12,7 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         engine.submix_loopbacks = {}
         engine.submix_sources = {}
         engine.submix_state_cache = {}
+        engine._pending_submix_state_reapply = set()
         engine.virtual_sink_modules = {}
         engine.channel_fx = {}
         engine.rnnoise_processes = {}
@@ -195,6 +196,78 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         self.assertEqual(engine.submix_loopbacks["55->Monitor"], "222")
         self.assertEqual(engine.submix_sources["55->Monitor"], "wavelinux.fx.mic.source")
         self.assertIn(["pactl", "unload-module", "111"], calls)
+
+    def test_route_input_to_submix_marks_new_route_for_state_reapply_even_after_initial_apply(self):
+        engine = self._engine()
+        engine.output_mixes["Stream"] = OutputMix("Stream", sink_name="wavelinux_mix_stream")
+        engine._run = lambda cmd, *args, **kwargs: "222" if cmd[:3] == ["pactl", "load-module", "module-loopback"] else ""
+        engine.get_channel_fx_source = lambda node_name, snap=None: None
+        engine._module_is_alive = lambda module_id, short_text=None: True
+        engine._find_loopback_for = lambda source_token, sink_token, snap=None: None
+        engine.invalidate_snapshot = lambda: None
+        apply_calls = []
+        engine._apply_loopback_state = lambda module_id, state: apply_calls.append((module_id, dict(state))) or True
+
+        success = engine.route_input_to_submix(
+            "55",
+            "wavelinux_music",
+            "Audio/Sink",
+            "Stream",
+            initial_state={"vol": 0.33, "mute": True},
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(apply_calls, [("222", {"vol": 0.33, "mute": True})])
+        self.assertIn("55->Stream", engine._pending_submix_state_reapply)
+        self.assertEqual(
+            engine.submix_state_cache["55->Stream"],
+            {"vol": 0.33, "mute": True},
+        )
+
+    def test_set_submix_state_caches_pending_restore_when_sink_input_missing(self):
+        engine = self._engine()
+        engine.get_submix_sink_input = lambda node_id, mix_name: None
+        engine._run = lambda cmd, *args, **kwargs: "ok"
+
+        vol_ok = engine.set_submix_volume("55", "Stream", 0.33)
+        mute_ok = engine.set_submix_mute("55", "Stream", True)
+
+        self.assertFalse(vol_ok)
+        self.assertFalse(mute_ok)
+        self.assertEqual(
+            engine.submix_state_cache["55->Stream"],
+            {"vol": 0.33, "mute": True},
+        )
+        self.assertIn("55->Stream", engine._pending_submix_state_reapply)
+
+    def test_create_snapshot_reapplies_pending_submix_state(self):
+        engine = self._engine()
+        engine.submix_loopbacks = {"55->Stream": "401"}
+        engine.submix_state_cache = {"55->Stream": {"vol": 0.33, "mute": True}}
+        engine._pending_submix_state_reapply = {"55->Stream"}
+        run_calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            run_calls.append(cmd)
+            return ""
+
+        engine._run = fake_run
+        engine._sink_input_for_module = lambda module_id: "88" if str(module_id) == "401" else None
+        engine._parse_nodes = lambda: []
+        engine._parse_short_sinks = lambda: []
+        engine.reap_dead_processes = lambda: None
+
+        engine.create_snapshot()
+
+        self.assertIn(
+            ["pactl", "set-sink-input-volume", "88", "33%"],
+            run_calls,
+        )
+        self.assertIn(
+            ["pactl", "set-sink-input-mute", "88", "1"],
+            run_calls,
+        )
+        self.assertNotIn("55->Stream", engine._pending_submix_state_reapply)
 
     def test_set_channel_fx_does_not_move_internal_submix_loopbacks(self):
         engine = self._engine()

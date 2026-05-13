@@ -28,6 +28,10 @@ class _FakeRuntime:
         self.mix_route_sync_calls = []
         self.submix_calls = []
         self.source_volume_calls = []
+        self.mix_volume_calls = []
+        self.ensure_output_mix_calls = []
+        self.ensure_virtual_channel_calls = []
+        self.remove_virtual_channel_calls = []
 
     def sync_persistent_state(self, **kwargs):
         self.calls.append(kwargs)
@@ -49,6 +53,18 @@ class _FakeRuntime:
 
     def set_source_volume(self, node_name, volume):
         self.source_volume_calls.append((node_name, volume))
+
+    def set_mix_volume(self, mix_name, volume):
+        self.mix_volume_calls.append((mix_name, volume))
+
+    def ensure_output_mix_sync(self, mix_name):
+        self.ensure_output_mix_calls.append(mix_name)
+
+    def ensure_virtual_channel_sync(self, name):
+        self.ensure_virtual_channel_calls.append(name)
+
+    def remove_virtual_channel_sync(self, sink_name):
+        self.remove_virtual_channel_calls.append(sink_name)
 
 
 class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
@@ -73,6 +89,7 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
         win.app_prune_days = 14
         win.forgotten_apps = set()
         win._desired_mix_hw = {"Monitor": None, "Stream": None}
+        win._desired_mix_volumes = {"Monitor": 1.0, "Stream": 1.0}
         win.mon_out_combo = _DummyCombo(None)
         win.str_out_combo = _DummyCombo(None)
         win._runtime_pid_path = ""
@@ -98,6 +115,8 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
         win = self._window()
         win._desired_mix_hw["Monitor"] = "bluez_output.AA_BB_CC_DD_EE_FF.1"
         win._desired_mix_hw["Stream"] = "alsa_output.speakers"
+        win._desired_mix_volumes["Monitor"] = 0.73
+        win._desired_mix_volumes["Stream"] = 0.41
         with tempfile.TemporaryDirectory() as tmpdir:
             win.config_path = f"{tmpdir}/config.json"
 
@@ -107,6 +126,8 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
                 conf = json.load(fh)
         self.assertEqual(conf["monitor_hw"], "bluez_output.AA_BB_CC_DD_EE_FF.1")
         self.assertEqual(conf["stream_hw"], "alsa_output.speakers")
+        self.assertEqual(conf["monitor_mix_volume"], 0.73)
+        self.assertEqual(conf["stream_mix_volume"], 0.41)
 
     def test_save_config_flushes_pending_stream_strip_volume_before_serializing(self):
         win = self._window()
@@ -232,6 +253,83 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
 
         self.assertEqual(win.runtime.mix_route_sync_calls, [("Monitor", "bluez_output.headset")])
         self.assertEqual(win.runtime.mix_route_calls, [])
+
+    def test_sorted_input_nodes_keeps_mics_on_far_left(self):
+        win = self._window()
+        win.channel_order = ["wavelinux_browser", "usb_mic", "wavelinux_music"]
+        mic = SimpleNamespace(name="usb_mic", is_mic=True)
+        browser = SimpleNamespace(name="wavelinux_browser", is_mic=False)
+        music = SimpleNamespace(name="wavelinux_music", is_mic=False)
+
+        ordered = win._sorted_input_nodes([mic], [browser, music])
+
+        self.assertEqual(
+            [node.name for node in ordered],
+            ["usb_mic", "wavelinux_browser", "wavelinux_music"],
+        )
+
+    def test_on_mix_out_change_uses_sync_runtime_for_monitor(self):
+        win = self._window()
+        win.runtime = _FakeRuntime()
+        win.schedule_save = lambda: setattr(win, "_saved", True)
+
+        win._on_mix_out_change("Monitor", "bluez_output.headset")
+
+        self.assertEqual(win.runtime.mix_route_sync_calls, [("Monitor", "bluez_output.headset")])
+        self.assertEqual(win.runtime.mix_route_calls, [])
+        self.assertTrue(win.__dict__.get("_saved", False))
+
+    def test_apply_config_prefers_live_default_sink_for_monitor_output(self):
+        win = self._window()
+        win.runtime = _FakeRuntime()
+        win.schedule_save = lambda: None
+        win.engine = type(
+            "Engine",
+            (),
+            {
+                "get_default_sink": lambda self: "alsa_output.live_default",
+                "get_default_source": lambda self: "mic_b",
+            },
+        )()
+        win._set_engine_identity_overrides = lambda: None
+        win._prune_stale_apps = lambda: None
+
+        win._apply_config_dict(
+            {
+                "monitor_hw": "bluez_output.saved_headset",
+                "stream_hw": "alsa_output.stream_saved",
+                "monitor_mix_volume": 0.67,
+                "stream_mix_volume": 0.28,
+            }
+        )
+
+        self.assertEqual(win._desired_mix_hw["Monitor"], "alsa_output.live_default")
+        self.assertEqual(win._desired_mix_hw["Stream"], "alsa_output.stream_saved")
+        self.assertEqual(win._desired_mix_volumes["Monitor"], 0.67)
+        self.assertEqual(win._desired_mix_volumes["Stream"], 0.28)
+        self.assertEqual(
+            win.runtime.mix_route_sync_calls,
+            [
+                ("Monitor", "alsa_output.live_default"),
+                ("Stream", "alsa_output.stream_saved"),
+            ],
+        )
+        self.assertEqual(win.runtime.calls[0]["monitor_mix_volume"], 0.67)
+        self.assertEqual(win.runtime.calls[0]["stream_mix_volume"], 0.28)
+
+    def test_on_master_vol_change_updates_persisted_mix_volume(self):
+        win = self._window()
+        win.runtime = _FakeRuntime()
+        win.schedule_save = lambda: setattr(win, "_saved", True)
+        win._pending_master_vol = {}
+        win._master_commit_timer = SimpleNamespace(start=lambda: None)
+
+        win._on_master_vol_change("Monitor", 62)
+        win._commit_master_vols()
+
+        self.assertEqual(win._desired_mix_volumes["Monitor"], 0.62)
+        self.assertEqual(win.runtime.mix_volume_calls, [("Monitor", 0.62)])
+        self.assertTrue(win.__dict__.get("_saved", False))
 
     def test_channel_strip_centers_vertical_sliders_with_mute_buttons(self):
         strip = ChannelStrip("1", "mic", "Digital Microphone", "Microphone", "🎤", engine=None)

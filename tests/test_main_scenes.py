@@ -46,6 +46,7 @@ class _FakeRuntime:
         self.ensure_output_mix_calls = []
         self.set_selected_mic_calls = []
         self.set_mix_hardware_calls = []
+        self.set_mix_hardware_sync_calls = []
         self.sync_calls = []
 
     def ensure_virtual_channel_sync(self, name):
@@ -63,6 +64,9 @@ class _FakeRuntime:
 
     def set_mix_hardware_route(self, mix_name, sink_name):
         self.set_mix_hardware_calls.append((mix_name, sink_name))
+
+    def set_mix_hardware_route_sync(self, mix_name, sink_name):
+        self.set_mix_hardware_sync_calls.append((mix_name, sink_name))
 
     def sync_persistent_state(self, **kwargs):
         self.sync_calls.append(kwargs)
@@ -94,6 +98,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         win.app_prune_days = 14
         win.forgotten_apps = set()
         win._desired_mix_hw = {"Monitor": None, "Stream": None}
+        win._desired_mix_volumes = {"Monitor": 1.0, "Stream": 1.0}
         win.mon_out_combo = _DummyCombo(None, [None, "alsa_output.default", "alsa_output.headphones"])
         win.str_out_combo = _DummyCombo(None, [None, "alsa_output.stream"])
         win.engine = _FakeEngine()
@@ -119,11 +124,15 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         win.active_effects = {"mic": ["rnnoise", "limiter"]}
         win.effect_params = {"mic": {"rnnoise": {"wet": 0.8}}}
         win._desired_mix_hw["Monitor"] = "alsa_output.headphones"
+        win._desired_mix_volumes["Monitor"] = 0.77
+        win._desired_mix_volumes["Stream"] = 0.31
 
         snapshot = win._capture_scene_snapshot()
 
         self.assertEqual(snapshot["selected_mic"], "mic")
         self.assertEqual(snapshot["monitor_hw"], "alsa_output.headphones")
+        self.assertEqual(snapshot["monitor_mix_volume"], 0.77)
+        self.assertEqual(snapshot["stream_mix_volume"], 0.31)
         self.assertEqual(snapshot["virtual_channels"], ["Music", "Voice Chat"])
         self.assertEqual(snapshot["channel_order"], ["wavelinux_music", "wavelinux_voice_chat"])
         self.assertEqual(snapshot["submixes"]["wavelinux_music_Monitor"]["vol"], 0.4)
@@ -144,6 +153,8 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
             "selected_mic": "usb_mic",
             "monitor_hw": "alsa_output.headphones",
             "stream_hw": "alsa_output.stream",
+            "monitor_mix_volume": 0.64,
+            "stream_mix_volume": 0.22,
             "virtual_channels": ["Music", "Voice Chat"],
             "channel_order": ["wavelinux_music", "wavelinux_voice_chat"],
             "submixes": {
@@ -171,13 +182,15 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         self.assertEqual(win.effect_params["usb_mic"]["rnnoise"]["wet"], 0.9)
         self.assertEqual(win.app_routing, {"com.test.player": "wavelinux_music"})
         self.assertEqual(win.app_volumes, {"com.test.player": 0.25})
+        self.assertEqual(win._desired_mix_volumes["Monitor"], 0.64)
+        self.assertEqual(win._desired_mix_volumes["Stream"], 0.22)
         self.assertEqual(
             win.runtime.ensure_virtual_channel_calls,
             ["Music", "Voice Chat"],
         )
         self.assertEqual(win.runtime.set_selected_mic_calls, [])
         self.assertEqual(
-            win.runtime.set_mix_hardware_calls,
+            win.runtime.set_mix_hardware_sync_calls,
             [
                 ("Monitor", "alsa_output.headphones"),
                 ("Stream", "alsa_output.stream"),
@@ -198,6 +211,8 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
                 "selected_mic": "usb_mic",
                 "monitor_hw": "alsa_output.headphones",
                 "stream_hw": None,
+                "monitor_mix_volume": 0.55,
+                "stream_mix_volume": 0.45,
                 "virtual_channels": ["Music"],
                 "channel_order": ["wavelinux_music"],
                 "submixes": {"wavelinux_music_Monitor": {"vol": 0.6, "mute": False}},
@@ -218,6 +233,8 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         self.assertIn("Streaming", conf["scenes"])
         self.assertEqual(conf["scenes"]["Streaming"]["selected_mic"], "usb_mic")
         self.assertEqual(conf["scenes"]["Streaming"]["app_volumes"]["com.test.player"], 0.4)
+        self.assertEqual(conf["scenes"]["Streaming"]["monitor_mix_volume"], 0.55)
+        self.assertEqual(conf["scenes"]["Streaming"]["stream_mix_volume"], 0.45)
 
     def test_apply_config_dict_replaces_virtual_channels_and_restores_scene_library(self):
         win = self._window()
@@ -225,10 +242,14 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         payload = {
             "monitor_hw": "alsa_output.headphones",
             "stream_hw": "alsa_output.stream",
+            "monitor_mix_volume": 0.58,
+            "stream_mix_volume": 0.34,
             "channels": ["Music"],
             "scenes": {
                 "Desk": {
                     "selected_mic": "usb_mic",
+                    "monitor_mix_volume": 0.44,
+                    "stream_mix_volume": 0.29,
                     "virtual_channels": ["Music"],
                     "channel_order": ["wavelinux_music"],
                     "submixes": {"wavelinux_music_Monitor": {"vol": 0.8, "mute": False}},
@@ -253,8 +274,10 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         self.assertIn("Desk", win.scenes)
         self.assertEqual(win.selected_mic, "usb_mic")
         self.assertEqual(win.app_volumes, {"com.test.player": 0.45})
-        self.assertEqual(win._desired_mix_hw["Monitor"], "alsa_output.headphones")
+        self.assertEqual(win._desired_mix_hw["Monitor"], "alsa_output.default")
         self.assertEqual(win._desired_mix_hw["Stream"], "alsa_output.stream")
+        self.assertEqual(win._desired_mix_volumes["Monitor"], 0.58)
+        self.assertEqual(win._desired_mix_volumes["Stream"], 0.34)
         self.assertEqual(win.runtime.ensure_output_mix_calls, ["Monitor", "Stream"])
         self.assertEqual(win.runtime.ensure_virtual_channel_calls, ["Music"])
         self.assertEqual(
@@ -262,13 +285,24 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
             [f"wavelinux_{PipeWireEngine._sanitize_channel_name('Old Virtual')[1]}"],
         )
         self.assertEqual(win.runtime.set_selected_mic_calls, [])
+        self.assertEqual(win.runtime.set_mix_hardware_calls, [])
         self.assertEqual(
-            win.runtime.set_mix_hardware_calls,
+            win.runtime.set_mix_hardware_sync_calls,
             [
-                ("Monitor", "alsa_output.headphones"),
+                ("Monitor", "alsa_output.default"),
                 ("Stream", "alsa_output.stream"),
             ],
         )
+        self.assertEqual(
+            win.runtime.sync_calls[0]["monitor_hw"],
+            "alsa_output.default",
+        )
+        self.assertEqual(
+            win.runtime.sync_calls[0]["stream_hw"],
+            "alsa_output.stream",
+        )
+        self.assertEqual(win.runtime.sync_calls[0]["monitor_mix_volume"], 0.58)
+        self.assertEqual(win.runtime.sync_calls[0]["stream_mix_volume"], 0.34)
         self.assertEqual(len(win.runtime.sync_calls), 1)
         self.assertEqual(win.runtime.sync_calls[0]["selected_mic"], "usb_mic")
         self.assertEqual(win.runtime.sync_calls[0]["app_volumes"], {"com.test.player": 0.45})
@@ -306,7 +340,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
             ["Game", "Music", "Browser", "Voice Chat", "Alerts"],
         )
         self.assertEqual(
-            win.runtime.set_mix_hardware_calls,
+            win.runtime.set_mix_hardware_sync_calls,
             [("Monitor", "alsa_output.default")],
         )
         self.assertTrue(win._onboarding_completed)

@@ -150,6 +150,13 @@ class RuntimeControllerStateTests(unittest.TestCase):
                 calls.append(("route_mix_to_hardware", mix_name, sink_name))
                 return True
 
+            def resolve_hardware_sink_name(self, sink_name):
+                calls.append(("resolve_hardware_sink_name", sink_name))
+                return sink_name
+
+            def set_default_sink(self, sink_name):
+                calls.append(("set_default_sink", sink_name))
+
         class _Session:
             def __enter__(self_inner):
                 return _Engine()
@@ -171,12 +178,53 @@ class RuntimeControllerStateTests(unittest.TestCase):
             [
                 ("create_output_mix", "Monitor"),
                 ("route_mix_to_hardware", "Monitor", "bluez_output.headset"),
+                ("resolve_hardware_sink_name", "bluez_output.headset"),
+                ("set_default_sink", "bluez_output.headset"),
                 ("refresh_now", "set-mix-hardware-route:Monitor"),
             ],
         )
         self.assertEqual(
             controller._worker.desired_state.mixes["Monitor"].hardware_sink,
             "bluez_output.headset",
+        )
+
+    def test_sync_persistent_state_persists_mix_master_volumes(self):
+        controller = self._controller()
+        controller._worker.state_lock = SimpleNamespace(
+            __enter__=lambda self_inner: None,
+            __exit__=lambda self_inner, exc_type, exc, tb: False,
+        )
+
+        class _Lock:
+            def __enter__(self_inner):
+                return None
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                return False
+
+        controller._worker.state_lock = _Lock()
+
+        controller.sync_persistent_state(
+            selected_mic="usb_mic",
+            submix_state={},
+            active_effects={},
+            effect_params={},
+            app_routing={},
+            app_volumes={},
+            virtual_channels={},
+            monitor_hw="alsa_output.headphones",
+            stream_hw="alsa_output.stream",
+            monitor_mix_volume=0.63,
+            stream_mix_volume=0.27,
+        )
+
+        self.assertEqual(
+            controller._worker.desired_state.mixes["Monitor"].master_volume,
+            0.63,
+        )
+        self.assertEqual(
+            controller._worker.desired_state.mixes["Stream"].master_volume,
+            0.27,
         )
 
 

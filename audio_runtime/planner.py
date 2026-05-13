@@ -34,6 +34,7 @@ class RuntimePlanner:
         re.IGNORECASE,
     )
     _APP_VOLUME_EPSILON = 0.01
+    _SUBMIX_STATE_EPSILON = 0.01
 
     @classmethod
     def _canonical_sink_name(cls, sink_name):
@@ -294,6 +295,24 @@ class RuntimePlanner:
                 live = bool(route_live.get(mix_name, False))
                 current_source = route_sources.get(mix_name)
                 if owner and live and current_source == expected_source:
+                    if mix_name == "Monitor":
+                        current_volume = float(channel.monitor_volume)
+                        current_mute = bool(channel.monitor_mute)
+                    else:
+                        current_volume = float(channel.stream_volume)
+                        current_mute = bool(channel.stream_mute)
+                    desired_volume = float(initial_state.get("vol", 1.0))
+                    desired_mute = bool(initial_state.get("mute", False))
+                    if (
+                        abs(current_volume - desired_volume) > self._SUBMIX_STATE_EPSILON
+                        or current_mute != desired_mute
+                    ):
+                        actions.append(Action("set_submix_state", {
+                            "node_id": channel.node_id,
+                            "mix_name": mix_name,
+                            "volume": desired_volume,
+                            "mute": desired_mute,
+                        }))
                     continue
                 actions.append(Action("ensure_submix_route", {
                     "node_id": channel.node_id,

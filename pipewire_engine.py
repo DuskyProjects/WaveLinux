@@ -99,6 +99,7 @@ class PipeWireEngine:
                                          #               source, capture_target,
                                          #               safe_key}
         self.submix_state_cache = {}    # "node_id->mix_name" -> {'vol', 'mute'}
+        self._pending_submix_state_reapply = set()
         self._app_identity_overrides = {}
         self._app_identity_label_overrides = {}
         self.ladspa_plugins = self._probe_ladspa_plugins()
@@ -623,8 +624,24 @@ class PipeWireEngine:
         if not self._module_is_alive(module_id):
             return None
         state = dict(initial_state or {})
-        if state and not self._apply_loopback_state(module_id, state):
-            return None
+        if state:
+            key = next(
+                (
+                    existing_key
+                    for existing_key, existing_module in self.submix_loopbacks.items()
+                    if str(existing_module) == str(module_id)
+                ),
+                None,
+            )
+            if key:
+                self.submix_state_cache[key] = {
+                    'vol': self._clamp(state.get('vol', 1.0)),
+                    'mute': bool(state.get('mute', False)),
+                }
+                if self._apply_loopback_state(module_id, state):
+                    self._pending_submix_state_reapply.discard(key)
+                else:
+                    self._pending_submix_state_reapply.add(key)
         return module_id
 
     def _commit_submix_replacements(self, replacements, *, new_source):
@@ -638,6 +655,7 @@ class PipeWireEngine:
                     'vol': self._clamp(state.get('vol', 1.0)),
                     'mute': bool(state.get('mute', False)),
                 }
+                self._pending_submix_state_reapply.add(key)
         for binding in replacements.values():
             old_module = binding.get('old_module_id')
             new_module = binding.get('module_id')
@@ -687,6 +705,9 @@ class PipeWireEngine:
         more than one tick on snapshot data alone — re-query when you
         actually act."""
         now = time.monotonic()
+        if getattr(self, "_pending_submix_state_reapply", None):
+            self._reapply_submix_state_cache()
+            force = True
         cached = getattr(self, '_snapshot_cache', None)
         cached_at = getattr(self, '_snapshot_cache_at', 0.0)
         if cached is not None and not force and (now - cached_at) < self._SNAPSHOT_TTL:
@@ -1192,11 +1213,17 @@ class PipeWireEngine:
         if target_module != str(known or ""):
             state = dict(initial_state or self.submix_state_cache.get(key, {}) or {})
             if state:
-                if self._apply_loopback_state(target_module, state):
-                    self.submix_state_cache[key] = {
-                        'vol': self._clamp(state.get('vol', 1.0)),
-                        'mute': bool(state.get('mute', False)),
-                    }
+                self.submix_state_cache[key] = {
+                    'vol': self._clamp(state.get('vol', 1.0)),
+                    'mute': bool(state.get('mute', False)),
+                }
+                # Fresh loopbacks often get a late stream-restore pass from
+                # Pulse/PipeWire that can resurrect 100% / unmuted defaults
+                # after our first write. Always schedule one more cached-state
+                # reapply on the next snapshot so startup restore and route
+                # rebuilds converge back to the saved submix values.
+                self._apply_loopback_state(target_module, state)
+                self._pending_submix_state_reapply.add(key)
             if known and str(known) != str(target_module):
                 logging.warning(
                     f"[FX-DEBUG] route_input_to_submix({key}): source changed "
@@ -1272,6 +1299,7 @@ class PipeWireEngine:
                 mod_id = self.submix_loopbacks.pop(key)
                 self.submix_sources.pop(key, None)
                 self.submix_state_cache.pop(key, None)
+                self._pending_submix_state_reapply.discard(key)
                 self._run(['pactl', 'unload-module', str(mod_id)])
 
     def get_submix_sink_input(self, node_id, mix_name, snap=None):
@@ -1300,27 +1328,33 @@ class PipeWireEngine:
         """Set the submix volume. Returns False if the sink-input isn't
         found yet (loopback hasn't loaded or was unloaded mid-tick); UI
         uses the bool to retry on the next refresh."""
+        key = f'{node_id}->{mix_name}'
+        cache = self.submix_state_cache.setdefault(key, {})
+        cache['vol'] = self._clamp(volume)
         si = self.get_submix_sink_input(node_id, mix_name)
         if not si:
             logging.warning(f"Could not find sink-input for {node_id}->{mix_name}")
+            self._pending_submix_state_reapply.add(key)
             return False
-        clamped = self._clamp(volume)
+        clamped = cache['vol']
         pct = max(0, min(int(round(clamped * 100)), 100))
         self._run(['pactl', 'set-sink-input-volume', si, f'{pct}%'])
-        cache = self.submix_state_cache.setdefault(f'{node_id}->{mix_name}', {})
-        cache['vol'] = clamped
+        self._pending_submix_state_reapply.discard(key)
         return True
 
     def set_submix_mute(self, node_id, mix_name, mute):
         """Set the submix mute. Same retry semantics as set_submix_volume."""
+        key = f'{node_id}->{mix_name}'
+        cache = self.submix_state_cache.setdefault(key, {})
+        cache['mute'] = bool(mute)
         si = self.get_submix_sink_input(node_id, mix_name)
         if not si:
             logging.warning(f"Could not find sink-input to mute for {node_id}->{mix_name}")
+            self._pending_submix_state_reapply.add(key)
             return False
-        bmute = bool(mute)
+        bmute = cache['mute']
         self._run(['pactl', 'set-sink-input-mute', si, '1' if bmute else '0'])
-        cache = self.submix_state_cache.setdefault(f'{node_id}->{mix_name}', {})
-        cache['mute'] = bmute
+        self._pending_submix_state_reapply.discard(key)
         return True
 
     def _reapply_submix_state_cache(self):
@@ -1329,7 +1363,12 @@ class PipeWireEngine:
         where pulse-bridge can flip a moved sink-input back to its
         stale per-app default — the audio leak users hear as 'mic
         plays for a second every time effects rebuild'."""
-        for key, cache in list(self.submix_state_cache.items()):
+        pending = set(getattr(self, "_pending_submix_state_reapply", set()) or set())
+        for key in pending:
+            cache = self.submix_state_cache.get(key)
+            if not cache:
+                self._pending_submix_state_reapply.discard(key)
+                continue
             mod_id = self.submix_loopbacks.get(key)
             if mod_id is None:
                 continue
@@ -1342,6 +1381,7 @@ class PipeWireEngine:
             if 'mute' in cache:
                 self._run(['pactl', 'set-sink-input-mute', si,
                            '1' if cache['mute'] else '0'])
+            self._pending_submix_state_reapply.discard(key)
 
     def snapshot_sink_inputs_by_owner(self, snap=None):
         """Map `owner_module_id -> (volume 0..1.5, muted)` in a single
@@ -5450,6 +5490,7 @@ context.modules = [
         self.submix_loopbacks.clear()
         self.submix_sources.clear()
         self.submix_state_cache.clear()
+        self._pending_submix_state_reapply.clear()
 
         # Hard sweep using full list (short mode doesn't show arguments)
         out = self._run(['pactl', 'list', 'modules'])

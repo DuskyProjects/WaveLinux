@@ -59,7 +59,7 @@ from wavelinux_theme import STYLESHEET
 
 import struct
 
-APP_VERSION = "2.0.8"
+APP_VERSION = "2.0.9"
 _RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire", "pw-cli"]
 _RUNTIME_HEALTH_MESSAGES = {
     "submix_monitor_missing": "Monitor route is missing.",
@@ -2141,6 +2141,7 @@ class WaveLinuxWindow(QMainWindow):
         self._app_widget_order = ()
         self._monitor_sink_fp = ()
         self._desired_mix_hw = {"Monitor": None, "Stream": None}
+        self._desired_mix_volumes = {"Monitor": 1.0, "Stream": 1.0}
         self._auto_recovery_state = {}
         self.config_path = os.path.expanduser("~/.config/wavelinux/config.json")
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
@@ -2733,6 +2734,43 @@ class WaveLinuxWindow(QMainWindow):
             return str(key or "")
         return key.rsplit("_", 1)[0]
 
+    @staticmethod
+    def _normalize_mix_volume(value, default=1.0):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = float(default)
+        return max(0.0, min(1.0, numeric))
+
+    def _current_mix_master_volume(self, mix_name, default=1.0):
+        desired = self.__dict__.get("_desired_mix_volumes", {}).get(mix_name)
+        if desired is not None:
+            return self._normalize_mix_volume(desired, default)
+        slider_name = "mon_master_slider" if mix_name == "Monitor" else "str_master_slider"
+        slider = self.__dict__.get(slider_name)
+        if slider is not None and hasattr(slider, "value"):
+            return self._normalize_mix_volume(slider.value() / 100.0, default)
+        return self._normalize_mix_volume(default, default)
+
+    def _set_mix_master_volume(self, mix_name, volume, *, persist=True, update_slider=False):
+        normalized = self._normalize_mix_volume(volume)
+        desired = self.__dict__.get("_desired_mix_volumes")
+        if desired is None:
+            self._desired_mix_volumes = {"Monitor": 1.0, "Stream": 1.0}
+            desired = self._desired_mix_volumes
+        desired[mix_name] = normalized
+        if update_slider:
+            slider_name = "mon_master_slider" if mix_name == "Monitor" else "str_master_slider"
+            slider = self.__dict__.get(slider_name)
+            if slider is not None and hasattr(slider, "setValue"):
+                slider_value = int(round(normalized * 100))
+                if not getattr(slider, "isSliderDown", lambda: False)():
+                    slider.blockSignals(True)
+                    slider.setValue(slider_value)
+                    slider.blockSignals(False)
+        if persist:
+            self.schedule_save()
+
     def _capture_scene_snapshot(self):
         submixes = {}
         for key, value in (self.submix_state or {}).items():
@@ -2750,6 +2788,8 @@ class WaveLinuxWindow(QMainWindow):
             "selected_mic": self.selected_mic or None,
             "monitor_hw": self._desired_mix_hw.get("Monitor"),
             "stream_hw": self._desired_mix_hw.get("Stream"),
+            "monitor_mix_volume": self._current_mix_master_volume("Monitor"),
+            "stream_mix_volume": self._current_mix_master_volume("Stream"),
             "virtual_channels": list(self._dedupe_names(self.virtual_channels)),
             "channel_order": self._dedupe_names(self.channel_order),
             "submixes": submixes,
@@ -2830,6 +2870,8 @@ class WaveLinuxWindow(QMainWindow):
             "selected_mic": raw.get("selected_mic") or None,
             "monitor_hw": raw.get("monitor_hw"),
             "stream_hw": raw.get("stream_hw"),
+            "monitor_mix_volume": cls._normalize_mix_volume(raw.get("monitor_mix_volume", 1.0)),
+            "stream_mix_volume": cls._normalize_mix_volume(raw.get("stream_mix_volume", 1.0)),
             "virtual_channels": cls._dedupe_names(raw.get("virtual_channels", []) or []),
             "channel_order": cls._dedupe_names(raw.get("channel_order", []) or []),
             "submixes": submixes,
@@ -2962,10 +3004,32 @@ class WaveLinuxWindow(QMainWindow):
             name for name in self.channel_order
             if name not in scene_order
         ]
-        self._desired_mix_hw["Monitor"] = snapshot.get("monitor_hw")
-        self._desired_mix_hw["Stream"] = snapshot.get("stream_hw")
-        self.runtime.set_mix_hardware_route("Monitor", snapshot.get("monitor_hw"))
-        self.runtime.set_mix_hardware_route("Stream", snapshot.get("stream_hw"))
+        self._set_mix_master_volume(
+            "Monitor",
+            snapshot.get("monitor_mix_volume", 1.0),
+            persist=False,
+            update_slider=True,
+        )
+        self._set_mix_master_volume(
+            "Stream",
+            snapshot.get("stream_mix_volume", 1.0),
+            persist=False,
+            update_slider=True,
+        )
+        self._set_mix_output_target(
+            "Monitor",
+            snapshot.get("monitor_hw"),
+            persist=False,
+            update_combo=True,
+            sync_runtime=True,
+        )
+        self._set_mix_output_target(
+            "Stream",
+            snapshot.get("stream_hw"),
+            persist=False,
+            update_combo=True,
+            sync_runtime=True,
+        )
         self._sync_runtime_persistent_state()
         self.schedule_save()
         if hasattr(self, "_refresh_hidden_list"):
@@ -3106,7 +3170,13 @@ class WaveLinuxWindow(QMainWindow):
 
         default_sink = self.engine.get_default_sink() if hasattr(self.engine, "get_default_sink") else None
         if default_sink:
-            self._set_mix_output_target("Monitor", default_sink, persist=False, update_combo=True)
+            self._set_mix_output_target(
+                "Monitor",
+                default_sink,
+                persist=False,
+                update_combo=True,
+                sync_runtime=True,
+            )
         self._selected_setup_template = template_id
         self._onboarding_completed = True
         self._show_first_run_setup = False
@@ -4935,6 +5005,8 @@ class WaveLinuxWindow(QMainWindow):
             virtual_channels=self._virtual_channel_specs(),
             monitor_hw=monitor_hw,
             stream_hw=stream_hw,
+            monitor_mix_volume=self._current_mix_master_volume("Monitor"),
+            stream_mix_volume=self._current_mix_master_volume("Stream"),
         )
 
     @staticmethod
@@ -5792,18 +5864,25 @@ class WaveLinuxWindow(QMainWindow):
 
     def _on_master_vol_change(self, mix_name, value):
         # 40ms debounce — same reasoning as the per-strip faders.
-        if not hasattr(self, '_pending_master_vol'):
+        if '_pending_master_vol' not in self.__dict__:
             self._pending_master_vol = {}
             self._master_commit_timer = QTimer(self)
             self._master_commit_timer.setSingleShot(True)
             self._master_commit_timer.setInterval(40)
             self._master_commit_timer.timeout.connect(self._commit_master_vols)
-        self._pending_master_vol[mix_name] = value / 100.0
+        normalized = self._normalize_mix_volume(value / 100.0)
+        self._pending_master_vol[mix_name] = normalized
+        self._set_mix_master_volume(
+            mix_name,
+            normalized,
+            persist=True,
+            update_slider=False,
+        )
         self._master_commit_timer.start()
 
     def _commit_master_vols(self):
         """Fire all pending master-fader writes in one pass."""
-        if not hasattr(self, '_pending_master_vol'):
+        if '_pending_master_vol' not in self.__dict__:
             return
         pending = self._pending_master_vol
         self._pending_master_vol = {}
@@ -5834,7 +5913,13 @@ class WaveLinuxWindow(QMainWindow):
             self.schedule_save()
 
     def _on_mix_out_change(self, mix_name, hw_sink_name):
-        self._set_mix_output_target(mix_name, hw_sink_name, persist=True, update_combo=False)
+        self._set_mix_output_target(
+            mix_name,
+            hw_sink_name,
+            persist=True,
+            update_combo=False,
+            sync_runtime=(mix_name == "Monitor"),
+        )
 
     def _apply_pending_clipguard_migration(self):
         """Rewrite the legacy master-bus `clipguard: true` flag as a
@@ -5903,6 +5988,25 @@ class WaveLinuxWindow(QMainWindow):
             combo.setCurrentIndex(idx)
             combo.blockSignals(False)
 
+    def _input_display_sort_key(self, node_name, *, is_mic=False):
+        order = list(self.__dict__.get("channel_order", []) or [])
+        order_index = {nm: i for i, nm in enumerate(order)}
+        return (
+            0 if is_mic else 1,
+            order_index.get(node_name, len(order_index) + 1),
+            str(node_name or "").lower(),
+        )
+
+    def _sorted_input_nodes(self, mic_nodes, virtual_nodes):
+        combined = list(mic_nodes or []) + list(virtual_nodes or [])
+        return sorted(
+            combined,
+            key=lambda node: self._input_display_sort_key(
+                getattr(node, "name", ""),
+                is_mic=bool(getattr(node, "is_mic", False)),
+            ),
+        )
+
     def _refresh_runtime_view(self):
         view = self._runtime_view_state
         if view is None:
@@ -5929,15 +6033,8 @@ class WaveLinuxWindow(QMainWindow):
         visible_strip_ids = []
         input_layout_changed = False
         selected_mic_node = next((m for m in mics if m.name == self.selected_mic), None)
-        shown_inputs = []
-        if selected_mic_node is not None:
-            shown_inputs.append(selected_mic_node)
-        shown_inputs.extend(virtuals)
-        order_index = {nm: i for i, nm in enumerate(self.channel_order)}
-        sorted_nodes = sorted(
-            shown_inputs,
-            key=lambda n: order_index.get(n.name, len(order_index) + 1),
-        )
+        shown_mics = [selected_mic_node] if selected_mic_node is not None else []
+        sorted_nodes = self._sorted_input_nodes(shown_mics, virtuals)
 
         for node in sorted_nodes:
             pw_id = str(node.node_id)
@@ -6168,11 +6265,23 @@ class WaveLinuxWindow(QMainWindow):
 
         mon_mix = view.mixes.get("Monitor")
         if mon_mix and not self.mon_master_slider.isSliderDown():
+            self._set_mix_master_volume(
+                "Monitor",
+                getattr(mon_mix, "master_volume", 1.0),
+                persist=False,
+                update_slider=False,
+            )
             self.mon_master_slider.blockSignals(True)
             self.mon_master_slider.setValue(int(mon_mix.master_volume * 100))
             self.mon_master_slider.blockSignals(False)
         str_mix = view.mixes.get("Stream")
         if str_mix and not self.str_master_slider.isSliderDown():
+            self._set_mix_master_volume(
+                "Stream",
+                getattr(str_mix, "master_volume", 1.0),
+                persist=False,
+                update_slider=False,
+            )
             self.str_master_slider.blockSignals(True)
             self.str_master_slider.setValue(int(str_mix.master_volume * 100))
             self.str_master_slider.blockSignals(False)
@@ -6244,6 +6353,8 @@ class WaveLinuxWindow(QMainWindow):
             'schema_version': 1,
             'monitor_hw': self._desired_mix_hw.get("Monitor"),
             'stream_hw': self._desired_mix_hw.get("Stream"),
+            'monitor_mix_volume': self._current_mix_master_volume("Monitor"),
+            'stream_mix_volume': self._current_mix_master_volume("Stream"),
             'channels': list(self.virtual_channels),
             'scenes': self._normalize_scene_library(scenes),
             'onboarding_completed': bool(self.__dict__.get('_onboarding_completed', True)),
@@ -6357,6 +6468,18 @@ class WaveLinuxWindow(QMainWindow):
         self._selected_setup_template = str(conf.get('quick_start_template') or "")
         self.channel_order = self._dedupe_names(conf.get('channel_order', []) or [])
         self.selected_mic = conf.get('selected_mic') or None
+        self._set_mix_master_volume(
+            "Monitor",
+            conf.get('monitor_mix_volume', 1.0),
+            persist=False,
+            update_slider=True,
+        )
+        self._set_mix_master_volume(
+            "Stream",
+            conf.get('stream_mix_volume', 1.0),
+            persist=False,
+            update_slider=True,
+        )
         self.effect_params = conf.get('effect_params', {}) or {}
         self.active_effects = {
             k: list(v) for k, v in (conf.get('active_effects', {}) or {}).items()
@@ -6403,7 +6526,7 @@ class WaveLinuxWindow(QMainWindow):
             if engine is not None and hasattr(engine, "get_default_sink")
             else None
         )
-        mon_hw = conf.get('monitor_hw') or default_sink
+        mon_hw = default_sink or conf.get('monitor_hw')
         str_hw = conf.get('stream_hw')
         self._set_mix_output_target(
             "Monitor", mon_hw, persist=False, update_combo=True, sync_runtime=True
@@ -6658,13 +6781,17 @@ class WaveLinuxWindow(QMainWindow):
         for w in widgets:
             self.input_layout.removeWidget(w)
         name_to_widget = {w.node_name: w for w in widgets if w.node_name}
-        for nm in self.channel_order:
+        ordered_names = sorted(
+            list(name_to_widget.keys()),
+            key=lambda nm: self._input_display_sort_key(
+                nm,
+                is_mic=bool(getattr(name_to_widget.get(nm), "is_mic", False)),
+            ),
+        )
+        for nm in ordered_names:
             w = name_to_widget.pop(nm, None)
             if w is not None:
                 self.input_layout.addWidget(w)
-        # Anything not in channel_order goes to the end.
-        for w in name_to_widget.values():
-            self.input_layout.addWidget(w)
         self._rescale_strips()
         self.inputs_container.adjustSize()
 

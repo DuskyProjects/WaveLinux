@@ -349,6 +349,10 @@ class AudioRuntimeController(QObject):
                 engine.create_output_mix(mix_name)
                 if sink_name:
                     out = engine.route_mix_to_hardware(mix_name, sink_name)
+                    if out and mix_name == "Monitor" and hasattr(engine, "set_default_sink"):
+                        resolved_sink = engine.resolve_hardware_sink_name(sink_name) or sink_name
+                        if resolved_sink:
+                            engine.set_default_sink(resolved_sink)
                 else:
                     out = engine.unroute_mix_from_hardware(mix_name)
         self.refresh_now(f"set-mix-hardware-route:{mix_name}")
@@ -431,7 +435,8 @@ class AudioRuntimeController(QObject):
 
     def sync_persistent_state(self, *, selected_mic, submix_state, active_effects,
                               effect_params, app_routing, app_volumes, virtual_channels,
-                              monitor_hw, stream_hw):
+                              monitor_hw, stream_hw, monitor_mix_volume=1.0,
+                              stream_mix_volume=1.0):
         with self._worker.state_lock:
             desired = self._worker.desired_state
             desired.selected_mic = selected_mic
@@ -448,6 +453,8 @@ class AudioRuntimeController(QObject):
             desired.mixes.setdefault("Stream", MixSpec(name="Stream"))
             desired.mixes["Monitor"].hardware_sink = monitor_hw
             desired.mixes["Stream"].hardware_sink = stream_hw
+            desired.mixes["Monitor"].master_volume = float(monitor_mix_volume)
+            desired.mixes["Stream"].master_volume = float(stream_mix_volume)
             desired.virtual_channels = dict(virtual_channels or {})
             channel_names = set(desired.channels.keys())
             channel_names.update(active_effects.keys())
