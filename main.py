@@ -59,7 +59,7 @@ from wavelinux_theme import STYLESHEET
 
 import struct
 
-APP_VERSION = "2.0.9"
+APP_VERSION = "2.0.10"
 _RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire", "pw-cli"]
 _RUNTIME_HEALTH_MESSAGES = {
     "submix_monitor_missing": "Monitor route is missing.",
@@ -3572,25 +3572,28 @@ class WaveLinuxWindow(QMainWindow):
                 f"{guidance}",
             )
             return
-        progress = getattr(self, "_update_progress", None)
+        progress = self.__dict__.get("_update_progress")
         if progress is not None:
             progress.setVisible(True)
             progress.setRange(0, 0)
-            progress.setFormat("Preparing update…")
+            progress.setFormat("Checking latest release…")
         self._download_update_btn.setEnabled(False)
         self._check_update_btn.setEnabled(False)
-        self._update_status_lbl.setText("Preparing AppImage download…")
+        self._update_status_lbl.setText("Checking latest verified AppImage release…")
         self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
 
-        prev = getattr(self, "_update_installer", None)
+        prev = self.__dict__.get("_update_installer")
         if prev is not None:
             prev.cancel()
 
-        release_info = getattr(self, "_pending_verified_release", None)
+        # Do not trust a cached release object for a "latest" install.
+        # The app can stay open across a new GitHub release; if we reuse a
+        # stale cached same-version asset here, the updater just reinstalls the
+        # currently running AppImage instead of the new release.
         self._update_installer = AppImageUpdateInstaller()
-        self._update_installer.install(release_info=release_info)
+        self._update_installer.install(release_info=None)
 
-        timer = getattr(self, "_update_install_poll_timer", None)
+        timer = self.__dict__.get("_update_install_poll_timer")
         if timer is None:
             timer = QTimer(self)
             timer.setInterval(200)
