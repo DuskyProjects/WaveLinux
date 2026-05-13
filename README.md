@@ -1,21 +1,34 @@
 # WaveLinux
 
-WaveLinux is a PyQt6 PipeWire mixer for Linux with Wave Link-style routing:
+WaveLinux is a PyQt6 PipeWire mixer for Linux with Wave Link-style routing for
+desktop audio, streaming, and microphone FX.
 
-- Monitor mix (what you hear)
-- Stream mix (`WaveLinux-Stream` for OBS)
-- Per-channel MON/STR faders with optional link
-- Per-app routing persistence
-- Per-channel FX (RNNoise, HPF, EQ, compressor, gate, limiter)
+## Current Capabilities
 
-## Release Model
+- Separate `Monitor` and `Stream` mixes
+- `WaveLinux-Stream` virtual source for OBS
+- Single active mic model with dedicated hardware `MIC` gain control
+- Virtual channels for app grouping and mix isolation
+- Per-channel `MON` / `STR` faders, mute, link, and peak meter
+- Per-app routing with persistence, offline volume presets, and app icons
+- Manual app identity pin / merge / reset for stubborn Chromium/Electron-style apps
+- Per-channel FX: RNNoise, high-pass, EQ, compressor, gate, limiter
+- Scenes, quick-start setup templates, Health diagnostics, and launcher repair
+- Verified AppImage self-update with signed manifest validation and rollback
 
-WaveLinux is now AppImage-first for end users.
+## Runtime Model
 
-- The release AppImage is the primary multi-distro build for Arch, Fedora, Ubuntu, and other XDG desktops.
-- In-app AppImage updates now verify a signed GitHub release manifest, validate the downloaded checksum, smoke-test the new AppImage, then install it into `~/.local/bin`.
-- Package-managed installs can still check for verified releases, but they do not replace themselves with an AppImage in place; update those through your package manager.
-- Host PipeWire tools are still required even when using the AppImage.
+WaveLinux is AppImage-first for end users.
+
+- The GitHub release AppImage is the primary supported desktop build.
+- AppImage installs can update themselves from `Settings -> Updates` using a
+  signed release manifest, checksum validation, smoke test, install, and
+  rollback backup.
+- Source checkouts and local bundled builds can repair or reinstall their own
+  launcher state from the app.
+- Package-managed installs can still check verified releases, but they do not
+  replace themselves with an AppImage in place.
+- Host PipeWire tools are always required, even when running the AppImage.
 
 ## Host Requirements
 
@@ -29,6 +42,9 @@ WaveLinux expects these host commands to exist:
 - `pw-cli`
 
 You also need a running PipeWire + WirePlumber session.
+
+For full mic FX coverage, install the host-side PipeWire/LADSPA packages your
+distro uses for RNNoise, compressor, and gate support.
 
 ## AppImage Install
 
@@ -45,11 +61,28 @@ chmod +x WaveLinux-*.AppImage
 ./WaveLinux-*.AppImage
 ```
 
-4. Inside WaveLinux, open `Settings -> Updates` and use the runtime-aware install button if you want a desktop launcher copied into `~/.local/bin` and `~/.local/share/applications`.
+4. Inside WaveLinux, open `Settings -> Updates` and use either:
+   - `Install/Reinstall This AppImage`
+   - the verified `Download && Install ...` action for the latest release
 
-WaveLinux uses host LADSPA plugins for FX by default, even in the AppImage. This is intentional: PipeWire loads those plugins from the host side, so AppImage-bundled LADSPA copies are less reliable across distros.
+That installs or refreshes:
 
-If you explicitly want to try bundled LADSPA plugins in a custom build, set `WAVELINUX_BUNDLE_LADSPA=1` when building and `WAVELINUX_ENABLE_BUNDLED_LADSPA=1` at runtime.
+- `~/.local/bin/WaveLinux.AppImage`
+- `~/.local/bin/wavelinux`
+- `~/.local/share/applications/io.github.duskyprojects.WaveLinux.desktop`
+
+Rollback uses:
+
+- `~/.local/bin/WaveLinux.AppImage.bak`
+
+WaveLinux uses host LADSPA plugins for FX by default. That is intentional:
+PipeWire loads those plugins from the host side, and bundled copies are less
+reliable across distros.
+
+If you explicitly want to try bundled LADSPA plugins in a custom build:
+
+- build with `WAVELINUX_BUNDLE_LADSPA=1`
+- run with `WAVELINUX_ENABLE_BUNDLED_LADSPA=1`
 
 ## Source Checkout Install
 
@@ -61,7 +94,7 @@ cd WaveLinux
 ./install.sh
 ```
 
-That installs a desktop launcher pointing at the current checkout. On Arch-based systems you can also install known runtime dependencies automatically:
+On Arch-based systems you can also install known runtime dependencies:
 
 ```bash
 ./install.sh --arch-deps
@@ -72,8 +105,6 @@ Run directly without installing a launcher:
 ```bash
 python3 main.py
 ```
-
-The same `Settings -> Updates` page can also reinstall the current source checkout launcher, or a local bundled build launcher, when you are running one of those modes.
 
 Remove launcher/config state:
 
@@ -94,6 +125,9 @@ Arch users can still build the package:
 ```bash
 makepkg -si
 ```
+
+Package-managed installs should be updated through the package manager, not by
+replacing them in place with an AppImage.
 
 ## Building the AppImage
 
@@ -118,28 +152,37 @@ Artifacts are written to `dist/`:
 - `wavelinux-release-manifest.json`
 - `wavelinux-release-manifest.sig`
 
-GitHub Actions release CI is defined in `.github/workflows/release.yml`.
+Release CI lives in `.github/workflows/release.yml`.
 
-## Release Signing
+## Project Layout
 
-Signed in-app updates require the GitHub Actions secret:
+- `main.py`: Qt UI, settings, scenes, update flow wiring
+- `pipewire_engine.py`: PipeWire routing, device discovery, app identity, FX graph
+- `audio_runtime/`: serialized runtime planner, executor, diagnostics, controller
+- `updates.py`: signed manifest verification, download/install, rollback
+- `distribution.py`: install paths, launcher repair, runtime mode detection
+- `packaging/appimage/`: desktop metadata and AppImage assets
 
-- `WAVELINUX_RELEASE_ED25519_PRIVATE_KEY_B64`
-
-That secret must contain the base64-encoded raw 32-byte Ed25519 private key
-that matches the public key embedded in `updates.py`. Without it, release CI
-cannot produce `wavelinux-release-manifest.sig`, and the in-app updater will
-refuse the release.
-
-## Signed Release Checklist
+## Maintainer Release Checklist
 
 Before tagging a release:
 
 - Bump `APP_VERSION` in `main.py`.
-- Update `PKGBUILD` if the Arch package version should track the same tag.
-- Confirm the GitHub Actions secret `WAVELINUX_RELEASE_ED25519_PRIVATE_KEY_B64` is present and matches `updates.py`.
-- Run `python3 -m unittest discover -s tests`.
-- Build a fresh AppImage with `PYTHON_BIN=/path/to/venv/bin/python ./scripts/build_appimage.sh`.
+- Update `pkgver` in `PKGBUILD` if the Arch package tracks the same release.
+- Confirm the GitHub Actions secret `WAVELINUX_RELEASE_ED25519_PRIVATE_KEY_B64`
+  is present and matches the public key embedded in `updates.py`.
+- Run:
+
+```bash
+python3 -m unittest discover -s tests
+PYTHON_BIN=/path/to/venv/bin/python ./scripts/build_appimage.sh
+```
+
+- Commit the version bump.
+- Push the release tag as `vX.Y.Z`.
+
+Normal branch pushes do not create GitHub releases. Release publishing only
+happens from the tag-triggered workflow.
 
 Expected release assets:
 
@@ -150,11 +193,11 @@ Expected release assets:
 
 Recommended updater validation path:
 
-1. Start from an installed `2.0.4` AppImage.
-2. Publish signed `v2.0.7`.
-3. Open installed `2.0.4`, then use `Settings -> Updates -> Download && Install v2.0.7`.
+1. Start from an installed previous AppImage release.
+2. Publish signed `v<new_version>`.
+3. Open the older installed build and use `Settings -> Updates -> Download && Install`.
 4. Confirm `~/.local/bin/WaveLinux.AppImage.bak` exists after install.
-5. Restart into `2.0.7`.
+5. Restart into the new version.
 6. Use `Restore Previous AppImage` if you need to roll back, then restart again.
 
 Testing-only updater source overrides:
@@ -162,16 +205,21 @@ Testing-only updater source overrides:
 - `WAVELINUX_UPDATE_RELEASE_API_URL`
 - `WAVELINUX_UPDATE_RELEASES_URL`
 
-Those overrides let you point WaveLinux at staging release metadata and release pages without changing any UI settings. Signature, checksum, smoke-test, install, and rollback rules stay the same.
+Those overrides let you point WaveLinux at staging release metadata and release
+pages without adding UI settings. Signature, checksum, smoke-test, install, and
+rollback rules stay the same.
 
 ## Paths
 
 - Config: `~/.config/wavelinux/config.json`
 - Log: `~/.config/wavelinux/wavelinux.log`
+- Diagnostics: `~/.config/wavelinux/diagnostics/`
 - FX logs: `~/.config/wavelinux/fx-logs/`
+- Installed AppImage: `~/.local/bin/WaveLinux.AppImage`
+- AppImage backup: `~/.local/bin/WaveLinux.AppImage.bak`
 
 ## OBS
 
 1. Launch WaveLinux.
-2. Add **Audio Input Capture** in OBS.
+2. In OBS, add **Audio Input Capture**.
 3. Select `WaveLinux-Stream` or the monitor variant you want.
