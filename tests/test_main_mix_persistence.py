@@ -26,6 +26,8 @@ class _FakeRuntime:
         self.selected_mic_calls = []
         self.mix_route_calls = []
         self.mix_route_sync_calls = []
+        self.submix_calls = []
+        self.source_volume_calls = []
 
     def sync_persistent_state(self, **kwargs):
         self.calls.append(kwargs)
@@ -41,6 +43,12 @@ class _FakeRuntime:
 
     def set_mix_hardware_route_sync(self, mix_name, sink_name):
         self.mix_route_sync_calls.append((mix_name, sink_name))
+
+    def set_submix_state(self, node_id, mix_name, volume, mute, node_name=""):
+        self.submix_calls.append((node_id, mix_name, volume, mute, node_name))
+
+    def set_source_volume(self, node_name, volume):
+        self.source_volume_calls.append((node_name, volume))
 
 
 class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
@@ -68,6 +76,8 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
         win.mon_out_combo = _DummyCombo(None)
         win.str_out_combo = _DummyCombo(None)
         win._runtime_pid_path = ""
+        win.channel_widgets = {}
+        win.app_widgets = {}
         return win
 
     def test_sync_runtime_persistent_state_uses_desired_mix_routes_when_combo_empty(self):
@@ -97,6 +107,36 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
                 conf = json.load(fh)
         self.assertEqual(conf["monitor_hw"], "bluez_output.AA_BB_CC_DD_EE_FF.1")
         self.assertEqual(conf["stream_hw"], "alsa_output.speakers")
+
+    def test_save_config_flushes_pending_stream_strip_volume_before_serializing(self):
+        win = self._window()
+        win.runtime = _FakeRuntime()
+        strip = ChannelStrip(
+            "11",
+            "wavelinux_music",
+            "Music",
+            "Virtual",
+            "🎵",
+            engine=None,
+        )
+        strip._main_win = win
+        win.channel_widgets = {"11": strip}
+
+        strip.str_slider.setValue(37)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            win.config_path = f"{tmpdir}/config.json"
+
+            win.save_config()
+
+            with open(win.config_path, "r") as fh:
+                conf = json.load(fh)
+
+        self.assertEqual(
+            conf["submixes"]["wavelinux_music_Stream"],
+            {"vol": 0.37, "mute": False},
+        )
+        self.assertIn(("11", "Stream", 0.37, False, "wavelinux_music"), win.runtime.submix_calls)
 
     def test_recover_unclean_runtime_state_resets_when_pid_is_stale(self):
         win = self._window()
@@ -159,7 +199,7 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
         self.assertEqual(win.runtime.selected_mic_calls, [])
         self.assertFalse(win.__dict__.get("_saved", False))
 
-    def test_sync_mic_picker_keeps_saved_selection_during_startup_if_missing(self):
+    def test_sync_mic_picker_falls_back_when_saved_selection_missing_during_initial_resolution(self):
         win = self._window()
         win.runtime = _FakeRuntime()
         win.engine = type("Engine", (), {"get_default_source": lambda self: "usb_mic"})()
@@ -173,10 +213,10 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
 
         win._sync_mic_picker(mics, default_src="usb_mic")
 
-        self.assertEqual(win.selected_mic, "mic_a")
+        self.assertEqual(win.selected_mic, "usb_mic")
         self.assertTrue(win._mic_selection_initialized)
-        self.assertEqual(win.runtime.selected_mic_calls, [])
-        self.assertFalse(win.__dict__.get("_saved", False))
+        self.assertEqual(win.runtime.selected_mic_calls, ["usb_mic"])
+        self.assertTrue(win.__dict__.get("_saved", False))
 
     def test_set_mix_output_target_uses_sync_runtime_when_requested(self):
         win = self._window()

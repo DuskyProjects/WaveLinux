@@ -158,6 +158,30 @@ class UpdatesTests(unittest.TestCase):
                 "https://updates.example.test/releases",
             )
 
+    def test_ssl_context_prefers_ssl_cert_file_env(self):
+        with mock.patch.dict(os.environ, {
+            "SSL_CERT_FILE": "/tmp/wavelinux-certs.pem",
+        }, clear=False):
+            with mock.patch.object(updates.os.path, "exists", side_effect=lambda path: path == "/tmp/wavelinux-certs.pem"):
+                with mock.patch.object(updates.ssl, "create_default_context", return_value="ctx") as create_mock:
+                    self.assertEqual(updates._ssl_context(), "ctx")
+
+        create_mock.assert_called_once_with(cafile="/tmp/wavelinux-certs.pem")
+
+    def test_ssl_context_prefers_certifi_bundle_when_present(self):
+        fake_certifi = SimpleNamespace(where=lambda: "/tmp/certifi.pem")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(updates, "certifi", fake_certifi):
+                with mock.patch.object(
+                    updates.os.path,
+                    "exists",
+                    side_effect=lambda path: path == "/tmp/certifi.pem",
+                ):
+                    with mock.patch.object(updates.ssl, "create_default_context", return_value="ctx") as create_mock:
+                        self.assertEqual(updates._ssl_context(), "ctx")
+
+        create_mock.assert_called_once_with(cafile="/tmp/certifi.pem")
+
     def test_install_verified_release_rolls_back_on_install_failure(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             installed = updates.installed_appimage_path(home=tmpdir)

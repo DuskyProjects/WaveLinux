@@ -41,7 +41,7 @@ jobs:
       - name: Install Python build dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install PyInstaller PyQt6 cryptography
+          python -m pip install PyInstaller PyQt6 cryptography certifi
 
       - name: Run syntax checks
         run: |

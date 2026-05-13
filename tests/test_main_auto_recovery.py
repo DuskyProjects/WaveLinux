@@ -59,6 +59,7 @@ class _FakeRuntime:
         self.statuses = {}
         self.recover_calls = []
         self.export_calls = []
+        self.refresh_calls = []
 
     def fx_status_for(self, node_name):
         return self.statuses.get(node_name, OperationStatus(node_name=node_name))
@@ -69,6 +70,9 @@ class _FakeRuntime:
     def export_diagnostics(self, reason="manual-export"):
         self.export_calls.append(reason)
         return "/tmp/exported-runtime-diagnostics.json"
+
+    def refresh_now(self, reason=""):
+        self.refresh_calls.append(reason)
 
 
 class WaveLinuxMainAutoRecoveryTests(unittest.TestCase):
@@ -82,6 +86,7 @@ class WaveLinuxMainAutoRecoveryTests(unittest.TestCase):
         win.channel_widgets = {}
         win._make_auto_recovery_timer = lambda: _FakeTimer()
         win._channel_label = lambda node_name: node_name
+        win._shutting_down = False
         return win
 
     def test_degraded_status_schedules_first_auto_recovery_attempt(self):
@@ -150,6 +155,15 @@ class WaveLinuxMainAutoRecoveryTests(unittest.TestCase):
 
         self.assertNotIn("mic", win._auto_recovery_state)
         self.assertEqual(win.recovery_status_for_channel("mic").state, "recovered")
+        self.assertEqual(win.runtime.refresh_calls, ["fx-status:active:mic"])
+
+    def test_idle_status_requests_followup_runtime_refresh(self):
+        win = self._window()
+        idle = OperationStatus(node_name="mic", state="idle", generation=1, message="ok")
+
+        win._on_runtime_fx_status(idle)
+
+        self.assertEqual(win.runtime.refresh_calls, ["fx-status:idle:mic"])
 
     def test_manual_recover_channel_clears_retry_state(self):
         win = self._window()

@@ -59,7 +59,7 @@ from wavelinux_theme import STYLESHEET
 
 import struct
 
-APP_VERSION = "2.0.7"
+APP_VERSION = "2.0.8"
 _RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire", "pw-cli"]
 _RUNTIME_HEALTH_MESSAGES = {
     "submix_monitor_missing": "Monitor route is missing.",
@@ -1365,6 +1365,16 @@ class ChannelStrip(QFrame):
             return
         runtime.set_source_volume(self.node_name, v / 100.0)
 
+    def flush_pending_state(self):
+        for timer, commit in (
+            (getattr(self, "_mon_commit_timer", None), self._commit_mon_vol),
+            (getattr(self, "_str_commit_timer", None), self._commit_str_vol),
+            (getattr(self, "_src_commit_timer", None), self._commit_src_vol),
+        ):
+            if timer is not None and timer.isActive():
+                timer.stop()
+                commit()
+
     def _apply_mute_style(self, btn, muted):
         if btn == self.mon_mute:
             icon = "🎧"
@@ -1787,6 +1797,12 @@ class AppRoutingRow(QWidget):
             return
         for idx in self._active_indices:
             runtime.set_app_volume(idx, normalized)
+
+    def flush_pending_state(self):
+        timer = getattr(self, "_app_commit_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+            self._commit_app_vol()
 
     def _on_route_change(self, idx):
         sink_name = self.combo.itemData(idx)
@@ -2220,6 +2236,8 @@ class WaveLinuxWindow(QMainWindow):
             self._cancel_auto_recovery_timer(node_name)
         elif state in {"active", "idle"}:
             self._clear_auto_recovery_state(node_name)
+            if node_name and not getattr(self, "_shutting_down", False):
+                self._request_runtime_refresh(f"fx-status:{state}:{node_name}")
         if state == "degraded":
             self.status_lbl.setText(
                 self.format_fx_status_message(status) or "FX runtime degraded"
@@ -4873,7 +4891,23 @@ class WaveLinuxWindow(QMainWindow):
         self._refresh_hidden_list()
 
     def schedule_save(self):
-        self._save_timer.start(500)
+        timer = self.__dict__.get("_save_timer")
+        if timer is not None:
+            timer.start(500)
+
+    def _flush_pending_ui_state(self):
+        master_timer = self.__dict__.get("_master_commit_timer")
+        if master_timer is not None and master_timer.isActive():
+            master_timer.stop()
+            self._commit_master_vols()
+
+        for strip in self.__dict__.get("channel_widgets", {}).values():
+            if hasattr(strip, "flush_pending_state"):
+                strip.flush_pending_state()
+
+        for row in self.__dict__.get("app_widgets", {}).values():
+            if hasattr(row, "flush_pending_state"):
+                row.flush_pending_state()
 
     def _virtual_channel_specs(self):
         specs = {}
@@ -5827,28 +5861,28 @@ class WaveLinuxWindow(QMainWindow):
         `pactl get-default-source` when nothing's saved yet."""
         combo = self.mic_in_combo
         mic_names = {m.name for m in mics}
-        if self.selected_mic:
+        if self.selected_mic and self.selected_mic in mic_names:
             self._mic_selection_initialized = True
 
-        # Resolve the mic only when no saved/user-chosen selection exists.
-        # If a selection is already present but temporarily missing from the
-        # observed device list, keep it pinned instead of silently promoting
-        # a newly connected/default mic into the active selection.
-        if (not self.selected_mic) and mics and (
-            not getattr(self, "_mic_selection_initialized", False)
-        ):
+        # Resolve the mic only during the initial selection pass. Once the
+        # user has an active mic locked, later hotplug churn should not
+        # silently promote another device into the selection.
+        if mics and not getattr(self, "_mic_selection_initialized", False):
             if default_src is None:
                 default_src = (
                     self.engine.get_default_source()
                     if hasattr(self.engine, 'get_default_source') else None
                 )
-            if default_src and default_src in mic_names:
-                self.selected_mic = default_src
+            if self.selected_mic in mic_names:
+                self._mic_selection_initialized = True
             else:
-                self.selected_mic = mics[0].name
-            self.runtime.set_selected_mic(self.selected_mic)
-            self._mic_selection_initialized = True
-            self.schedule_save()
+                if default_src and default_src in mic_names:
+                    self.selected_mic = default_src
+                else:
+                    self.selected_mic = mics[0].name
+                self.runtime.set_selected_mic(self.selected_mic)
+                self._mic_selection_initialized = True
+                self.schedule_save()
 
         mic_fp = tuple((m.name, m.description or '') for m in mics)
         if self.__dict__.get('_mic_combo_fp') != mic_fp:
@@ -6441,6 +6475,7 @@ class WaveLinuxWindow(QMainWindow):
         # `clipguard` (legacy master-bus flag) is not written — it's
         # been replaced by the per-mic `limiter` effect.
         try:
+            self._flush_pending_ui_state()
             self._write_config_file(self.config_path, self._serialize_config())
         except Exception as e:
             logging.error(f"Error saving config: {e}")

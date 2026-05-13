@@ -90,6 +90,42 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
             any(cmd[:2] == ["pactl", "unload-module"] for cmd in calls)
         )
 
+    def test_route_mix_to_hardware_falls_back_when_requested_sink_missing(self):
+        engine = self._engine()
+        mix = OutputMix("Monitor", sink_name="wavelinux_mix_monitor")
+        engine.output_mixes["Monitor"] = mix
+
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[:3] == ["pactl", "load-module", "module-loopback"]:
+                self.assertIn("sink=alsa_output.speakers", cmd)
+                return "22"
+            return ""
+
+        engine._run = fake_run
+        engine.invalidate_snapshot = lambda: None
+        engine.get_default_sink = lambda: "alsa_output.speakers"
+        engine.get_all_sinks = lambda snap=None: [
+            {"index": "1", "name": "alsa_output.speakers"}
+        ]
+        engine._find_loopback_for = lambda source_token, sink_token, snap=None: None
+        engine._module_is_alive = lambda module_id, short_text=None: True
+        engine._sink_input_for_module = lambda module_id: "55" if str(module_id) == "22" else None
+
+        success = engine.route_mix_to_hardware(
+            "Monitor",
+            "bluez_output.AA_BB_CC_DD_EE_FF.1",
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(mix.hardware_output, "alsa_output.speakers")
+        self.assertEqual(
+            engine.loopback_modules,
+            {"Monitor->alsa_output.speakers": "22"},
+        )
+
     def test_route_input_to_submix_keeps_old_loopback_if_replacement_fails(self):
         engine = self._engine()
         engine.output_mixes["Monitor"] = OutputMix("Monitor", sink_name="wavelinux_mix_monitor")
@@ -124,6 +160,41 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         self.assertFalse(
             any(cmd[:2] == ["pactl", "unload-module"] for cmd in calls)
         )
+
+    def test_route_input_to_submix_unloads_stale_raw_loopback_when_fx_route_takes_over(self):
+        engine = self._engine()
+        engine.output_mixes["Monitor"] = OutputMix("Monitor", sink_name="wavelinux_mix_monitor")
+
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[:3] == ["pactl", "load-module", "module-loopback"]:
+                return "222"
+            return ""
+
+        def fake_find_loopback(source_token, sink_token, snap=None):
+            if source_token == "mic" and sink_token == "wavelinux_mix_monitor":
+                return "111"
+            return None
+
+        engine._run = fake_run
+        engine.get_channel_fx_source = lambda node_name, snap=None: "wavelinux.fx.mic.source"
+        engine._module_is_alive = lambda module_id, short_text=None: True
+        engine._find_loopback_for = fake_find_loopback
+        engine.invalidate_snapshot = lambda: None
+
+        success = engine.route_input_to_submix(
+            "55",
+            "mic",
+            "Audio/Source",
+            "Monitor",
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(engine.submix_loopbacks["55->Monitor"], "222")
+        self.assertEqual(engine.submix_sources["55->Monitor"], "wavelinux.fx.mic.source")
+        self.assertIn(["pactl", "unload-module", "111"], calls)
 
     def test_set_channel_fx_does_not_move_internal_submix_loopbacks(self):
         engine = self._engine()
@@ -511,6 +582,38 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         self.assertFalse(any(cmd[:3] == ["pactl", "move-sink-input", "91"] for cmd in calls))
         self.assertFalse(any(cmd[:3] == ["pactl", "set-default-sink", "bluez_output.AA_BB_CC_DD_EE_FF.1"] for cmd in calls))
         self.assertFalse(any(cmd[:3] == ["pactl", "set-default-source", "alsa_input.real_mic"] for cmd in calls))
+
+    def test_full_audio_reset_unloads_virtual_sources(self):
+        engine = self._engine()
+        calls = []
+        modules_text = "\n".join([
+            "201\tmodule-loopback\tsource=wavelinux_music.monitor sink=wavelinux_mix_monitor",
+            "202\tmodule-virtual-source\tsource_name=wavelinux_src_monitor master=wavelinux_mix_monitor.monitor",
+            "203\tmodule-null-sink\tsink_name=wavelinux_mix_monitor",
+        ])
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[:4] == ["pactl", "list", "short", "modules"]:
+                return modules_text
+            return "ok"
+
+        engine._run = fake_run
+        engine.create_snapshot = lambda force=True: object()
+        engine._restore_physical_defaults_before_reset = lambda snap=None: None
+        engine.loopback_modules = {"Monitor->sink": "201"}
+        engine.virtual_sink_modules = {"wavelinux_mix_monitor": "203"}
+        engine.output_mixes = {"Monitor": OutputMix("Monitor", sink_name="wavelinux_mix_monitor")}
+
+        engine.full_audio_reset()
+
+        unloads = [cmd for cmd in calls if cmd[:2] == ["pactl", "unload-module"]]
+        self.assertIn(["pactl", "unload-module", "201"], unloads)
+        self.assertIn(["pactl", "unload-module", "202"], unloads)
+        self.assertIn(["pactl", "unload-module", "203"], unloads)
+        self.assertEqual(engine.loopback_modules, {})
+        self.assertEqual(engine.virtual_sink_modules, {})
+        self.assertEqual(engine.output_mixes, {})
 
     def test_set_source_volume_by_name_resolves_virtual_source_alias(self):
         engine = self._engine()

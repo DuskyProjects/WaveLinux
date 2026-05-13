@@ -511,7 +511,21 @@ class RuntimeExecutor:
                 if not route_live.get(mix_name, False):
                     health.setdefault(node_name, f"submix_{mix_name.lower()}_dead")
                     break
+        observed_mic_names = {view.name for view in observed_state.mic_inputs}
+        observed_virtual_names = {view.name for view in observed_state.virtual_channels}
+        fx_managed_channels = set(observed_virtual_names)
+        if desired_state.selected_mic:
+            fx_managed_channels.add(desired_state.selected_mic)
+        elif observed_mic_names:
+            fx_managed_channels.update(observed_mic_names)
+        else:
+            fx_managed_channels.update(
+                node_name for node_name in desired_state.channels.keys()
+                if node_name in observed_state.present_node_names
+            )
         for node_name, chan in desired_state.channels.items():
+            if node_name not in fx_managed_channels:
+                continue
             if node_name not in observed_state.present_node_names:
                 continue
             if not chan.fx.effects:
@@ -541,6 +555,8 @@ class RuntimeExecutor:
 
         source_owners = {}
         for node_name, fx_source in observed_state.fx_sources_by_channel.items():
+            if node_name not in fx_managed_channels:
+                continue
             if not fx_source:
                 continue
             source_owners.setdefault(fx_source, []).append(node_name)

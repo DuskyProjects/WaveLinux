@@ -9,6 +9,7 @@ import json
 import os
 import queue
 import shutil
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -33,6 +34,20 @@ RELEASE_MANIFEST_SIGNATURE_FILENAME = "wavelinux-release-manifest.sig"
 RELEASE_SIGNING_PUBLIC_KEY_B64 = "a6wczeBBFFfIu0JaZERGhwskfbkgRNBM1BFjBJR/k4w="
 UPDATE_RELEASE_API_URL_ENV = "WAVELINUX_UPDATE_RELEASE_API_URL"
 UPDATE_RELEASES_URL_ENV = "WAVELINUX_UPDATE_RELEASES_URL"
+_SSL_CERT_FILE_ENV = "SSL_CERT_FILE"
+_SSL_CERT_DIR_ENV = "SSL_CERT_DIR"
+_SYSTEM_CA_BUNDLE_CANDIDATES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/tls/cacert.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+)
+
+try:
+    import certifi
+except Exception:  # pragma: no cover - optional runtime dependency
+    certifi = None
 
 try:
     from cryptography.exceptions import InvalidSignature
@@ -102,6 +117,31 @@ def _request(url: str) -> urllib.request.Request:
     )
 
 
+def _ssl_context() -> ssl.SSLContext:
+    cafile = str(os.environ.get(_SSL_CERT_FILE_ENV) or "").strip()
+    if cafile and os.path.exists(cafile):
+        return ssl.create_default_context(cafile=cafile)
+
+    certifi_bundle = ""
+    if certifi is not None:
+        try:
+            certifi_bundle = str(certifi.where() or "").strip()
+        except Exception:
+            certifi_bundle = ""
+    if certifi_bundle and os.path.exists(certifi_bundle):
+        return ssl.create_default_context(cafile=certifi_bundle)
+
+    for candidate in _SYSTEM_CA_BUNDLE_CANDIDATES:
+        if os.path.exists(candidate):
+            return ssl.create_default_context(cafile=candidate)
+
+    cert_dir = str(os.environ.get(_SSL_CERT_DIR_ENV) or "").strip()
+    if cert_dir and os.path.isdir(cert_dir):
+        return ssl.create_default_context(capath=cert_dir)
+
+    return ssl.create_default_context()
+
+
 def release_page_url(*, environ=None) -> str:
     env = os.environ if environ is None else environ
     value = str(env.get(UPDATE_RELEASES_URL_ENV) or "").strip()
@@ -115,12 +155,12 @@ def latest_release_api_url(*, environ=None) -> str:
 
 
 def _fetch_json(url: str) -> dict:
-    with urllib.request.urlopen(_request(url), timeout=10) as resp:
+    with urllib.request.urlopen(_request(url), timeout=10, context=_ssl_context()) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def _fetch_bytes(url: str) -> bytes:
-    with urllib.request.urlopen(_request(url), timeout=15) as resp:
+    with urllib.request.urlopen(_request(url), timeout=15, context=_ssl_context()) as resp:
         return resp.read()
 
 
@@ -387,7 +427,11 @@ def download_file(
     progress_callback=None,
     cancel_event: threading.Event | None = None,
 ) -> int:
-    with urllib.request.urlopen(_request(url), timeout=30) as resp, open(target_path, "wb") as handle:
+    with urllib.request.urlopen(
+        _request(url),
+        timeout=30,
+        context=_ssl_context(),
+    ) as resp, open(target_path, "wb") as handle:
         total_header = resp.headers.get("Content-Length")
         total = int(total_header) if total_header and total_header.isdigit() else 0
         downloaded = 0

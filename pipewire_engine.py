@@ -1136,6 +1136,7 @@ class PipeWireEngine:
         # The "true" source token: FX chain output if the channel has any
         # effects running, otherwise the raw mic / sink-monitor.
         fx_source = self.get_channel_fx_source(node_name, snap=snap)
+        raw_source_id = str(node_name)
         if fx_source:
             source_id = fx_source
         elif media_class == 'Audio/Sink':
@@ -1151,7 +1152,7 @@ class PipeWireEngine:
             # loopback pinned to a stale source token. Using the same
             # name-based token here keeps submix routing coherent across FX
             # rebuilds.
-            source_id = str(node_name)
+            source_id = raw_source_id
 
         # If a loopback we created earlier is still live AND its source
         # matches the current routing (FX state hasn't changed), keep it.
@@ -1183,6 +1184,11 @@ class PipeWireEngine:
 
         self.submix_loopbacks[key] = target_module
         self.submix_sources[key] = source_id
+        if fx_source and media_class != 'Audio/Sink':
+            stale_raw_module = self._find_loopback_for(raw_source_id, mix.sink_name, snap=snap)
+            if stale_raw_module is not None and str(stale_raw_module) != str(target_module):
+                self._run(['pactl', 'unload-module', str(stale_raw_module)])
+                self.invalidate_snapshot()
         if target_module != str(known or ""):
             state = dict(initial_state or self.submix_state_cache.get(key, {}) or {})
             if state:
@@ -1546,14 +1552,24 @@ class PipeWireEngine:
         mix = self.output_mixes.get(mix_name)
         if not mix:
             return False
-        resolved_sink = self.resolve_hardware_sink_name(hw_sink_name)
-        current_key = f'{mix_name}->{resolved_sink or hw_sink_name}'
+        requested_sink = str(hw_sink_name or "").strip()
+        resolved_sink = self.resolve_hardware_sink_name(requested_sink)
+        if not resolved_sink:
+            resolved_sink = self._preferred_hardware_sink_fallback(snap=None)
+            if resolved_sink and requested_sink:
+                logging.warning(
+                    "route_mix_to_hardware: falling back from missing sink %s to %s for %s",
+                    requested_sink,
+                    resolved_sink,
+                    mix_name,
+                )
+        current_key = f'{mix_name}->{resolved_sink or requested_sink}'
         short = self._run(['pactl', 'list', 'short', 'modules']) or ''
         existing_mod = self.loopback_modules.get(current_key)
         if (existing_mod
                 and self._module_is_alive(existing_mod, short_text=short)
                 and self._wait_sink_input_for_module(existing_mod, attempts=2, delay=0.01)):
-            mix.hardware_output = resolved_sink or hw_sink_name
+            mix.hardware_output = resolved_sink or requested_sink
             return True
 
         # Retry briefly — picked sink may not be visible yet (BT mid-profile
@@ -1568,7 +1584,9 @@ class PipeWireEngine:
         for attempt in range(12):
             if out:
                 break
-            candidate_sink = self.resolve_hardware_sink_name(hw_sink_name)
+            candidate_sink = self.resolve_hardware_sink_name(requested_sink)
+            if not candidate_sink:
+                candidate_sink = self._preferred_hardware_sink_fallback(snap=None)
             if candidate_sink:
                 adopted = self._find_loopback_for(f'{mix.sink_name}.monitor', candidate_sink)
                 if adopted and self._wait_sink_input_for_module(adopted, attempts=2, delay=0.01):
@@ -1588,7 +1606,7 @@ class PipeWireEngine:
         if not out:
             logging.warning(
                 f"route_mix_to_hardware: could not load loopback "
-                f"{mix.sink_name}.monitor → {hw_sink_name}"
+                f"{mix.sink_name}.monitor → {requested_sink or '<none>'}"
             )
             return False
 
@@ -1610,7 +1628,7 @@ class PipeWireEngine:
             self._run(['pactl', 'unload-module', str(self.loopback_modules[key])])
             del self.loopback_modules[key]
 
-        resolved_sink = candidate_sink or resolved_sink or hw_sink_name
+        resolved_sink = candidate_sink or resolved_sink or requested_sink
         current_key = f'{mix_name}->{resolved_sink}'
         self.loopback_modules[current_key] = candidate_mod
         mix.hardware_output = resolved_sink
@@ -1775,7 +1793,14 @@ class PipeWireEngine:
                     mod_id = line.split()[0]
                     logging.info(f"Unloading loopback: {mod_id}")
                     self._run(['pactl', 'unload-module', mod_id], timeout=3)
-            
+
+            # Then unload virtual sources that depend on the mix monitors.
+            for line in reversed(lines):
+                if 'wavelinux' in line and 'module-virtual-source' in line:
+                    mod_id = line.split()[0]
+                    logging.info(f"Unloading source: {mod_id}")
+                    self._run(['pactl', 'unload-module', mod_id], timeout=3)
+
             # Then unload sinks
             for line in reversed(lines):
                 if 'wavelinux' in line and 'module-null-sink' in line:

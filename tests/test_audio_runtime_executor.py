@@ -544,6 +544,71 @@ class RuntimeExecutorTests(unittest.TestCase):
 
         self.assertEqual(health.get("mic"), "default_source_mismatch")
 
+    def test_check_invariants_ignores_inactive_saved_mic_fx(self):
+        desired = DesiredState(
+            selected_mic="usb_mic",
+            channels={
+                "mic": ChannelSpec(
+                    node_name="mic",
+                    fx=FxSpec(effects=["rnnoise"], generation=1),
+                ),
+                "usb_mic": ChannelSpec(
+                    node_name="usb_mic",
+                    fx=FxSpec(effects=["rnnoise"], generation=2),
+                ),
+            },
+        )
+        observed = ObservedState(
+            default_source="wavelinux.fx.usb_mic.source",
+            present_node_names={"mic", "usb_mic"},
+            source_names={"mic", "usb_mic", "wavelinux.fx.usb_mic.source"},
+            fx_sources_by_channel={
+                "mic": None,
+                "usb_mic": "wavelinux.fx.usb_mic.source",
+            },
+            fx_effects_by_channel={
+                "mic": [],
+                "usb_mic": ["rnnoise"],
+            },
+            submix_owner_by_channel={
+                "usb_mic": {"Monitor": "11", "Stream": "12"},
+            },
+            submix_live_by_channel={
+                "usb_mic": {"Monitor": True, "Stream": True},
+            },
+            mic_inputs=[
+                RuntimeChannelView(
+                    node_id="55",
+                    name="mic",
+                    description="Mic",
+                    media_class="Audio/Source",
+                    label="Mic",
+                    channel_type="Microphone",
+                    icon="mic",
+                    is_mic=True,
+                    capture_target="mic",
+                    meter_source="mic",
+                ),
+                RuntimeChannelView(
+                    node_id="56",
+                    name="usb_mic",
+                    description="USB Mic",
+                    media_class="Audio/Source",
+                    label="USB Mic",
+                    channel_type="Microphone",
+                    icon="mic",
+                    is_mic=True,
+                    capture_target="usb_mic",
+                    meter_source="usb_mic",
+                ),
+            ],
+        )
+
+        health = RuntimeExecutor._check_invariants(desired, observed)
+
+        self.assertNotIn("mic", health)
+        self.assertNotIn("usb_mic", health)
+
     def test_build_app_views_reuses_parsed_volume_when_present(self):
         class AppEngine:
             def __init__(self):
