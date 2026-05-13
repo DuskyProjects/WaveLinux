@@ -20,7 +20,7 @@ WAVELINUX_BUNDLE_LADSPA="${WAVELINUX_BUNDLE_LADSPA:-0}"
 require_build_modules() {
     local missing=()
     local module
-    for module in PyInstaller PyQt6; do
+    for module in PyInstaller PyQt6 cryptography; do
         if ! env -u PYTHONPATH "${PYTHON_BIN}" -c "import ${module}" >/dev/null 2>&1; then
             missing+=("${module}")
         fi
@@ -28,7 +28,7 @@ require_build_modules() {
     if [ "${#missing[@]}" -gt 0 ]; then
         echo "Build interpreter ${PYTHON_BIN} is missing required modules: ${missing[*]}" >&2
         echo "Install them into the same interpreter, e.g.:" >&2
-        echo "  ${PYTHON_BIN} -m pip install PyInstaller PyQt6" >&2
+        echo "  ${PYTHON_BIN} -m pip install PyInstaller PyQt6 cryptography" >&2
         exit 1
     fi
 }

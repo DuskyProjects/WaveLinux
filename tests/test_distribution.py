@@ -89,6 +89,7 @@ class DistributionTests(unittest.TestCase):
                 state = distribution.install_state(home=home)
 
             self.assertTrue(state.installed_appimage_exists)
+            self.assertFalse(state.appimage_missing)
             self.assertTrue(state.desktop_exists)
             self.assertEqual(len(state.stale_launcher_entries), 1)
             self.assertTrue(
@@ -106,6 +107,8 @@ class DistributionTests(unittest.TestCase):
             state = distribution.install_state(home=tmpdir)
 
             self.assertEqual(state.wrapper_target, "/tmp/Other.AppImage")
+            self.assertTrue(state.wrapper_mismatch)
+            self.assertTrue(state.appimage_missing)
             self.assertIn("Installed wrapper points at an unexpected AppImage path.", state.warnings)
 
     def test_repair_installed_appimage_launchers_rewrites_canonical_files_and_removes_stale(self):

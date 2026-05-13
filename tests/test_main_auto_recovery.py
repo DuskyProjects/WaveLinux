@@ -75,6 +75,7 @@ class WaveLinuxMainAutoRecoveryTests(unittest.TestCase):
     def _window(self):
         win = WaveLinuxWindow.__new__(WaveLinuxWindow)
         win._auto_recovery_state = {}
+        win._recent_recovery_status = {}
         win.runtime = _FakeRuntime()
         win.status_lbl = _FakeLabel()
         win._runtime_view_state = None
@@ -148,6 +149,7 @@ class WaveLinuxMainAutoRecoveryTests(unittest.TestCase):
         win._on_runtime_fx_status(active)
 
         self.assertNotIn("mic", win._auto_recovery_state)
+        self.assertEqual(win.recovery_status_for_channel("mic").state, "recovered")
 
     def test_manual_recover_channel_clears_retry_state(self):
         win = self._window()
@@ -204,6 +206,21 @@ class WaveLinuxMainAutoRecoveryTests(unittest.TestCase):
                 win.open_channel_diagnostics("mic")
 
         self.assertEqual(win.runtime.export_calls, ["channel-diagnostics:mic"])
+
+    def test_recovery_status_marks_exhausted_channel(self):
+        win = self._window()
+        status = OperationStatus(node_name="mic", state="degraded", generation=8, message="boom")
+        win.runtime.statuses["mic"] = status
+        win._on_runtime_fx_status(status)
+        win._auto_recovery_state["mic"]["timer"].fire()
+        win._on_runtime_fx_status(status)
+        win._auto_recovery_state["mic"]["timer"].fire()
+        win._on_runtime_fx_status(status)
+
+        recovery = win.recovery_status_for_channel("mic")
+
+        self.assertEqual(recovery.state, "exhausted")
+        self.assertEqual(recovery.retry_count, 2)
 
 
 if __name__ == "__main__":

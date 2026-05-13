@@ -39,13 +39,16 @@ class InstallState:
     running_appimage_path: str | None
     installed_appimage_path: str
     installed_appimage_exists: bool
+    appimage_missing: bool
     wrapper_path: str
     wrapper_exists: bool
     wrapper_target: str | None
+    wrapper_mismatch: bool
     desktop_path: str
     desktop_exists: bool
     desktop_exec_command: str | None
     desktop_exec_target: str | None
+    desktop_mismatch: bool
     launcher_entries: tuple[LauncherEntry, ...]
     stale_launcher_entries: tuple[LauncherEntry, ...]
     warnings: tuple[str, ...]
@@ -282,21 +285,31 @@ def install_state(*, home=None, environ=None, argv=None) -> InstallState:
     desktop_exec = _desktop_exec_command(desktop) if os.path.exists(desktop) else None
     desktop_target = _command_target(desktop_exec)
     wrapper_target = _wrapper_target(wrapper) if os.path.exists(wrapper) else None
+    appimage_exists = os.path.exists(installed_appimage)
+    appimage_missing = not appimage_exists
+    wrapper_mismatch = (
+        os.path.exists(wrapper)
+        and wrapper_target not in {None, os.path.abspath(installed_appimage)}
+    )
+    desktop_mismatch = (
+        os.path.exists(desktop)
+        and desktop_target not in {
+            None,
+            os.path.abspath(wrapper),
+            os.path.abspath(installed_appimage),
+            os.path.basename(wrapper),
+            os.path.basename(installed_appimage),
+        }
+    )
     stale_entries = tuple(
         entry for entry in launcher_entries
         if not entry.is_canonical
     )
 
     warnings = []
-    if os.path.exists(wrapper) and wrapper_target not in {None, os.path.abspath(installed_appimage)}:
+    if wrapper_mismatch:
         warnings.append("Installed wrapper points at an unexpected AppImage path.")
-    if os.path.exists(desktop) and desktop_target not in {
-        None,
-        os.path.abspath(wrapper),
-        os.path.abspath(installed_appimage),
-        os.path.basename(wrapper),
-        os.path.basename(installed_appimage),
-    }:
+    if desktop_mismatch:
         warnings.append("Installed desktop launcher points at an unexpected target.")
     if stale_entries:
         warnings.append(
@@ -306,14 +319,17 @@ def install_state(*, home=None, environ=None, argv=None) -> InstallState:
     return InstallState(
         running_appimage_path=running,
         installed_appimage_path=installed_appimage,
-        installed_appimage_exists=os.path.exists(installed_appimage),
+        installed_appimage_exists=appimage_exists,
+        appimage_missing=appimage_missing,
         wrapper_path=wrapper,
         wrapper_exists=os.path.exists(wrapper),
         wrapper_target=wrapper_target,
+        wrapper_mismatch=wrapper_mismatch,
         desktop_path=desktop,
         desktop_exists=os.path.exists(desktop),
         desktop_exec_command=desktop_exec,
         desktop_exec_target=desktop_target,
+        desktop_mismatch=desktop_mismatch,
         launcher_entries=launcher_entries,
         stale_launcher_entries=stale_entries,
         warnings=tuple(warnings),

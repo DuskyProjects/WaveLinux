@@ -8,12 +8,9 @@ import subprocess
 import sys
 import os
 import re
-import tempfile
 import time
 import threading
 import queue
-import urllib.request
-import urllib.error
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -39,14 +36,19 @@ from distribution import (
     repair_installed_appimage_launchers,
     resource_path,
 )
+from health import HealthIssue, RecoveryStatus
 from pipewire_engine import PipeWireEngine
+from updates import (
+    AppImageUpdateInstaller,
+    GITHUB_RELEASES_URL,
+    UpdateChecker,
+    VerifiedReleaseInfo,
+)
 from wavelinux_theme import STYLESHEET
 
 import struct
 
 APP_VERSION = "2.0.4"
-_GITHUB_OWNER = "DuskyProjects"
-_GITHUB_REPO  = "WaveLinux"
 _RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire", "pw-cli"]
 _RUNTIME_HEALTH_MESSAGES = {
     "submix_monitor_missing": "Monitor route is missing.",
@@ -120,6 +122,7 @@ def startup_preflight_report(*, which=shutil.which, runner=subprocess.run,
     deps = {cmd: bool(which(cmd)) for cmd in _RUNTIME_DEPS}
     missing = [cmd for cmd, present in deps.items() if not present]
     checks = {}
+    issue_details = []
     if deps.get("pactl"):
         checks["pactl_info"] = _probe_command(["pactl", "info"], runner=runner)
     if deps.get("wpctl"):
@@ -129,27 +132,49 @@ def startup_preflight_report(*, which=shutil.which, runner=subprocess.run,
     config_error = ""
     try:
         os.makedirs(config_root, exist_ok=True)
+        probe_path = os.path.join(config_root, ".wavelinux-write-check")
+        with open(probe_path, "w", encoding="utf-8") as handle:
+            handle.write("ok")
+        os.remove(probe_path)
     except OSError as exc:
         config_ok = False
         config_error = str(exc)
 
     issues = []
     if missing:
-        issues.append(
-            "Missing required audio/runtime tools: " + ", ".join(missing)
-        )
+        detail = "Missing required audio/runtime tools: " + ", ".join(missing)
+        issues.append(detail)
+        issue_details.append({
+            "code": "runtime.missing_tool",
+            "detail": detail,
+            "context": {"tools": list(missing)},
+        })
     pactl_check = checks.get("pactl_info")
     if pactl_check and not pactl_check.get("ok"):
-        issues.append(
-            "Could not query the PulseAudio compatibility server via `pactl info`."
-        )
+        detail = "Could not query the PulseAudio compatibility server via `pactl info`."
+        issues.append(detail)
+        issue_details.append({
+            "code": "runtime.pipewire_unreachable",
+            "detail": detail,
+            "context": {"check": dict(pactl_check)},
+        })
     wpctl_check = checks.get("wpctl_status")
     if wpctl_check and not wpctl_check.get("ok"):
-        issues.append(
-            "Could not query WirePlumber via `wpctl status`."
-        )
+        detail = "Could not query WirePlumber via `wpctl status`."
+        issues.append(detail)
+        issue_details.append({
+            "code": "runtime.wireplumber_unreachable",
+            "detail": detail,
+            "context": {"check": dict(wpctl_check)},
+        })
     if not config_ok:
-        issues.append(f"Could not prepare config directory {config_root}: {config_error}")
+        detail = f"Could not prepare config directory {config_root}: {config_error}"
+        issues.append(detail)
+        issue_details.append({
+            "code": "runtime.config_unwritable",
+            "detail": detail,
+            "context": {"config_dir": config_root, "error": config_error},
+        })
 
     return {
         "deps": deps,
@@ -159,6 +184,7 @@ def startup_preflight_report(*, which=shutil.which, runner=subprocess.run,
         "config_ok": config_ok,
         "config_error": config_error,
         "issues": issues,
+        "issue_details": issue_details,
     }
 
 
@@ -204,183 +230,6 @@ def _handle_cli_args(argv=None):
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report.get("ok") else 1
     return None
-
-
-class UpdateChecker:
-    """Background release checker using queue polling from the Qt thread."""
-
-    _API_URL  = (f"https://api.github.com/"
-                 f"repos/{_GITHUB_OWNER}/{_GITHUB_REPO}/releases/latest")
-    _RELEASES_URL = f"https://github.com/{_GITHUB_OWNER}/{_GITHUB_REPO}/releases"
-    _USER_AGENT = "WaveLinux-Updater"
-
-    def __init__(self):
-        self._q = queue.SimpleQueue()
-        self._cancel = threading.Event()
-
-    def check(self):
-        self._cancel.clear()
-        threading.Thread(target=self._do_check, daemon=True).start()
-
-    def cancel(self):
-        self._cancel.set()
-
-    def poll(self):
-        """Return next queued item or None. Always called from the Qt thread."""
-        try:
-            return self._q.get_nowait()
-        except queue.Empty:
-            return None
-
-    @classmethod
-    def _request(cls, url):
-        return urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": cls._USER_AGENT,
-                "Accept": "application/vnd.github+json",
-            },
-        )
-
-    @classmethod
-    def _fetch_json(cls, url):
-        req = cls._request(url)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode())
-
-    @classmethod
-    def _select_appimage_asset(cls, release_data):
-        candidates = []
-        for asset in release_data.get("assets", []) or []:
-            name = str(asset.get("name") or "").strip()
-            download_url = str(asset.get("browser_download_url") or "").strip()
-            if not name or not download_url or not name.endswith(".AppImage"):
-                continue
-            lowered = name.lower()
-            score = (
-                1 if lowered.startswith("wavelinux-") else 0,
-                1 if "x86_64" in lowered else 0,
-                1 if "linux" in lowered else 0,
-                len(name),
-            )
-            candidates.append((score, asset))
-        if not candidates:
-            return None
-        return max(candidates, key=lambda item: item[0])[1]
-
-    @classmethod
-    def _release_info_from_data(cls, data):
-        tag = str(data.get("tag_name") or "").lstrip("v").strip()
-        if not tag:
-            raise ValueError("GitHub returned no release tag — has a release been published yet?")
-        release_url = str(data.get("html_url") or cls._RELEASES_URL).strip() or cls._RELEASES_URL
-        asset = cls._select_appimage_asset(data)
-        return {
-            "tag": tag,
-            "release_url": release_url,
-            "asset_name": str(asset.get("name") or "").strip() if asset else "",
-            "asset_url": str(asset.get("browser_download_url") or "").strip() if asset else "",
-        }
-
-    @classmethod
-    def latest_release_info(cls):
-        return cls._release_info_from_data(cls._fetch_json(cls._API_URL))
-
-    def _do_check(self):
-        try:
-            info = self.latest_release_info()
-            if self._cancel.is_set():
-                return
-            self._q.put(('result', info))
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                self._q.put(('error', "No releases published yet on GitHub."))
-            else:
-                self._q.put(('error', f"HTTP {e.code}: {e.reason}"))
-        except urllib.error.URLError as e:
-            self._q.put(('error', f"Network error: {e.reason}"))
-        except ValueError as e:
-            self._q.put(('error', str(e)))
-        except Exception as e:
-            self._q.put(('error', f"Check failed: {e}"))
-
-
-class AppImageUpdateInstaller:
-    """Download the latest GitHub AppImage and install it locally."""
-
-    def __init__(self):
-        self._q = queue.SimpleQueue()
-        self._cancel = threading.Event()
-
-    def install(self, *, release_info=None):
-        self._cancel.clear()
-        info = dict(release_info or {})
-        threading.Thread(target=self._do_install, args=(info,), daemon=True).start()
-
-    def cancel(self):
-        self._cancel.set()
-
-    def poll(self):
-        try:
-            return self._q.get_nowait()
-        except queue.Empty:
-            return None
-
-    def _download_asset(self, asset_url, target_path, asset_name):
-        req = UpdateChecker._request(asset_url)
-        with urllib.request.urlopen(req, timeout=30) as resp, open(target_path, "wb") as handle:
-            total_header = resp.headers.get("Content-Length")
-            total = int(total_header) if total_header and total_header.isdigit() else 0
-            downloaded = 0
-            self._q.put(("progress", asset_name, downloaded, total))
-            while True:
-                if self._cancel.is_set():
-                    raise RuntimeError("Update cancelled.")
-                chunk = resp.read(1024 * 256)
-                if not chunk:
-                    break
-                handle.write(chunk)
-                downloaded += len(chunk)
-                self._q.put(("progress", asset_name, downloaded, total))
-        return downloaded
-
-    def _do_install(self, info):
-        temp_path = ""
-        try:
-            if not info.get("tag"):
-                info = UpdateChecker.latest_release_info()
-                if self._cancel.is_set():
-                    return
-            asset_url = str(info.get("asset_url") or "").strip()
-            asset_name = str(info.get("asset_name") or "").strip() or "WaveLinux AppImage"
-            if not asset_url:
-                raise RuntimeError(
-                    "The latest GitHub release does not include an AppImage asset."
-                )
-            with tempfile.NamedTemporaryFile(
-                prefix="wavelinux-update-",
-                suffix=".AppImage",
-                delete=False,
-            ) as handle:
-                temp_path = handle.name
-            self._download_asset(asset_url, temp_path, asset_name)
-            if self._cancel.is_set():
-                return
-            self._q.put(("status", "Installing downloaded AppImage…"))
-            result = install_appimage_file(temp_path)
-            self._q.put(("installed", result, dict(info)))
-        except urllib.error.HTTPError as e:
-            self._q.put(("error", f"HTTP {e.code}: {e.reason}"))
-        except urllib.error.URLError as e:
-            self._q.put(("error", f"Network error: {e.reason}"))
-        except Exception as e:
-            self._q.put(("error", str(e)))
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
 
 
 class MeterWorker(QObject):
@@ -1890,6 +1739,94 @@ class AppRoutingRow(QWidget):
                 self._last_sink_selection = current_sink
 
 
+class HealthCard(QFrame):
+    """Small status card used by the Health settings tab."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("healthCard")
+        self.setProperty("severity", "info")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
+
+        self.badge_lbl = QLabel("INFO")
+        self.badge_lbl.setObjectName("healthBadge")
+        self.badge_lbl.setProperty("severity", "info")
+        head.addWidget(self.badge_lbl, 0, Qt.AlignmentFlag.AlignTop)
+
+        self.title_lbl = QLabel()
+        self.title_lbl.setObjectName("healthTitle")
+        self.title_lbl.setWordWrap(True)
+        head.addWidget(self.title_lbl, 1)
+        layout.addLayout(head)
+
+        self.detail_lbl = QLabel()
+        self.detail_lbl.setObjectName("healthDetail")
+        self.detail_lbl.setWordWrap(True)
+        layout.addWidget(self.detail_lbl)
+
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(8)
+        self.primary_btn = QPushButton()
+        self.primary_btn.setObjectName("showHiddenBtn")
+        action_row.addWidget(self.primary_btn)
+        self.secondary_btn = QPushButton()
+        self.secondary_btn.setObjectName("showHiddenBtn")
+        action_row.addWidget(self.secondary_btn)
+        action_row.addStretch()
+        layout.addLayout(action_row)
+
+    def configure(self, issue: HealthIssue, *, primary_handler=None,
+                  secondary_handler=None):
+        severity = (issue.severity or "info").strip().lower()
+        badge_text = severity.upper()
+        self.setProperty("severity", severity)
+        self.badge_lbl.setText(badge_text)
+        self.badge_lbl.setProperty("severity", severity)
+        self.title_lbl.setText(issue.title or issue.code)
+        self.detail_lbl.setText(issue.detail or "")
+        self._refresh_style()
+
+        self._configure_button(
+            self.primary_btn,
+            issue.primary_action,
+            primary_handler,
+        )
+        self._configure_button(
+            self.secondary_btn,
+            issue.secondary_action,
+            secondary_handler,
+        )
+
+    @staticmethod
+    def _disconnect_button(button):
+        try:
+            button.clicked.disconnect()
+        except TypeError:
+            pass
+
+    def _configure_button(self, button, text, handler):
+        self._disconnect_button(button)
+        text = str(text or "").strip()
+        visible = bool(text and handler is not None)
+        button.setVisible(visible)
+        if not visible:
+            return
+        button.setText(text)
+        button.clicked.connect(handler)
+
+    def _refresh_style(self):
+        for widget in (self, self.badge_lbl):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+
 # ── Main Window ────────────────────────────────────────────────────
 class WaveLinuxWindow(QMainWindow):
     _AUTO_RECOVERY_DELAYS_MS = (1500, 5000)
@@ -1988,6 +1925,14 @@ class WaveLinuxWindow(QMainWindow):
         self.refresh_timer.start(5000)
         self._start_event_subscriber()
         self._pending_update_tag = None
+        self._pending_verified_release = None
+        self._pending_update_url = GITHUB_RELEASES_URL
+        self._pending_update_asset_url = ""
+        self._pending_update_asset_name = ""
+        self._last_update_check_at = None
+        self._last_update_issue = None
+        self._last_update_attempt_result = "No update activity yet."
+        self._recent_recovery_status = {}
         # Silent update check 30 s after startup so it never blocks startup.
         QTimer.singleShot(30_000, self._check_for_updates_bg)
 
@@ -2009,12 +1954,10 @@ class WaveLinuxWindow(QMainWindow):
         elif self.status_lbl.text().startswith("Applying audio changes"):
             self.status_lbl.setText("PipeWire connected")
         hidden_to_tray = self.tray is not None and not self.isVisible()
-        settings_open = (
-            getattr(self, "settings_dialog", None)
-            and self.settings_dialog.isVisible()
-        )
+        settings_open = self._settings_dialog_visible()
         if settings_open:
             self._refresh_advanced_tab()
+            self._refresh_system_tab(preflight=self._startup_preflight)
         if hidden_to_tray and not settings_open:
             return
         if self._any_slider_dragging():
@@ -2033,7 +1976,13 @@ class WaveLinuxWindow(QMainWindow):
                 self.format_fx_status_message(status) or "FX runtime degraded"
             )
             self._schedule_auto_recovery(status)
+        if self._settings_dialog_visible():
+            self._refresh_system_tab(preflight=self._startup_preflight)
         self._refresh_channel_runtime_status(node_name)
+
+    def _settings_dialog_visible(self):
+        dialog = self.__dict__.get("settings_dialog")
+        return bool(dialog is not None and dialog.isVisible())
 
     def _make_auto_recovery_timer(self):
         timer = QTimer(self)
@@ -2055,6 +2004,20 @@ class WaveLinuxWindow(QMainWindow):
     def _clear_auto_recovery_state(self, node_name):
         if not node_name:
             return
+        if not hasattr(self, "_recent_recovery_status"):
+            self._recent_recovery_status = {}
+        entry = self._auto_recovery_state.get(node_name)
+        if entry and int(entry.get("attempts", 0)) > 0:
+            status = getattr(self, "runtime", None).fx_status_for(node_name) if getattr(self, "runtime", None) is not None else None
+            self._recent_recovery_status[node_name] = {
+                "at": time.time(),
+                "status": RecoveryStatus(
+                    node_name=node_name,
+                    state="recovered",
+                    retry_count=int(entry.get("attempts", 0)),
+                    diagnostics_path=self._fx_status_diagnostics_path(status),
+                ),
+            }
         self._cancel_auto_recovery_timer(node_name)
         self._auto_recovery_state.pop(node_name, None)
         self._refresh_channel_runtime_status(node_name)
@@ -2062,6 +2025,9 @@ class WaveLinuxWindow(QMainWindow):
     def _ensure_auto_recovery_entry(self, node_name, generation):
         entry = self._auto_recovery_state.get(node_name)
         generation = int(generation or 0)
+        if not hasattr(self, "_recent_recovery_status"):
+            self._recent_recovery_status = {}
+        self._recent_recovery_status.pop(node_name, None)
         if entry is None or int(entry.get("generation", 0)) != generation:
             if entry is not None:
                 self._cancel_auto_recovery_timer(node_name)
@@ -2124,6 +2090,58 @@ class WaveLinuxWindow(QMainWindow):
         if attempts:
             return f"Automatic recovery attempt {attempts}/{total} is in progress."
         return ""
+
+    def recovery_status_for_channel(self, node_name):
+        if not node_name:
+            return RecoveryStatus(node_name="", state="idle", retry_count=0)
+        runtime = getattr(self, "runtime", None)
+        fx_status = runtime.fx_status_for(node_name) if runtime is not None else None
+        diagnostics_path = self._fx_status_diagnostics_path(fx_status)
+        entry = self._auto_recovery_state.get(node_name) or {}
+        timer = entry.get("timer")
+        attempts = int(entry.get("attempts", 0))
+        if entry.get("exhausted"):
+            return RecoveryStatus(
+                node_name=node_name,
+                state="exhausted",
+                retry_count=attempts,
+                diagnostics_path=diagnostics_path,
+            )
+        if timer is not None and timer.isActive():
+            remaining_ms = max(0, int(timer.remainingTime()))
+            next_retry_at = time.time() + (remaining_ms / 1000.0)
+            return RecoveryStatus(
+                node_name=node_name,
+                state="scheduled",
+                retry_count=attempts,
+                next_retry_at=next_retry_at,
+                diagnostics_path=diagnostics_path,
+            )
+        if attempts:
+            return RecoveryStatus(
+                node_name=node_name,
+                state="retrying",
+                retry_count=attempts,
+                diagnostics_path=diagnostics_path,
+            )
+        recent = getattr(self, "_recent_recovery_status", {}).get(node_name) or {}
+        recent_status = recent.get("status")
+        recent_at = float(recent.get("at", 0) or 0)
+        if recent_status is not None and (time.time() - recent_at) < 90:
+            return recent_status
+        if getattr(fx_status, "state", "") == "degraded":
+            return RecoveryStatus(
+                node_name=node_name,
+                state="retrying",
+                retry_count=0,
+                diagnostics_path=diagnostics_path,
+            )
+        return RecoveryStatus(
+            node_name=node_name,
+            state="idle",
+            retry_count=0,
+            diagnostics_path=diagnostics_path,
+        )
 
     def channel_runtime_issue(self, node_name):
         view = self._runtime_view_state
@@ -2305,6 +2323,10 @@ class WaveLinuxWindow(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
+        title = QLabel("HEALTH")
+        title.setObjectName("sectionLabel")
+        layout.addWidget(title)
+
         self._system_summary_lbl = QLabel()
         self._system_summary_lbl.setWordWrap(True)
         self._system_summary_lbl.setStyleSheet("color: #e0e0ee; font-size: 13px; font-weight: bold;")
@@ -2314,16 +2336,6 @@ class WaveLinuxWindow(QMainWindow):
         self._system_runtime_lbl.setWordWrap(True)
         self._system_runtime_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
         layout.addWidget(self._system_runtime_lbl)
-
-        self._system_install_lbl = QLabel()
-        self._system_install_lbl.setWordWrap(True)
-        self._system_install_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
-        layout.addWidget(self._system_install_lbl)
-
-        self._system_fx_lbl = QLabel()
-        self._system_fx_lbl.setWordWrap(True)
-        self._system_fx_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
-        layout.addWidget(self._system_fx_lbl)
 
         btn_row = QHBoxLayout()
         self._rerun_system_check_btn = QPushButton("Re-run System Check")
@@ -2336,9 +2348,36 @@ class WaveLinuxWindow(QMainWindow):
         self._repair_launcher_btn.clicked.connect(self._repair_installed_launchers)
         btn_row.addWidget(self._repair_launcher_btn)
 
+        self._health_recover_btn = QPushButton("Recover degraded channels")
+        self._health_recover_btn.setObjectName("showHiddenBtn")
+        self._health_recover_btn.clicked.connect(self._recover_all_degraded_channels)
+        btn_row.addWidget(self._health_recover_btn)
+
+        self._health_diag_btn = QPushButton("Open diagnostics folder")
+        self._health_diag_btn.setObjectName("showHiddenBtn")
+        self._health_diag_btn.clicked.connect(self._open_diagnostics_folder)
+        btn_row.addWidget(self._health_diag_btn)
+
+        self._health_restart_btn = QPushButton("Restart WaveLinux")
+        self._health_restart_btn.setObjectName("showHiddenBtn")
+        self._health_restart_btn.clicked.connect(self._restart_app)
+        btn_row.addWidget(self._health_restart_btn)
+
         btn_row.addStretch()
         layout.addLayout(btn_row)
-        layout.addStretch(1)
+
+        self._health_cards_scroll = QScrollArea()
+        self._health_cards_scroll.setWidgetResizable(True)
+        self._health_cards_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._health_cards_scroll.setStyleSheet("background: transparent;")
+        self._health_cards_container = QWidget()
+        self._health_cards_layout = QVBoxLayout(self._health_cards_container)
+        self._health_cards_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._health_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self._health_cards_layout.setSpacing(10)
+        self._health_cards_scroll.setWidget(self._health_cards_container)
+        layout.addWidget(self._health_cards_scroll, 1)
+
         return tab
 
     def _build_scenes_tab(self):
@@ -3056,8 +3095,9 @@ class WaveLinuxWindow(QMainWindow):
         layout.addWidget(self._update_progress)
 
         note = QLabel(
-            "WaveLinux can download the latest GitHub AppImage and install it to "
-            "~/.local/bin for you.\n"
+            "WaveLinux verifies a signed GitHub release manifest, downloads the matching "
+            "AppImage, validates its checksum, runs smoke checks, and only then replaces "
+            "~/.local/bin/WaveLinux.AppImage for you.\n"
             "If you use a distro package, keep updating through your package manager."
         )
         note.setWordWrap(True)
@@ -3114,18 +3154,23 @@ class WaveLinuxWindow(QMainWindow):
 
     def _handle_update_result(self, release_info):
         self._check_update_btn.setEnabled(True)
-        release_info = dict(release_info or {})
-        latest_tag = str(release_info.get("tag") or "").strip()
-        self._pending_update_url = release_info.get("release_url") or UpdateChecker._RELEASES_URL
-        self._pending_update_asset_url = release_info.get("asset_url") or ""
-        self._pending_update_asset_name = release_info.get("asset_name") or ""
+        if not isinstance(release_info, VerifiedReleaseInfo):
+            raise TypeError("Expected VerifiedReleaseInfo from update checker")
+        latest_tag = str(release_info.version or "").strip()
+        self._pending_verified_release = release_info
+        self._pending_update_url = release_info.release_url or GITHUB_RELEASES_URL
+        self._pending_update_asset_url = release_info.asset_url or ""
+        self._pending_update_asset_name = release_info.asset_name or ""
+        self._last_update_check_at = time.time()
+        self._last_update_issue = None
         current = _parse_version(APP_VERSION)
         latest  = _parse_version(latest_tag)
         if latest > current:
             self._pending_update_tag = latest_tag
             if self._pending_update_asset_url:
+                self._last_update_attempt_result = f"Verified update available: v{latest_tag}"
                 self._update_status_lbl.setText(
-                    f"Update available: v{latest_tag}  (current: v{APP_VERSION})"
+                    f"Verified update available: v{latest_tag}  (current: v{APP_VERSION})"
                 )
                 self._update_status_lbl.setStyleSheet("color: #00d4aa; font-size: 12px; font-weight: bold;")
                 self._show_notification(
@@ -3133,26 +3178,41 @@ class WaveLinuxWindow(QMainWindow):
                     f"Version {latest_tag} is available. Open Settings → Updates to install it.",
                 )
             else:
+                self._last_update_attempt_result = f"Verified release v{latest_tag} has no eligible AppImage asset."
                 self._update_status_lbl.setText(
-                    f"Version {latest_tag} is available, but no AppImage asset was found in the latest GitHub release."
+                    f"Version {latest_tag} is available, but the signed manifest exposes no eligible AppImage asset."
                 )
                 self._update_status_lbl.setStyleSheet("color: #d28b26; font-size: 12px;")
         else:
-            self._update_status_lbl.setText(f"You're up to date! (v{APP_VERSION})")
+            self._last_update_attempt_result = f"Already on the latest verified release: v{APP_VERSION}"
+            self._update_status_lbl.setText(f"You're up to date on the latest verified release! (v{APP_VERSION})")
             self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
             self._pending_update_tag = None
             self._pending_update_asset_url = ""
             self._pending_update_asset_name = ""
         self._refresh_update_tab()
+        self._refresh_system_tab()
 
-    def _handle_update_error(self, message):
+    def _handle_update_error(self, payload):
         self._check_update_btn.setEnabled(True)
-        self._update_status_lbl.setText(f"Error: {message}")
-        self._update_status_lbl.setStyleSheet("color: #e05050; font-size: 12px;")
+        payload = dict(payload or {})
+        self._last_update_issue = payload
+        self._pending_update_url = str(payload.get("release_url") or GITHUB_RELEASES_URL)
+        self._last_update_attempt_result = f"Update check failed: {payload.get('message') or 'unknown error'}"
+        message = str(payload.get("message") or "unknown error")
+        code = str(payload.get("code") or "")
+        style = (
+            "color: #d28b26; font-size: 12px;"
+            if code in {"update.manifest_missing", "update.asset_missing"}
+            else "color: #e05050; font-size: 12px;"
+        )
+        self._update_status_lbl.setText(f"Update check failed: {message}")
+        self._update_status_lbl.setStyleSheet(style)
         self._refresh_update_tab()
+        self._refresh_system_tab()
 
     def _open_release_page(self):
-        url = getattr(self, "_pending_update_url", None) or UpdateChecker._RELEASES_URL
+        url = getattr(self, "_pending_update_url", None) or GITHUB_RELEASES_URL
         QDesktopServices.openUrl(QUrl(url))
 
     def _download_and_install_update(self):
@@ -3170,12 +3230,7 @@ class WaveLinuxWindow(QMainWindow):
         if prev is not None:
             prev.cancel()
 
-        release_info = {
-            "tag": getattr(self, "_pending_update_tag", None) or "",
-            "release_url": getattr(self, "_pending_update_url", None) or UpdateChecker._RELEASES_URL,
-            "asset_url": getattr(self, "_pending_update_asset_url", "") or "",
-            "asset_name": getattr(self, "_pending_update_asset_name", "") or "",
-        }
+        release_info = getattr(self, "_pending_verified_release", None)
         self._update_installer = AppImageUpdateInstaller()
         self._update_installer.install(release_info=release_info)
 
@@ -3241,15 +3296,20 @@ class WaveLinuxWindow(QMainWindow):
             progress.setVisible(False)
             progress.setRange(0, 100)
             progress.setValue(0)
-        release_info = dict(release_info or {})
-        tag = str(release_info.get("tag") or "").strip()
+        if not isinstance(release_info, VerifiedReleaseInfo):
+            raise TypeError("Expected VerifiedReleaseInfo from installer")
+        tag = str(release_info.version or "").strip()
+        self._pending_verified_release = release_info
         self._pending_update_tag = tag or None
-        self._pending_update_url = release_info.get("release_url") or UpdateChecker._RELEASES_URL
-        self._pending_update_asset_url = release_info.get("asset_url") or ""
-        self._pending_update_asset_name = release_info.get("asset_name") or ""
+        self._pending_update_url = release_info.release_url or GITHUB_RELEASES_URL
+        self._pending_update_asset_url = release_info.asset_url or ""
+        self._pending_update_asset_name = release_info.asset_name or ""
+        self._last_update_check_at = time.time()
+        self._last_update_issue = None
         version_text = f"v{tag}" if tag else "the latest version"
+        self._last_update_attempt_result = f"Installed verified {version_text} to {result.appimage_path}"
         self._update_status_lbl.setText(
-            f"Installed {version_text} to {result.appimage_path}. Restart WaveLinux to run it."
+            f"Installed verified {version_text} to {result.appimage_path}. Restart WaveLinux to run it."
         )
         self._update_status_lbl.setStyleSheet("color: #00d4aa; font-size: 12px; font-weight: bold;")
         self._refresh_update_tab()
@@ -3258,7 +3318,7 @@ class WaveLinuxWindow(QMainWindow):
         yn = QMessageBox.question(
             self.settings_dialog,
             "Update installed",
-            "WaveLinux downloaded and installed the latest AppImage.\n\n"
+            "WaveLinux downloaded, verified, and installed the latest AppImage.\n\n"
             f"Installed AppImage: {result.appimage_path}\n"
             f"Launcher: {result.wrapper_path}\n\n"
             "Restart into the updated AppImage now?",
@@ -3267,7 +3327,7 @@ class WaveLinuxWindow(QMainWindow):
         if yn == QMessageBox.StandardButton.Yes:
             self._restart_with_command([result.appimage_path])
 
-    def _handle_update_install_error(self, message):
+    def _handle_update_install_error(self, payload):
         self._download_update_btn.setEnabled(True)
         self._check_update_btn.setEnabled(True)
         progress = getattr(self, "_update_progress", None)
@@ -3275,9 +3335,21 @@ class WaveLinuxWindow(QMainWindow):
             progress.setVisible(False)
             progress.setRange(0, 100)
             progress.setValue(0)
-        self._update_status_lbl.setText(f"Update install failed: {message}")
-        self._update_status_lbl.setStyleSheet("color: #e05050; font-size: 12px;")
+        payload = dict(payload or {})
+        self._last_update_issue = payload
+        self._pending_update_url = str(payload.get("release_url") or GITHUB_RELEASES_URL)
+        self._last_update_attempt_result = f"Update install failed: {payload.get('message') or 'unknown error'}"
+        code = str(payload.get("code") or "")
+        self._update_status_lbl.setText(
+            f"Update install failed: {payload.get('message') or 'unknown error'}"
+        )
+        self._update_status_lbl.setStyleSheet(
+            "color: #d28b26; font-size: 12px;"
+            if code in {"update.manifest_missing", "update.asset_missing"}
+            else "color: #e05050; font-size: 12px;"
+        )
         self._refresh_update_tab()
+        self._refresh_system_tab()
 
     def _install_running_appimage(self):
         try:
@@ -3377,11 +3449,16 @@ class WaveLinuxWindow(QMainWindow):
             return
         self._bg_poll_timer.stop()
         if item[0] == 'result':
-            info = dict(item[1] or {})
-            tag = str(info.get("tag") or "").strip()
-            self._pending_update_url = info.get("release_url") or UpdateChecker._RELEASES_URL
-            self._pending_update_asset_url = info.get("asset_url") or ""
-            self._pending_update_asset_name = info.get("asset_name") or ""
+            info = item[1]
+            if not isinstance(info, VerifiedReleaseInfo):
+                return
+            tag = str(info.version or "").strip()
+            self._pending_verified_release = info
+            self._pending_update_url = info.release_url or GITHUB_RELEASES_URL
+            self._pending_update_asset_url = info.asset_url or ""
+            self._pending_update_asset_name = info.asset_name or ""
+            self._last_update_check_at = time.time()
+            self._last_update_issue = None
             if _parse_version(tag) > _parse_version(APP_VERSION):
                 self._pending_update_tag = tag
                 self._show_notification(
@@ -3392,6 +3469,10 @@ class WaveLinuxWindow(QMainWindow):
                         else f"Version {tag} is available. Open Settings → Updates for details."
                     ),
                 )
+        elif item[0] == 'error':
+            self._last_update_issue = dict(item[1] or {})
+            self._pending_update_url = str(self._last_update_issue.get("release_url") or GITHUB_RELEASES_URL)
+            self._last_update_attempt_result = f"Background update check failed: {self._last_update_issue.get('message') or 'unknown error'}"
 
     def _refresh_update_tab(self):
         btn = getattr(self, "_install_appimage_btn", None)
@@ -3409,17 +3490,17 @@ class WaveLinuxWindow(QMainWindow):
                 download_btn.setEnabled(bool(pending_asset_url))
                 if not pending_asset_url:
                     download_btn.setToolTip(
-                        "The latest GitHub release does not expose an AppImage asset."
+                        "The latest signed release manifest does not expose an eligible x86_64 AppImage asset."
                     )
                 else:
                     download_btn.setToolTip(
-                        "Download the latest AppImage from GitHub and replace the installed desktop build."
+                        "Download the latest verified AppImage from GitHub and replace the installed desktop build."
                     )
             else:
                 download_btn.setText("Download && Install Latest AppImage")
                 download_btn.setEnabled(True)
                 download_btn.setToolTip(
-                    "Fetch the latest GitHub AppImage and install it to ~/.local/bin/WaveLinux.AppImage."
+                    "Fetch the latest verified GitHub AppImage and install it to ~/.local/bin/WaveLinux.AppImage."
                 )
         info_lbl = getattr(self, "_install_state_lbl", None)
         if info_lbl is not None:
@@ -3473,80 +3554,350 @@ class WaveLinuxWindow(QMainWindow):
             )
             repair_btn.setEnabled(needs_repair or is_running_in_appimage())
 
-    def _refresh_system_tab(self):
-        preflight = startup_preflight_report()
+    @staticmethod
+    def _format_timestamp(stamp):
+        if not stamp:
+            return "never"
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamp))
+
+    def _diagnostics_root_path(self):
+        runtime = getattr(self, "runtime", None)
+        diagnostics = getattr(runtime, "diagnostics", None) if runtime is not None else None
+        root_dir = getattr(diagnostics, "root_dir", None)
+        return str(root_dir) if root_dir else os.path.expanduser("~/.config/wavelinux/diagnostics")
+
+    def _running_binary_path(self, state):
+        if state.running_appimage_path:
+            return state.running_appimage_path
+        if getattr(sys, "frozen", False):
+            return os.path.abspath(sys.executable)
+        return resource_path("main.py")
+
+    def _update_issue_title(self, code):
+        titles = {
+            "update.manifest_missing": "Signed release manifest unavailable",
+            "update.signature_invalid": "Release signature verification failed",
+            "update.asset_missing": "Verified AppImage asset unavailable",
+            "update.checksum_mismatch": "Downloaded AppImage checksum mismatch",
+            "update.smoke_test_failed": "Downloaded AppImage failed validation",
+        }
+        return titles.get(code, "Update verification issue")
+
+    def _health_issue_for_runtime_detail(self, detail):
+        code = str(detail.get("code") or "").strip()
+        message = str(detail.get("detail") or "").strip()
+        context = dict(detail.get("context") or {})
+        if code == "runtime.missing_tool":
+            return HealthIssue(
+                code=code,
+                severity="error",
+                title="Missing host audio tools",
+                detail=message,
+                primary_action="Re-run check",
+                secondary_action="Open Releases Page",
+                context=context,
+            )
+        if code == "runtime.pipewire_unreachable":
+            return HealthIssue(
+                code=code,
+                severity="error",
+                title="PipeWire compatibility query failed",
+                detail=message,
+                primary_action="Re-run check",
+                secondary_action="Open Releases Page",
+                context=context,
+            )
+        if code == "runtime.wireplumber_unreachable":
+            return HealthIssue(
+                code=code,
+                severity="error",
+                title="WirePlumber query failed",
+                detail=message,
+                primary_action="Re-run check",
+                secondary_action="Open Releases Page",
+                context=context,
+            )
+        if code == "runtime.config_unwritable":
+            return HealthIssue(
+                code=code,
+                severity="error",
+                title="WaveLinux config directory is not writable",
+                detail=message,
+                primary_action="Re-run check",
+                secondary_action="Open Releases Page",
+                context=context,
+            )
+        return HealthIssue(
+            code=code or "runtime.issue",
+            severity="warning",
+            title="Runtime issue",
+            detail=message or "WaveLinux detected a runtime issue.",
+            primary_action="Re-run check",
+            secondary_action="Open Releases Page",
+            context=context,
+        )
+
+    def _health_issue_for_channel(self, node_name, *, recovered=False):
+        label = self._channel_label(node_name)
+        recovery = self.recovery_status_for_channel(node_name)
+        issue = self.channel_runtime_issue(node_name)
+        if recovered:
+            detail = f"Automatic recovery completed after {max(1, recovery.retry_count)} attempt(s)."
+            if recovery.diagnostics_path:
+                detail += f"\nDiagnostics: {recovery.diagnostics_path}"
+            return HealthIssue(
+                code="fx.channel_recovered",
+                severity="info",
+                title=f"{label} recovered",
+                detail=detail,
+                primary_action="Open diagnostics" if recovery.diagnostics_path else "",
+                context={"node_name": node_name, "diagnostics_path": recovery.diagnostics_path},
+            )
+        detail_lines = []
+        if issue.get("summary"):
+            detail_lines.append(str(issue["summary"]))
+        tooltip = str(issue.get("tooltip") or "").strip()
+        if tooltip:
+            detail_lines.extend(
+                line.strip() for line in tooltip.splitlines() if line.strip()
+            )
+        if recovery.state == "scheduled" and recovery.next_retry_at:
+            detail_lines.append(
+                f"Next retry around {self._format_timestamp(recovery.next_retry_at)}."
+            )
+        elif recovery.state == "retrying":
+            detail_lines.append(
+                f"Recovery attempt count: {recovery.retry_count}."
+            )
+        elif recovery.state == "exhausted":
+            detail_lines.append("Automatic recovery is exhausted; manual recovery is required.")
+        code = (
+            "fx.channel_recovery_exhausted"
+            if recovery.state == "exhausted"
+            else "fx.channel_degraded"
+        )
+        return HealthIssue(
+            code=code,
+            severity="error" if recovery.state == "exhausted" else "warning",
+            title=f"{label} degraded",
+            detail="\n".join(dict.fromkeys(line for line in detail_lines if line)),
+            primary_action="Recover channel",
+            secondary_action="Open diagnostics" if recovery.diagnostics_path else "",
+            context={
+                "node_name": node_name,
+                "diagnostics_path": recovery.diagnostics_path,
+                "recovery_state": recovery.state,
+                "retry_count": recovery.retry_count,
+            },
+        )
+
+    def _collect_health_issues(self, *, preflight=None, state=None):
+        preflight = preflight or startup_preflight_report()
+        state = state or install_state()
+        issues = [
+            self._health_issue_for_runtime_detail(detail)
+            for detail in preflight.get("issue_details", [])
+        ]
+
+        if state.appimage_missing:
+            detail = (
+                f"No installed AppImage was found at {state.installed_appimage_path}. "
+                "WaveLinux can still run from source or a package manager, but one-click "
+                "AppImage restart/update flows install into that path."
+            )
+            issues.append(HealthIssue(
+                code="install.appimage_missing",
+                severity="warning",
+                title="Installed AppImage missing",
+                detail=detail,
+                primary_action="Open Releases Page",
+                secondary_action="Re-run check",
+                context={"path": state.installed_appimage_path},
+            ))
+        if state.wrapper_mismatch:
+            issues.append(HealthIssue(
+                code="install.wrapper_mismatch",
+                severity="warning",
+                title="Desktop wrapper points at the wrong AppImage",
+                detail=(
+                    f"The launcher wrapper at {state.wrapper_path} points at "
+                    f"{state.wrapper_target or 'an unexpected target'} instead of "
+                    f"{state.installed_appimage_path}."
+                ),
+                primary_action="Repair launchers",
+                secondary_action="Re-run check",
+                context={"path": state.wrapper_path, "target": state.wrapper_target or ""},
+            ))
+        if state.desktop_mismatch or state.stale_launcher_entries:
+            stale_paths = "\n".join(entry.path for entry in state.stale_launcher_entries)
+            detail = (
+                f"The canonical desktop entry at {state.desktop_path} does not match the "
+                "current install state."
+            )
+            if stale_paths:
+                detail += f"\nStale launchers:\n{stale_paths}"
+            issues.append(HealthIssue(
+                code="install.desktop_stale",
+                severity="warning",
+                title="Desktop launchers need repair",
+                detail=detail,
+                primary_action="Repair launchers",
+                secondary_action="Re-run check",
+                context={"desktop_path": state.desktop_path},
+            ))
+
+        update_issue = dict(getattr(self, "_last_update_issue", {}) or {})
+        if update_issue:
+            code = str(update_issue.get("code") or "update.asset_missing")
+            severity = (
+                "warning"
+                if code in {"update.manifest_missing", "update.asset_missing"}
+                else "error"
+            )
+            issues.append(HealthIssue(
+                code=code,
+                severity=severity,
+                title=self._update_issue_title(code),
+                detail=str(update_issue.get("message") or "WaveLinux detected an update verification issue."),
+                primary_action="Retry update check",
+                secondary_action="Open Releases Page",
+                context=update_issue,
+            ))
+
+        degraded = set(self._runtime_degraded_channels())
+        for node_name in sorted(degraded):
+            issues.append(self._health_issue_for_channel(node_name))
+
+        for node_name, payload in sorted((self._recent_recovery_status or {}).items()):
+            if node_name in degraded:
+                continue
+            if (time.time() - float(payload.get("at", 0) or 0)) >= 90:
+                continue
+            issues.append(self._health_issue_for_channel(node_name, recovered=True))
+
+        return issues
+
+    def _run_health_issue_action(self, issue, action):
+        action = str(action or "").strip()
+        if not action:
+            return
+        if action == "Re-run check":
+            self._rerun_system_check()
+            return
+        if action == "Repair launchers":
+            self._repair_installed_launchers()
+            return
+        if action == "Open Releases Page":
+            self._open_release_page()
+            return
+        if action == "Retry update check":
+            self._check_for_updates()
+            return
+        if action == "Recover channel":
+            self.recover_channel(str(issue.context.get("node_name") or ""))
+            return
+        if action == "Open diagnostics":
+            self.open_channel_diagnostics(str(issue.context.get("node_name") or ""))
+            return
+
+    def _render_health_cards(self, issues):
+        layout = getattr(self, "_health_cards_layout", None)
+        if layout is None:
+            return
+        self._clear_layout(layout)
+        if not issues:
+            issues = [HealthIssue(
+                code="health.ok",
+                severity="ok",
+                title="No active issues detected",
+                detail="Host runtime checks, install state, runtime recovery, and updater status all look healthy.",
+            )]
+        for issue in issues:
+            card = HealthCard(self._health_cards_container)
+            card.configure(
+                issue,
+                primary_handler=(
+                    lambda checked=False, issue=issue: self._run_health_issue_action(issue, issue.primary_action)
+                ) if issue.primary_action else None,
+                secondary_handler=(
+                    lambda checked=False, issue=issue: self._run_health_issue_action(issue, issue.secondary_action)
+                ) if issue.secondary_action else None,
+            )
+            layout.addWidget(card)
+        layout.addStretch(1)
+
+    def _open_diagnostics_folder(self):
+        path = self._diagnostics_root_path()
+        if os.path.isdir(path) and QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            self.status_lbl.setText("Opened diagnostics folder")
+            return
+        QMessageBox.information(
+            self,
+            "Diagnostics Folder",
+            f"WaveLinux stores runtime diagnostics here:\n{path}",
+        )
+
+    def _refresh_system_tab(self, *, preflight=None, state=None):
+        preflight = preflight or startup_preflight_report()
         self._startup_preflight = preflight
-        state = install_state()
+        state = state or install_state()
 
         summary_lbl = getattr(self, "_system_summary_lbl", None)
         runtime_lbl = getattr(self, "_system_runtime_lbl", None)
-        install_lbl = getattr(self, "_system_install_lbl", None)
-        fx_lbl = getattr(self, "_system_fx_lbl", None)
-        if not all((summary_lbl, runtime_lbl, install_lbl, fx_lbl)):
+        if not all((summary_lbl, runtime_lbl)):
             return
-
-        if preflight["issues"] or state.warnings:
-            summary_lbl.setText("System check found issues that can affect launch, routing, or desktop integration.")
+        issues = self._collect_health_issues(preflight=preflight, state=state)
+        active_issues = [
+            issue for issue in issues
+            if issue.severity in {"warning", "error"}
+            and not issue.code.startswith("fx.channel_recovered")
+        ]
+        if active_issues:
+            summary_lbl.setText(
+                f"Health check found {len(active_issues)} active issue(s) that can affect routing, recovery, or updates."
+            )
             summary_lbl.setStyleSheet("color: #d28b26; font-size: 13px; font-weight: bold;")
         else:
-            summary_lbl.setText("System check passed. Host tools, install state, and FX backend look healthy.")
+            summary_lbl.setText("WaveLinux health looks good. Host runtime, install state, recovery, and updater status are healthy.")
             summary_lbl.setStyleSheet("color: #00d4aa; font-size: 13px; font-weight: bold;")
 
         runtime_lines = [
-            "Host runtime:",
-            "  Tools present: "
-            + ", ".join(sorted(cmd for cmd, present in preflight["deps"].items() if present)),
+            f"Installed version: v{APP_VERSION}",
+            f"Running binary: {self._running_binary_path(state)}",
+            "Installed AppImage: "
+            + (state.installed_appimage_path if state.installed_appimage_exists else "not installed"),
+            "Desktop launcher target: " + (state.desktop_exec_target or "not installed"),
+            "Wrapper target: " + (state.wrapper_target or "not installed"),
+            "Host tools present: " + ", ".join(sorted(cmd for cmd, present in preflight["deps"].items() if present)),
+            f"LADSPA plugins detected: {len(getattr(self.engine, 'ladspa_plugins', set()) or set())}",
+            f"Last successful update check: {self._format_timestamp(self._last_update_check_at)}",
+            f"Last update attempt result: {self._last_update_attempt_result}",
+            f"Diagnostics directory: {self._diagnostics_root_path()}",
         ]
-        if preflight["missing"]:
-            runtime_lines.append("  Missing tools: " + ", ".join(preflight["missing"]))
-        for key in ("pactl_info", "wpctl_status"):
-            check = preflight["checks"].get(key)
-            if check is None:
-                continue
-            status = "ok" if check.get("ok") else f"failed ({check.get('error') or check.get('returncode')})"
-            runtime_lines.append(f"  {key}: {status}")
-        runtime_lines.append(f"  Config dir: {preflight['config_dir']}")
-        if preflight["issues"]:
-            runtime_lines.append("  Issues:")
-            runtime_lines.extend(f"    - {issue}" for issue in preflight["issues"])
         runtime_lbl.setText("\n".join(runtime_lines))
+        self._render_health_cards(issues)
 
-        install_lines = ["Install state:"]
-        if state.running_appimage_path:
-            install_lines.append(f"  Running AppImage: {state.running_appimage_path}")
-        elif getattr(sys, "frozen", False):
-            install_lines.append(f"  Running binary: {os.path.abspath(sys.executable)}")
-        else:
-            install_lines.append(f"  Running from source: {resource_path('main.py')}")
-        install_lines.append(
-            "  Installed AppImage: "
-            + (state.installed_appimage_path if state.installed_appimage_exists else "not installed")
-        )
-        install_lines.append("  Wrapper target: " + (state.wrapper_target or "not installed"))
-        install_lines.append("  Desktop target: " + (state.desktop_exec_target or "not installed"))
-        if state.stale_launcher_entries:
-            install_lines.append("  Extra launchers:")
-            install_lines.extend(f"    - {entry.path}" for entry in state.stale_launcher_entries)
-        if state.warnings:
-            install_lines.append("  Warnings:")
-            install_lines.extend(f"    - {warning}" for warning in state.warnings)
-        install_lbl.setText("\n".join(install_lines))
-
-        fx_lbl.setText(
-            "\n".join([
-                "FX backend:",
-                f"  LADSPA plugins detected: {len(getattr(self.engine, 'ladspa_plugins', set()) or set())}",
-                "  Bundled LADSPA remains opt-in with WAVELINUX_ENABLE_BUNDLED_LADSPA=1.",
-            ])
-        )
+        repair_btn = getattr(self, "_repair_launcher_btn", None)
+        if repair_btn is not None:
+            repair_btn.setEnabled(
+                bool(state.stale_launcher_entries or state.wrapper_mismatch or state.desktop_mismatch)
+                or is_running_in_appimage()
+            )
+        recover_btn = getattr(self, "_health_recover_btn", None)
+        if recover_btn is not None:
+            degraded = len(self._runtime_degraded_channels())
+            recover_btn.setEnabled(degraded > 0)
+            recover_btn.setText(
+                f"Recover degraded channels ({degraded})" if degraded else "Recover degraded channels"
+            )
 
     def _rerun_system_check(self):
         self._refresh_system_tab()
         self._refresh_update_tab()
         QMessageBox.information(
             self.settings_dialog,
-            "System check complete",
-            "WaveLinux refreshed its host-runtime and install-state checks.",
+            "Health check complete",
+            "WaveLinux refreshed its host-runtime, install-state, recovery, and updater checks.",
         )
 
     def _refresh_advanced_tab(self):
@@ -3858,7 +4209,7 @@ class WaveLinuxWindow(QMainWindow):
         if payload and not self._should_refresh_for_pactl_event(payload):
             return
         hidden_to_tray = self.tray is not None and not self.isVisible()
-        settings_open  = getattr(self, 'settings_dialog', None) and self.settings_dialog.isVisible()
+        settings_open  = self._settings_dialog_visible()
         if hidden_to_tray and not settings_open:
             return
         self._event_refresh_timer.start()
@@ -4048,7 +4399,7 @@ class WaveLinuxWindow(QMainWindow):
 
         bottom_container.addWidget(out_frame, 1)
 
-        # Settings dialog — tabbed (Apps / Hidden / System / Advanced / Updates).
+        # Settings dialog — tabbed (Apps / Hidden / Scenes / Health / Advanced / Updates).
         self.settings_dialog = QDialog(self)
         self.settings_dialog.setWindowTitle("WaveLinux Settings")
         self.settings_dialog.setMinimumSize(640, 480)
@@ -4095,8 +4446,8 @@ class WaveLinuxWindow(QMainWindow):
         # — Scenes tab —
         tabs.addTab(self._build_scenes_tab(), "Scenes")
 
-        # — System tab —
-        tabs.addTab(self._build_system_tab(), "System")
+        # — Health tab —
+        tabs.addTab(self._build_system_tab(), "Health")
 
         # — Advanced tab —
         tabs.addTab(self._build_advanced_tab(), "Advanced")
@@ -4187,7 +4538,7 @@ class WaveLinuxWindow(QMainWindow):
         Skip when minimised to tray unless the settings dialog is open
         (app routing list needs to stay live when the user has it open)."""
         hidden_to_tray = self.tray is not None and not self.isVisible()
-        settings_open  = getattr(self, 'settings_dialog', None) and self.settings_dialog.isVisible()
+        settings_open  = self._settings_dialog_visible()
         if hidden_to_tray and not settings_open:
             return
 

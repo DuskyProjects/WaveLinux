@@ -41,7 +41,7 @@ jobs:
       - name: Install Python build dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install PyInstaller PyQt6
+          python -m pip install PyInstaller PyQt6 cryptography
 
       - name: Run syntax checks
         run: |
@@ -65,6 +65,46 @@ jobs:
           "$APPIMAGE" --version
           "$APPIMAGE" --self-test
 
+      - name: Build signed release manifest
+        run: |
+          APPIMAGE="$(echo dist/*.AppImage)"
+          if [ "${GITHUB_REF}" = "${GITHUB_REF#refs/tags/}" ]; then
+            RELEASE_TAG="v$(python - <<'PY'
+import re
+from pathlib import Path
+text = Path('main.py').read_text(encoding='utf-8')
+match = re.search(r'^APP_VERSION = "([^"]+)"', text, re.MULTILINE)
+if not match:
+    raise SystemExit('Could not determine APP_VERSION from main.py')
+print(match.group(1))
+PY
+)"
+          else
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+          fi
+          python scripts/build_release_manifest.py \
+            --appimage "$APPIMAGE" \
+            --version "${RELEASE_TAG#v}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --tag "${RELEASE_TAG}" \
+            --output dist/wavelinux-release-manifest.json
+
+      - name: Sign release manifest
+        env:
+          WAVELINUX_RELEASE_ED25519_PRIVATE_KEY_B64: ${{ secrets.WAVELINUX_RELEASE_ED25519_PRIVATE_KEY_B64 }}
+        run: |
+          python scripts/sign_release_manifest.py \
+            dist/wavelinux-release-manifest.json \
+            dist/wavelinux-release-manifest.sig
+
+      - name: Verify manifest acceptance path
+        run: |
+          APPIMAGE="$(echo dist/*.AppImage)"
+          python scripts/verify_release_manifest.py \
+            dist/wavelinux-release-manifest.json \
+            dist/wavelinux-release-manifest.sig \
+            "$APPIMAGE"
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -72,6 +112,8 @@ jobs:
           path: |
             dist/*.AppImage
             dist/sha256sums.txt
+            dist/wavelinux-release-manifest.json
+            dist/wavelinux-release-manifest.sig
 
       - name: Publish GitHub release assets
         if: startsWith(github.ref, 'refs/tags/')
@@ -80,3 +122,5 @@ jobs:
           files: |
             dist/*.AppImage
             dist/sha256sums.txt
+            dist/wavelinux-release-manifest.json
+            dist/wavelinux-release-manifest.sig

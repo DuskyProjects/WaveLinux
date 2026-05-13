@@ -45,6 +45,8 @@ class MainCliTests(unittest.TestCase):
             "Could not query the PulseAudio compatibility server via `pactl info`.",
             report["issues"],
         )
+        self.assertEqual(report["issue_details"][0]["code"], "runtime.missing_tool")
+        self.assertEqual(report["issue_details"][1]["code"], "runtime.pipewire_unreachable")
         self.assertTrue(report["config_ok"])
 
 

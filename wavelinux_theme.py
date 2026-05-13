@@ -35,6 +35,63 @@ QLabel#sectionLabel {
     padding: 3px 4px;
 }
 
+/* ── Health Center ── */
+QFrame#healthCard {
+    background: rgba(20, 20, 32, 0.92);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px;
+}
+QFrame#healthCard[severity="ok"] {
+    border: 1px solid rgba(0,212,170,0.25);
+    background: rgba(12, 34, 32, 0.78);
+}
+QFrame#healthCard[severity="info"] {
+    border: 1px solid rgba(0,229,255,0.2);
+}
+QFrame#healthCard[severity="warning"] {
+    border: 1px solid rgba(210,139,38,0.35);
+    background: rgba(42, 30, 18, 0.84);
+}
+QFrame#healthCard[severity="error"] {
+    border: 1px solid rgba(255,107,107,0.4);
+    background: rgba(44, 20, 28, 0.9);
+}
+QLabel#healthBadge {
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1px;
+    font-family: 'Outfit', sans-serif;
+}
+QLabel#healthBadge[severity="ok"] {
+    background: rgba(0,212,170,0.18);
+    color: #00d4aa;
+}
+QLabel#healthBadge[severity="info"] {
+    background: rgba(0,229,255,0.16);
+    color: #00e5ff;
+}
+QLabel#healthBadge[severity="warning"] {
+    background: rgba(210,139,38,0.2);
+    color: #d28b26;
+}
+QLabel#healthBadge[severity="error"] {
+    background: rgba(255,107,107,0.2);
+    color: #ff8f8f;
+}
+QLabel#healthTitle {
+    color: #f2f2fa;
+    font-size: 13px;
+    font-weight: 700;
+    font-family: 'Outfit', sans-serif;
+}
+QLabel#healthDetail {
+    color: #9ea0b8;
+    font-size: 11px;
+    line-height: 1.4;
+}
+
 /* ── Channel Strip ── */
 QFrame#channelStrip {
     background: rgba(22,21,36,0.85);

@@ -13,7 +13,7 @@ WaveLinux is a PyQt6 PipeWire mixer for Linux with Wave Link-style routing:
 WaveLinux is now AppImage-first for end users.
 
 - The release AppImage is the primary multi-distro build for Arch, Fedora, Ubuntu, and other XDG desktops.
-- In-app updates are notify-only. WaveLinux checks GitHub releases, then sends you to the release page instead of mutating local files in place.
+- In-app AppImage updates now verify a signed GitHub release manifest, validate the downloaded checksum, smoke-test the new AppImage, then install it into `~/.local/bin`.
 - Host PipeWire tools are still required even when using the AppImage.
 
 ## Host Requirements
@@ -97,12 +97,12 @@ makepkg -si
 The release AppImage is built with PyInstaller plus AppImageKit:
 
 ```bash
-python3 -m pip install PyInstaller PyQt6
+python3 -m pip install PyInstaller PyQt6 cryptography
 ./scripts/build_appimage.sh
 ```
 
 If you build from a virtualenv, point the script at that exact interpreter so
-`PyInstaller` and `PyQt6` come from the same environment:
+`PyInstaller`, `PyQt6`, and `cryptography` come from the same environment:
 
 ```bash
 PYTHON_BIN=/path/to/venv/bin/python ./scripts/build_appimage.sh
@@ -112,8 +112,21 @@ Artifacts are written to `dist/`:
 
 - `WaveLinux-<version>-x86_64.AppImage`
 - `sha256sums.txt`
+- `wavelinux-release-manifest.json`
+- `wavelinux-release-manifest.sig`
 
 GitHub Actions release CI is defined in `.github/workflows/release.yml`.
+
+## Release Signing
+
+Signed in-app updates require the GitHub Actions secret:
+
+- `WAVELINUX_RELEASE_ED25519_PRIVATE_KEY_B64`
+
+That secret must contain the base64-encoded raw 32-byte Ed25519 private key
+that matches the public key embedded in `updates.py`. Without it, release CI
+cannot produce `wavelinux-release-manifest.sig`, and the in-app updater will
+refuse the release.
 
 ## Paths
 
