@@ -244,6 +244,34 @@ class UpdatesTests(unittest.TestCase):
             with open(result.backup_path, "rb") as handle:
                 self.assertEqual(handle.read(), b"old-build")
 
+    def test_install_verified_release_marks_download_executable_before_smoke_test(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            downloaded = os.path.join(tmpdir, "WaveLinux-2.0.5-x86_64.AppImage")
+            with open(downloaded, "wb") as handle:
+                handle.write(b"new-build")
+            os.chmod(downloaded, 0o644)
+
+            release = updates.VerifiedReleaseInfo(
+                version="2.0.5",
+                release_url="https://example.test/release",
+                asset_name="WaveLinux-2.0.5-x86_64.AppImage",
+                asset_url="https://example.test/download",
+                sha256=updates.file_sha256(downloaded),
+                size_bytes=os.path.getsize(downloaded),
+                signature_verified=True,
+            )
+
+            def fake_download(_url, target_path, **_kwargs):
+                shutil.copy2(downloaded, target_path)
+                return os.path.getsize(downloaded)
+
+            def fake_smoke(path):
+                self.assertTrue(os.access(path, os.X_OK))
+
+            with mock.patch.object(updates, "download_file", side_effect=fake_download):
+                with mock.patch.object(updates, "smoke_test_appimage", side_effect=fake_smoke):
+                    updates.install_verified_release(release, home=tmpdir)
+
     def test_restore_previous_install_requires_backup(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with self.assertRaises(updates.UpdateError) as ctx:

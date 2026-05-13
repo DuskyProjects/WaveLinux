@@ -433,6 +433,7 @@ def install_verified_release(
             progress_callback=progress_callback,
             cancel_event=cancel_event,
         )
+        os.chmod(temp_path, 0o755)
         if progress_callback is not None:
             progress_callback("status", "Verifying AppImage checksum…")
         verify_file_sha256(temp_path, release_info.sha256)
