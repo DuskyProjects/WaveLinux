@@ -45,6 +45,20 @@ APP_VERSION = "2.0.4"
 _GITHUB_OWNER = "DuskyProjects"
 _GITHUB_REPO  = "WaveLinux"
 _RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire", "pw-cli"]
+_RUNTIME_HEALTH_MESSAGES = {
+    "submix_monitor_missing": "Monitor route is missing.",
+    "submix_monitor_dead": "Monitor route exists but is not live.",
+    "submix_stream_missing": "Stream route is missing.",
+    "submix_stream_dead": "Stream route exists but is not live.",
+    "desired_fx_missing": "The requested FX source is missing.",
+    "fx_effects_not_visible": "The FX source exists, but its effects are not visible yet.",
+    "fx_effects_mismatch": "The active FX chain does not match the requested effects.",
+    "fx_params_mismatch": "The active FX parameters do not match the saved settings.",
+    "fx_source_not_present": "The FX source is not present in PipeWire.",
+    "duplicate_fx_source": "Multiple channels are sharing the same FX source.",
+    "default_source_expected_fx_missing": "The selected mic's FX source is missing.",
+    "default_source_mismatch": "The selected mic is not the current default source.",
+}
 
 
 def _parse_version(v):
@@ -230,15 +244,37 @@ class MeterWorker(QObject):
         super().__init__(parent)
         self.source_name = source_name
         self._proc = None
-        self._buf = bytearray()
         self._sample_rate = 24000
         self._frame_hz = 20
         self._sample_bytes = self._sample_rate * 2 // self._frame_hz
-        self._last_peak = 0.0
+        self._decode_queue = queue.Queue(maxsize=6)
+        self._decode_stop = threading.Event()
+        self._decode_thread = None
+
+    @staticmethod
+    def _frame_peak(frame, last_peak):
+        count = len(frame) // 2
+        if count <= 0:
+            return last_peak
+        samples = struct.unpack(f"<{count}h", frame)
+        peak_int = max((abs(s) for s in samples), default=0)
+        normalized = peak_int / 32768.0
+        if normalized >= last_peak:
+            return normalized
+        return max(normalized, last_peak * 0.6)
 
     def start(self):
         if self._proc is not None:
             return
+        self._decode_stop.clear()
+        self._drain_decode_queue()
+        if self._decode_thread is None or not self._decode_thread.is_alive():
+            self._decode_thread = threading.Thread(
+                target=self._decode_loop,
+                daemon=True,
+                name=f"meter:{self.source_name}",
+            )
+            self._decode_thread.start()
         self._proc = QProcess(self)
         self._proc.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
         self._proc.readyReadStandardOutput.connect(self._on_bytes)
@@ -261,7 +297,23 @@ class MeterWorker(QObject):
         except Exception:
             pass
         self._proc = None
-        self._buf.clear()
+        self._decode_stop.set()
+        try:
+            self._decode_queue.put_nowait(None)
+        except queue.Full:
+            try:
+                self._decode_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._decode_queue.put_nowait(None)
+            except queue.Full:
+                pass
+        thread = self._decode_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.3)
+        self._decode_thread = None
+        self._drain_decode_queue()
 
     def _on_bytes(self):
         if self._proc is None:
@@ -269,23 +321,41 @@ class MeterWorker(QObject):
         chunk = bytes(self._proc.readAllStandardOutput())
         if not chunk:
             return
-        self._buf.extend(chunk)
-        # Process the buffer in window-sized frames.
-        while len(self._buf) >= self._sample_bytes:
-            frame = bytes(self._buf[:self._sample_bytes])
-            del self._buf[:self._sample_bytes]
-            count = len(frame) // 2
-            if count == 0:
+        try:
+            self._decode_queue.put_nowait(chunk)
+        except queue.Full:
+            try:
+                self._decode_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._decode_queue.put_nowait(chunk)
+            except queue.Full:
+                pass
+
+    def _decode_loop(self):
+        buf = bytearray()
+        last_peak = 0.0
+        while not self._decode_stop.is_set():
+            try:
+                chunk = self._decode_queue.get(timeout=0.2)
+            except queue.Empty:
                 continue
-            samples = struct.unpack(f"<{count}h", frame)
-            peak_int = max((abs(s) for s in samples), default=0)
-            normalized = peak_int / 32768.0
-            # Simple release envelope so the meter doesn't flicker.
-            if normalized >= self._last_peak:
-                self._last_peak = normalized
-            else:
-                self._last_peak = max(normalized, self._last_peak * 0.6)
-            self.peak.emit(min(self._last_peak, 1.0))
+            if chunk is None:
+                break
+            buf.extend(chunk)
+            while len(buf) >= self._sample_bytes:
+                frame = bytes(buf[:self._sample_bytes])
+                del buf[:self._sample_bytes]
+                last_peak = self._frame_peak(frame, last_peak)
+                self.peak.emit(min(last_peak, 1.0))
+
+    def _drain_decode_queue(self):
+        while True:
+            try:
+                self._decode_queue.get_nowait()
+            except queue.Empty:
+                return
 
 
 # ── ALSA card / profile picker ────────────────────────────────────
@@ -524,6 +594,12 @@ class FXSelectionDialog(QDialog):
         desc = QLabel("Processing is live per-channel. Parameters save automatically.")
         desc.setStyleSheet("color: #8b8b9e; font-size: 11px;")
         root.addWidget(desc)
+
+        self._status_lbl = QLabel("")
+        self._status_lbl.setWordWrap(True)
+        self._status_lbl.setVisible(False)
+        self._status_lbl.setStyleSheet("color: #ffb26a; font-size: 11px;")
+        root.addWidget(self._status_lbl)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -808,12 +884,24 @@ class FXSelectionDialog(QDialog):
                 return
         self._runtime_inflight = status.state in {"building", "cutover_pending", "clearing"}
         if status.state == "degraded":
-                QMessageBox.warning(
-                    self,
-                    "Effects rebuild failed",
-                    "WaveLinux could not apply one or more effects.\n\n"
-                    f"{status.message}"
-                )
+            recovery_note = ""
+            win = self._main_window()
+            if hasattr(win, "fx_recovery_status_message"):
+                recovery_note = (win.fx_recovery_status_message(self.node_name) or "").strip()
+            status_text = (status.message or "").strip()
+            if hasattr(win, "format_fx_status_message"):
+                status_text = (win.format_fx_status_message(status) or "").strip()
+            parts = [
+                "WaveLinux could not apply one or more effects.",
+                status_text,
+            ]
+            if recovery_note:
+                parts.append(recovery_note)
+            self._status_lbl.setText("\n\n".join(part for part in parts if part))
+            self._status_lbl.setVisible(True)
+        elif status.state in {"active", "idle"}:
+            self._status_lbl.clear()
+            self._status_lbl.setVisible(False)
         if status.state not in {"building", "cutover_pending", "clearing"}:
             self.close_btn.setText("Apply")
             self.close_btn.setEnabled(True)
@@ -963,6 +1051,7 @@ class ChannelStrip(QFrame):
         self._main_win = None
         self._last_rendered_state = None
         self._last_fx_indicator_active = None
+        self._last_runtime_issue_active = None
 
         # Slider-commit debouncers — UI moves at full Qt rate but only
         # the final value reaches `pactl set-sink-input-volume`.
@@ -986,6 +1075,11 @@ class ChannelStrip(QFrame):
         # Icon + optional FX indicator. Other actions live in right-click.
         head_row = QHBoxLayout()
         head_row.setContentsMargins(0, 0, 0, 0)
+        self.health_indicator = QLabel("!")
+        self.health_indicator.setObjectName("healthIndicator")
+        self.health_indicator.setToolTip("Runtime issue detected — right-click for recovery tools")
+        self.health_indicator.setVisible(False)
+        head_row.addWidget(self.health_indicator)
         head_row.addStretch()
         icon_lbl = QLabel(icon)
         icon_lbl.setObjectName("channelIcon")
@@ -1284,6 +1378,17 @@ class ChannelStrip(QFrame):
         self.fx_indicator.setVisible(visible)
         self._last_fx_indicator_active = visible
 
+    def set_runtime_issue(self, active, message=""):
+        active = bool(active)
+        if active != self._last_runtime_issue_active:
+            self.health_indicator.setVisible(active)
+            self.setProperty("degraded", "true" if active else "false")
+            self.style().unpolish(self)
+            self.style().polish(self)
+            self._last_runtime_issue_active = active
+        tip = message or "Runtime issue detected — right-click for recovery tools."
+        self.health_indicator.setToolTip(tip if active else "")
+
     def _show_context_menu(self, pos):
         """Right-click menu for channel-strip actions."""
         win = self._main_window()
@@ -1301,16 +1406,19 @@ class ChannelStrip(QFrame):
         fx_act.triggered.connect(self._on_fx_toggle)
 
         if self.node_name:
-            view = getattr(win, "_runtime_view_state", None)
-            health = getattr(view, "health", {}) if view is not None else {}
-            node_health = (health or {}).get(self.node_name)
-            fx_status = runtime.fx_status_for(self.node_name) if runtime is not None else None
-            is_degraded = bool(node_health) or getattr(fx_status, "state", "") == "degraded"
-            if is_degraded:
-                recover_act = menu.addAction("🛠 Recover Channel")
-                recover_act.triggered.connect(self._request_recover)
-                if node_health:
-                    recover_act.setToolTip(f"Current health error: {node_health}")
+            issue = (
+                win.channel_runtime_issue(self.node_name)
+                if hasattr(win, "channel_runtime_issue")
+                else {"degraded": False}
+            )
+            if issue.get("degraded"):
+                summary = issue.get("summary") or "Runtime issue detected."
+                status_act = menu.addAction(summary)
+                status_act.setEnabled(False)
+                retry_act = menu.addAction("Retry FX Now")
+                retry_act.triggered.connect(self._request_recover)
+                diag_act = menu.addAction("Open Diagnostics")
+                diag_act.triggered.connect(self._open_diagnostics)
                 menu.addSeparator()
 
         # Carla VST/LV2 host — only shown when `carla` is on $PATH.
@@ -1372,6 +1480,11 @@ class ChannelStrip(QFrame):
         win = self._main_window()
         if hasattr(win, 'recover_channel') and self.node_name:
             win.recover_channel(self.node_name)
+
+    def _open_diagnostics(self):
+        win = self._main_window()
+        if hasattr(win, "open_channel_diagnostics") and self.node_name:
+            win.open_channel_diagnostics(self.node_name)
 
     def _request_rename(self):
         win = self._main_window()
@@ -1615,6 +1728,8 @@ class AppRoutingRow(QWidget):
 
 # ── Main Window ────────────────────────────────────────────────────
 class WaveLinuxWindow(QMainWindow):
+    _AUTO_RECOVERY_DELAYS_MS = (1500, 5000)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("WaveLinux")
@@ -1671,6 +1786,7 @@ class WaveLinuxWindow(QMainWindow):
         self._app_widget_order = ()
         self._monitor_sink_fp = ()
         self._desired_mix_hw = {"Monitor": None, "Stream": None}
+        self._auto_recovery_state = {}
         self.config_path = os.path.expanduser("~/.config/wavelinux/config.json")
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
         self._runtime_pid_path = os.path.expanduser("~/.config/wavelinux/runtime.pid")
@@ -1735,8 +1851,205 @@ class WaveLinuxWindow(QMainWindow):
         self._refresh_runtime_view()
 
     def _on_runtime_fx_status(self, status):
-        if getattr(status, "state", "") == "degraded":
-            self.status_lbl.setText(status.message or "FX runtime degraded")
+        node_name = getattr(status, "node_name", "")
+        state = getattr(status, "state", "")
+        if state in {"building", "cutover_pending", "clearing"}:
+            self._cancel_auto_recovery_timer(node_name)
+        elif state in {"active", "idle"}:
+            self._clear_auto_recovery_state(node_name)
+        if state == "degraded":
+            self.status_lbl.setText(
+                self.format_fx_status_message(status) or "FX runtime degraded"
+            )
+            self._schedule_auto_recovery(status)
+        self._refresh_channel_runtime_status(node_name)
+
+    def _make_auto_recovery_timer(self):
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        return timer
+
+    def _cancel_auto_recovery_timer(self, node_name):
+        state = self._auto_recovery_state.get(node_name)
+        if not state:
+            return
+        timer = state.get("timer")
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        state["timer"] = None
+
+    def _clear_auto_recovery_state(self, node_name):
+        if not node_name:
+            return
+        self._cancel_auto_recovery_timer(node_name)
+        self._auto_recovery_state.pop(node_name, None)
+        self._refresh_channel_runtime_status(node_name)
+
+    def _ensure_auto_recovery_entry(self, node_name, generation):
+        entry = self._auto_recovery_state.get(node_name)
+        generation = int(generation or 0)
+        if entry is None or int(entry.get("generation", 0)) != generation:
+            if entry is not None:
+                self._cancel_auto_recovery_timer(node_name)
+            entry = {
+                "generation": generation,
+                "attempts": 0,
+                "timer": None,
+                "last_delay_ms": 0,
+                "exhausted": False,
+            }
+            self._auto_recovery_state[node_name] = entry
+        return entry
+
+    def _channel_label(self, node_name):
+        view = self._runtime_view_state
+        if view is not None:
+            for channel in list(getattr(view, "mic_inputs", []) or []) + list(getattr(view, "virtual_channels", []) or []):
+                if getattr(channel, "name", "") == node_name:
+                    return getattr(channel, "label", "") or node_name
+        return PipeWireEngine.friendly_name(node_name) or node_name
+
+    @staticmethod
+    def _format_runtime_health_code(code):
+        code = (code or "").strip()
+        if not code:
+            return ""
+        if code in _RUNTIME_HEALTH_MESSAGES:
+            return _RUNTIME_HEALTH_MESSAGES[code]
+        return code.replace("_", " ").strip().capitalize() + "."
+
+    @staticmethod
+    def _fx_status_diagnostics_path(status):
+        path = (getattr(status, "diagnostics_path", "") or "").strip()
+        if path:
+            return path
+        message = (getattr(status, "message", "") or "").strip()
+        match = re.search(r"diagnostics:\s*(\S+)", message)
+        return match.group(1) if match else ""
+
+    def format_fx_status_message(self, status):
+        message = (getattr(status, "message", "") or "").strip()
+        if not message:
+            return ""
+        path = self._fx_status_diagnostics_path(status)
+        if path:
+            message = message.replace(f"diagnostics: {path}", "diagnostics saved")
+        return re.sub(r"\s+", " ", message).strip()
+
+    def fx_recovery_status_message(self, node_name):
+        state = self._auto_recovery_state.get(node_name) or {}
+        timer = state.get("timer")
+        attempts = int(state.get("attempts", 0))
+        total = len(self._AUTO_RECOVERY_DELAYS_MS)
+        if timer is not None and timer.isActive():
+            delay_ms = int(state.get("last_delay_ms", 0))
+            seconds = max(1, int(round(delay_ms / 1000.0)))
+            return f"Automatic recovery scheduled in ~{seconds}s ({attempts}/{total})."
+        if state.get("exhausted"):
+            return "Automatic recovery attempts were exhausted. Use Recover channel to try again manually."
+        if attempts:
+            return f"Automatic recovery attempt {attempts}/{total} is in progress."
+        return ""
+
+    def channel_runtime_issue(self, node_name):
+        view = self._runtime_view_state
+        health = getattr(view, "health", {}) if view is not None else {}
+        health_code = ((health or {}).get(node_name) or "").strip()
+        runtime = getattr(self, "runtime", None)
+        fx_status = runtime.fx_status_for(node_name) if runtime is not None else None
+        fx_degraded = getattr(fx_status, "state", "") == "degraded"
+        diagnostics_path = self._fx_status_diagnostics_path(fx_status)
+        lines = []
+        summary = ""
+        if health_code:
+            summary = self._format_runtime_health_code(health_code).rstrip(".")
+            lines.append(f"Health: {self._format_runtime_health_code(health_code)}")
+        if fx_degraded:
+            if not summary:
+                summary = "FX runtime degraded"
+            formatted = self.format_fx_status_message(fx_status)
+            if formatted:
+                lines.append(formatted)
+        recovery_note = self.fx_recovery_status_message(node_name)
+        if recovery_note:
+            lines.append(recovery_note)
+        if diagnostics_path:
+            lines.append(f"Diagnostics: {diagnostics_path}")
+        degraded = bool(health_code) or fx_degraded
+        if degraded:
+            lines.append("Right-click for Retry FX Now and Open Diagnostics.")
+        return {
+            "degraded": degraded,
+            "health_code": health_code,
+            "summary": summary or "Runtime issue detected",
+            "tooltip": "\n".join(line for line in lines if line),
+            "diagnostics_path": diagnostics_path,
+            "status": fx_status,
+        }
+
+    def _find_channel_strip(self, node_name):
+        for strip in getattr(self, "channel_widgets", {}).values():
+            if getattr(strip, "node_name", "") == node_name:
+                return strip
+        return None
+
+    def _refresh_channel_runtime_status(self, node_name):
+        strip = self._find_channel_strip(node_name)
+        if strip is None:
+            return
+        issue = self.channel_runtime_issue(node_name)
+        strip.set_runtime_issue(issue["degraded"], issue["tooltip"])
+        strip.setToolTip(issue["tooltip"] if issue["degraded"] else "")
+
+    def _schedule_auto_recovery(self, status):
+        node_name = getattr(status, "node_name", "")
+        if not node_name:
+            return
+        entry = self._ensure_auto_recovery_entry(node_name, getattr(status, "generation", 0))
+        timer = entry.get("timer")
+        if timer is not None and timer.isActive():
+            return
+        attempts = int(entry.get("attempts", 0))
+        label = self._channel_label(node_name)
+        if attempts >= len(self._AUTO_RECOVERY_DELAYS_MS):
+            entry["exhausted"] = True
+            self.status_lbl.setText(
+                f"{label} is still degraded. Automatic recovery attempts are exhausted."
+            )
+            self._refresh_channel_runtime_status(node_name)
+            return
+        delay_ms = int(self._AUTO_RECOVERY_DELAYS_MS[attempts])
+        timer = self._make_auto_recovery_timer()
+        timer.timeout.connect(
+            lambda node_name=node_name, generation=int(getattr(status, "generation", 0)): self._run_auto_recovery(node_name, generation)
+        )
+        entry["timer"] = timer
+        entry["attempts"] = attempts + 1
+        entry["last_delay_ms"] = delay_ms
+        timer.start(delay_ms)
+        self.status_lbl.setText(
+            f"{label} degraded; retrying automatically in ~{max(1, int(round(delay_ms / 1000.0)))}s "
+            f"({entry['attempts']}/{len(self._AUTO_RECOVERY_DELAYS_MS)})"
+        )
+        self._refresh_channel_runtime_status(node_name)
+
+    def _run_auto_recovery(self, node_name, generation):
+        entry = self._auto_recovery_state.get(node_name)
+        if not entry or int(entry.get("generation", 0)) != int(generation or 0):
+            return
+        entry["timer"] = None
+        current = self.runtime.fx_status_for(node_name)
+        if getattr(current, "state", "") != "degraded":
+            return
+        current_generation = int(getattr(current, "generation", 0) or 0)
+        if current_generation and int(generation or 0) and current_generation != int(generation or 0):
+            return
+        self.status_lbl.setText(f"Attempting automatic recovery for {self._channel_label(node_name)}...")
+        self._refresh_channel_runtime_status(node_name)
+        self.runtime.recover_channel(node_name)
 
     def _run_startup_preflight(self):
         """Check for required runtime binaries and surface a clear warning."""
@@ -2420,6 +2733,29 @@ class WaveLinuxWindow(QMainWindow):
             f"Saved runtime diagnostics to:\n{path}",
         )
 
+    def open_channel_diagnostics(self, node_name):
+        if not node_name:
+            return
+        issue = self.channel_runtime_issue(node_name)
+        path = (issue.get("diagnostics_path") or "").strip()
+        if not path:
+            path = self.runtime.export_diagnostics(f"channel-diagnostics:{node_name}")
+        if not path:
+            QMessageBox.information(
+                self,
+                "Diagnostics Unavailable",
+                "WaveLinux could not locate or export diagnostics for that channel.",
+            )
+            return
+        if os.path.exists(path) and QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            self.status_lbl.setText(f"Opened diagnostics for {self._channel_label(node_name)}")
+            return
+        QMessageBox.information(
+            self,
+            "Diagnostics Path",
+            f"WaveLinux saved diagnostics for {self._channel_label(node_name)} here:\n{path}",
+        )
+
     def _runtime_degraded_channels(self):
         view = self._runtime_view_state
         if view is None:
@@ -2440,6 +2776,8 @@ class WaveLinuxWindow(QMainWindow):
         )
         if yn != QMessageBox.StandardButton.Yes:
             return
+        for node_name in degraded:
+            self._clear_auto_recovery_state(node_name)
         self.runtime.recover_channels(degraded)
         self.status_lbl.setText(f"Recovering {len(degraded)} channel(s)...")
         self._refresh_advanced_tab()
@@ -2564,6 +2902,7 @@ class WaveLinuxWindow(QMainWindow):
     def recover_channel(self, node_name):
         if not node_name:
             return
+        self._clear_auto_recovery_state(node_name)
         self.runtime.recover_channel(node_name)
 
     def _start_event_subscriber(self):
@@ -3112,14 +3451,9 @@ class WaveLinuxWindow(QMainWindow):
                 is_hidden,
             )
             strip._refresh_fx_indicator(active=getattr(node, "fx_running", False))
-            node_health = (getattr(view, "health", {}) or {}).get(nname)
-            if node_health:
-                strip.setToolTip(
-                    f"Runtime health: {node_health}. "
-                    "Right-click and select Recover Channel."
-                )
-            else:
-                strip.setToolTip("")
+            issue = self.channel_runtime_issue(nname)
+            strip.set_runtime_issue(issue["degraded"], issue["tooltip"])
+            strip.setToolTip(issue["tooltip"] if issue["degraded"] else "")
 
             meter = self.meters.get(pw_id)
             meter_source = node.meter_source

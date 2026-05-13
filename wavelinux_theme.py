@@ -42,14 +42,28 @@ QFrame#channelStrip {
     border-radius: 14px;
     padding: 6px 6px;
 }
+QFrame#channelStrip[degraded="true"] {
+    background: rgba(44,20,28,0.92);
+    border: 1px solid rgba(255,107,107,0.45);
+}
 QFrame#channelStrip:hover {
     border: 1px solid rgba(0,229,255,0.2);
     background: rgba(26,25,42,0.95);
+}
+QFrame#channelStrip[degraded="true"]:hover {
+    border: 1px solid rgba(255,140,140,0.65);
+    background: rgba(54,24,34,0.96);
 }
 
 QLabel#channelIcon {
     font-size: 22px;
     padding: 2px;
+}
+QLabel#healthIndicator {
+    color: #ff6b6b;
+    font-size: 13px;
+    font-weight: 700;
+    padding: 0 2px;
 }
 QLabel#fxIndicator {
     color: #00e5ff;

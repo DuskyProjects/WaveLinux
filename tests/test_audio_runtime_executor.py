@@ -187,6 +187,7 @@ class RuntimeExecutorTests(unittest.TestCase):
         self.assertEqual(statuses[-1].state, "degraded")
         self.assertIn("source_output_move", statuses[-1].message)
         self.assertIn("source-output move to candidate source failed", statuses[-1].message)
+        self.assertEqual(statuses[-1].diagnostics_path, "/tmp/runtime-failure.json")
 
     def test_clear_channel_fx_uses_transaction_result(self):
         engine = FakeEngine()
@@ -209,6 +210,56 @@ class RuntimeExecutorTests(unittest.TestCase):
         executor._set_default_source({"source_name": "wavelinux.fx.mic.source"})
 
         self.assertEqual(engine.default_source_calls, ["wavelinux.fx.mic.source"])
+
+    def test_check_invariants_flags_effect_mismatch(self):
+        desired = DesiredState(
+            selected_mic="mic",
+            channels={
+                "mic": ChannelSpec(
+                    node_name="mic",
+                    fx=FxSpec(effects=["rnnoise", "eq"], generation=2),
+                )
+            },
+        )
+        observed = ObservedState(
+            present_node_names={"mic"},
+            default_source="wavelinux.fx.mic.source",
+            fx_sources_by_channel={"mic": "wavelinux.fx.mic.source"},
+            fx_effects_by_channel={"mic": ["rnnoise"]},
+            fx_params_by_channel={"mic": {}},
+            source_names={"wavelinux.fx.mic.source"},
+        )
+
+        health = RuntimeExecutor._check_invariants(desired, observed)
+
+        self.assertEqual(health["mic"], "fx_effects_mismatch")
+
+    def test_check_invariants_flags_param_mismatch(self):
+        desired = DesiredState(
+            selected_mic="mic",
+            channels={
+                "mic": ChannelSpec(
+                    node_name="mic",
+                    fx=FxSpec(
+                        effects=["rnnoise"],
+                        params_map={"rnnoise": {"wet": 0.8}},
+                        generation=2,
+                    ),
+                )
+            },
+        )
+        observed = ObservedState(
+            present_node_names={"mic"},
+            default_source="wavelinux.fx.mic.source",
+            fx_sources_by_channel={"mic": "wavelinux.fx.mic.source"},
+            fx_effects_by_channel={"mic": ["rnnoise"]},
+            fx_params_by_channel={"mic": {"rnnoise": {"wet": 0.4}}},
+            source_names={"wavelinux.fx.mic.source"},
+        )
+
+        health = RuntimeExecutor._check_invariants(desired, observed)
+
+        self.assertEqual(health["mic"], "fx_params_mismatch")
 
     def test_execute_without_actions_reuses_observed_state(self):
         executor = RuntimeExecutor(FakeAdapter(FakeEngine()), DummyDiagnostics())

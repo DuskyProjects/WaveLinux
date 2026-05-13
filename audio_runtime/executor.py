@@ -328,6 +328,7 @@ class RuntimeExecutor:
                     + (f" ({message})" if message else "")
                 ),
                 error=message,
+                diagnostics_path=bundle,
             ),
         )
 
@@ -367,6 +368,7 @@ class RuntimeExecutor:
                         + (f" ({message})" if message else "")
                     ),
                     error=message,
+                    diagnostics_path=bundle,
                 ),
             )
             return
@@ -494,11 +496,21 @@ class RuntimeExecutor:
                 continue
             fx_source = observed_state.fx_sources_by_channel.get(node_name)
             fx_effects = observed_state.fx_effects_by_channel.get(node_name) or []
+            desired_effects = list(chan.fx.effects)
+            desired_params = {
+                key: dict(values)
+                for key, values in (chan.fx.params_map or {}).items()
+            }
+            observed_params = observed_state.fx_params_by_channel.get(node_name) or {}
             if not fx_source:
                 health.setdefault(node_name, "desired_fx_missing")
                 continue
             if not fx_effects:
                 health.setdefault(node_name, "fx_effects_not_visible")
+            elif fx_effects != desired_effects:
+                health.setdefault(node_name, "fx_effects_mismatch")
+            elif observed_params != desired_params:
+                health.setdefault(node_name, "fx_params_mismatch")
             if fx_source not in observed_state.source_names:
                 health.setdefault(node_name, "fx_source_not_present")
 

@@ -123,6 +123,7 @@ class OperationStatus:
     message: str = ""
     updated_at: float = field(default_factory=time.time)
     error: str = ""
+    diagnostics_path: str = ""
 
 
 @dataclass
