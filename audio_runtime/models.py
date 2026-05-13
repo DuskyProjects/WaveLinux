@@ -80,6 +80,10 @@ class RuntimeChannelView:
 class RuntimeAppView:
     app_id: str
     app_name: str
+    resolved_app_id: str = ""
+    resolved_app_name: str = ""
+    identity_source: str = ""
+    override_applied: bool = False
     active_indices: list[str] = field(default_factory=list)
     current_sink: str | None = None
     current_volume: float | None = None

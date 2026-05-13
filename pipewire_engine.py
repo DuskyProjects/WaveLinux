@@ -96,6 +96,8 @@ class PipeWireEngine:
                                          #               source, capture_target,
                                          #               safe_key}
         self.submix_state_cache = {}    # "node_id->mix_name" -> {'vol', 'mute'}
+        self._app_identity_overrides = {}
+        self._app_identity_label_overrides = {}
         self.ladspa_plugins = self._probe_ladspa_plugins()
         self._reap_orphan_fx_processes()
         self._bt_autoswitch_overridden = False
@@ -2324,6 +2326,58 @@ class PipeWireEngine:
             return False
         return not str(app_id).startswith("stream:")
 
+    @classmethod
+    def _normalize_identity_override_map(cls, raw):
+        if not isinstance(raw, dict):
+            return {}
+        cleaned = {}
+        for source_app_id, target_app_id in raw.items():
+            if not isinstance(source_app_id, str) or not isinstance(target_app_id, str):
+                continue
+            source_app_id = source_app_id.strip()
+            target_app_id = target_app_id.strip()
+            if not source_app_id or not target_app_id:
+                continue
+            if source_app_id == cls.SYSTEM_SOUNDS_BUCKET or target_app_id == cls.SYSTEM_SOUNDS_BUCKET:
+                continue
+            if not cls.is_persistent_app_id(source_app_id):
+                continue
+            if not cls.is_persistent_app_id(target_app_id):
+                continue
+            cleaned[source_app_id] = target_app_id
+        return cleaned
+
+    @classmethod
+    def _normalize_label_override_map(cls, raw):
+        if not isinstance(raw, dict):
+            return {}
+        cleaned = {}
+        for app_id, label in raw.items():
+            if not isinstance(app_id, str):
+                continue
+            app_id = app_id.strip()
+            if not app_id or not cls.is_persistent_app_id(app_id):
+                continue
+            if app_id == cls.SYSTEM_SOUNDS_BUCKET:
+                continue
+            normalized = cls._sanitize_app_label(label) if label is not None else None
+            if not normalized:
+                continue
+            cleaned[app_id] = normalized
+        return cleaned
+
+    def set_app_identity_overrides(self, overrides, labels):
+        self._app_identity_overrides = self._normalize_identity_override_map(overrides)
+        self._app_identity_label_overrides = self._normalize_label_override_map(labels)
+
+    def _override_display_name_for_app_id(self, app_id, fallback=None):
+        label = getattr(self, "_app_identity_label_overrides", {}).get(app_id)
+        if label:
+            return label
+        if fallback:
+            return fallback
+        return self.display_name_for_app_id(app_id)
+
     @staticmethod
     def _proc_exe_basename(pid):
         """Resolve /proc/<pid>/exe to its basename. Unlike /proc/<pid>/comm
@@ -2976,7 +3030,10 @@ class PipeWireEngine:
         return {
             "app_id": self._make_app_route_key("stream", stream_id),
             "app_name": display,
+            "resolved_app_id": self._make_app_route_key("stream", stream_id),
+            "resolved_app_name": display,
             "source": "fallback",
+            "override_applied": False,
         }
 
     def _prefer_specific_identity_candidate(self, candidates, best):
@@ -2995,12 +3052,94 @@ class PipeWireEngine:
             return alternative
         return best
 
+    @staticmethod
+    def _candidate_source_preference(candidate):
+        source = str((candidate or {}).get("source") or "")
+        if source in {"gio-desktop", "flatpak", "snap-env", "flatpak-cgroup", "snap-cgroup"}:
+            return 5
+        if source.startswith(("cmdline:--app", "cmdline:--app-id")):
+            return 5
+        if source.startswith(("desktop-index:", "cmdline-index:", "cmdline-binary:", "appimage")):
+            return 4
+        if source in {"exe-path"} or source.startswith(("flatpak-cmdline", "gtk_application_id", "app_id", "xdg_current_desktop_app")):
+            return 4
+        if source.startswith(("application.id", "pipewire.access.portal.app_id", "xdg.portal.app_id", "window.app_id")):
+            return 4
+        if source.startswith(("window.x11.", "window.class", "wmclass")):
+            return 3
+        if source.startswith(("application.display_name", "application.name", "node.description", "node.nick")):
+            return 2
+        if source.startswith(("application.process.binary", "binary-map:", "binary:", "name")):
+            return 1
+        return 0
+
+    def _prefer_wrapper_identity_candidate(self, candidates, best):
+        if not best:
+            return best
+        best_source_pref = self._candidate_source_preference(best)
+        best_is_generic = self._is_generic_name(best.get("app_name"))
+        alternatives = [
+            candidate for candidate in candidates
+            if candidate
+            and not self._is_generic_name(candidate.get("app_name"))
+            and not self.name_matches_host(candidate.get("app_name"))
+            and self._candidate_source_preference(candidate) >= 3
+        ]
+        if not alternatives:
+            return best
+        alternative = max(
+            alternatives,
+            key=lambda item: (
+                self._candidate_source_preference(item),
+                item["score"],
+                len(item["app_name"]),
+            ),
+        )
+        alt_source_pref = self._candidate_source_preference(alternative)
+        if alt_source_pref > best_source_pref and alternative["score"] >= best["score"] - 18:
+            return alternative
+        if best_is_generic and alt_source_pref >= best_source_pref and alternative["score"] >= best["score"] - 18:
+            return alternative
+        return best
+
+    def _apply_identity_override(self, identity):
+        if not isinstance(identity, dict):
+            return identity
+        resolved_app_id = str(identity.get("app_id") or "").strip()
+        resolved_app_name = str(identity.get("app_name") or "").strip()
+        source = str(identity.get("source") or "").strip()
+        if not resolved_app_id:
+            return identity
+        target_app_id = getattr(self, "_app_identity_overrides", {}).get(
+            resolved_app_id,
+            resolved_app_id,
+        )
+        override_applied = target_app_id != resolved_app_id
+        if override_applied:
+            display_name = self._override_display_name_for_app_id(target_app_id)
+        else:
+            display_name = self._override_display_name_for_app_id(
+                target_app_id,
+                fallback=resolved_app_name,
+            )
+        return {
+            "app_id": target_app_id,
+            "app_name": display_name or resolved_app_name or self.display_name_for_app_id(target_app_id),
+            "resolved_app_id": resolved_app_id,
+            "resolved_app_name": resolved_app_name or self.display_name_for_app_id(resolved_app_id),
+            "source": source,
+            "override_applied": override_applied,
+        }
+
     def _resolve_app_identity(self, current):
         if self._is_system_sound_stream(current):
             return {
                 "app_id": self.SYSTEM_SOUNDS_BUCKET,
                 "app_name": self.SYSTEM_SOUNDS_BUCKET,
+                "resolved_app_id": self.SYSTEM_SOUNDS_BUCKET,
+                "resolved_app_name": self.SYSTEM_SOUNDS_BUCKET,
                 "source": "system-sounds",
+                "override_applied": False,
             }
 
         pid = current.get('pid') or current.get('application.process.id')
@@ -3031,12 +3170,13 @@ class PipeWireEngine:
             return self._stream_fallback_identity(current)
 
         best = max(best_by_id.values(), key=lambda item: (item["score"], len(item["app_name"])))
+        best = self._prefer_wrapper_identity_candidate(candidates, best)
         best = self._prefer_specific_identity_candidate(candidates, best)
-        return {
+        return self._apply_identity_override({
             "app_id": best["app_id"],
             "app_name": best["app_name"],
             "source": best["source"],
-        }
+        })
 
     def _process_sink_input(self, current, entries, sink_id_to_name):
         # Resolve sink name
@@ -3056,7 +3196,10 @@ class PipeWireEngine:
         identity = self._resolve_app_identity(current)
         current['app_id'] = identity["app_id"]
         current['app_name'] = identity["app_name"] or "Unknown App"
+        current['resolved_app_id'] = identity.get("resolved_app_id") or current['app_id']
+        current['resolved_app_name'] = identity.get("resolved_app_name") or current['app_name']
         current['app_identity_source'] = identity.get("source", "")
+        current['app_identity_override_applied'] = bool(identity.get("override_applied"))
         current['_is_system_sound'] = current['app_id'] == self.SYSTEM_SOUNDS_BUCKET
         entries.append(current)
 

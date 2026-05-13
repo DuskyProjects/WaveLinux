@@ -634,12 +634,41 @@ class RuntimeExecutor:
         for app in apps:
             app_id = app.get("app_id") or app.get("app_name") or app.get("binary") or "Unknown App"
             app_name = app.get("app_name") or app.get("binary") or app_id
+            resolved_app_id = app.get("resolved_app_id") or app_id
+            resolved_app_name = app.get("resolved_app_name") or app_name
+            identity_source = app.get("app_identity_source") or ""
+            override_applied = bool(app.get("app_identity_override_applied"))
             view = grouped.get(app_id)
             if view is None:
-                view = RuntimeAppView(app_id=app_id, app_name=app_name)
+                view = RuntimeAppView(
+                    app_id=app_id,
+                    app_name=app_name,
+                    resolved_app_id=resolved_app_id,
+                    resolved_app_name=resolved_app_name,
+                    identity_source=identity_source,
+                    override_applied=override_applied,
+                )
                 grouped[app_id] = view
             elif app_name and (view.app_name == view.app_id or len(app_name) > len(view.app_name)):
                 view.app_name = app_name
+            if (
+                resolved_app_name
+                and (
+                    not view.resolved_app_name
+                    or view.resolved_app_name == view.resolved_app_id
+                    or len(resolved_app_name) > len(view.resolved_app_name)
+                )
+            ):
+                view.resolved_app_name = resolved_app_name
+            if not view.identity_source and identity_source:
+                view.identity_source = identity_source
+            view.override_applied = bool(view.override_applied or override_applied)
+            if not view.resolved_app_id:
+                view.resolved_app_id = resolved_app_id
+            elif resolved_app_id and view.resolved_app_id != resolved_app_id:
+                # Multiple resolved identities were merged into one canonical
+                # target, so reset/pin must treat the source as ambiguous.
+                view.resolved_app_id = ""
             idx = app.get("index")
             if idx is not None:
                 view.active_indices.append(str(idx))

@@ -11,6 +11,7 @@ import re
 import time
 import threading
 import queue
+from types import SimpleNamespace
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -1554,6 +1555,12 @@ class AppRoutingRow(QWidget):
         self.engine = engine
         self.app_id = app_id
         self.app_name = display_name
+        self.resolved_app_id = app_id
+        self.resolved_app_name = display_name
+        self.identity_source = ""
+        self.override_applied = False
+        self.manual_override_active = False
+        self.reset_source_app_id = ""
         self._main_win = main_win
         self._active_indices = [] # Current sink-input indices for this app
         self._last_active_state = None
@@ -1596,6 +1603,13 @@ class AppRoutingRow(QWidget):
         self.combo.setFixedWidth(220)
         self.combo.currentIndexChanged.connect(self._on_route_change)
         layout.addWidget(self.combo)
+
+        self.manage_btn = QPushButton("⋯")
+        self.manage_btn.setObjectName("forgetBtn")
+        self.manage_btn.setFixedWidth(26)
+        self.manage_btn.setToolTip("Pin, merge, or reset this app identity")
+        self.manage_btn.clicked.connect(self._show_identity_menu)
+        layout.addWidget(self.manage_btn)
 
         self.forget_btn = QPushButton("✕")
         self.forget_btn.setObjectName("forgetBtn")
@@ -1657,10 +1671,57 @@ class AppRoutingRow(QWidget):
         if win is not None:
             win.forget_app(self.app_id)
 
+    def _identity_source_app_id(self):
+        if PipeWireEngine.is_persistent_app_id(self.resolved_app_id):
+            return self.resolved_app_id
+        if PipeWireEngine.is_persistent_app_id(self.app_id):
+            return self.app_id
+        return ""
+
+    def _show_identity_menu(self):
+        win = self._main_win
+        if win is None:
+            return
+        menu = QMenu(self)
+        persistent_source = self._identity_source_app_id()
+        is_system = self.app_id == PipeWireEngine.SYSTEM_SOUNDS_BUCKET
+        can_pin_merge = bool(persistent_source) and not is_system
+        can_reset = bool(self.manual_override_active) and not is_system
+
+        if not can_pin_merge:
+            info_act = menu.addAction(
+                "WaveLinux needs a stable app signature before it can pin or merge this stream."
+            )
+            info_act.setEnabled(False)
+            menu.addSeparator()
+
+        pin_act = menu.addAction("Pin / Rename App…")
+        pin_act.setEnabled(can_pin_merge)
+        pin_act.triggered.connect(lambda checked=False: win._pin_app_identity(self))
+
+        merge_act = menu.addAction("Merge Into Existing App…")
+        merge_act.setEnabled(can_pin_merge)
+        merge_act.triggered.connect(lambda checked=False: win._merge_app_identity(self))
+
+        reset_act = menu.addAction("Reset to Auto Detection")
+        reset_act.setEnabled(can_reset)
+        reset_act.triggered.connect(lambda checked=False: win._reset_app_identity_override(self))
+
+        menu.exec(self.manage_btn.mapToGlobal(self.manage_btn.rect().bottomLeft()))
+
     def update_state(self, display_name, active_indices, sinks, current_sink,
-                     current_volume=None, saved_volume=None):
+                     current_volume=None, saved_volume=None,
+                     resolved_app_id=None, resolved_app_name=None,
+                     identity_source="", override_applied=False,
+                     manual_override_active=False, reset_source_app_id=""):
         self.app_name = display_name or self.app_name
         self._active_indices = active_indices
+        self.resolved_app_id = str(resolved_app_id or self.app_id)
+        self.resolved_app_name = str(resolved_app_name or self.app_name)
+        self.identity_source = str(identity_source or "")
+        self.override_applied = bool(override_applied)
+        self.manual_override_active = bool(manual_override_active)
+        self.reset_source_app_id = str(reset_source_app_id or "")
         is_active = len(active_indices) > 0
         is_system = (self.app_id == PipeWireEngine.SYSTEM_SOUNDS_BUCKET)
 
@@ -1680,12 +1741,24 @@ class AppRoutingRow(QWidget):
             self._last_active_state = active_state
 
         self.forget_btn.setVisible(not is_system)
+        self.manage_btn.setVisible(not is_system)
         if not is_system:
+            self.manage_btn.setEnabled(True)
+            self.manage_btn.setToolTip("Pin, merge, or reset this app identity")
             self.forget_btn.setEnabled(True)
             self.forget_btn.setToolTip(
                 "Permanently hide this app from the routing list. "
                 "Drops its saved volume / destination too."
             )
+        tooltip_lines = [
+            f"Canonical app ID: {self.app_id}",
+            f"Resolved app ID: {self.resolved_app_id or 'n/a'}",
+            "Identity source: " + (self.identity_source or "n/a"),
+            "Manual override active: " + ("yes" if self.manual_override_active else "no"),
+        ]
+        tooltip = "\n".join(tooltip_lines)
+        self.name_lbl.setToolTip(tooltip)
+        self.manage_btn.setToolTip("Pin, merge, or reset this app identity\n\n" + tooltip)
 
         vol = current_volume
         if vol is None:
@@ -1879,6 +1952,8 @@ class WaveLinuxWindow(QMainWindow):
         self.app_volumes = {}       # app_id -> normalized volume (persistent)
         self.app_last_seen = {}     # app_id -> epoch seconds (for stale prune)
         self.app_display_names = {} # app_id -> last known display label
+        self.app_identity_overrides = {}  # source app_id -> canonical target app_id
+        self.app_label_overrides = {}     # canonical app_id -> user-facing label
         self.app_prune_days = 14    # forget routing entries not seen in this many days
         # ✕'d apps. Consulted in `_refresh` BEFORE the row is built so
         # the ✕ button sticks across re-syntheses.
@@ -1908,6 +1983,7 @@ class WaveLinuxWindow(QMainWindow):
         self.config_path = os.path.expanduser("~/.config/wavelinux/config.json")
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
         self._runtime_pid_path = os.path.expanduser("~/.config/wavelinux/runtime.pid")
+        self._set_engine_identity_overrides()
         
         # Backstop poll. `pactl subscribe` drives most refreshes; this
         # only fires when an event was missed.
@@ -4667,7 +4743,175 @@ class WaveLinuxWindow(QMainWindow):
             stream_hw=stream_hw,
         )
 
+    @staticmethod
+    def _normalize_app_identity_overrides(raw):
+        return PipeWireEngine._normalize_identity_override_map(raw)
+
+    @staticmethod
+    def _normalize_app_label_overrides(raw):
+        return PipeWireEngine._normalize_label_override_map(raw)
+
+    def _set_engine_identity_overrides(self):
+        engine = self.__dict__.get("engine")
+        if engine is None or not hasattr(engine, "set_app_identity_overrides"):
+            return
+        engine.set_app_identity_overrides(
+            self.__dict__.get("app_identity_overrides", {}),
+            self.__dict__.get("app_label_overrides", {}),
+        )
+
+    def _identity_dialog_parent(self):
+        return getattr(self, "settings_dialog", None) or self
+
+    def _all_scene_app_ids(self):
+        app_ids = set()
+        for snapshot in (self.scenes or {}).values():
+            if not isinstance(snapshot, dict):
+                continue
+            for mapping_name in ("app_routing", "app_volumes"):
+                mapping = snapshot.get(mapping_name, {}) or {}
+                if not isinstance(mapping, dict):
+                    continue
+                for app_id in mapping.keys():
+                    if PipeWireEngine.is_persistent_app_id(app_id):
+                        app_ids.add(app_id)
+        return app_ids
+
+    def _known_persistent_app_ids(self):
+        app_ids = set()
+        sources = (
+            set(getattr(self, "app_routing", {}).keys())
+            | set(getattr(self, "app_volumes", {}).keys())
+            | set(getattr(self, "app_last_seen", {}).keys())
+            | set(getattr(self, "app_display_names", {}).keys())
+            | set(getattr(self, "forgotten_apps", set()))
+            | set(self.__dict__.get("app_identity_overrides", {}).keys())
+            | set(self.__dict__.get("app_identity_overrides", {}).values())
+            | set(self.__dict__.get("app_label_overrides", {}).keys())
+            | self._all_scene_app_ids()
+        )
+        for app_id in sources:
+            if PipeWireEngine.is_persistent_app_id(app_id):
+                app_ids.add(app_id)
+        view = getattr(self, "_runtime_view_state", None)
+        for app_view in getattr(view, "app_views", []) or []:
+            app_id = getattr(app_view, "app_id", "")
+            if PipeWireEngine.is_persistent_app_id(app_id):
+                app_ids.add(app_id)
+        app_ids.discard(PipeWireEngine.SYSTEM_SOUNDS_BUCKET)
+        return app_ids
+
+    def _override_sources_for_target(self, target_app_id, *, exclude_source=None):
+        sources = []
+        for source_app_id, mapped_target in self.__dict__.get("app_identity_overrides", {}).items():
+            if mapped_target != target_app_id:
+                continue
+            if exclude_source and source_app_id == exclude_source:
+                continue
+            sources.append(source_app_id)
+        return sorted(set(sources))
+
+    def _app_id_has_runtime_or_saved_references(self, app_id):
+        if not app_id:
+            return False
+        if app_id in getattr(self, "app_routing", {}):
+            return True
+        if app_id in getattr(self, "app_volumes", {}):
+            return True
+        if app_id in getattr(self, "app_last_seen", {}):
+            return True
+        if app_id in getattr(self, "forgotten_apps", set()):
+            return True
+        for snapshot in (self.scenes or {}).values():
+            if not isinstance(snapshot, dict):
+                continue
+            if app_id in (snapshot.get("app_routing", {}) or {}):
+                return True
+            if app_id in (snapshot.get("app_volumes", {}) or {}):
+                return True
+        return False
+
+    def _cleanup_orphaned_custom_identity(self, app_id):
+        if not isinstance(app_id, str) or not app_id.startswith("custom:"):
+            return
+        if self._override_sources_for_target(app_id):
+            return
+        if self._app_id_has_runtime_or_saved_references(app_id):
+            return
+        self.app_label_overrides.pop(app_id, None)
+        self.app_display_names.pop(app_id, None)
+
+    def _allocate_custom_app_id(self, label, *, keep_existing=""):
+        base_id = PipeWireEngine._make_app_route_key("custom", label)
+        if keep_existing and keep_existing.startswith("custom:"):
+            base_id = keep_existing
+        if not base_id:
+            base_id = "custom:app"
+        candidate = base_id
+        known = self._known_persistent_app_ids()
+        suffix = 2
+        while candidate in known and candidate != keep_existing:
+            candidate = f"{base_id}-{suffix}"
+            suffix += 1
+        return candidate
+
+    def _migrate_scene_library_app_identity(self, source_app_id, target_app_id):
+        if not source_app_id or not target_app_id or source_app_id == target_app_id:
+            return False
+        changed = False
+        for snapshot in (self.scenes or {}).values():
+            if not isinstance(snapshot, dict):
+                continue
+            for mapping_name in ("app_routing", "app_volumes"):
+                mapping = snapshot.get(mapping_name, {}) or {}
+                if source_app_id not in mapping:
+                    continue
+                if target_app_id not in mapping:
+                    mapping[target_app_id] = mapping[source_app_id]
+                mapping.pop(source_app_id, None)
+                changed = True
+        return changed
+
+    def _migrate_app_identity_state(self, source_app_id, target_app_id):
+        if not source_app_id or not target_app_id or source_app_id == target_app_id:
+            return False
+        changed = False
+        if source_app_id in self.app_routing:
+            if target_app_id not in self.app_routing:
+                self.app_routing[target_app_id] = self.app_routing[source_app_id]
+            self.app_routing.pop(source_app_id, None)
+            changed = True
+        if source_app_id in self.app_volumes:
+            if target_app_id not in self.app_volumes:
+                self.app_volumes[target_app_id] = self.app_volumes[source_app_id]
+            self.app_volumes.pop(source_app_id, None)
+            changed = True
+        if source_app_id in self.app_last_seen:
+            source_seen = int(self.app_last_seen.pop(source_app_id))
+            target_seen = int(self.app_last_seen.get(target_app_id, 0) or 0)
+            self.app_last_seen[target_app_id] = max(source_seen, target_seen)
+            changed = True
+        source_label = self.app_display_names.pop(source_app_id, None)
+        if target_app_id in self.app_label_overrides:
+            self.app_display_names[target_app_id] = self.app_label_overrides[target_app_id]
+            changed = True
+        elif source_label and target_app_id not in self.app_display_names:
+            self.app_display_names[target_app_id] = source_label
+            changed = True
+        if source_app_id in self.forgotten_apps:
+            self.forgotten_apps.discard(source_app_id)
+            self.forgotten_apps.add(target_app_id)
+            changed = True
+        if self._migrate_scene_library_app_identity(source_app_id, target_app_id):
+            changed = True
+        self._cleanup_orphaned_custom_identity(source_app_id)
+        return changed
+
     def _display_name_for_app_id(self, app_id, fallback=None):
+        override = self.__dict__.get("app_label_overrides", {}).get(app_id)
+        if override:
+            self.app_display_names[app_id] = override
+            return override
         if fallback:
             self.app_display_names[app_id] = fallback
             return fallback
@@ -4675,6 +4919,57 @@ class WaveLinuxWindow(QMainWindow):
         if cached:
             return cached
         return PipeWireEngine.display_name_for_app_id(app_id)
+
+    def _app_identity_context(self, app_view_or_row):
+        app_id = str(getattr(app_view_or_row, "app_id", "") or "").strip()
+        app_name = str(getattr(app_view_or_row, "app_name", "") or "").strip()
+        resolved_app_id = str(
+            getattr(app_view_or_row, "resolved_app_id", "") or app_id
+        ).strip()
+        resolved_app_name = str(
+            getattr(app_view_or_row, "resolved_app_name", "") or app_name
+        ).strip()
+        reset_source_app_id = str(
+            getattr(app_view_or_row, "reset_source_app_id", "") or ""
+        ).strip()
+        sources_for_target = self._override_sources_for_target(app_id)
+        if not reset_source_app_id and len(sources_for_target) == 1:
+            reset_source_app_id = sources_for_target[0]
+        label_override_active = app_id in self.__dict__.get("app_label_overrides", {})
+        manual_override_active = bool(
+            getattr(app_view_or_row, "manual_override_active", False)
+            or getattr(app_view_or_row, "override_applied", False)
+            or bool(reset_source_app_id)
+            or label_override_active
+        )
+        source_app_id = ""
+        if (
+            resolved_app_id
+            and resolved_app_id != PipeWireEngine.SYSTEM_SOUNDS_BUCKET
+            and PipeWireEngine.is_persistent_app_id(resolved_app_id)
+        ):
+            source_app_id = resolved_app_id
+        elif (
+            app_id
+            and app_id != PipeWireEngine.SYSTEM_SOUNDS_BUCKET
+            and PipeWireEngine.is_persistent_app_id(app_id)
+        ):
+            source_app_id = app_id
+        display_name = self._display_name_for_app_id(
+            app_id,
+            app_name or resolved_app_name,
+        )
+        return {
+            "app_id": app_id,
+            "app_name": display_name,
+            "resolved_app_id": resolved_app_id,
+            "resolved_app_name": resolved_app_name,
+            "source_app_id": source_app_id,
+            "reset_source_app_id": reset_source_app_id,
+            "manual_override_active": manual_override_active,
+            "identity_source": str(getattr(app_view_or_row, "identity_source", "") or ""),
+            "override_applied": bool(getattr(app_view_or_row, "override_applied", False)),
+        }
 
     def _migrate_legacy_app_identity(self, app_id, display_name):
         if not app_id or not display_name:
@@ -4702,6 +4997,171 @@ class WaveLinuxWindow(QMainWindow):
             self.app_display_names[app_id] = display_name
             changed = True
         return changed
+
+    def _apply_app_identity_changes(self, status_message):
+        self._set_engine_identity_overrides()
+        self._sync_runtime_persistent_state()
+        self.save_config()
+        runtime = getattr(self, "runtime", None)
+        if runtime is not None and hasattr(runtime, "refresh_now"):
+            runtime.refresh_now("app-identity-change")
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText(status_message)
+        if hasattr(self, "_refresh"):
+            self._refresh()
+
+    def _pin_app_identity(self, app_view_or_row):
+        ctx = self._app_identity_context(app_view_or_row)
+        source_app_id = ctx["source_app_id"]
+        if not source_app_id:
+            QMessageBox.information(
+                self._identity_dialog_parent(),
+                "Pin App Identity",
+                "WaveLinux needs a stable app signature before it can pin this stream.",
+            )
+            return False
+
+        current_label = self._display_name_for_app_id(
+            ctx["app_id"],
+            ctx["app_name"] or ctx["resolved_app_name"],
+        )
+        label, ok = QInputDialog.getText(
+            self._identity_dialog_parent(),
+            "Pin / Rename App",
+            "Display label:",
+            text=current_label,
+        )
+        if not ok:
+            return False
+        label = PipeWireEngine._sanitize_app_label(label)
+        if not label:
+            QMessageBox.information(
+                self._identity_dialog_parent(),
+                "Pin / Rename App",
+                "Enter a non-empty app label.",
+            )
+            return False
+
+        current_app_id = ctx["app_id"]
+        manual_override_active = ctx["manual_override_active"]
+        if current_app_id.startswith("custom:") or manual_override_active:
+            target_app_id = current_app_id
+        elif current_app_id.startswith(("app:", "snap:")):
+            target_app_id = current_app_id
+        else:
+            target_app_id = self._allocate_custom_app_id(label)
+
+        if target_app_id != current_app_id:
+            self._migrate_app_identity_state(current_app_id, target_app_id)
+            self.app_identity_overrides[source_app_id] = target_app_id
+        elif (
+            source_app_id != current_app_id
+            and PipeWireEngine.is_persistent_app_id(source_app_id)
+            and manual_override_active
+        ):
+            self.app_identity_overrides[source_app_id] = current_app_id
+
+        self.app_label_overrides[target_app_id] = label
+        self.app_display_names[target_app_id] = label
+        if target_app_id != current_app_id:
+            self.app_display_names.pop(current_app_id, None)
+        self._apply_app_identity_changes(f"Pinned app identity: {label}")
+        return True
+
+    def _merge_app_identity(self, app_view_or_row):
+        ctx = self._app_identity_context(app_view_or_row)
+        source_app_id = ctx["source_app_id"]
+        if not source_app_id:
+            QMessageBox.information(
+                self._identity_dialog_parent(),
+                "Merge App Identity",
+                "WaveLinux needs a stable app signature before it can merge this stream.",
+            )
+            return False
+
+        candidate_ids = sorted(
+            (
+                app_id for app_id in self._known_persistent_app_ids()
+                if app_id != ctx["app_id"]
+                and app_id != PipeWireEngine.SYSTEM_SOUNDS_BUCKET
+                and PipeWireEngine.is_persistent_app_id(app_id)
+            ),
+            key=lambda app_id: (
+                self._display_name_for_app_id(app_id).lower(),
+                app_id,
+            ),
+        )
+        if not candidate_ids:
+            QMessageBox.information(
+                self._identity_dialog_parent(),
+                "Merge App Identity",
+                "No other saved app identities are available to merge into yet.",
+            )
+            return False
+
+        labels = [
+            f"{self._display_name_for_app_id(app_id)} [{app_id}]"
+            for app_id in candidate_ids
+        ]
+        selection, ok = QInputDialog.getItem(
+            self._identity_dialog_parent(),
+            "Merge Into Existing App",
+            "Route this app identity into:",
+            labels,
+            0,
+            False,
+        )
+        if not ok or not selection:
+            return False
+        target_app_id = candidate_ids[labels.index(selection)]
+        current_app_id = ctx["app_id"]
+
+        self.app_identity_overrides[source_app_id] = target_app_id
+        if current_app_id != target_app_id:
+            self._migrate_app_identity_state(current_app_id, target_app_id)
+        self._cleanup_orphaned_custom_identity(current_app_id)
+        target_label = self.app_label_overrides.get(target_app_id)
+        if target_label:
+            self.app_display_names[target_app_id] = target_label
+        self._apply_app_identity_changes(
+            f"Merged app identity into {self._display_name_for_app_id(target_app_id)}"
+        )
+        return True
+
+    def _reset_app_identity_override(self, app_view_or_row):
+        ctx = self._app_identity_context(app_view_or_row)
+        current_app_id = ctx["app_id"]
+        source_app_id = ctx["reset_source_app_id"]
+        had_source_override = bool(
+            source_app_id
+            and self.app_identity_overrides.get(source_app_id) == current_app_id
+        )
+        had_label_override = current_app_id in self.app_label_overrides
+        if not had_source_override and not had_label_override:
+            return False
+
+        if had_source_override:
+            self.app_identity_overrides.pop(source_app_id, None)
+            remaining_sources = self._override_sources_for_target(
+                current_app_id,
+                exclude_source=source_app_id,
+            )
+            if current_app_id.startswith("custom:") and not remaining_sources:
+                self._migrate_app_identity_state(current_app_id, source_app_id)
+                self.app_label_overrides.pop(current_app_id, None)
+                self.app_display_names.pop(current_app_id, None)
+                self.app_display_names[source_app_id] = PipeWireEngine.display_name_for_app_id(
+                    source_app_id,
+                )
+                self._cleanup_orphaned_custom_identity(current_app_id)
+        elif had_label_override:
+            self.app_label_overrides.pop(current_app_id, None)
+            self.app_display_names[current_app_id] = PipeWireEngine.display_name_for_app_id(
+                current_app_id,
+            )
+
+        self._apply_app_identity_changes("Reset app identity to automatic detection")
+        return True
 
     def _any_slider_dragging(self):
         """True if any slider thumb is being held — refresh defers when
@@ -5363,10 +5823,27 @@ class WaveLinuxWindow(QMainWindow):
         for app_id in ordered_display_apps:
             runtime_app = apps_by_id.get(app_id)
             active_indices = list(runtime_app.active_indices) if runtime_app is not None else []
+            if runtime_app is not None:
+                row_identity = runtime_app
+            else:
+                reset_sources = self._override_sources_for_target(app_id)
+                row_identity = SimpleNamespace(
+                    app_id=app_id,
+                    app_name=self._display_name_for_app_id(app_id),
+                    resolved_app_id=reset_sources[0] if len(reset_sources) == 1 else app_id,
+                    resolved_app_name=self._display_name_for_app_id(
+                        reset_sources[0] if len(reset_sources) == 1 else app_id,
+                    ),
+                    identity_source="remembered",
+                    override_applied=bool(reset_sources),
+                    manual_override_active=bool(reset_sources or app_id in self.app_label_overrides),
+                    reset_source_app_id=reset_sources[0] if len(reset_sources) == 1 else "",
+                )
             display_name = self._display_name_for_app_id(
                 app_id,
-                runtime_app.app_name if runtime_app is not None else None,
+                getattr(row_identity, "app_name", None),
             )
+            ctx = self._app_identity_context(row_identity)
             preferred_sink = self.app_routing.get(app_id)
             live_sink = runtime_app.current_sink if runtime_app is not None else None
             current_sink = preferred_sink or live_sink
@@ -5384,6 +5861,12 @@ class WaveLinuxWindow(QMainWindow):
                 current_sink,
                 current_volume=current_volume,
                 saved_volume=saved_volume,
+                resolved_app_id=ctx["resolved_app_id"],
+                resolved_app_name=ctx["resolved_app_name"],
+                identity_source=ctx["identity_source"],
+                override_applied=ctx["override_applied"],
+                manual_override_active=ctx["manual_override_active"],
+                reset_source_app_id=ctx["reset_source_app_id"],
             )
         for app_id in list(self.app_widgets.keys()):
             if app_id not in all_display_app_ids:
@@ -5539,6 +6022,12 @@ class WaveLinuxWindow(QMainWindow):
                 k: v for k, v in self.app_display_names.items()
                 if PipeWireEngine.is_persistent_app_id(k)
             },
+            'app_identity_overrides': self._normalize_app_identity_overrides(
+                self.__dict__.get("app_identity_overrides", {}),
+            ),
+            'app_label_overrides': self._normalize_app_label_overrides(
+                self.__dict__.get("app_label_overrides", {}),
+            ),
             'app_prune_days': self.app_prune_days,
             'forgotten_apps': sorted(
                 name for name in self.forgotten_apps
@@ -5575,6 +6064,12 @@ class WaveLinuxWindow(QMainWindow):
             k: v for k, v in (conf.get('app_display_names', {}) or {}).items()
             if isinstance(k, str) and isinstance(v, str) and PipeWireEngine.is_persistent_app_id(k)
         }
+        self.app_identity_overrides = self._normalize_app_identity_overrides(
+            conf.get('app_identity_overrides', {}),
+        )
+        self.app_label_overrides = self._normalize_app_label_overrides(
+            conf.get('app_label_overrides', {}),
+        )
         self.app_prune_days = int(conf.get('app_prune_days', self.app_prune_days) or 14)
         self.forgotten_apps = {
             name for name in (conf.get('forgotten_apps', []) or [])
@@ -5595,11 +6090,16 @@ class WaveLinuxWindow(QMainWindow):
             | set(self.app_volumes)
             | set(self.app_last_seen)
             | set(self.forgotten_apps)
+            | set(self.app_identity_overrides.values())
+            | set(self.app_label_overrides.keys())
         ):
             self.app_display_names.setdefault(
                 app_id,
                 PipeWireEngine.display_name_for_app_id(app_id),
             )
+        for app_id, label in self.app_label_overrides.items():
+            self.app_display_names[app_id] = label
+        self._set_engine_identity_overrides()
         self._prune_stale_apps()
         self.virtual_channels = self._dedupe_names(conf.get('channels', []) or [])
         self.scenes = self._normalize_scene_library(conf.get('scenes', {}))
