@@ -84,14 +84,19 @@ class WaveLinuxHealthTests(unittest.TestCase):
                 ],
             },
             state=SimpleNamespace(
+                running_appimage_path=None,
                 appimage_missing=True,
                 installed_appimage_path="/tmp/WaveLinux.AppImage",
+                installed_appimage_backup_path="/tmp/WaveLinux.AppImage.bak",
+                installed_appimage_backup_exists=False,
                 wrapper_mismatch=True,
                 wrapper_mode="unknown",
+                wrapper_exists=True,
                 wrapper_path="/tmp/wavelinux",
                 wrapper_bundle_exec=None,
                 wrapper_source_dir=None,
                 wrapper_target="/opt/old.AppImage",
+                desktop_exists=True,
                 desktop_mismatch=True,
                 desktop_path="/tmp/io.github.duskyprojects.WaveLinux.desktop",
                 stale_launcher_entries=(SimpleNamespace(path="/tmp/stale.desktop"),),
@@ -125,14 +130,19 @@ class WaveLinuxHealthTests(unittest.TestCase):
         issues = win._collect_health_issues(
             preflight={"deps": {}, "issue_details": []},
             state=SimpleNamespace(
+                running_appimage_path=None,
                 appimage_missing=False,
                 installed_appimage_path="/tmp/WaveLinux.AppImage",
+                installed_appimage_backup_path="/tmp/WaveLinux.AppImage.bak",
+                installed_appimage_backup_exists=False,
                 wrapper_mismatch=False,
                 wrapper_mode="appimage",
+                wrapper_exists=True,
                 wrapper_path="/tmp/wavelinux",
                 wrapper_bundle_exec=None,
                 wrapper_source_dir=None,
                 wrapper_target="/tmp/WaveLinux.AppImage",
+                desktop_exists=True,
                 desktop_mismatch=False,
                 desktop_path="/tmp/io.github.duskyprojects.WaveLinux.desktop",
                 stale_launcher_entries=(),
@@ -155,8 +165,11 @@ class WaveLinuxHealthTests(unittest.TestCase):
         issues = win._collect_health_issues(
             preflight={"deps": {}, "issue_details": []},
             state=SimpleNamespace(
+                running_appimage_path=None,
                 appimage_missing=True,
                 installed_appimage_path="/tmp/WaveLinux.AppImage",
+                installed_appimage_backup_path="/tmp/WaveLinux.AppImage.bak",
+                installed_appimage_backup_exists=False,
                 wrapper_mismatch=False,
                 wrapper_mode="unknown",
                 wrapper_exists=False,
@@ -185,8 +198,11 @@ class WaveLinuxHealthTests(unittest.TestCase):
         issues = win._collect_health_issues(
             preflight={"deps": {}, "issue_details": []},
             state=SimpleNamespace(
+                running_appimage_path=None,
                 appimage_missing=True,
                 installed_appimage_path="/tmp/WaveLinux.AppImage",
+                installed_appimage_backup_path="/tmp/WaveLinux.AppImage.bak",
+                installed_appimage_backup_exists=False,
                 wrapper_mismatch=False,
                 wrapper_mode="source",
                 wrapper_exists=True,
@@ -218,8 +234,11 @@ class WaveLinuxHealthTests(unittest.TestCase):
         issues = win._collect_health_issues(
             preflight={"deps": {}, "issue_details": []},
             state=SimpleNamespace(
+                running_appimage_path=None,
                 appimage_missing=True,
                 installed_appimage_path="/tmp/WaveLinux.AppImage",
+                installed_appimage_backup_path="/tmp/WaveLinux.AppImage.bak",
+                installed_appimage_backup_exists=False,
                 wrapper_mismatch=False,
                 wrapper_mode="bundle",
                 wrapper_exists=True,
@@ -251,9 +270,12 @@ class WaveLinuxHealthTests(unittest.TestCase):
         issues = win._collect_health_issues(
             preflight={"deps": {}, "issue_details": []},
             state=SimpleNamespace(
+                running_appimage_path=None,
                 appimage_missing=True,
                 installed_appimage_path="/tmp/WaveLinux.AppImage",
                 installed_appimage_exists=False,
+                installed_appimage_backup_path="/tmp/WaveLinux.AppImage.bak",
+                installed_appimage_backup_exists=False,
                 wrapper_mismatch=False,
                 wrapper_mode="source",
                 wrapper_exists=True,
@@ -269,10 +291,47 @@ class WaveLinuxHealthTests(unittest.TestCase):
             ),
         )
 
-        mismatch = next(issue for issue in issues if issue.code == "install.wrapper_mismatch")
+        mismatch = next(issue for issue in issues if issue.code == "install.runtime_target_mismatch")
         self.assertEqual(mismatch.severity, "info")
         self.assertIn("different checkout", mismatch.title.lower())
         self.assertNotIn("install.appimage_missing", {issue.code for issue in issues})
+
+    def test_collect_health_issues_flags_different_bundle_binary(self):
+        win = self._window()
+        win._current_runtime_mode = lambda: SimpleNamespace(
+            kind="bundle",
+            running_path="/home/tester/Downloads/WaveLinux-dev/WaveLinux",
+            allows_self_update=True,
+            update_channel="appimage",
+        )
+
+        issues = win._collect_health_issues(
+            preflight={"deps": {}, "issue_details": []},
+            state=SimpleNamespace(
+                running_appimage_path=None,
+                appimage_missing=True,
+                installed_appimage_path="/tmp/WaveLinux.AppImage",
+                installed_appimage_exists=False,
+                installed_appimage_backup_path="/tmp/WaveLinux.AppImage.bak",
+                installed_appimage_backup_exists=False,
+                wrapper_mismatch=False,
+                wrapper_mode="bundle",
+                wrapper_exists=True,
+                wrapper_path="/tmp/wavelinux",
+                wrapper_bundle_exec="/home/tester/Downloads/WaveLinux-stable/WaveLinux",
+                wrapper_source_dir=None,
+                wrapper_target="/home/tester/Downloads/WaveLinux-stable/WaveLinux",
+                desktop_exists=True,
+                desktop_mismatch=False,
+                desktop_path="/tmp/io.github.duskyprojects.WaveLinux.desktop",
+                stale_launcher_entries=(),
+                warnings=(),
+            ),
+        )
+
+        mismatch = next(issue for issue in issues if issue.code == "install.runtime_target_mismatch")
+        self.assertEqual(mismatch.severity, "info")
+        self.assertIn("different binary", mismatch.title.lower())
 
     def test_collect_health_issues_flags_different_running_appimage(self):
         win = self._window()
@@ -284,6 +343,8 @@ class WaveLinuxHealthTests(unittest.TestCase):
                 appimage_missing=False,
                 installed_appimage_exists=True,
                 installed_appimage_path="/tmp/WaveLinux.AppImage",
+                installed_appimage_backup_path="/tmp/WaveLinux.AppImage.bak",
+                installed_appimage_backup_exists=False,
                 wrapper_mismatch=False,
                 wrapper_mode="appimage",
                 wrapper_exists=True,
@@ -299,9 +360,77 @@ class WaveLinuxHealthTests(unittest.TestCase):
             ),
         )
 
-        mismatch = next(issue for issue in issues if issue.code == "install.wrapper_mismatch")
+        mismatch = next(issue for issue in issues if issue.code == "install.runtime_target_mismatch")
         self.assertEqual(mismatch.severity, "info")
         self.assertIn("different file", mismatch.title.lower())
+
+    def test_collect_health_issues_includes_backup_available_card(self):
+        win = self._window()
+
+        issues = win._collect_health_issues(
+            preflight={"deps": {}, "issue_details": []},
+            state=SimpleNamespace(
+                running_appimage_path="/tmp/WaveLinux.AppImage",
+                appimage_missing=False,
+                installed_appimage_exists=True,
+                installed_appimage_path="/tmp/WaveLinux.AppImage",
+                installed_appimage_backup_path="/tmp/WaveLinux.AppImage.bak",
+                installed_appimage_backup_exists=True,
+                wrapper_mismatch=False,
+                wrapper_mode="appimage",
+                wrapper_exists=True,
+                wrapper_path="/tmp/wavelinux",
+                wrapper_bundle_exec=None,
+                wrapper_source_dir=None,
+                wrapper_target="/tmp/WaveLinux.AppImage",
+                desktop_exists=True,
+                desktop_exec_target="/tmp/wavelinux",
+                desktop_mismatch=False,
+                desktop_path="/tmp/io.github.duskyprojects.WaveLinux.desktop",
+                stale_launcher_entries=(),
+                warnings=(),
+            ),
+        )
+
+        backup_issue = next(issue for issue in issues if issue.code == "update.backup_available")
+        self.assertEqual(backup_issue.severity, "info")
+        self.assertEqual(backup_issue.primary_action, "Restore Previous AppImage")
+
+    def test_collect_health_issues_surfaces_rollback_failure(self):
+        win = self._window()
+        win._last_update_issue = {
+            "code": "update.rollback_failed",
+            "message": "Could not restore the previous AppImage backup.",
+            "release_url": "https://example.test/releases",
+        }
+
+        issues = win._collect_health_issues(
+            preflight={"deps": {}, "issue_details": []},
+            state=SimpleNamespace(
+                running_appimage_path="/tmp/WaveLinux.AppImage",
+                appimage_missing=False,
+                installed_appimage_exists=True,
+                installed_appimage_path="/tmp/WaveLinux.AppImage",
+                installed_appimage_backup_path="/tmp/WaveLinux.AppImage.bak",
+                installed_appimage_backup_exists=False,
+                wrapper_mismatch=False,
+                wrapper_mode="appimage",
+                wrapper_exists=True,
+                wrapper_path="/tmp/wavelinux",
+                wrapper_bundle_exec=None,
+                wrapper_source_dir=None,
+                wrapper_target="/tmp/WaveLinux.AppImage",
+                desktop_exists=True,
+                desktop_exec_target="/tmp/wavelinux",
+                desktop_mismatch=False,
+                desktop_path="/tmp/io.github.duskyprojects.WaveLinux.desktop",
+                stale_launcher_entries=(),
+                warnings=(),
+            ),
+        )
+
+        rollback_issue = next(issue for issue in issues if issue.code == "update.rollback_failed")
+        self.assertEqual(rollback_issue.severity, "error")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import urllib.request
 
 from distribution import (
     install_appimage_file,
+    installed_appimage_backup_path,
     installed_appimage_path,
 )
 
@@ -29,7 +30,9 @@ GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases
 UPDATE_USER_AGENT = "WaveLinux-Updater"
 RELEASE_MANIFEST_FILENAME = "wavelinux-release-manifest.json"
 RELEASE_MANIFEST_SIGNATURE_FILENAME = "wavelinux-release-manifest.sig"
-RELEASE_SIGNING_PUBLIC_KEY_B64 = "/84ez7Bwr5AQw6fZvdefRpxmZh3u5EwHLx1JGdIGjGU="
+RELEASE_SIGNING_PUBLIC_KEY_B64 = "a6wczeBBFFfIu0JaZERGhwskfbkgRNBM1BFjBJR/k4w="
+UPDATE_RELEASE_API_URL_ENV = "WAVELINUX_UPDATE_RELEASE_API_URL"
+UPDATE_RELEASES_URL_ENV = "WAVELINUX_UPDATE_RELEASES_URL"
 
 try:
     from cryptography.exceptions import InvalidSignature
@@ -64,13 +67,22 @@ class UpdateInstallResult:
     smoke_test_passed: bool
 
 
+@dataclass(frozen=True)
+class UpdateRollbackResult:
+    appimage_path: str
+    backup_path: str
+    desktop_path: str
+    wrapper_path: str
+    restored_version: str = ""
+
+
 class UpdateError(RuntimeError):
     """Structured updater failure with a stable machine-readable code."""
 
     def __init__(self, code: str, message: str, *, release_url: str = ""):
         super().__init__(message)
         self.code = str(code or "update.failed")
-        self.release_url = str(release_url or GITHUB_RELEASES_URL)
+        self.release_url = str(release_url or release_page_url())
 
     def as_payload(self) -> dict[str, str]:
         return {
@@ -88,6 +100,18 @@ def _request(url: str) -> urllib.request.Request:
             "Accept": "application/vnd.github+json",
         },
     )
+
+
+def release_page_url(*, environ=None) -> str:
+    env = os.environ if environ is None else environ
+    value = str(env.get(UPDATE_RELEASES_URL_ENV) or "").strip()
+    return value or GITHUB_RELEASES_URL
+
+
+def latest_release_api_url(*, environ=None) -> str:
+    env = os.environ if environ is None else environ
+    value = str(env.get(UPDATE_RELEASE_API_URL_ENV) or "").strip()
+    return value or GITHUB_LATEST_RELEASE_API_URL
 
 
 def _fetch_json(url: str) -> dict:
@@ -214,7 +238,7 @@ def select_appimage_asset(manifest: dict, *, arch: str = "x86_64") -> dict:
         raise UpdateError(
             "update.asset_missing",
             "The signed release manifest does not contain an x86_64 AppImage asset.",
-            release_url=str(manifest.get("release_url") or GITHUB_RELEASES_URL),
+            release_url=str(manifest.get("release_url") or release_page_url()),
         )
     return max(candidates, key=lambda item: item[0])[1]
 
@@ -228,11 +252,11 @@ def find_release_asset_download_url(release_data: dict, asset_name: str) -> str:
 
 
 def latest_release_data() -> dict:
-    return _fetch_json(GITHUB_LATEST_RELEASE_API_URL)
+    return _fetch_json(latest_release_api_url())
 
 
 def verified_release_info_from_release_data(release_data: dict) -> VerifiedReleaseInfo:
-    release_url = str(release_data.get("html_url") or GITHUB_RELEASES_URL).strip() or GITHUB_RELEASES_URL
+    release_url = str(release_data.get("html_url") or release_page_url()).strip() or release_page_url()
     manifest_url = find_release_asset_download_url(
         release_data,
         RELEASE_MANIFEST_FILENAME,
@@ -312,6 +336,22 @@ def smoke_test_appimage(path: str) -> None:
             )
 
 
+def _read_appimage_version(path: str) -> str:
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return str(result.stdout or "").strip().splitlines()[0] if str(result.stdout or "").strip() else ""
+
+
 def _copy_backup(source: str, backup_path: str):
     tmp_backup = backup_path + ".tmp"
     try:
@@ -367,7 +407,7 @@ def install_verified_release(
 ) -> UpdateInstallResult:
     temp_path = ""
     installed_path = installed_appimage_path(home=home)
-    backup_path = installed_path + ".bak"
+    backup_path = installed_appimage_backup_path(home=home)
     backup_created = False
     try:
         with tempfile.NamedTemporaryFile(
@@ -438,6 +478,36 @@ def install_verified_release(
                 os.remove(temp_path)
             except OSError:
                 pass
+
+
+def restore_previous_install(*, home=None) -> UpdateRollbackResult:
+    backup_path = installed_appimage_backup_path(home=home)
+    if not os.path.exists(backup_path):
+        raise UpdateError(
+            "update.rollback_failed",
+            f"No previous AppImage backup exists at {backup_path}.",
+        )
+    try:
+        smoke_test_appimage(backup_path)
+        result = install_appimage_file(backup_path, home=home)
+    except UpdateError as exc:
+        raise UpdateError(
+            "update.rollback_failed",
+            str(exc),
+            release_url=exc.release_url,
+        ) from exc
+    except Exception as exc:
+        raise UpdateError(
+            "update.rollback_failed",
+            f"Could not restore the previous AppImage backup: {exc}",
+        ) from exc
+    return UpdateRollbackResult(
+        appimage_path=result.appimage_path,
+        backup_path=backup_path,
+        desktop_path=result.desktop_path,
+        wrapper_path=result.wrapper_path,
+        restored_version=_read_appimage_version(backup_path),
+    )
 
 
 class UpdateChecker:

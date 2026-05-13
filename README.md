@@ -131,6 +131,39 @@ that matches the public key embedded in `updates.py`. Without it, release CI
 cannot produce `wavelinux-release-manifest.sig`, and the in-app updater will
 refuse the release.
 
+## Signed Release Checklist
+
+Before tagging a release:
+
+- Bump `APP_VERSION` in `main.py`.
+- Update `PKGBUILD` if the Arch package version should track the same tag.
+- Confirm the GitHub Actions secret `WAVELINUX_RELEASE_ED25519_PRIVATE_KEY_B64` is present and matches `updates.py`.
+- Run `python3 -m unittest discover -s tests`.
+- Build a fresh AppImage with `PYTHON_BIN=/path/to/venv/bin/python ./scripts/build_appimage.sh`.
+
+Expected release assets:
+
+- `WaveLinux-<version>-x86_64.AppImage`
+- `sha256sums.txt`
+- `wavelinux-release-manifest.json`
+- `wavelinux-release-manifest.sig`
+
+Recommended updater validation path:
+
+1. Start from an installed `2.0.4` AppImage.
+2. Publish signed `v2.0.5`.
+3. Open installed `2.0.4`, then use `Settings -> Updates -> Download && Install v2.0.5`.
+4. Confirm `~/.local/bin/WaveLinux.AppImage.bak` exists after install.
+5. Restart into `2.0.5`.
+6. Use `Restore Previous AppImage` if you need to roll back, then restart again.
+
+Testing-only updater source overrides:
+
+- `WAVELINUX_UPDATE_RELEASE_API_URL`
+- `WAVELINUX_UPDATE_RELEASES_URL`
+
+Those overrides let you point WaveLinux at staging release metadata and release pages without changing any UI settings. Signature, checksum, smoke-test, install, and rollback rules stay the same.
+
 ## Paths
 
 - Config: `~/.config/wavelinux/config.json`

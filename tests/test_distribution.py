@@ -56,6 +56,10 @@ class DistributionTests(unittest.TestCase):
             cmd = distribution.desktop_exec_command()
         self.assertEqual(cmd, 'python3 "/tmp/My App/main.py"')
 
+    def test_installed_appimage_backup_path_uses_canonical_suffix(self):
+        path = distribution.installed_appimage_backup_path(home="/home/tester")
+        self.assertEqual(path, "/home/tester/.local/bin/WaveLinux.AppImage.bak")
+
     def test_install_current_appimage_writes_launcher_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_appimage = os.path.join(tmpdir, "WaveLinux.AppImage")
@@ -139,6 +143,13 @@ class DistributionTests(unittest.TestCase):
             with open(result.wrapper_path, "r", encoding="utf-8") as handle:
                 wrapper = handle.read()
             self.assertIn(result.appimage_path, wrapper)
+
+            state = distribution.install_state(home=tmpdir)
+            self.assertEqual(
+                state.installed_appimage_backup_path,
+                distribution.installed_appimage_backup_path(home=tmpdir),
+            )
+            self.assertFalse(state.installed_appimage_backup_exists)
 
     def test_install_state_reports_stale_desktop_entries(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -39,6 +39,8 @@ class InstallState:
     running_appimage_path: str | None
     installed_appimage_path: str
     installed_appimage_exists: bool
+    installed_appimage_backup_path: str
+    installed_appimage_backup_exists: bool
     appimage_missing: bool
     wrapper_path: str
     wrapper_exists: bool
@@ -199,6 +201,10 @@ def runtime_mode(*, home=None, environ=None, argv=None, executable=None,
 def installed_appimage_path(*, home=None) -> str:
     home_dir = os.path.expanduser("~") if home is None else os.path.abspath(home)
     return os.path.join(home_dir, ".local", "bin", APPIMAGE_FILENAME)
+
+
+def installed_appimage_backup_path(*, home=None) -> str:
+    return installed_appimage_path(home=home) + ".bak"
 
 
 def installed_wrapper_path(*, home=None) -> str:
@@ -491,6 +497,7 @@ def install_state(*, home=None, environ=None, argv=None) -> InstallState:
     home_dir = os.path.expanduser("~") if home is None else os.path.abspath(home)
     running = current_appimage_path(environ=environ, argv=argv)
     installed_appimage = installed_appimage_path(home=home_dir)
+    installed_backup = installed_appimage_backup_path(home=home_dir)
     wrapper = installed_wrapper_path(home=home_dir)
     desktop = installed_desktop_path(home=home_dir)
 
@@ -556,6 +563,8 @@ def install_state(*, home=None, environ=None, argv=None) -> InstallState:
         running_appimage_path=running,
         installed_appimage_path=installed_appimage,
         installed_appimage_exists=appimage_exists,
+        installed_appimage_backup_path=installed_backup,
+        installed_appimage_backup_exists=os.path.exists(installed_backup),
         appimage_missing=appimage_missing,
         wrapper_path=wrapper,
         wrapper_exists=os.path.exists(wrapper),

@@ -29,6 +29,7 @@ from distribution import (
     DESKTOP_FILENAME,
     current_runtime_path,
     desktop_exec_command,
+    installed_appimage_backup_path,
     install_current_bundle,
     install_current_appimage,
     install_current_source_checkout,
@@ -46,15 +47,18 @@ from health import HealthIssue, RecoveryStatus
 from pipewire_engine import PipeWireEngine
 from updates import (
     AppImageUpdateInstaller,
-    GITHUB_RELEASES_URL,
+    UpdateError,
     UpdateChecker,
+    UpdateRollbackResult,
     VerifiedReleaseInfo,
+    release_page_url,
+    restore_previous_install,
 )
 from wavelinux_theme import STYLESHEET
 
 import struct
 
-APP_VERSION = "2.0.4"
+APP_VERSION = "2.0.5"
 _RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire", "pw-cli"]
 _RUNTIME_HEALTH_MESSAGES = {
     "submix_monitor_missing": "Monitor route is missing.",
@@ -1934,7 +1938,7 @@ class WaveLinuxWindow(QMainWindow):
         self._start_event_subscriber()
         self._pending_update_tag = None
         self._pending_verified_release = None
-        self._pending_update_url = GITHUB_RELEASES_URL
+        self._pending_update_url = release_page_url()
         self._pending_update_asset_url = ""
         self._pending_update_asset_name = ""
         self._last_update_check_at = None
@@ -3049,7 +3053,7 @@ class WaveLinuxWindow(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        ver_lbl = QLabel(f"Current version: <b>{APP_VERSION}</b>")
+        ver_lbl = QLabel(f"Current running version: <b>{APP_VERSION}</b>")
         ver_lbl.setStyleSheet("color: #e0e0ee; font-size: 13px;")
         layout.addWidget(ver_lbl)
 
@@ -3083,6 +3087,11 @@ class WaveLinuxWindow(QMainWindow):
         self._install_runtime_btn.setObjectName("showHiddenBtn")
         self._install_runtime_btn.clicked.connect(self._install_current_runtime_launcher)
         btn_row.addWidget(self._install_runtime_btn)
+
+        self._rollback_update_btn = QPushButton("Restore Previous AppImage")
+        self._rollback_update_btn.setObjectName("showHiddenBtn")
+        self._rollback_update_btn.clicked.connect(self._restore_previous_appimage)
+        btn_row.addWidget(self._rollback_update_btn)
 
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -3163,7 +3172,7 @@ class WaveLinuxWindow(QMainWindow):
             raise TypeError("Expected VerifiedReleaseInfo from update checker")
         latest_tag = str(release_info.version or "").strip()
         self._pending_verified_release = release_info
-        self._pending_update_url = release_info.release_url or GITHUB_RELEASES_URL
+        self._pending_update_url = release_info.release_url or release_page_url()
         self._pending_update_asset_url = release_info.asset_url or ""
         self._pending_update_asset_name = release_info.asset_name or ""
         self._last_update_check_at = time.time()
@@ -3211,7 +3220,7 @@ class WaveLinuxWindow(QMainWindow):
         self._check_update_btn.setEnabled(True)
         payload = dict(payload or {})
         self._last_update_issue = payload
-        self._pending_update_url = str(payload.get("release_url") or GITHUB_RELEASES_URL)
+        self._pending_update_url = str(payload.get("release_url") or release_page_url())
         self._last_update_attempt_result = f"Update check failed: {payload.get('message') or 'unknown error'}"
         message = str(payload.get("message") or "unknown error")
         code = str(payload.get("code") or "")
@@ -3226,7 +3235,7 @@ class WaveLinuxWindow(QMainWindow):
         self._refresh_system_tab()
 
     def _open_release_page(self):
-        url = getattr(self, "_pending_update_url", None) or GITHUB_RELEASES_URL
+        url = getattr(self, "_pending_update_url", None) or release_page_url()
         QDesktopServices.openUrl(QUrl(url))
 
     def _download_and_install_update(self):
@@ -3314,6 +3323,9 @@ class WaveLinuxWindow(QMainWindow):
     def _handle_update_install_success(self, result, release_info):
         self._download_update_btn.setEnabled(True)
         self._check_update_btn.setEnabled(True)
+        rollback_btn = getattr(self, "_rollback_update_btn", None)
+        if rollback_btn is not None:
+            rollback_btn.setEnabled(True)
         progress = getattr(self, "_update_progress", None)
         if progress is not None:
             progress.setVisible(False)
@@ -3324,13 +3336,16 @@ class WaveLinuxWindow(QMainWindow):
         tag = str(release_info.version or "").strip()
         self._pending_verified_release = release_info
         self._pending_update_tag = tag or None
-        self._pending_update_url = release_info.release_url or GITHUB_RELEASES_URL
+        self._pending_update_url = release_info.release_url or release_page_url()
         self._pending_update_asset_url = release_info.asset_url or ""
         self._pending_update_asset_name = release_info.asset_name or ""
         self._last_update_check_at = time.time()
         self._last_update_issue = None
         version_text = f"v{tag}" if tag else "the latest version"
-        self._last_update_attempt_result = f"Installed verified {version_text} to {result.appimage_path}"
+        self._last_update_attempt_result = (
+            f"Installed verified {version_text} to {result.appimage_path}"
+            + (f" with backup at {result.backup_path}" if result.backup_path else "")
+        )
         self._update_status_lbl.setText(
             f"Installed verified {version_text} to {result.appimage_path}. Restart WaveLinux to run it."
         )
@@ -3338,13 +3353,21 @@ class WaveLinuxWindow(QMainWindow):
         self._refresh_update_tab()
         self._refresh_system_tab()
 
+        install_message = (
+            "WaveLinux downloaded, verified, and installed the latest AppImage.\n\n"
+            f"Installed AppImage: {result.appimage_path}\n"
+            + (
+                f"Previous AppImage backup: {result.backup_path}\n"
+                if result.backup_path else ""
+            )
+            + f"Launcher: {result.wrapper_path}\n\n"
+            "Restart into the updated AppImage now?"
+        )
+
         yn = QMessageBox.question(
             self.settings_dialog,
             "Update installed",
-            "WaveLinux downloaded, verified, and installed the latest AppImage.\n\n"
-            f"Installed AppImage: {result.appimage_path}\n"
-            f"Launcher: {result.wrapper_path}\n\n"
-            "Restart into the updated AppImage now?",
+            install_message,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if yn == QMessageBox.StandardButton.Yes:
@@ -3353,6 +3376,9 @@ class WaveLinuxWindow(QMainWindow):
     def _handle_update_install_error(self, payload):
         self._download_update_btn.setEnabled(True)
         self._check_update_btn.setEnabled(True)
+        rollback_btn = getattr(self, "_rollback_update_btn", None)
+        if rollback_btn is not None:
+            rollback_btn.setEnabled(True)
         progress = getattr(self, "_update_progress", None)
         if progress is not None:
             progress.setVisible(False)
@@ -3360,7 +3386,7 @@ class WaveLinuxWindow(QMainWindow):
             progress.setValue(0)
         payload = dict(payload or {})
         self._last_update_issue = payload
-        self._pending_update_url = str(payload.get("release_url") or GITHUB_RELEASES_URL)
+        self._pending_update_url = str(payload.get("release_url") or release_page_url())
         self._last_update_attempt_result = f"Update install failed: {payload.get('message') or 'unknown error'}"
         code = str(payload.get("code") or "")
         self._update_status_lbl.setText(
@@ -3373,6 +3399,116 @@ class WaveLinuxWindow(QMainWindow):
         )
         self._refresh_update_tab()
         self._refresh_system_tab()
+
+    def _restore_previous_appimage(self):
+        mode, _description, guidance = self._runtime_mode_detail()
+        if mode.kind == "package":
+            QMessageBox.information(
+                self.settings_dialog,
+                "Package-managed install",
+                "WaveLinux detected a package-managed install for this runtime.\n\n"
+                f"{guidance}",
+            )
+            return
+        backup_path = installed_appimage_backup_path()
+        if not os.path.exists(backup_path):
+            QMessageBox.information(
+                self.settings_dialog,
+                "No backup AppImage",
+                f"No previous AppImage backup exists at:\n{backup_path}",
+            )
+            return
+
+        progress = getattr(self, "_update_progress", None)
+        if progress is not None:
+            progress.setVisible(True)
+            progress.setRange(0, 0)
+            progress.setFormat("Preparing rollback…")
+        self._download_update_btn.setEnabled(False)
+        self._check_update_btn.setEnabled(False)
+        rollback_btn = getattr(self, "_rollback_update_btn", None)
+        if rollback_btn is not None:
+            rollback_btn.setEnabled(False)
+        self._update_status_lbl.setText("Restoring previous AppImage backup…")
+        self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
+
+        try:
+            result = restore_previous_install()
+        except UpdateError as exc:
+            self._handle_update_restore_error(exc.as_payload())
+            return
+        except Exception as exc:
+            self._handle_update_restore_error(
+                UpdateError("update.rollback_failed", str(exc)).as_payload()
+            )
+            return
+
+        self._handle_update_restore_success(result)
+
+    def _handle_update_restore_success(self, result):
+        self._download_update_btn.setEnabled(True)
+        self._check_update_btn.setEnabled(True)
+        rollback_btn = getattr(self, "_rollback_update_btn", None)
+        if rollback_btn is not None:
+            rollback_btn.setEnabled(True)
+        progress = getattr(self, "_update_progress", None)
+        if progress is not None:
+            progress.setVisible(False)
+            progress.setRange(0, 100)
+            progress.setValue(0)
+        if not isinstance(result, UpdateRollbackResult):
+            raise TypeError("Expected UpdateRollbackResult from rollback")
+        version_text = f"v{result.restored_version}" if result.restored_version else "the previous version"
+        self._last_update_issue = None
+        self._last_update_attempt_result = (
+            f"Restored previous AppImage {version_text} from {result.backup_path}"
+        )
+        self._update_status_lbl.setText(
+            f"Restored previous AppImage {version_text} to {result.appimage_path}. Restart WaveLinux to run it."
+        )
+        self._update_status_lbl.setStyleSheet("color: #00d4aa; font-size: 12px; font-weight: bold;")
+        self._refresh_update_tab()
+        self._refresh_system_tab()
+
+        yn = QMessageBox.question(
+            self.settings_dialog,
+            "Previous AppImage restored",
+            "WaveLinux restored the previous AppImage backup.\n\n"
+            f"Backup: {result.backup_path}\n"
+            f"Installed AppImage: {result.appimage_path}\n"
+            f"Launcher: {result.wrapper_path}\n\n"
+            "Restart into the restored AppImage now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if yn == QMessageBox.StandardButton.Yes:
+            self._restart_with_command([result.appimage_path])
+
+    def _handle_update_restore_error(self, payload):
+        self._download_update_btn.setEnabled(True)
+        self._check_update_btn.setEnabled(True)
+        rollback_btn = getattr(self, "_rollback_update_btn", None)
+        if rollback_btn is not None:
+            rollback_btn.setEnabled(True)
+        progress = getattr(self, "_update_progress", None)
+        if progress is not None:
+            progress.setVisible(False)
+            progress.setRange(0, 100)
+            progress.setValue(0)
+        payload = dict(payload or {})
+        self._last_update_issue = payload
+        self._pending_update_url = str(payload.get("release_url") or release_page_url())
+        self._last_update_attempt_result = f"Rollback failed: {payload.get('message') or 'unknown error'}"
+        self._update_status_lbl.setText(
+            f"Rollback failed: {payload.get('message') or 'unknown error'}"
+        )
+        self._update_status_lbl.setStyleSheet("color: #e05050; font-size: 12px;")
+        self._refresh_update_tab()
+        self._refresh_system_tab()
+        QMessageBox.warning(
+            self.settings_dialog,
+            "Rollback failed",
+            str(payload.get("message") or "WaveLinux could not restore the previous AppImage."),
+        )
 
     def _install_current_runtime_launcher(self):
         mode = self._current_runtime_mode()
@@ -3561,7 +3697,7 @@ class WaveLinuxWindow(QMainWindow):
             tag = str(info.version or "").strip()
             mode, _description, guidance = self._runtime_mode_detail()
             self._pending_verified_release = info
-            self._pending_update_url = info.release_url or GITHUB_RELEASES_URL
+            self._pending_update_url = info.release_url or release_page_url()
             self._pending_update_asset_url = info.asset_url or ""
             self._pending_update_asset_name = info.asset_name or ""
             self._last_update_check_at = time.time()
@@ -3582,13 +3718,16 @@ class WaveLinuxWindow(QMainWindow):
                 )
         elif item[0] == 'error':
             self._last_update_issue = dict(item[1] or {})
-            self._pending_update_url = str(self._last_update_issue.get("release_url") or GITHUB_RELEASES_URL)
+            self._pending_update_url = str(self._last_update_issue.get("release_url") or release_page_url())
             self._last_update_attempt_result = f"Background update check failed: {self._last_update_issue.get('message') or 'unknown error'}"
 
     def _refresh_update_tab(self):
         btn = getattr(self, "_install_runtime_btn", None)
         state = install_state()
         mode, description, guidance = self._runtime_mode_detail()
+        backup_path = getattr(state, "installed_appimage_backup_path", installed_appimage_backup_path())
+        backup_exists = bool(getattr(state, "installed_appimage_backup_exists", os.path.exists(backup_path)))
+        launcher_targets_active = self._launcher_targets_active_runtime(state=state, mode=mode)
         if btn is not None:
             if mode.kind == "appimage":
                 btn.setVisible(True)
@@ -3610,6 +3749,17 @@ class WaveLinuxWindow(QMainWindow):
                 btn.setToolTip("Install or refresh the desktop launcher for the current source checkout.")
             else:
                 btn.setVisible(False)
+        rollback_btn = getattr(self, "_rollback_update_btn", None)
+        if rollback_btn is not None:
+            rollback_btn.setVisible(mode.kind in {"appimage", "source", "bundle"})
+            rollback_btn.setEnabled(mode.kind in {"appimage", "source", "bundle"} and backup_exists)
+            rollback_btn.setToolTip(
+                (
+                    f"Restore the previous installed AppImage backup from {backup_path}."
+                    if backup_exists else
+                    "No previous AppImage backup is available to restore."
+                )
+            )
         download_btn = getattr(self, "_download_update_btn", None)
         if download_btn is not None:
             pending_tag = getattr(self, "_pending_update_tag", None)
@@ -3641,6 +3791,7 @@ class WaveLinuxWindow(QMainWindow):
         info_lbl = getattr(self, "_install_state_lbl", None)
         if info_lbl is not None:
             lines = []
+            lines.append(f"Current running version: v{APP_VERSION}")
             lines.append(f"Runtime mode: {mode.kind}")
             if state.wrapper_mode == "source":
                 lines.append(
@@ -3671,6 +3822,10 @@ class WaveLinuxWindow(QMainWindow):
                 + (state.installed_appimage_path if state.installed_appimage_exists else "not installed")
             )
             lines.append(
+                "Backup AppImage: "
+                + (backup_path if backup_exists else "not available")
+            )
+            lines.append(
                 "Desktop launcher: "
                 + (
                     (state.desktop_exec_target or state.desktop_path)
@@ -3678,6 +3833,13 @@ class WaveLinuxWindow(QMainWindow):
                     else "not installed"
                 )
             )
+            if launcher_targets_active is None:
+                lines.append("Launcher targets active runtime: n/a")
+            else:
+                lines.append(
+                    "Launcher targets active runtime: "
+                    + ("yes" if launcher_targets_active else "no")
+                )
             if state.stale_launcher_entries:
                 stale_names = ", ".join(
                     os.path.basename(entry.path)
@@ -3737,6 +3899,43 @@ class WaveLinuxWindow(QMainWindow):
     def _current_runtime_mode(self):
         return runtime_mode()
 
+    def _launcher_targets_active_runtime(self, *, state=None, mode=None):
+        state = state or install_state()
+        mode = mode or self._current_runtime_mode()
+        wrapper_path = getattr(state, "wrapper_path", "")
+        desktop_target = getattr(state, "desktop_exec_target", None)
+        if not getattr(state, "desktop_exists", False) or not getattr(state, "wrapper_exists", False):
+            return False if mode.kind in {"appimage", "source", "bundle"} else None
+        if desktop_target not in {
+            os.path.abspath(wrapper_path),
+            wrapper_path,
+            os.path.basename(wrapper_path),
+        }:
+            return False
+        if mode.kind == "appimage":
+            running_appimage = getattr(state, "running_appimage_path", None)
+            return bool(
+                getattr(state, "wrapper_mode", "") == "appimage"
+                and running_appimage
+                and getattr(state, "installed_appimage_exists", False)
+                and os.path.abspath(running_appimage) == os.path.abspath(state.installed_appimage_path)
+            )
+        if mode.kind == "source":
+            source_dir = getattr(state, "wrapper_source_dir", None)
+            return bool(
+                getattr(state, "wrapper_mode", "") == "source"
+                and source_dir
+                and os.path.abspath(source_dir) == os.path.abspath(os.path.dirname(mode.running_path))
+            )
+        if mode.kind == "bundle":
+            bundle_exec = getattr(state, "wrapper_bundle_exec", None)
+            return bool(
+                getattr(state, "wrapper_mode", "") == "bundle"
+                and bundle_exec
+                and os.path.abspath(bundle_exec) == os.path.abspath(mode.running_path)
+            )
+        return None
+
     def _runtime_mode_detail(self):
         mode = self._current_runtime_mode()
         details = {
@@ -3775,6 +3974,7 @@ class WaveLinuxWindow(QMainWindow):
             "update.asset_missing": "Verified AppImage asset unavailable",
             "update.checksum_mismatch": "Downloaded AppImage checksum mismatch",
             "update.smoke_test_failed": "Downloaded AppImage failed validation",
+            "update.rollback_failed": "Previous AppImage restore failed",
         }
         return titles.get(code, "Update verification issue")
 
@@ -3975,7 +4175,7 @@ class WaveLinuxWindow(QMainWindow):
             and os.path.abspath(wrapper_source_dir) != os.path.abspath(os.path.dirname(mode.running_path))
         ):
             issues.append(HealthIssue(
-                code="install.wrapper_mismatch",
+                code="install.runtime_target_mismatch",
                 severity="info",
                 title="Installed source launcher targets a different checkout",
                 detail=(
@@ -3998,7 +4198,7 @@ class WaveLinuxWindow(QMainWindow):
             and os.path.abspath(wrapper_bundle_exec) != os.path.abspath(mode.running_path)
         ):
             issues.append(HealthIssue(
-                code="install.wrapper_mismatch",
+                code="install.runtime_target_mismatch",
                 severity="info",
                 title="Installed local build launcher targets a different binary",
                 detail=(
@@ -4022,7 +4222,7 @@ class WaveLinuxWindow(QMainWindow):
             and os.path.abspath(state.running_appimage_path) != os.path.abspath(state.installed_appimage_path)
         ):
             issues.append(HealthIssue(
-                code="install.wrapper_mismatch",
+                code="install.runtime_target_mismatch",
                 severity="info",
                 title="Installed AppImage launcher targets a different file",
                 detail=(
@@ -4037,6 +4237,25 @@ class WaveLinuxWindow(QMainWindow):
                     "installed_appimage_path": state.installed_appimage_path,
                     "running_appimage_path": state.running_appimage_path,
                 },
+            ))
+        backup_path = getattr(state, "installed_appimage_backup_path", installed_appimage_backup_path())
+        backup_exists = bool(getattr(state, "installed_appimage_backup_exists", os.path.exists(backup_path)))
+        if backup_exists:
+            issues.append(HealthIssue(
+                code="update.backup_available",
+                severity="info",
+                title="Previous AppImage backup is available",
+                detail=(
+                    f"WaveLinux has a restorable backup AppImage at {backup_path}."
+                    + (
+                        "\nThis runtime can restore that backup directly from Settings -> Updates."
+                        if mode.kind in {"appimage", "source", "bundle"}
+                        else "\nThis runtime is package-managed, so rollback stays informational only."
+                    )
+                ),
+                primary_action="Restore Previous AppImage" if mode.kind in {"appimage", "source", "bundle"} else "",
+                secondary_action="Re-run check" if mode.kind in {"appimage", "source", "bundle"} else "",
+                context={"backup_path": backup_path},
             ))
         if getattr(state, "desktop_mismatch", False) or getattr(state, "stale_launcher_entries", ()):
             stale_paths = "\n".join(entry.path for entry in getattr(state, "stale_launcher_entries", ()))
@@ -4103,6 +4322,9 @@ class WaveLinuxWindow(QMainWindow):
         if action == "Retry update check":
             self._check_for_updates()
             return
+        if action == "Restore Previous AppImage":
+            self._restore_previous_appimage()
+            return
         if action == "Recover channel":
             self.recover_channel(str(issue.context.get("node_name") or ""))
             return
@@ -4151,6 +4373,9 @@ class WaveLinuxWindow(QMainWindow):
         preflight = preflight or startup_preflight_report()
         self._startup_preflight = preflight
         state = state or install_state()
+        backup_path = getattr(state, "installed_appimage_backup_path", installed_appimage_backup_path())
+        backup_exists = bool(getattr(state, "installed_appimage_backup_exists", os.path.exists(backup_path)))
+        launcher_targets_active = self._launcher_targets_active_runtime(state=state)
 
         summary_lbl = getattr(self, "_system_summary_lbl", None)
         runtime_lbl = getattr(self, "_system_runtime_lbl", None)
@@ -4172,12 +4397,19 @@ class WaveLinuxWindow(QMainWindow):
             summary_lbl.setStyleSheet("color: #00d4aa; font-size: 13px; font-weight: bold;")
 
         runtime_lines = [
-            f"Installed version: v{APP_VERSION}",
+            f"Current running version: v{APP_VERSION}",
             f"Running binary: {self._running_binary_path(state)}",
             "Installed AppImage: "
             + (state.installed_appimage_path if state.installed_appimage_exists else "not installed"),
+            "Backup AppImage: "
+            + (backup_path if backup_exists else "not available"),
             "Desktop launcher target: " + (state.desktop_exec_target or "not installed"),
             "Wrapper target: " + (state.wrapper_target or "not installed"),
+            "Launcher targets active runtime: "
+            + (
+                "n/a" if launcher_targets_active is None
+                else ("yes" if launcher_targets_active else "no")
+            ),
             "Host tools present: " + ", ".join(sorted(cmd for cmd, present in preflight["deps"].items() if present)),
             f"LADSPA plugins detected: {len(getattr(self.engine, 'ladspa_plugins', set()) or set())}",
             f"Last successful update check: {self._format_timestamp(self._last_update_check_at)}",

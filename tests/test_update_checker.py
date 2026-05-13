@@ -140,6 +140,24 @@ class UpdatesTests(unittest.TestCase):
         self.assertTrue(info.signature_verified)
         self.assertEqual(info.asset_name, "WaveLinux-2.0.5-x86_64.AppImage")
 
+    def test_latest_release_api_url_uses_env_override(self):
+        with mock.patch.dict(os.environ, {
+            updates.UPDATE_RELEASE_API_URL_ENV: "https://updates.example.test/latest",
+        }, clear=False):
+            self.assertEqual(
+                updates.latest_release_api_url(),
+                "https://updates.example.test/latest",
+            )
+
+    def test_release_page_url_uses_env_override(self):
+        with mock.patch.dict(os.environ, {
+            updates.UPDATE_RELEASES_URL_ENV: "https://updates.example.test/releases",
+        }, clear=False):
+            self.assertEqual(
+                updates.release_page_url(),
+                "https://updates.example.test/releases",
+            )
+
     def test_install_verified_release_rolls_back_on_install_failure(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             installed = updates.installed_appimage_path(home=tmpdir)
@@ -225,6 +243,46 @@ class UpdatesTests(unittest.TestCase):
                 self.assertEqual(handle.read(), b"new-build")
             with open(result.backup_path, "rb") as handle:
                 self.assertEqual(handle.read(), b"old-build")
+
+    def test_restore_previous_install_requires_backup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(updates.UpdateError) as ctx:
+                updates.restore_previous_install(home=tmpdir)
+
+            self.assertEqual(ctx.exception.code, "update.rollback_failed")
+
+    def test_restore_previous_install_reinstalls_backup_and_refreshes_launchers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            installed = updates.installed_appimage_path(home=tmpdir)
+            backup = updates.installed_appimage_backup_path(home=tmpdir)
+            os.makedirs(os.path.dirname(installed), exist_ok=True)
+            with open(installed, "wb") as handle:
+                handle.write(b"current-build")
+            with open(backup, "wb") as handle:
+                handle.write(b"previous-build")
+            os.chmod(installed, 0o755)
+            os.chmod(backup, 0o755)
+
+            def fake_version(path):
+                if os.path.abspath(path) == os.path.abspath(backup):
+                    return "2.0.4"
+                return ""
+
+            with mock.patch.object(updates, "smoke_test_appimage", return_value=None):
+                with mock.patch.object(updates, "_read_appimage_version", side_effect=fake_version):
+                    result = updates.restore_previous_install(home=tmpdir)
+
+            self.assertEqual(result.appimage_path, installed)
+            self.assertEqual(result.backup_path, backup)
+            self.assertEqual(result.restored_version, "2.0.4")
+            with open(installed, "rb") as handle:
+                self.assertEqual(handle.read(), b"previous-build")
+            with open(result.wrapper_path, "r", encoding="utf-8") as handle:
+                wrapper = handle.read()
+            self.assertIn(installed, wrapper)
+            with open(result.desktop_path, "r", encoding="utf-8") as handle:
+                desktop = handle.read()
+            self.assertIn(f"Exec={result.wrapper_path}", desktop)
 
 
 if __name__ == "__main__":

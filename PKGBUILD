@@ -1,6 +1,6 @@
 # Maintainer: WaveLinux contributors <https://github.com/DuskyProjects/WaveLinux>
 pkgname=wavelinux
-pkgver=2.0.4
+pkgver=2.0.5
 pkgrel=1
 pkgdesc="Elgato Wave Link–style PipeWire mixer for Linux (virtual channels, Monitor/Stream buses, per-channel FX)"
 arch=('any')
