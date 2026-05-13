@@ -136,9 +136,13 @@ QLabel#mixLabel {
 }
 
 /* ── Sliders ── */
+QSlider:horizontal {
+    min-height: 18px;
+}
 QSlider::groove:horizontal {
     background: #1a1a28;
     height: 6px;
+    margin: 0 8px;
     border-radius: 3px;
 }
 QSlider::handle:horizontal {
@@ -162,17 +166,21 @@ QSlider::add-page:horizontal {
     border-radius: 3px;
 }
 
+QSlider:vertical {
+    min-width: 16px;
+}
 QSlider::groove:vertical {
     background: #1a1a28;
-    width: 6px;
-    border-radius: 3px;
+    width: 4px;
+    margin: 0 6px;
+    border-radius: 2px;
 }
 QSlider::handle:vertical {
     background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
         stop:0 #00e5ff, stop:1 #7000ff);
     height: 16px;
     width: 16px;
-    margin: 0 -5px;
+    margin: 0 -6px;
     border-radius: 8px;
 }
 QSlider::handle:vertical:hover {
@@ -180,12 +188,16 @@ QSlider::handle:vertical:hover {
 }
 QSlider::sub-page:vertical {
     background: #1a1a28;
-    border-radius: 3px;
+    width: 4px;
+    margin: 0 6px;
+    border-radius: 2px;
 }
 QSlider::add-page:vertical {
     background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
         stop:0 #00e5ff, stop:0.7 #7000ff, stop:1 #7000ff);
-    border-radius: 3px;
+    width: 4px;
+    margin: 0 6px;
+    border-radius: 2px;
 }
 
 /* ── Buttons ── */

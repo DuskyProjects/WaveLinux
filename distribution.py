@@ -350,10 +350,8 @@ def repair_installed_appimage_launchers(*, home=None) -> LauncherRepairResult:
     )
 
 
-def install_current_appimage(*, home=None) -> AppImageInstallResult:
-    source = current_appimage_path()
-    if not source:
-        raise RuntimeError("WaveLinux is not running from an AppImage.")
+def install_appimage_file(source: str, *, home=None) -> AppImageInstallResult:
+    source = os.path.abspath(str(source or ""))
     if not os.path.isfile(source):
         raise RuntimeError(f"AppImage not found at {source}.")
 
@@ -365,7 +363,22 @@ def install_current_appimage(*, home=None) -> AppImageInstallResult:
     os.makedirs(os.path.dirname(target_icon), exist_ok=True)
 
     if os.path.abspath(source) != os.path.abspath(target_appimage):
-        shutil.copy2(source, target_appimage)
+        tmp_target = target_appimage + ".tmp"
+        try:
+            shutil.copy2(source, tmp_target)
+            os.chmod(
+                tmp_target,
+                stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+                | stat.S_IRGRP | stat.S_IXGRP
+                | stat.S_IROTH | stat.S_IXOTH,
+            )
+            os.replace(tmp_target, target_appimage)
+        finally:
+            if os.path.exists(tmp_target):
+                try:
+                    os.remove(tmp_target)
+                except OSError:
+                    pass
     os.chmod(
         target_appimage,
         stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
@@ -388,3 +401,10 @@ def install_current_appimage(*, home=None) -> AppImageInstallResult:
         icon_path=target_icon,
         wrapper_path=target_wrapper,
     )
+
+
+def install_current_appimage(*, home=None) -> AppImageInstallResult:
+    source = current_appimage_path()
+    if not source:
+        raise RuntimeError("WaveLinux is not running from an AppImage.")
+    return install_appimage_file(source, home=home)

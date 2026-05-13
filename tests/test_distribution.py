@@ -47,6 +47,23 @@ class DistributionTests(unittest.TestCase):
                 desktop = handle.read()
             self.assertIn(f"Exec={result.wrapper_path}", desktop)
 
+    def test_install_appimage_file_writes_launcher_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            download_dir = os.path.join(tmpdir, "downloads")
+            os.makedirs(download_dir, exist_ok=True)
+            fake_appimage = os.path.join(download_dir, "WaveLinux-2.0.4-x86_64.AppImage")
+            with open(fake_appimage, "wb") as handle:
+                handle.write(b"downloaded-appimage")
+            os.chmod(fake_appimage, 0o755)
+
+            result = distribution.install_appimage_file(fake_appimage, home=tmpdir)
+
+            self.assertTrue(os.path.exists(result.appimage_path))
+            self.assertNotEqual(os.path.abspath(result.appimage_path), os.path.abspath(fake_appimage))
+            with open(result.wrapper_path, "r", encoding="utf-8") as handle:
+                wrapper = handle.read()
+            self.assertIn(result.appimage_path, wrapper)
+
     def test_install_state_reports_stale_desktop_entries(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = tmpdir

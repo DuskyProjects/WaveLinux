@@ -2811,6 +2811,91 @@ class PipeWireEngine:
                     ))
         return [candidate for candidate in candidates if candidate]
 
+    def _cmdline_identity_candidates(self, pid):
+        candidates = []
+        if not pid:
+            return candidates
+        index = self._desktop_app_index() or {}
+        wrapper_set = self._EXEC_WRAPPERS | {
+            "bwrap", "python", "python3", "flatpak", "snap", "snap-confine",
+        }
+        for depth, cur in enumerate(self._pid_lineage(pid)):
+            cmdline = self._read_proc_cmdline(cur)
+            if not cmdline:
+                continue
+            seen = set()
+            score_penalty = depth * 2
+            for token in cmdline:
+                if not token:
+                    continue
+                if token.startswith("--") and "=" in token:
+                    flag, raw_value = token.split("=", 1)
+                    value = raw_value.strip()
+                    if not value:
+                        continue
+                    low_flag = flag.lower()
+                    if low_flag in {"--class", "--name"} and not self._is_generic_name(value):
+                        candidates.append(self._candidate_from_raw(
+                            "wmclass" if low_flag == "--class" else "name",
+                            value,
+                            self._sanitize_app_label(value),
+                            106 - score_penalty,
+                            f"cmdline:{low_flag}",
+                        ))
+                        continue
+                    if low_flag in {"--app", "--app-id"} and (
+                        "." in value or value.lower() in self._KNOWN_APP_IDS
+                    ):
+                        candidates.append(self._candidate_from_raw(
+                            "app",
+                            value,
+                            self._canonicalize_app_id(value),
+                            112 - score_penalty,
+                            f"cmdline:{low_flag}",
+                        ))
+                        continue
+                if token.startswith("-"):
+                    continue
+                if "." in token and token.lower() in self._KNOWN_APP_IDS:
+                    candidates.append(self._candidate_from_raw(
+                        "app",
+                        token,
+                        self._canonicalize_app_id(token),
+                        112 - score_penalty,
+                        "cmdline-app-id",
+                    ))
+                base = os.path.basename(token).strip().lower()
+                if not base or base in seen or base in wrapper_set:
+                    continue
+                seen.add(base)
+                if base in index:
+                    candidates.append(self._candidate_from_raw(
+                        "binary",
+                        base,
+                        index[base],
+                        108 - score_penalty,
+                        f"cmdline-index:{depth}",
+                    ))
+                mapped = self._BINARY_DISPLAY_NAMES.get(base)
+                if mapped:
+                    child_penalty = 18 if base in self._MULTIPROCESS_CHILD_BINARIES else 0
+                    candidates.append(self._candidate_from_raw(
+                        "binary",
+                        base,
+                        mapped,
+                        106 - score_penalty - child_penalty,
+                        f"cmdline-binary:{depth}",
+                    ))
+                elif not self._is_generic_name(base):
+                    candidates.append(self._candidate_from_raw(
+                        "binary",
+                        base,
+                        base,
+                        78 - score_penalty,
+                        f"cmdline:{depth}",
+                    ))
+        return [candidate for candidate in candidates if candidate]
+
     def _path_identity_candidate(self, pid):
         for depth, cur in enumerate(self._pid_lineage(pid)):
             current_name = self._proc_exe_basename(cur) or self._proc_comm(cur)
@@ -2894,6 +2979,22 @@ class PipeWireEngine:
             "source": "fallback",
         }
 
+    def _prefer_specific_identity_candidate(self, candidates, best):
+        if not best or not self._is_generic_name(best.get("app_name")):
+            return best
+        alternatives = [
+            candidate for candidate in candidates
+            if candidate
+            and not self._is_generic_name(candidate.get("app_name"))
+            and not self.name_matches_host(candidate.get("app_name"))
+        ]
+        if not alternatives:
+            return best
+        alternative = max(alternatives, key=lambda item: (item["score"], len(item["app_name"])))
+        if alternative["score"] >= best["score"] - 14:
+            return alternative
+        return best
+
     def _resolve_app_identity(self, current):
         if self._is_system_sound_stream(current):
             return {
@@ -2911,6 +3012,7 @@ class PipeWireEngine:
         ):
             if candidate:
                 candidates.append(candidate)
+        candidates.extend(self._cmdline_identity_candidates(pid))
         candidates.extend(self._window_identity_candidates(current))
         candidates.extend(self._binary_identity_candidates(pid, current))
         candidates.extend(self._text_identity_candidates(current))
@@ -2929,6 +3031,7 @@ class PipeWireEngine:
             return self._stream_fallback_identity(current)
 
         best = max(best_by_id.values(), key=lambda item: (item["score"], len(item["app_name"])))
+        best = self._prefer_specific_identity_candidate(candidates, best)
         return {
             "app_id": best["app_id"],
             "app_name": best["app_name"],

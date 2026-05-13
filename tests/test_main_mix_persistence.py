@@ -33,6 +33,7 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
         win.active_effects = {}
         win.effect_params = {}
         win.app_routing = {}
+        win.app_volumes = {}
         win.virtual_channels = []
         win.hidden_nodes = set()
         win.channel_order = []
@@ -58,6 +59,7 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
         call = win.runtime.calls[0]
         self.assertEqual(call["monitor_hw"], "bluez_output.AA_BB_CC_DD_EE_FF.1")
         self.assertEqual(call["stream_hw"], "alsa_output.speakers")
+        self.assertEqual(call["app_volumes"], {})
 
     def test_save_config_persists_desired_mix_routes_when_combo_empty(self):
         win = self._window()

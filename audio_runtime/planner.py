@@ -32,6 +32,7 @@ class RuntimePlanner:
         r'^(bluez_output\.[0-9A-Fa-f]{2}(?:[_:-][0-9A-Fa-f]{2}){5})(?:\..+)?$',
         re.IGNORECASE,
     )
+    _APP_VOLUME_EPSILON = 0.01
 
     @classmethod
     def _canonical_sink_name(cls, sink_name):
@@ -107,9 +108,11 @@ class RuntimePlanner:
             mix.master_volume = float(intent.volume)
             return
         if isinstance(intent, SetAppRoute):
+            existing = desired_state.app_routes.get(intent.app_id)
             desired_state.app_routes[intent.app_id] = AppRouteSpec(
                 app_id=intent.app_id,
                 sink_name=intent.sink_name,
+                volume=existing.volume if existing is not None else None,
             )
             return
         if isinstance(intent, SetCardProfile):
@@ -347,6 +350,25 @@ class RuntimePlanner:
                 actions.append(Action("set_app_route", {
                     "app_id": app_id,
                     "sink_name": route_spec.sink_name,
+                }))
+            if route_spec.volume is None:
+                continue
+            app_view = next(
+                (view for view in observed_state.app_views if view.app_id == app_id),
+                None,
+            )
+            if app_view is None:
+                continue
+            live_volume = app_view.current_volume
+            if (
+                live_volume is not None
+                and abs(float(live_volume) - float(route_spec.volume)) <= self._APP_VOLUME_EPSILON
+            ):
+                continue
+            for sink_input_index in app_view.active_indices:
+                actions.append(Action("set_app_volume", {
+                    "sink_input_index": str(sink_input_index),
+                    "volume": float(route_spec.volume),
                 }))
         return actions
 

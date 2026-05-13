@@ -84,6 +84,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         win.active_effects = {}
         win.effect_params = {}
         win.app_routing = {}
+        win.app_volumes = {}
         win.virtual_channels = []
         win.scenes = {}
         win.hidden_nodes = set()
@@ -114,6 +115,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
             "wavelinux_music_linked": True,
         }
         win.app_routing = {"com.test.player": "wavelinux_music"}
+        win.app_volumes = {"com.test.player": 0.35}
         win.active_effects = {"mic": ["rnnoise", "limiter"]}
         win.effect_params = {"mic": {"rnnoise": {"wet": 0.8}}}
         win._desired_mix_hw["Monitor"] = "alsa_output.headphones"
@@ -127,6 +129,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         self.assertEqual(snapshot["submixes"]["wavelinux_music_Monitor"]["vol"], 0.4)
         self.assertTrue(snapshot["submixes"]["wavelinux_music_linked"])
         self.assertEqual(snapshot["app_routing"], {"com.test.player": "wavelinux_music"})
+        self.assertEqual(snapshot["app_volumes"], {"com.test.player": 0.35})
         self.assertEqual(snapshot["active_effects"]["mic"], ["rnnoise", "limiter"])
         self.assertEqual(snapshot["effect_params"]["mic"]["rnnoise"]["wet"], 0.8)
 
@@ -148,6 +151,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
                 "wavelinux_voice_chat_Stream": {"vol": 0.5, "mute": False},
             },
             "app_routing": {"com.test.player": "wavelinux_music"},
+            "app_volumes": {"com.test.player": 0.25},
             "active_effects": {"usb_mic": ["rnnoise"]},
             "effect_params": {"usb_mic": {"rnnoise": {"wet": 0.9}}},
         }
@@ -166,6 +170,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         self.assertEqual(win.active_effects["usb_mic"], ["rnnoise"])
         self.assertEqual(win.effect_params["usb_mic"]["rnnoise"]["wet"], 0.9)
         self.assertEqual(win.app_routing, {"com.test.player": "wavelinux_music"})
+        self.assertEqual(win.app_volumes, {"com.test.player": 0.25})
         self.assertEqual(
             win.runtime.ensure_virtual_channel_calls,
             ["Music", "Voice Chat"],
@@ -180,6 +185,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         )
         self.assertEqual(len(win.runtime.sync_calls), 1)
         self.assertEqual(win.runtime.sync_calls[0]["app_routing"], {"com.test.player": "wavelinux_music"})
+        self.assertEqual(win.runtime.sync_calls[0]["app_volumes"], {"com.test.player": 0.25})
         self.assertTrue(getattr(win, "_scheduled_save", False))
         self.assertEqual(win.status_lbl.text(), "Applied Streaming")
 
@@ -195,6 +201,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
                 "channel_order": ["wavelinux_music"],
                 "submixes": {"wavelinux_music_Monitor": {"vol": 0.6, "mute": False}},
                 "app_routing": {"com.test.player": "wavelinux_music"},
+                "app_volumes": {"com.test.player": 0.4},
                 "active_effects": {"usb_mic": ["rnnoise"]},
                 "effect_params": {"usb_mic": {"rnnoise": {"wet": 0.9}}},
             }
@@ -209,6 +216,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         self.assertIn("scenes", conf)
         self.assertIn("Streaming", conf["scenes"])
         self.assertEqual(conf["scenes"]["Streaming"]["selected_mic"], "usb_mic")
+        self.assertEqual(conf["scenes"]["Streaming"]["app_volumes"]["com.test.player"], 0.4)
 
     def test_apply_config_dict_replaces_virtual_channels_and_restores_scene_library(self):
         win = self._window()
@@ -224,6 +232,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
                     "channel_order": ["wavelinux_music"],
                     "submixes": {"wavelinux_music_Monitor": {"vol": 0.8, "mute": False}},
                     "app_routing": {"com.test.player": "wavelinux_music"},
+                    "app_volumes": {"com.test.player": 0.45},
                     "active_effects": {"usb_mic": ["rnnoise"]},
                     "effect_params": {"usb_mic": {"rnnoise": {"wet": 0.6}}},
                 }
@@ -231,6 +240,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
             "selected_mic": "usb_mic",
             "submixes": {"wavelinux_music_Monitor": {"vol": 0.8, "mute": False}},
             "app_routing": {"com.test.player": "wavelinux_music"},
+            "app_volumes": {"com.test.player": 0.45},
             "channel_order": ["wavelinux_music"],
             "active_effects": {"usb_mic": ["rnnoise"]},
             "effect_params": {"usb_mic": {"rnnoise": {"wet": 0.6}}},
@@ -241,6 +251,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         self.assertEqual(win.virtual_channels, ["Music"])
         self.assertIn("Desk", win.scenes)
         self.assertEqual(win.selected_mic, "usb_mic")
+        self.assertEqual(win.app_volumes, {"com.test.player": 0.45})
         self.assertEqual(win._desired_mix_hw["Monitor"], "alsa_output.headphones")
         self.assertEqual(win._desired_mix_hw["Stream"], "alsa_output.stream")
         self.assertEqual(win.runtime.ensure_output_mix_calls, ["Monitor", "Stream"])
@@ -258,6 +269,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(win.runtime.sync_calls), 1)
+        self.assertEqual(win.runtime.sync_calls[0]["app_volumes"], {"com.test.player": 0.45})
 
     def test_apply_quick_start_template_sets_channels_mic_and_default_fx(self):
         win = self._window()

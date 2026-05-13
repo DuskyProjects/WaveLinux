@@ -405,14 +405,19 @@ class AudioRuntimeController(QObject):
         self.enqueue_intent(SetSelectedMic(node_name=node_name))
 
     def sync_persistent_state(self, *, selected_mic, submix_state, active_effects,
-                              effect_params, app_routing, virtual_channels,
+                              effect_params, app_routing, app_volumes, virtual_channels,
                               monitor_hw, stream_hw):
         with self._worker.state_lock:
             desired = self._worker.desired_state
             desired.selected_mic = selected_mic
+            remembered_app_ids = set((app_routing or {}).keys()) | set((app_volumes or {}).keys())
             desired.app_routes = {
-                str(app_id): AppRouteSpec(app_id=str(app_id), sink_name=sink_name)
-                for app_id, sink_name in (app_routing or {}).items()
+                str(app_id): AppRouteSpec(
+                    app_id=str(app_id),
+                    sink_name=(app_routing or {}).get(app_id),
+                    volume=(app_volumes or {}).get(app_id),
+                )
+                for app_id in remembered_app_ids
             }
             desired.mixes.setdefault("Monitor", MixSpec(name="Monitor"))
             desired.mixes.setdefault("Stream", MixSpec(name="Stream"))

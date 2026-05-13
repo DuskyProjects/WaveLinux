@@ -8,6 +8,7 @@ import subprocess
 import sys
 import os
 import re
+import tempfile
 import time
 import threading
 import queue
@@ -30,6 +31,7 @@ from distribution import (
     APP_DESKTOP_ID,
     DESKTOP_FILENAME,
     desktop_exec_command,
+    install_appimage_file,
     install_current_appimage,
     install_state,
     is_running_in_appimage,
@@ -210,6 +212,7 @@ class UpdateChecker:
     _API_URL  = (f"https://api.github.com/"
                  f"repos/{_GITHUB_OWNER}/{_GITHUB_REPO}/releases/latest")
     _RELEASES_URL = f"https://github.com/{_GITHUB_OWNER}/{_GITHUB_REPO}/releases"
+    _USER_AGENT = "WaveLinux-Updater"
 
     def __init__(self):
         self._q = queue.SimpleQueue()
@@ -229,22 +232,66 @@ class UpdateChecker:
         except queue.Empty:
             return None
 
-    def _fetch_json(self, url):
-        req = urllib.request.Request(url, headers={"User-Agent": "WaveLinux-Updater"})
+    @classmethod
+    def _request(cls, url):
+        return urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": cls._USER_AGENT,
+                "Accept": "application/vnd.github+json",
+            },
+        )
+
+    @classmethod
+    def _fetch_json(cls, url):
+        req = cls._request(url)
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode())
 
+    @classmethod
+    def _select_appimage_asset(cls, release_data):
+        candidates = []
+        for asset in release_data.get("assets", []) or []:
+            name = str(asset.get("name") or "").strip()
+            download_url = str(asset.get("browser_download_url") or "").strip()
+            if not name or not download_url or not name.endswith(".AppImage"):
+                continue
+            lowered = name.lower()
+            score = (
+                1 if lowered.startswith("wavelinux-") else 0,
+                1 if "x86_64" in lowered else 0,
+                1 if "linux" in lowered else 0,
+                len(name),
+            )
+            candidates.append((score, asset))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
+
+    @classmethod
+    def _release_info_from_data(cls, data):
+        tag = str(data.get("tag_name") or "").lstrip("v").strip()
+        if not tag:
+            raise ValueError("GitHub returned no release tag — has a release been published yet?")
+        release_url = str(data.get("html_url") or cls._RELEASES_URL).strip() or cls._RELEASES_URL
+        asset = cls._select_appimage_asset(data)
+        return {
+            "tag": tag,
+            "release_url": release_url,
+            "asset_name": str(asset.get("name") or "").strip() if asset else "",
+            "asset_url": str(asset.get("browser_download_url") or "").strip() if asset else "",
+        }
+
+    @classmethod
+    def latest_release_info(cls):
+        return cls._release_info_from_data(cls._fetch_json(cls._API_URL))
+
     def _do_check(self):
         try:
-            data = self._fetch_json(self._API_URL)
+            info = self.latest_release_info()
             if self._cancel.is_set():
                 return
-            tag = data.get("tag_name", "").lstrip('v')
-            release_url = data.get("html_url") or self._RELEASES_URL
-            if not tag:
-                self._q.put(('error', "GitHub returned no release tag — has a release been published yet?"))
-                return
-            self._q.put(('result', tag, release_url))
+            self._q.put(('result', info))
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 self._q.put(('error', "No releases published yet on GitHub."))
@@ -252,8 +299,88 @@ class UpdateChecker:
                 self._q.put(('error', f"HTTP {e.code}: {e.reason}"))
         except urllib.error.URLError as e:
             self._q.put(('error', f"Network error: {e.reason}"))
+        except ValueError as e:
+            self._q.put(('error', str(e)))
         except Exception as e:
             self._q.put(('error', f"Check failed: {e}"))
+
+
+class AppImageUpdateInstaller:
+    """Download the latest GitHub AppImage and install it locally."""
+
+    def __init__(self):
+        self._q = queue.SimpleQueue()
+        self._cancel = threading.Event()
+
+    def install(self, *, release_info=None):
+        self._cancel.clear()
+        info = dict(release_info or {})
+        threading.Thread(target=self._do_install, args=(info,), daemon=True).start()
+
+    def cancel(self):
+        self._cancel.set()
+
+    def poll(self):
+        try:
+            return self._q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _download_asset(self, asset_url, target_path, asset_name):
+        req = UpdateChecker._request(asset_url)
+        with urllib.request.urlopen(req, timeout=30) as resp, open(target_path, "wb") as handle:
+            total_header = resp.headers.get("Content-Length")
+            total = int(total_header) if total_header and total_header.isdigit() else 0
+            downloaded = 0
+            self._q.put(("progress", asset_name, downloaded, total))
+            while True:
+                if self._cancel.is_set():
+                    raise RuntimeError("Update cancelled.")
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                downloaded += len(chunk)
+                self._q.put(("progress", asset_name, downloaded, total))
+        return downloaded
+
+    def _do_install(self, info):
+        temp_path = ""
+        try:
+            if not info.get("tag"):
+                info = UpdateChecker.latest_release_info()
+                if self._cancel.is_set():
+                    return
+            asset_url = str(info.get("asset_url") or "").strip()
+            asset_name = str(info.get("asset_name") or "").strip() or "WaveLinux AppImage"
+            if not asset_url:
+                raise RuntimeError(
+                    "The latest GitHub release does not include an AppImage asset."
+                )
+            with tempfile.NamedTemporaryFile(
+                prefix="wavelinux-update-",
+                suffix=".AppImage",
+                delete=False,
+            ) as handle:
+                temp_path = handle.name
+            self._download_asset(asset_url, temp_path, asset_name)
+            if self._cancel.is_set():
+                return
+            self._q.put(("status", "Installing downloaded AppImage…"))
+            result = install_appimage_file(temp_path)
+            self._q.put(("installed", result, dict(info)))
+        except urllib.error.HTTPError as e:
+            self._q.put(("error", f"HTTP {e.code}: {e.reason}"))
+        except urllib.error.URLError as e:
+            self._q.put(("error", f"Network error: {e.reason}"))
+        except Exception as e:
+            self._q.put(("error", str(e)))
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
 
 class MeterWorker(QObject):
@@ -1593,6 +1720,7 @@ class AppRoutingRow(QWidget):
         self.vol_slider = QSlider(Qt.Orientation.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setFixedWidth(100)
+        self.vol_slider.setValue(100)
         self.vol_slider.valueChanged.connect(self._on_vol_change)
         
         self.vol_lbl = QLabel("Vol:")
@@ -1633,11 +1761,23 @@ class AppRoutingRow(QWidget):
         self._pending_app_vol = None
         if v is None:
             return
-        runtime = getattr(self._main_win, "runtime", None)
+        normalized = max(0.0, min(float(v) / 100.0, 1.0))
+        win = self._main_win
+        if win is not None:
+            app_volumes = getattr(win, "app_volumes", None)
+            if (
+                app_volumes is not None
+                and PipeWireEngine.is_persistent_app_id(self.app_id)
+                and app_volumes.get(self.app_id) != normalized
+            ):
+                app_volumes[self.app_id] = normalized
+                win._sync_runtime_persistent_state()
+                win.schedule_save()
+        runtime = getattr(win, "runtime", None)
         if runtime is None:
             return
         for idx in self._active_indices:
-            runtime.set_app_volume(idx, v / 100.0)
+            runtime.set_app_volume(idx, normalized)
 
     def _on_route_change(self, idx):
         sink_name = self.combo.itemData(idx)
@@ -1656,7 +1796,8 @@ class AppRoutingRow(QWidget):
         if win is not None:
             win.forget_app(self.app_id)
 
-    def update_state(self, display_name, active_indices, sinks, current_sink, current_volume=None):
+    def update_state(self, display_name, active_indices, sinks, current_sink,
+                     current_volume=None, saved_volume=None):
         self.app_name = display_name or self.app_name
         self._active_indices = active_indices
         is_active = len(active_indices) > 0
@@ -1672,7 +1813,7 @@ class AppRoutingRow(QWidget):
         active_state = (label_text, is_active, is_system)
         if active_state != self._last_active_state:
             self.name_lbl.setText(label_text)
-            self.vol_slider.setEnabled(is_active)
+            self.vol_slider.setEnabled(True)
             self.vol_lbl.setStyleSheet("" if is_active else "color: #666;")
             self.name_lbl.setStyleSheet("" if is_active else "color: #888;")
             self._last_active_state = active_state
@@ -1685,17 +1826,19 @@ class AppRoutingRow(QWidget):
                 "Drops its saved volume / destination too."
             )
 
-        if is_active:
-            vol = current_volume
-            if vol is None:
-                vol = self.engine.get_sink_input_volume(active_indices[0])
+        vol = current_volume
+        if vol is None:
+            vol = saved_volume
+        if vol is None and is_active:
+            vol = self.engine.get_sink_input_volume(active_indices[0])
+        if vol is not None and not self.vol_slider.isSliderDown():
             vol_pct = int(vol * 100)
             if self.vol_slider.value() != vol_pct:
                 self.vol_slider.blockSignals(True)
                 self.vol_slider.setValue(vol_pct)
                 self.vol_slider.blockSignals(False)
 
-        # Combo: hardware sinks + user-created WaveLinux channels (starred).
+        # Combo: hardware sinks + user-created WaveLinux channels.
         # Internal mix/source nodes stay hidden. Rebuild only when the
         # sink list actually changes (cached via a fingerprint).
         if not self.combo.view().isVisible():
@@ -1725,7 +1868,7 @@ class AppRoutingRow(QWidget):
                         continue
                     if name.startswith('wavelinux_'):
                         pretty = name.replace('wavelinux_', '').replace('_', ' ').title()
-                        display = display_name or f"{pretty} STAR"
+                        display = display_name or pretty
                     else:
                         display = display_name or self.engine.display_name_for_sink(name)
                     self.combo.addItem(display, name)
@@ -1784,6 +1927,7 @@ class WaveLinuxWindow(QMainWindow):
         self.app_widgets = {}       # app_id -> AppRoutingRow
         self.submix_state = {}      # "node_id_MixName" -> {'vol': 1.0, 'mute': False}
         self.app_routing = {}       # app_id -> sink_name (persistent)
+        self.app_volumes = {}       # app_id -> normalized volume (persistent)
         self.app_last_seen = {}     # app_id -> epoch seconds (for stale prune)
         self.app_display_names = {} # app_id -> last known display label
         self.app_prune_days = 14    # forget routing entries not seen in this many days
@@ -2307,6 +2451,12 @@ class WaveLinuxWindow(QMainWindow):
                 k: v for k, v in (self.app_routing or {}).items()
                 if PipeWireEngine.is_persistent_app_id(k)
             },
+            "app_volumes": {
+                k: v for k, v in (self._normalize_app_volume_prefs(
+                    getattr(self, "app_volumes", {}),
+                ) or {}).items()
+                if PipeWireEngine.is_persistent_app_id(k)
+            },
             "active_effects": {
                 k: list(v) for k, v in (self.active_effects or {}).items()
                 if isinstance(k, str) and isinstance(v, list)
@@ -2321,6 +2471,20 @@ class WaveLinuxWindow(QMainWindow):
                 if isinstance(node_name, str) and isinstance(effects, dict)
             },
         }
+
+    @classmethod
+    def _normalize_app_volume_prefs(cls, raw):
+        if not isinstance(raw, dict):
+            return {}
+        cleaned = {}
+        for app_id, value in raw.items():
+            if not isinstance(app_id, str) or not PipeWireEngine.is_persistent_app_id(app_id):
+                continue
+            try:
+                cleaned[app_id] = max(0.0, min(float(value), 1.0))
+            except (TypeError, ValueError):
+                continue
+        return cleaned
 
     @classmethod
     def _normalize_scene_snapshot(cls, raw):
@@ -2367,6 +2531,7 @@ class WaveLinuxWindow(QMainWindow):
                 k: v for k, v in (raw.get("app_routing", {}) or {}).items()
                 if isinstance(k, str) and PipeWireEngine.is_persistent_app_id(k)
             },
+            "app_volumes": cls._normalize_app_volume_prefs(raw.get("app_volumes", {})),
             "active_effects": active_effects,
             "effect_params": effect_params,
         }
@@ -2486,6 +2651,7 @@ class WaveLinuxWindow(QMainWindow):
         self.effect_params.update(snapshot.get("effect_params", {}))
 
         self.app_routing = dict(snapshot.get("app_routing", {}))
+        self.app_volumes = self._normalize_app_volume_prefs(snapshot.get("app_volumes", {}))
         scene_order = list(snapshot.get("channel_order", []))
         self.channel_order = scene_order + [
             name for name in self.channel_order
@@ -2856,6 +3022,11 @@ class WaveLinuxWindow(QMainWindow):
         self._open_release_btn.clicked.connect(self._open_release_page)
         btn_row.addWidget(self._open_release_btn)
 
+        self._download_update_btn = QPushButton("Download && Install Latest AppImage")
+        self._download_update_btn.setObjectName("showHiddenBtn")
+        self._download_update_btn.clicked.connect(self._download_and_install_update)
+        btn_row.addWidget(self._download_update_btn)
+
         if is_running_in_appimage():
             self._install_appimage_btn = QPushButton()
             self._install_appimage_btn.setObjectName("showHiddenBtn")
@@ -2877,10 +3048,17 @@ class WaveLinuxWindow(QMainWindow):
         self._install_warning_lbl.setStyleSheet("color: #d28b26; font-size: 11px;")
         layout.addWidget(self._install_warning_lbl)
 
+        self._update_progress = QProgressBar()
+        self._update_progress.setVisible(False)
+        self._update_progress.setTextVisible(True)
+        self._update_progress.setRange(0, 100)
+        self._update_progress.setValue(0)
+        layout.addWidget(self._update_progress)
+
         note = QLabel(
-            "WaveLinux now uses notify-only updates.\n"
-            "Use GitHub releases to download the latest AppImage or source package.\n"
-            "Packaged installs should be updated by replacing the AppImage or using your distro package manager."
+            "WaveLinux can download the latest GitHub AppImage and install it to "
+            "~/.local/bin for you.\n"
+            "If you use a distro package, keep updating through your package manager."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #5a5a72; font-size: 11px;")
@@ -2929,38 +3107,177 @@ class WaveLinuxWindow(QMainWindow):
             kind = item[0]
             if kind == 'result':
                 self._update_poll_timer.stop()
-                self._handle_update_result(item[1], item[2])
+                self._handle_update_result(item[1])
             elif kind == 'error':
                 self._update_poll_timer.stop()
                 self._handle_update_error(item[1])
 
-    def _handle_update_result(self, latest_tag, release_url):
+    def _handle_update_result(self, release_info):
         self._check_update_btn.setEnabled(True)
-        self._pending_update_url = release_url
+        release_info = dict(release_info or {})
+        latest_tag = str(release_info.get("tag") or "").strip()
+        self._pending_update_url = release_info.get("release_url") or UpdateChecker._RELEASES_URL
+        self._pending_update_asset_url = release_info.get("asset_url") or ""
+        self._pending_update_asset_name = release_info.get("asset_name") or ""
         current = _parse_version(APP_VERSION)
         latest  = _parse_version(latest_tag)
         if latest > current:
-            self._update_status_lbl.setText(
-                f"Update available: v{latest_tag}  (current: v{APP_VERSION})"
-            )
-            self._update_status_lbl.setStyleSheet("color: #00d4aa; font-size: 12px; font-weight: bold;")
             self._pending_update_tag = latest_tag
-            self._show_notification(
-                "WaveLinux Update Available",
-                f"Version {latest_tag} is available. Open Settings → Updates to download it.",
-            )
+            if self._pending_update_asset_url:
+                self._update_status_lbl.setText(
+                    f"Update available: v{latest_tag}  (current: v{APP_VERSION})"
+                )
+                self._update_status_lbl.setStyleSheet("color: #00d4aa; font-size: 12px; font-weight: bold;")
+                self._show_notification(
+                    "WaveLinux Update Available",
+                    f"Version {latest_tag} is available. Open Settings → Updates to install it.",
+                )
+            else:
+                self._update_status_lbl.setText(
+                    f"Version {latest_tag} is available, but no AppImage asset was found in the latest GitHub release."
+                )
+                self._update_status_lbl.setStyleSheet("color: #d28b26; font-size: 12px;")
         else:
             self._update_status_lbl.setText(f"You're up to date! (v{APP_VERSION})")
             self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
+            self._pending_update_tag = None
+            self._pending_update_asset_url = ""
+            self._pending_update_asset_name = ""
+        self._refresh_update_tab()
 
     def _handle_update_error(self, message):
         self._check_update_btn.setEnabled(True)
         self._update_status_lbl.setText(f"Error: {message}")
         self._update_status_lbl.setStyleSheet("color: #e05050; font-size: 12px;")
+        self._refresh_update_tab()
 
     def _open_release_page(self):
         url = getattr(self, "_pending_update_url", None) or UpdateChecker._RELEASES_URL
         QDesktopServices.openUrl(QUrl(url))
+
+    def _download_and_install_update(self):
+        progress = getattr(self, "_update_progress", None)
+        if progress is not None:
+            progress.setVisible(True)
+            progress.setRange(0, 0)
+            progress.setFormat("Preparing update…")
+        self._download_update_btn.setEnabled(False)
+        self._check_update_btn.setEnabled(False)
+        self._update_status_lbl.setText("Preparing AppImage download…")
+        self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
+
+        prev = getattr(self, "_update_installer", None)
+        if prev is not None:
+            prev.cancel()
+
+        release_info = {
+            "tag": getattr(self, "_pending_update_tag", None) or "",
+            "release_url": getattr(self, "_pending_update_url", None) or UpdateChecker._RELEASES_URL,
+            "asset_url": getattr(self, "_pending_update_asset_url", "") or "",
+            "asset_name": getattr(self, "_pending_update_asset_name", "") or "",
+        }
+        self._update_installer = AppImageUpdateInstaller()
+        self._update_installer.install(release_info=release_info)
+
+        timer = getattr(self, "_update_install_poll_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(200)
+            timer.timeout.connect(self._poll_update_installer)
+            self._update_install_poll_timer = timer
+        else:
+            timer.stop()
+        timer.start()
+
+    def _poll_update_installer(self):
+        installer = getattr(self, "_update_installer", None)
+        if installer is None:
+            return
+        while True:
+            item = installer.poll()
+            if item is None:
+                break
+            kind = item[0]
+            if kind == "progress":
+                self._handle_update_install_progress(item[1], item[2], item[3])
+            elif kind == "status":
+                self._update_status_lbl.setText(str(item[1]))
+                self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
+            elif kind == "installed":
+                self._update_install_poll_timer.stop()
+                self._handle_update_install_success(item[1], item[2])
+            elif kind == "error":
+                self._update_install_poll_timer.stop()
+                self._handle_update_install_error(item[1])
+
+    def _handle_update_install_progress(self, asset_name, downloaded, total):
+        progress = getattr(self, "_update_progress", None)
+        if progress is not None:
+            progress.setVisible(True)
+            if total > 0:
+                percent = max(0, min(int((downloaded / total) * 100), 100))
+                progress.setRange(0, 100)
+                progress.setValue(percent)
+                progress.setFormat(f"{percent}%")
+            else:
+                progress.setRange(0, 0)
+                progress.setFormat("Downloading…")
+        if total > 0:
+            percent = max(0, min(int((downloaded / total) * 100), 100))
+            self._update_status_lbl.setText(
+                f"Downloading {asset_name or 'AppImage'}… {percent}%"
+            )
+        else:
+            self._update_status_lbl.setText(
+                f"Downloading {asset_name or 'AppImage'}…"
+            )
+        self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
+
+    def _handle_update_install_success(self, result, release_info):
+        self._download_update_btn.setEnabled(True)
+        self._check_update_btn.setEnabled(True)
+        progress = getattr(self, "_update_progress", None)
+        if progress is not None:
+            progress.setVisible(False)
+            progress.setRange(0, 100)
+            progress.setValue(0)
+        release_info = dict(release_info or {})
+        tag = str(release_info.get("tag") or "").strip()
+        self._pending_update_tag = tag or None
+        self._pending_update_url = release_info.get("release_url") or UpdateChecker._RELEASES_URL
+        self._pending_update_asset_url = release_info.get("asset_url") or ""
+        self._pending_update_asset_name = release_info.get("asset_name") or ""
+        version_text = f"v{tag}" if tag else "the latest version"
+        self._update_status_lbl.setText(
+            f"Installed {version_text} to {result.appimage_path}. Restart WaveLinux to run it."
+        )
+        self._update_status_lbl.setStyleSheet("color: #00d4aa; font-size: 12px; font-weight: bold;")
+        self._refresh_update_tab()
+        self._refresh_system_tab()
+
+        yn = QMessageBox.question(
+            self.settings_dialog,
+            "Update installed",
+            "WaveLinux downloaded and installed the latest AppImage.\n\n"
+            f"Installed AppImage: {result.appimage_path}\n"
+            f"Launcher: {result.wrapper_path}\n\n"
+            "Restart into the updated AppImage now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if yn == QMessageBox.StandardButton.Yes:
+            self._restart_with_command([result.appimage_path])
+
+    def _handle_update_install_error(self, message):
+        self._download_update_btn.setEnabled(True)
+        self._check_update_btn.setEnabled(True)
+        progress = getattr(self, "_update_progress", None)
+        if progress is not None:
+            progress.setVisible(False)
+            progress.setRange(0, 100)
+            progress.setValue(0)
+        self._update_status_lbl.setText(f"Update install failed: {message}")
+        self._update_status_lbl.setStyleSheet("color: #e05050; font-size: 12px;")
+        self._refresh_update_tab()
 
     def _install_running_appimage(self):
         try:
@@ -3021,12 +3338,14 @@ class WaveLinuxWindow(QMainWindow):
         )
 
     def _restart_app(self):
+        self._restart_with_command(launch_command())
+
+    def _restart_with_command(self, command):
         self.save_config()
         self._shutting_down = True
         self._clear_runtime_pid()
         self.runtime.cleanup_sync()
         self.runtime.shutdown()
-        command = launch_command()
         os.execv(command[0], command + sys.argv[1:])
 
     def _check_for_updates_bg(self):
@@ -3058,13 +3377,20 @@ class WaveLinuxWindow(QMainWindow):
             return
         self._bg_poll_timer.stop()
         if item[0] == 'result':
-            tag = item[1]
-            self._pending_update_url = item[2]
+            info = dict(item[1] or {})
+            tag = str(info.get("tag") or "").strip()
+            self._pending_update_url = info.get("release_url") or UpdateChecker._RELEASES_URL
+            self._pending_update_asset_url = info.get("asset_url") or ""
+            self._pending_update_asset_name = info.get("asset_name") or ""
             if _parse_version(tag) > _parse_version(APP_VERSION):
                 self._pending_update_tag = tag
                 self._show_notification(
                     "WaveLinux Update Available",
-                    f"Version {tag} is available. Open Settings → Updates to download it.",
+                    (
+                        f"Version {tag} is available. Open Settings → Updates to install it."
+                        if self._pending_update_asset_url
+                        else f"Version {tag} is available. Open Settings → Updates for details."
+                    ),
                 )
 
     def _refresh_update_tab(self):
@@ -3074,6 +3400,27 @@ class WaveLinuxWindow(QMainWindow):
             btn.setText(
                 "Reinstall This AppImage" if state.installed_appimage_exists else "Install This AppImage"
             )
+        download_btn = getattr(self, "_download_update_btn", None)
+        if download_btn is not None:
+            pending_tag = getattr(self, "_pending_update_tag", None)
+            pending_asset_url = getattr(self, "_pending_update_asset_url", "") or ""
+            if pending_tag and _parse_version(pending_tag) > _parse_version(APP_VERSION):
+                download_btn.setText(f"Download && Install v{pending_tag}")
+                download_btn.setEnabled(bool(pending_asset_url))
+                if not pending_asset_url:
+                    download_btn.setToolTip(
+                        "The latest GitHub release does not expose an AppImage asset."
+                    )
+                else:
+                    download_btn.setToolTip(
+                        "Download the latest AppImage from GitHub and replace the installed desktop build."
+                    )
+            else:
+                download_btn.setText("Download && Install Latest AppImage")
+                download_btn.setEnabled(True)
+                download_btn.setToolTip(
+                    "Fetch the latest GitHub AppImage and install it to ~/.local/bin/WaveLinux.AppImage."
+                )
         info_lbl = getattr(self, "_install_state_lbl", None)
         if info_lbl is not None:
             lines = []
@@ -3254,26 +3601,32 @@ class WaveLinuxWindow(QMainWindow):
         self.schedule_save()
 
     def _forget_all_offline(self):
-        """One-shot: drop every app_routing entry whose app isn't currently
-        making sound. Refreshes the panel immediately."""
+        """One-shot: drop every saved app preference whose app isn't
+        currently making sound. Refreshes the panel immediately."""
         active_ids = {
             app_id for app_id in self.app_widgets
             if self.app_widgets[app_id]._active_indices
         }
-        to_forget = [app_id for app_id in list(self.app_routing.keys()) if app_id not in active_ids]
+        remembered_ids = (
+            set(getattr(self, "app_routing", {}).keys())
+            | set(getattr(self, "app_volumes", {}).keys())
+            | set(getattr(self, "app_last_seen", {}).keys())
+        )
+        to_forget = [app_id for app_id in remembered_ids if app_id not in active_ids]
         if not to_forget:
             QMessageBox.information(self.settings_dialog, "Forget offline apps",
                                     "No offline apps to forget.")
             return
         yn = QMessageBox.question(
             self.settings_dialog, "Forget offline apps",
-            f"Drop saved routing for {len(to_forget)} offline app(s)?",
+            f"Drop saved routing and volume settings for {len(to_forget)} offline app(s)?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if yn != QMessageBox.StandardButton.Yes:
             return
         for app_id in to_forget:
             self.app_routing.pop(app_id, None)
+            self.app_volumes.pop(app_id, None)
             self.app_last_seen.pop(app_id, None)
             self.forgotten_apps.add(app_id)
             widget = self.app_widgets.pop(app_id, None)
@@ -3413,6 +3766,9 @@ class WaveLinuxWindow(QMainWindow):
             active_effects=self.active_effects,
             effect_params=self.effect_params,
             app_routing=dict(self.app_routing),
+            app_volumes=self._normalize_app_volume_prefs(
+                getattr(self, "app_volumes", {}),
+            ),
             virtual_channels=self._virtual_channel_specs(),
             monitor_hw=monitor_hw,
             stream_hw=stream_hw,
@@ -3436,6 +3792,9 @@ class WaveLinuxWindow(QMainWindow):
             changed = True
         if app_id not in self.app_last_seen and display_name in self.app_last_seen:
             self.app_last_seen[app_id] = self.app_last_seen.pop(display_name)
+            changed = True
+        if app_id not in self.app_volumes and display_name in self.app_volumes:
+            self.app_volumes[app_id] = self.app_volumes.pop(display_name)
             changed = True
         if app_id not in self.forgotten_apps and display_name in self.forgotten_apps:
             self.forgotten_apps.discard(display_name)
@@ -4091,6 +4450,7 @@ class WaveLinuxWindow(QMainWindow):
         all_display_app_ids = (
             set(apps_by_id.keys())
             | set(self.app_routing.keys())
+            | set(getattr(self, "app_volumes", {}).keys())
             | recently_seen
             | {PipeWireEngine.SYSTEM_SOUNDS_BUCKET}
         )
@@ -4118,6 +4478,7 @@ class WaveLinuxWindow(QMainWindow):
             live_sink = runtime_app.current_sink if runtime_app is not None else None
             current_sink = preferred_sink or live_sink
             current_volume = runtime_app.current_volume if runtime_app is not None else None
+            saved_volume = getattr(self, "app_volumes", {}).get(app_id)
             if app_id not in self.app_widgets:
                 row = AppRoutingRow(app_id, display_name, self.engine, sink_rows, main_win=self)
                 self.app_widgets[app_id] = row
@@ -4129,6 +4490,7 @@ class WaveLinuxWindow(QMainWindow):
                 sink_rows,
                 current_sink,
                 current_volume=current_volume,
+                saved_volume=saved_volume,
             )
         for app_id in list(self.app_widgets.keys()):
             if app_id not in all_display_app_ids:
@@ -4267,6 +4629,12 @@ class WaveLinuxWindow(QMainWindow):
                 k: v for k, v in self.app_routing.items()
                 if PipeWireEngine.is_persistent_app_id(k)
             },
+            'app_volumes': {
+                k: v for k, v in self._normalize_app_volume_prefs(
+                    getattr(self, "app_volumes", {}),
+                ).items()
+                if PipeWireEngine.is_persistent_app_id(k)
+            },
             'channel_order': list(self.channel_order),
             'effect_params': self.effect_params,
             'active_effects': self.active_effects,
@@ -4304,6 +4672,7 @@ class WaveLinuxWindow(QMainWindow):
             k: v for k, v in (conf.get('app_routing', {}) or {}).items()
             if PipeWireEngine.is_persistent_app_id(k)
         }
+        self.app_volumes = self._normalize_app_volume_prefs(conf.get('app_volumes', {}))
         self.app_last_seen = {
             k: int(v) for k, v in (conf.get('app_last_seen', {}) or {}).items()
             if isinstance(k, str) and isinstance(v, (int, float))
@@ -4321,11 +4690,19 @@ class WaveLinuxWindow(QMainWindow):
         for name in list(self.app_routing.keys()):
             if PipeWireEngine.name_matches_host(name):
                 self.app_routing.pop(name, None)
+        for name in list(self.app_volumes.keys()):
+            if PipeWireEngine.name_matches_host(name):
+                self.app_volumes.pop(name, None)
         for name in list(self.app_last_seen.keys()):
             if PipeWireEngine.name_matches_host(name):
                 self.app_last_seen.pop(name, None)
                 self.app_display_names.pop(name, None)
-        for app_id in set(self.app_routing) | set(self.app_last_seen) | set(self.forgotten_apps):
+        for app_id in (
+            set(self.app_routing)
+            | set(self.app_volumes)
+            | set(self.app_last_seen)
+            | set(self.forgotten_apps)
+        ):
             self.app_display_names.setdefault(
                 app_id,
                 PipeWireEngine.display_name_for_app_id(app_id),
@@ -4552,7 +4929,9 @@ class WaveLinuxWindow(QMainWindow):
         if app_id == PipeWireEngine.SYSTEM_SOUNDS_BUCKET:
             return
         self.app_routing.pop(app_id, None)
+        self.app_volumes.pop(app_id, None)
         self.app_last_seen.pop(app_id, None)
+        self.app_display_names.pop(app_id, None)
         self.forgotten_apps.add(app_id)
         widget = self.app_widgets.pop(app_id, None)
         if widget is not None:
@@ -4569,11 +4948,16 @@ class WaveLinuxWindow(QMainWindow):
             return
         cutoff = int(time.time()) - self.app_prune_days * 24 * 3600
         stale_routed = [
-            name for name in list(self.app_routing.keys())
-            if self.app_last_seen.get(name, 0) < cutoff
+            name for name in (
+                set(self.app_routing.keys())
+                | set(getattr(self, "app_volumes", {}).keys())
+            )
+            if self.app_last_seen.get(name) is not None
+            and self.app_last_seen.get(name, 0) < cutoff
         ]
         for name in stale_routed:
             self.app_routing.pop(name, None)
+            self.app_volumes.pop(name, None)
             self.app_last_seen.pop(name, None)
             if name not in self.forgotten_apps:
                 self.app_display_names.pop(name, None)
@@ -4584,7 +4968,11 @@ class WaveLinuxWindow(QMainWindow):
         ]
         for name in stale_seen:
             self.app_last_seen.pop(name, None)
-            if name not in self.app_routing and name not in self.forgotten_apps:
+            if (
+                name not in self.app_routing
+                and name not in getattr(self, "app_volumes", {})
+                and name not in self.forgotten_apps
+            ):
                 self.app_display_names.pop(name, None)
         total = len(stale_routed) + len(stale_seen)
         if total:

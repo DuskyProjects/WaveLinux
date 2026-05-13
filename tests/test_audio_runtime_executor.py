@@ -139,6 +139,14 @@ class RuntimeExecutorTests(unittest.TestCase):
             },
         )
 
+    def test_display_name_for_virtual_sink_uses_plain_channel_name(self):
+        engine = SimpleNamespace(display_name_for_sink=lambda sink_name, snap=None: sink_name)
+
+        self.assertEqual(
+            RuntimeExecutor._display_name_for_sink(engine, "wavelinux_voice_chat", snap=None),
+            "Voice Chat",
+        )
+
     def test_apply_channel_fx_uses_transaction_result(self):
         engine = FakeEngine()
         executor = RuntimeExecutor(FakeAdapter(engine), DummyDiagnostics())

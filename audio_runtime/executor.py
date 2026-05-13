@@ -625,7 +625,7 @@ class RuntimeExecutor:
             return sink_name
         if sink_name.startswith("wavelinux_"):
             pretty = sink_name.replace("wavelinux_", "").replace("_", " ").title()
-            return f"{pretty} STAR"
+            return pretty
         return engine.display_name_for_sink(sink_name, snap=snap)
 
     @staticmethod

@@ -1,6 +1,7 @@
 import unittest
 
 from audio_runtime.models import (
+    AppRouteSpec,
     ChannelSpec,
     ClearChannelFx,
     DesiredState,
@@ -10,7 +11,9 @@ from audio_runtime.models import (
     ObservedState,
     RecoverChannel,
     RefreshNow,
+    RuntimeAppView,
     RuntimeChannelView,
+    SetAppRoute,
     SetCardProfile,
     SetChannelFx,
     SetMixHardwareRoute,
@@ -163,6 +166,34 @@ class RuntimePlannerTests(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].kind, "set_submix_state")
 
+    def test_set_app_route_preserves_saved_volume_preference(self):
+        planner = RuntimePlanner()
+        desired = DesiredState(
+            app_routes={
+                "app:io.ferdium.ferdium": AppRouteSpec(
+                    app_id="app:io.ferdium.ferdium",
+                    volume=0.42,
+                )
+            }
+        )
+
+        planner.apply_intent(
+            desired,
+            SetAppRoute(
+                app_id="app:io.ferdium.ferdium",
+                sink_name="wavelinux_voice_chat",
+            ),
+        )
+
+        self.assertEqual(
+            desired.app_routes["app:io.ferdium.ferdium"].sink_name,
+            "wavelinux_voice_chat",
+        )
+        self.assertEqual(
+            desired.app_routes["app:io.ferdium.ferdium"].volume,
+            0.42,
+        )
+
     def test_refresh_now_reconciles_selected_mic_fx_and_submixes(self):
         planner = RuntimePlanner()
         desired = DesiredState(
@@ -258,6 +289,37 @@ class RuntimePlannerTests(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].kind, "ensure_virtual_channel")
         self.assertEqual(actions[0].payload["display_name"], "Game")
+
+    def test_refresh_now_reapplies_saved_app_volume_to_returned_app(self):
+        planner = RuntimePlanner()
+        desired = DesiredState(
+            app_routes={
+                "app:io.ferdium.ferdium": AppRouteSpec(
+                    app_id="app:io.ferdium.ferdium",
+                    volume=0.35,
+                )
+            }
+        )
+        observed = ObservedState(
+            app_views=[
+                RuntimeAppView(
+                    app_id="app:io.ferdium.ferdium",
+                    app_name="Ferdium",
+                    active_indices=["71", "72"],
+                    current_volume=1.0,
+                )
+            ],
+            app_routes={"app:io.ferdium.ferdium": None},
+        )
+
+        actions = planner.reconcile(desired, observed, RefreshNow("tick"))
+
+        volume_actions = [action for action in actions if action.kind == "set_app_volume"]
+        self.assertEqual(len(volume_actions), 2)
+        self.assertEqual(volume_actions[0].payload["sink_input_index"], "71")
+        self.assertEqual(volume_actions[1].payload["sink_input_index"], "72")
+        for action in volume_actions:
+            self.assertEqual(action.payload["volume"], 0.35)
 
     def test_refresh_now_removes_stale_channel_routing_and_fx(self):
         planner = RuntimePlanner()

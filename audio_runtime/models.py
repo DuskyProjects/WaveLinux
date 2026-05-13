@@ -36,6 +36,7 @@ class AppRouteSpec:
     app_id: str
     display_name: str = ""
     sink_name: str | None = None
+    volume: float | None = None
 
 
 @dataclass
