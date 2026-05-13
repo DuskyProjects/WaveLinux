@@ -101,6 +101,28 @@ class DistributionTests(unittest.TestCase):
                 desktop = handle.read()
             self.assertIn(f"Exec={result.wrapper_path}", desktop)
 
+    def test_install_bundle_binary_writes_bundle_launcher_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_dir = os.path.join(tmpdir, "WaveLinux-bundle")
+            os.makedirs(bundle_dir, exist_ok=True)
+            bundle_path = os.path.join(bundle_dir, "WaveLinux")
+            with open(bundle_path, "wb") as handle:
+                handle.write(b"bundle")
+            os.chmod(bundle_path, 0o755)
+
+            result = distribution.install_bundle_binary(bundle_path, home=tmpdir)
+
+            self.assertTrue(os.path.exists(result.wrapper_path))
+            self.assertTrue(os.path.exists(result.desktop_path))
+            self.assertTrue(os.path.exists(result.icon_path))
+            with open(result.wrapper_path, "r", encoding="utf-8") as handle:
+                wrapper = handle.read()
+            self.assertIn(f'BUNDLE_EXEC="{bundle_path}"', wrapper)
+            self.assertIn('exec "$BUNDLE_EXEC" "$@"', wrapper)
+            with open(result.desktop_path, "r", encoding="utf-8") as handle:
+                desktop = handle.read()
+            self.assertIn(f"Exec={result.wrapper_path}", desktop)
+
     def test_install_appimage_file_writes_launcher_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             download_dir = os.path.join(tmpdir, "downloads")
@@ -199,6 +221,42 @@ class DistributionTests(unittest.TestCase):
             self.assertTrue(state.appimage_missing)
             self.assertEqual(state.warnings, ())
 
+    def test_install_state_accepts_bundle_wrapper(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_dir = os.path.join(tmpdir, "WaveLinux-bundle")
+            os.makedirs(bundle_dir, exist_ok=True)
+            bundle_path = os.path.join(bundle_dir, "WaveLinux")
+            with open(bundle_path, "wb") as handle:
+                handle.write(b"bundle")
+            os.chmod(bundle_path, 0o755)
+
+            wrapper_path = distribution.installed_wrapper_path(home=tmpdir)
+            os.makedirs(os.path.dirname(wrapper_path), exist_ok=True)
+            with open(wrapper_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "#!/bin/sh\n"
+                    f'BUNDLE_EXEC="{bundle_path}"\n'
+                    'exec "$BUNDLE_EXEC" "$@"\n'
+                )
+
+            desktop_path = distribution.installed_desktop_path(home=tmpdir)
+            os.makedirs(os.path.dirname(desktop_path), exist_ok=True)
+            with open(desktop_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "[Desktop Entry]\n"
+                    "Name=WaveLinux\n"
+                    f"Exec={wrapper_path}\n"
+                    "Type=Application\n"
+                )
+
+            state = distribution.install_state(home=tmpdir)
+
+            self.assertEqual(state.wrapper_mode, "bundle")
+            self.assertEqual(state.wrapper_bundle_exec, bundle_path)
+            self.assertFalse(state.wrapper_mismatch)
+            self.assertTrue(state.appimage_missing)
+            self.assertEqual(state.warnings, ())
+
     def test_install_state_warns_when_source_wrapper_checkout_is_missing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             wrapper_path = distribution.installed_wrapper_path(home=tmpdir)
@@ -214,6 +272,22 @@ class DistributionTests(unittest.TestCase):
 
             self.assertEqual(state.wrapper_mode, "source")
             self.assertIn("Installed source wrapper points at a missing WaveLinux checkout.", state.warnings)
+
+    def test_install_state_warns_when_bundle_wrapper_binary_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wrapper_path = distribution.installed_wrapper_path(home=tmpdir)
+            os.makedirs(os.path.dirname(wrapper_path), exist_ok=True)
+            with open(wrapper_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "#!/bin/sh\n"
+                    'BUNDLE_EXEC="/tmp/missing-wavelinux-bundle"\n'
+                    'exec "$BUNDLE_EXEC" "$@"\n'
+                )
+
+            state = distribution.install_state(home=tmpdir)
+
+            self.assertEqual(state.wrapper_mode, "bundle")
+            self.assertIn("Installed bundle launcher points at a missing WaveLinux binary.", state.warnings)
 
     def test_repair_source_checkout_launchers_rewrites_canonical_files_and_removes_stale(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -249,6 +323,41 @@ class DistributionTests(unittest.TestCase):
             with open(result.wrapper_path, "r", encoding="utf-8") as handle:
                 wrapper = handle.read()
             self.assertIn(f'SOURCE_DIR="{source_dir}"', wrapper)
+
+    def test_repair_bundle_launchers_rewrites_canonical_files_and_removes_stale(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_dir = os.path.join(tmpdir, "WaveLinux-bundle")
+            os.makedirs(bundle_dir, exist_ok=True)
+            bundle_path = os.path.join(bundle_dir, "WaveLinux")
+            with open(bundle_path, "wb") as handle:
+                handle.write(b"bundle")
+            os.chmod(bundle_path, 0o755)
+
+            result = distribution.install_bundle_binary(bundle_path, home=tmpdir)
+
+            stale_path = os.path.join(
+                tmpdir,
+                ".local",
+                "share",
+                "applications",
+                "wavelinux-legacy.desktop",
+            )
+            with open(stale_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "[Desktop Entry]\n"
+                    "Name=WaveLinux\n"
+                    'Exec="/tmp/old/WaveLinux"\n'
+                    "Type=Application\n"
+                )
+
+            repaired = distribution.repair_bundle_launchers(bundle_path, home=tmpdir)
+
+            self.assertEqual(repaired.bundle_path, bundle_path)
+            self.assertIn(stale_path, repaired.removed_entries)
+            self.assertFalse(os.path.exists(stale_path))
+            with open(result.wrapper_path, "r", encoding="utf-8") as handle:
+                wrapper = handle.read()
+            self.assertIn(f'BUNDLE_EXEC="{bundle_path}"', wrapper)
 
     def test_repair_installed_appimage_launchers_rewrites_canonical_files_and_removes_stale(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -29,12 +29,14 @@ from distribution import (
     DESKTOP_FILENAME,
     current_runtime_path,
     desktop_exec_command,
-    install_appimage_file,
+    install_current_bundle,
     install_current_appimage,
     install_current_source_checkout,
     install_state,
     is_running_in_appimage,
     launch_command,
+    repair_bundle_launchers,
+    repair_current_bundle_launchers,
     repair_current_source_checkout_launchers,
     repair_installed_appimage_launchers,
     resource_path,
@@ -3383,6 +3385,15 @@ class WaveLinuxWindow(QMainWindow):
                     f"Launcher: {result.wrapper_path}\n"
                     f"Desktop file: {result.desktop_path}"
                 )
+            elif mode.kind == "bundle":
+                result = install_current_bundle()
+                title = "Local build launcher installed"
+                message = (
+                    "WaveLinux installed a launcher for this local bundled build.\n\n"
+                    f"Binary: {result.bundle_path}\n"
+                    f"Launcher: {result.wrapper_path}\n"
+                    f"Desktop file: {result.desktop_path}"
+                )
             elif mode.kind == "source":
                 result = install_current_source_checkout()
                 title = "Source launcher installed"
@@ -3418,7 +3429,7 @@ class WaveLinuxWindow(QMainWindow):
         state = install_state()
         mode = self._current_runtime_mode()
         try:
-            if state.wrapper_mode == "source" or mode.kind == "source":
+            if mode.kind == "source":
                 result = repair_current_source_checkout_launchers()
                 removed = len(result.removed_entries)
                 msg = (
@@ -3428,6 +3439,47 @@ class WaveLinuxWindow(QMainWindow):
                     f"Desktop file: {result.desktop_path}\n"
                     f"Removed stale launchers: {removed}"
                 )
+            elif mode.kind == "bundle":
+                result = repair_current_bundle_launchers()
+                removed = len(result.removed_entries)
+                msg = (
+                    "WaveLinux rebuilt the local bundled-build desktop launcher.\n\n"
+                    f"Binary: {result.bundle_path}\n"
+                    f"Launcher: {result.wrapper_path}\n"
+                    f"Desktop file: {result.desktop_path}\n"
+                    f"Removed stale launchers: {removed}"
+                )
+            elif state.wrapper_mode == "source":
+                if state.wrapper_source_dir and os.path.isfile(os.path.join(state.wrapper_source_dir, "main.py")):
+                    result = repair_current_source_checkout_launchers()
+                    removed = len(result.removed_entries)
+                    msg = (
+                        "WaveLinux rebuilt the source-checkout desktop launcher.\n\n"
+                        f"Source: {result.source_dir}\n"
+                        f"Launcher: {result.wrapper_path}\n"
+                        f"Desktop file: {result.desktop_path}\n"
+                        f"Removed stale launchers: {removed}"
+                    )
+                else:
+                    raise RuntimeError(
+                        "The installed source launcher points at a missing checkout. Run WaveLinux from the desired checkout and use Reinstall This Source Checkout, or install a verified AppImage."
+                    )
+            elif state.wrapper_mode == "bundle":
+                bundle_exec = getattr(state, "wrapper_bundle_exec", None)
+                if bundle_exec and os.path.isfile(bundle_exec) and os.access(bundle_exec, os.X_OK):
+                    result = repair_bundle_launchers(bundle_exec)
+                    removed = len(result.removed_entries)
+                    msg = (
+                        "WaveLinux rebuilt the local bundled-build desktop launcher.\n\n"
+                        f"Binary: {result.bundle_path}\n"
+                        f"Launcher: {result.wrapper_path}\n"
+                        f"Desktop file: {result.desktop_path}\n"
+                        f"Removed stale launchers: {removed}"
+                    )
+                else:
+                    raise RuntimeError(
+                        "The installed bundled-build launcher points at a missing binary. Run WaveLinux from the desired local build and use Install This Local Build, or install a verified AppImage."
+                    )
             elif state.installed_appimage_exists:
                 result = repair_installed_appimage_launchers()
                 removed = len(result.removed_entries)
@@ -3544,6 +3596,14 @@ class WaveLinuxWindow(QMainWindow):
                     "Reinstall This AppImage" if state.installed_appimage_exists else "Install This AppImage"
                 )
                 btn.setToolTip("Install the currently running AppImage into ~/.local/bin and refresh its desktop launcher.")
+            elif mode.kind == "bundle":
+                btn.setVisible(True)
+                btn.setText(
+                    "Reinstall This Local Build"
+                    if state.wrapper_mode == "bundle" and getattr(state, "wrapper_bundle_exec", None) == mode.running_path
+                    else "Install This Local Build"
+                )
+                btn.setToolTip("Install or refresh the desktop launcher for the current local bundled WaveLinux binary.")
             elif mode.kind == "source":
                 btn.setVisible(True)
                 btn.setText("Reinstall This Source Checkout")
@@ -3588,6 +3648,14 @@ class WaveLinuxWindow(QMainWindow):
                     + (
                         f" ({state.wrapper_source_dir})"
                         if state.wrapper_source_dir else ""
+                    )
+                )
+            elif state.wrapper_mode == "bundle":
+                lines.append(
+                    "Installed launcher mode: local bundle"
+                    + (
+                        f" ({state.wrapper_bundle_exec})"
+                        if getattr(state, "wrapper_bundle_exec", None) else ""
                     )
                 )
             elif state.wrapper_mode == "appimage":
@@ -3824,6 +3892,7 @@ class WaveLinuxWindow(QMainWindow):
         mode = self._current_runtime_mode()
         wrapper_mode = getattr(state, "wrapper_mode", "unknown")
         wrapper_source_dir = getattr(state, "wrapper_source_dir", None)
+        wrapper_bundle_exec = getattr(state, "wrapper_bundle_exec", None)
         warnings = tuple(getattr(state, "warnings", ()) or ())
         issues = [
             self._health_issue_for_runtime_detail(detail)
@@ -3833,7 +3902,7 @@ class WaveLinuxWindow(QMainWindow):
         expects_appimage_install = (
             mode.kind == "appimage"
             or wrapper_mode == "appimage"
-            or (getattr(state, "desktop_exists", False) and wrapper_mode != "source")
+            or (getattr(state, "desktop_exists", False) and wrapper_mode not in {"source", "bundle"})
             or bool(getattr(state, "stale_launcher_entries", ()))
         )
         if expects_appimage_install and getattr(state, "appimage_missing", False):
@@ -3881,6 +3950,93 @@ class WaveLinuxWindow(QMainWindow):
                 primary_action="Repair launchers",
                 secondary_action="Re-run check",
                 context={"path": state.wrapper_path, "source_dir": wrapper_source_dir or ""},
+            ))
+        if (
+            wrapper_mode == "bundle"
+            and any("bundle launcher points at a missing WaveLinux binary" in warning for warning in warnings)
+        ):
+            issues.append(HealthIssue(
+                code="install.wrapper_mismatch",
+                severity="warning",
+                title="Installed local build launcher points at a missing binary",
+                detail=(
+                    f"The bundled-build launcher wrapper at {state.wrapper_path} points at "
+                    f"{wrapper_bundle_exec or 'a missing binary'}.\n"
+                    "Run WaveLinux from the desired local build and reinstall its launcher, or install a verified AppImage."
+                ),
+                primary_action="Repair launchers",
+                secondary_action="Re-run check",
+                context={"path": state.wrapper_path, "bundle_exec": wrapper_bundle_exec or ""},
+            ))
+        if (
+            mode.kind == "source"
+            and wrapper_mode == "source"
+            and wrapper_source_dir
+            and os.path.abspath(wrapper_source_dir) != os.path.abspath(os.path.dirname(mode.running_path))
+        ):
+            issues.append(HealthIssue(
+                code="install.wrapper_mismatch",
+                severity="info",
+                title="Installed source launcher targets a different checkout",
+                detail=(
+                    f"The installed source launcher points at {wrapper_source_dir}, but the current "
+                    f"WaveLinux session is running from {os.path.dirname(mode.running_path)}.\n"
+                    "Repair launchers if you want the desktop/menu entry to launch this checkout instead."
+                ),
+                primary_action="Repair launchers",
+                secondary_action="Re-run check",
+                context={
+                    "path": state.wrapper_path,
+                    "source_dir": wrapper_source_dir,
+                    "running_source_dir": os.path.dirname(mode.running_path),
+                },
+            ))
+        if (
+            mode.kind == "bundle"
+            and wrapper_mode == "bundle"
+            and wrapper_bundle_exec
+            and os.path.abspath(wrapper_bundle_exec) != os.path.abspath(mode.running_path)
+        ):
+            issues.append(HealthIssue(
+                code="install.wrapper_mismatch",
+                severity="info",
+                title="Installed local build launcher targets a different binary",
+                detail=(
+                    f"The installed bundled-build launcher points at {wrapper_bundle_exec}, but the "
+                    f"current WaveLinux session is running from {mode.running_path}.\n"
+                    "Repair launchers if you want the desktop/menu entry to launch this build instead."
+                ),
+                primary_action="Repair launchers",
+                secondary_action="Re-run check",
+                context={
+                    "path": state.wrapper_path,
+                    "bundle_exec": wrapper_bundle_exec,
+                    "running_bundle": mode.running_path,
+                },
+            ))
+        if (
+            mode.kind == "appimage"
+            and wrapper_mode == "appimage"
+            and getattr(state, "running_appimage_path", None)
+            and getattr(state, "installed_appimage_exists", False)
+            and os.path.abspath(state.running_appimage_path) != os.path.abspath(state.installed_appimage_path)
+        ):
+            issues.append(HealthIssue(
+                code="install.wrapper_mismatch",
+                severity="info",
+                title="Installed AppImage launcher targets a different file",
+                detail=(
+                    f"The installed AppImage launcher points at {state.installed_appimage_path}, but the "
+                    f"current WaveLinux session is running from {state.running_appimage_path}.\n"
+                    "Repair launchers if you want the desktop/menu entry to launch this AppImage instead."
+                ),
+                primary_action="Repair launchers",
+                secondary_action="Re-run check",
+                context={
+                    "path": state.wrapper_path,
+                    "installed_appimage_path": state.installed_appimage_path,
+                    "running_appimage_path": state.running_appimage_path,
+                },
             ))
         if getattr(state, "desktop_mismatch", False) or getattr(state, "stale_launcher_entries", ()):
             stale_paths = "\n".join(entry.path for entry in getattr(state, "stale_launcher_entries", ()))

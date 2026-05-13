@@ -89,6 +89,7 @@ class WaveLinuxHealthTests(unittest.TestCase):
                 wrapper_mismatch=True,
                 wrapper_mode="unknown",
                 wrapper_path="/tmp/wavelinux",
+                wrapper_bundle_exec=None,
                 wrapper_source_dir=None,
                 wrapper_target="/opt/old.AppImage",
                 desktop_mismatch=True,
@@ -129,6 +130,7 @@ class WaveLinuxHealthTests(unittest.TestCase):
                 wrapper_mismatch=False,
                 wrapper_mode="appimage",
                 wrapper_path="/tmp/wavelinux",
+                wrapper_bundle_exec=None,
                 wrapper_source_dir=None,
                 wrapper_target="/tmp/WaveLinux.AppImage",
                 desktop_mismatch=False,
@@ -159,6 +161,7 @@ class WaveLinuxHealthTests(unittest.TestCase):
                 wrapper_mode="unknown",
                 wrapper_exists=False,
                 wrapper_path="/tmp/wavelinux",
+                wrapper_bundle_exec=None,
                 wrapper_source_dir=None,
                 wrapper_target=None,
                 desktop_exists=False,
@@ -188,6 +191,7 @@ class WaveLinuxHealthTests(unittest.TestCase):
                 wrapper_mode="source",
                 wrapper_exists=True,
                 wrapper_path="/tmp/wavelinux",
+                wrapper_bundle_exec=None,
                 wrapper_source_dir="/tmp/missing-checkout",
                 wrapper_target="python3",
                 desktop_exists=True,
@@ -201,6 +205,103 @@ class WaveLinuxHealthTests(unittest.TestCase):
         codes = {issue.code for issue in issues}
         self.assertIn("install.wrapper_mismatch", codes)
         self.assertNotIn("install.appimage_missing", codes)
+
+    def test_collect_health_issues_flags_missing_bundle_wrapper(self):
+        win = self._window()
+        win._current_runtime_mode = lambda: SimpleNamespace(
+            kind="bundle",
+            running_path="/home/tester/Downloads/WaveLinux/WaveLinux",
+            allows_self_update=True,
+            update_channel="appimage",
+        )
+
+        issues = win._collect_health_issues(
+            preflight={"deps": {}, "issue_details": []},
+            state=SimpleNamespace(
+                appimage_missing=True,
+                installed_appimage_path="/tmp/WaveLinux.AppImage",
+                wrapper_mismatch=False,
+                wrapper_mode="bundle",
+                wrapper_exists=True,
+                wrapper_path="/tmp/wavelinux",
+                wrapper_bundle_exec="/tmp/missing-bundle",
+                wrapper_source_dir=None,
+                wrapper_target="/tmp/missing-bundle",
+                desktop_exists=True,
+                desktop_mismatch=False,
+                desktop_path="/tmp/io.github.duskyprojects.WaveLinux.desktop",
+                stale_launcher_entries=(),
+                warnings=("Installed bundle launcher points at a missing WaveLinux binary.",),
+            ),
+        )
+
+        codes = {issue.code for issue in issues}
+        self.assertIn("install.wrapper_mismatch", codes)
+        self.assertNotIn("install.appimage_missing", codes)
+
+    def test_collect_health_issues_flags_different_source_checkout(self):
+        win = self._window()
+        win._current_runtime_mode = lambda: SimpleNamespace(
+            kind="source",
+            running_path="/home/tester/Projects/WaveLinux-dev/main.py",
+            allows_self_update=True,
+            update_channel="appimage",
+        )
+
+        issues = win._collect_health_issues(
+            preflight={"deps": {}, "issue_details": []},
+            state=SimpleNamespace(
+                appimage_missing=True,
+                installed_appimage_path="/tmp/WaveLinux.AppImage",
+                installed_appimage_exists=False,
+                wrapper_mismatch=False,
+                wrapper_mode="source",
+                wrapper_exists=True,
+                wrapper_path="/tmp/wavelinux",
+                wrapper_bundle_exec=None,
+                wrapper_source_dir="/home/tester/Projects/WaveLinux-stable",
+                wrapper_target="python3",
+                desktop_exists=True,
+                desktop_mismatch=False,
+                desktop_path="/tmp/io.github.duskyprojects.WaveLinux.desktop",
+                stale_launcher_entries=(),
+                warnings=(),
+            ),
+        )
+
+        mismatch = next(issue for issue in issues if issue.code == "install.wrapper_mismatch")
+        self.assertEqual(mismatch.severity, "info")
+        self.assertIn("different checkout", mismatch.title.lower())
+        self.assertNotIn("install.appimage_missing", {issue.code for issue in issues})
+
+    def test_collect_health_issues_flags_different_running_appimage(self):
+        win = self._window()
+
+        issues = win._collect_health_issues(
+            preflight={"deps": {}, "issue_details": []},
+            state=SimpleNamespace(
+                running_appimage_path="/tmp/WaveLinux-2.0.5-x86_64.AppImage",
+                appimage_missing=False,
+                installed_appimage_exists=True,
+                installed_appimage_path="/tmp/WaveLinux.AppImage",
+                wrapper_mismatch=False,
+                wrapper_mode="appimage",
+                wrapper_exists=True,
+                wrapper_path="/tmp/wavelinux",
+                wrapper_bundle_exec=None,
+                wrapper_source_dir=None,
+                wrapper_target="/tmp/WaveLinux.AppImage",
+                desktop_exists=True,
+                desktop_mismatch=False,
+                desktop_path="/tmp/io.github.duskyprojects.WaveLinux.desktop",
+                stale_launcher_entries=(),
+                warnings=(),
+            ),
+        )
+
+        mismatch = next(issue for issue in issues if issue.code == "install.wrapper_mismatch")
+        self.assertEqual(mismatch.severity, "info")
+        self.assertIn("different file", mismatch.title.lower())
 
 
 if __name__ == "__main__":

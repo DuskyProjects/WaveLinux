@@ -45,7 +45,7 @@ chmod +x WaveLinux-*.AppImage
 ./WaveLinux-*.AppImage
 ```
 
-4. Inside WaveLinux, open `Settings -> Updates` and use `Install This AppImage` if you want a desktop launcher copied into `~/.local/bin` and `~/.local/share/applications`.
+4. Inside WaveLinux, open `Settings -> Updates` and use the runtime-aware install button if you want a desktop launcher copied into `~/.local/bin` and `~/.local/share/applications`.
 
 WaveLinux uses host LADSPA plugins for FX by default, even in the AppImage. This is intentional: PipeWire loads those plugins from the host side, so AppImage-bundled LADSPA copies are less reliable across distros.
 
@@ -72,6 +72,8 @@ Run directly without installing a launcher:
 ```bash
 python3 main.py
 ```
+
+The same `Settings -> Updates` page can also reinstall the current source checkout launcher, or a local bundled build launcher, when you are running one of those modes.
 
 Remove launcher/config state:
 
