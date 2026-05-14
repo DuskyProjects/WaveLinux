@@ -54,6 +54,7 @@ class RuntimeSinkView:
     name: str
     display_name: str
     is_internal: bool = False
+    stable_id: str = ""
 
 
 @dataclass
@@ -76,6 +77,7 @@ class RuntimeChannelView:
     stream_mute: bool = False
     fx_effects: list[str] = field(default_factory=list)
     fx_running: bool = False
+    stable_id: str = ""
 
 
 @dataclass
@@ -112,7 +114,10 @@ class ObservedState:
     submix_owner_by_channel: dict[str, dict[str, str | None]] = field(default_factory=dict)
     submix_live_by_channel: dict[str, dict[str, bool]] = field(default_factory=dict)
     submix_source_by_channel: dict[str, dict[str, str | None]] = field(default_factory=dict)
+    default_sink: str | None = None
     default_source: str | None = None
+    available_sink_ids: set[str] = field(default_factory=set)
+    available_source_ids: set[str] = field(default_factory=set)
     health: dict[str, str] = field(default_factory=dict)
     snapshot: Any = None
 
@@ -144,7 +149,10 @@ class RuntimeViewState:
     sinks: list[RuntimeSinkView] = field(default_factory=list)
     app_views: list[RuntimeAppView] = field(default_factory=list)
     present_node_names: set[str] = field(default_factory=set)
+    default_sink: str | None = None
     default_source: str | None = None
+    available_sink_ids: set[str] = field(default_factory=set)
+    available_source_ids: set[str] = field(default_factory=set)
     fx_status_by_channel: dict[str, OperationStatus] = field(default_factory=dict)
     health: dict[str, str] = field(default_factory=dict)
     pending_operations: dict[str, str] = field(default_factory=dict)

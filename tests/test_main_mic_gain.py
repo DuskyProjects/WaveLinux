@@ -5,7 +5,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from main import ChannelStrip
+from main import ChannelStrip, MixerStripMetrics
 
 
 class _FakeRuntime:
@@ -57,18 +57,44 @@ class ChannelStripMicGainTests(unittest.TestCase):
         strip.show()
         self._app.processEvents()
 
-        strip.apply_scale(180, 140)
+        tall_metrics = MixerStripMetrics(
+            strip_width=180,
+            slider_height=140,
+            strip_height=0,
+            outer_margin=6,
+            inner_spacing=4,
+            fader_spacing=10,
+            peak_height=5,
+            link_button_size=24,
+            mute_button_size=28,
+            mic_gain_height=20,
+            use_horizontal_scroll=False,
+        )
+        short_metrics = MixerStripMetrics(
+            strip_width=180,
+            slider_height=90,
+            strip_height=0,
+            outer_margin=4,
+            inner_spacing=2,
+            fader_spacing=7,
+            peak_height=4,
+            link_button_size=20,
+            mute_button_size=24,
+            mic_gain_height=16,
+            use_horizontal_scroll=False,
+        )
+        strip.apply_scale(tall_metrics)
         self._app.processEvents()
         tall_height = strip.height()
         tall_slider = strip.mon_slider.height()
 
-        strip.apply_scale(180, 90)
+        strip.apply_scale(short_metrics)
         self._app.processEvents()
 
         self.assertLess(strip.height(), tall_height)
         self.assertLess(strip.mon_slider.height(), tall_slider)
-        self.assertEqual(strip.mon_slider.maximumHeight(), 102)
-        self.assertEqual(strip.str_slider.maximumHeight(), 102)
+        self.assertEqual(strip.mon_slider.height(), 102)
+        self.assertEqual(strip.str_slider.height(), 102)
 
     def test_mic_and_virtual_strips_share_the_same_scaled_card_height(self):
         mic = ChannelStrip("55", "mic", "Mic", "Microphone", "mic", engine=None)
@@ -79,11 +105,22 @@ class ChannelStripMicGainTests(unittest.TestCase):
         virt.show()
         self._app.processEvents()
 
-        mic_target = mic.apply_scale(158, 80)
-        virt_target = virt.apply_scale(158, 80)
-        target = max(mic_target, virt_target)
-        mic.apply_scale(158, 80, target_height=target)
-        virt.apply_scale(158, 80, target_height=target)
+        metrics = MixerStripMetrics(
+            strip_width=158,
+            slider_height=80,
+            strip_height=0,
+            outer_margin=3,
+            inner_spacing=2,
+            fader_spacing=6,
+            peak_height=4,
+            link_button_size=20,
+            mute_button_size=24,
+            mic_gain_height=16,
+            use_horizontal_scroll=False,
+        )
+        target = max(mic.measure_scaled_height(metrics), virt.measure_scaled_height(metrics))
+        mic.apply_scale(metrics, target_height=target)
+        virt.apply_scale(metrics, target_height=target)
         self._app.processEvents()
 
         self.assertEqual(mic.height(), virt.height())

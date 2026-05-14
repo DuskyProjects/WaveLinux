@@ -127,6 +127,57 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
             {"Monitor->alsa_output.speakers": "22"},
         )
 
+    def test_route_mix_to_hardware_keeps_stream_explicit_when_target_missing(self):
+        engine = self._engine()
+        mix = OutputMix("Stream", sink_name="wavelinux_mix_stream")
+        engine.output_mixes["Stream"] = mix
+
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[:3] == ["pactl", "load-module", "module-loopback"]:
+                return "22"
+            return ""
+
+        engine._run = fake_run
+        engine.invalidate_snapshot = lambda: None
+        engine.get_default_sink = lambda: "alsa_output.speakers"
+        engine.get_all_sinks = lambda snap=None: [
+            {"index": "1", "name": "alsa_output.speakers"}
+        ]
+        engine._find_loopback_for = lambda source_token, sink_token, snap=None: None
+        engine._module_is_alive = lambda module_id, short_text=None: True
+        engine._sink_input_for_module = lambda module_id: "55" if str(module_id) == "22" else None
+
+        success = engine.route_mix_to_hardware(
+            "Stream",
+            "bluez_output.AA_BB_CC_DD_EE_FF.1",
+        )
+
+        self.assertFalse(success)
+        self.assertEqual(engine.loopback_modules, {})
+        self.assertFalse(
+            any(cmd[:3] == ["pactl", "load-module", "module-loopback"] for cmd in calls)
+        )
+
+    def test_resolve_hardware_source_name_matches_stable_usb_identity_after_rename(self):
+        engine = self._engine()
+        renamed_mic = AudioNode(
+            55,
+            "alsa_input.usb-renamed",
+            "USB Mic",
+            "Audio/Source",
+            props={"device.serial": "ABC123"},
+        )
+        engine.get_hardware_inputs = lambda snap=None: [renamed_mic]
+
+        stable_id = engine.stable_source_id(renamed_mic)
+        resolved = engine.resolve_hardware_source_name("usb:abc123")
+
+        self.assertEqual(stable_id, "usb:abc123")
+        self.assertEqual(resolved, "alsa_input.usb-renamed")
+
     def test_route_input_to_submix_keeps_old_loopback_if_replacement_fails(self):
         engine = self._engine()
         engine.output_mixes["Monitor"] = OutputMix("Monitor", sink_name="wavelinux_mix_monitor")

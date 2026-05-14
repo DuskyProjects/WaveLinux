@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from audio_runtime.models import OperationStatus
-from health import RecoveryStatus
+from health import HealthIssue, RecoveryStatus
 from main import WaveLinuxWindow
 
 
@@ -152,6 +152,113 @@ class WaveLinuxHealthTests(unittest.TestCase):
         recovered = next(issue for issue in issues if issue.code == "fx.channel_recovered")
         self.assertEqual(recovered.severity, "info")
         self.assertIn("Automatic recovery completed", recovered.detail)
+
+    def test_collect_health_issues_includes_device_fallback_and_restore_cards(self):
+        win = self._window()
+        win._desired_mix_hw = {"Monitor": "alsa_output.speakers", "Stream": None}
+        win.selected_mic = "alsa_input.internal"
+        win._active_monitor_fallback = True
+        win._preferred_monitor_hw_name = "bluez_output.headset"
+        win._restorable_monitor_hw_name = "bluez_output.headset"
+        win._active_mic_fallback = True
+        win._preferred_selected_mic_name = "alsa_input.usb_mic"
+        win._restorable_selected_mic_name = "alsa_input.usb_mic"
+
+        issues = win._collect_health_issues(
+            preflight={"deps": {}, "issue_details": []},
+            state=SimpleNamespace(
+                running_appimage_path=None,
+                appimage_missing=False,
+                installed_appimage_path="/tmp/WaveLinux.AppImage",
+                installed_appimage_backup_path="/tmp/WaveLinux.AppImage.bak",
+                installed_appimage_backup_exists=False,
+                wrapper_mismatch=False,
+                wrapper_mode="appimage",
+                wrapper_exists=True,
+                wrapper_path="/tmp/wavelinux",
+                wrapper_bundle_exec=None,
+                wrapper_source_dir=None,
+                wrapper_target="/tmp/WaveLinux.AppImage",
+                desktop_exists=True,
+                desktop_mismatch=False,
+                desktop_path="/tmp/io.github.duskyprojects.WaveLinux.desktop",
+                stale_launcher_entries=(),
+            ),
+        )
+
+        codes = {issue.code for issue in issues}
+        self.assertIn("device.monitor_fallback_active", codes)
+        self.assertIn("device.monitor_preferred_restorable", codes)
+        self.assertIn("device.mic_fallback_active", codes)
+        self.assertIn("device.mic_preferred_restorable", codes)
+
+    def test_collect_health_issues_flags_missing_stream_target(self):
+        win = self._window()
+        win._desired_mix_hw = {
+            "Monitor": "alsa_output.speakers",
+            "Stream": "bluez_output.missing_headset",
+        }
+        win._resolve_hardware_sink_name = lambda sink_name: (
+            sink_name if sink_name == "alsa_output.speakers" else None
+        )
+
+        issues = win._collect_health_issues(
+            preflight={"deps": {}, "issue_details": []},
+            state=SimpleNamespace(
+                running_appimage_path=None,
+                appimage_missing=False,
+                installed_appimage_path="/tmp/WaveLinux.AppImage",
+                installed_appimage_backup_path="/tmp/WaveLinux.AppImage.bak",
+                installed_appimage_backup_exists=False,
+                wrapper_mismatch=False,
+                wrapper_mode="appimage",
+                wrapper_exists=True,
+                wrapper_path="/tmp/wavelinux",
+                wrapper_bundle_exec=None,
+                wrapper_source_dir=None,
+                wrapper_target="/tmp/WaveLinux.AppImage",
+                desktop_exists=True,
+                desktop_mismatch=False,
+                desktop_path="/tmp/io.github.duskyprojects.WaveLinux.desktop",
+                stale_launcher_entries=(),
+            ),
+        )
+
+        stream_issue = next(issue for issue in issues if issue.code == "device.stream_target_missing")
+        self.assertEqual(stream_issue.primary_action, "Re-run device reconcile")
+        self.assertEqual(stream_issue.secondary_action, "Open diagnostics")
+
+    def test_run_health_issue_action_dispatches_device_restore_actions(self):
+        win = self._window()
+        calls = []
+        win._restore_preferred_monitor = lambda: calls.append("restore-monitor")
+        win._restore_preferred_mic = lambda: calls.append("restore-mic")
+        win._reconcile_device_policy = lambda: calls.append("reconcile")
+        win._request_runtime_refresh = lambda reason: calls.append(("refresh", reason))
+
+        issue = HealthIssue(
+            code="device.monitor_preferred_restorable",
+            severity="info",
+            title="Preferred monitor device is available again",
+            detail="",
+            primary_action="Restore monitor device",
+            secondary_action="Re-run device reconcile",
+            context={},
+        )
+
+        win._run_health_issue_action(issue, "Restore monitor device")
+        win._run_health_issue_action(issue, "Restore microphone device")
+        win._run_health_issue_action(issue, "Re-run device reconcile")
+
+        self.assertEqual(
+            calls,
+            [
+                "restore-monitor",
+                "restore-mic",
+                "reconcile",
+                ("refresh", "device-reconcile"),
+            ],
+        )
 
     def test_collect_health_issues_skips_missing_appimage_for_package_mode(self):
         win = self._window()

@@ -14,6 +14,8 @@ desktop audio, streaming, and microphone FX.
 - Manual app identity pin / merge / reset for stubborn Chromium/Electron-style apps
 - Per-channel FX: RNNoise, high-pass, EQ, compressor, gate, limiter
 - Scenes, quick-start setup templates, Health diagnostics, and launcher repair
+- Default-driven device startup with conservative monitor/mic fallback and restore actions
+- Responsive single-row mixer layout that expands on wide windows and compacts cleanly on short windows
 - Verified AppImage self-update with signed manifest validation and rollback
 
 ## Runtime Model
@@ -21,6 +23,13 @@ desktop audio, streaming, and microphone FX.
 WaveLinux is AppImage-first for end users.
 
 - The GitHub release AppImage is the primary supported desktop build.
+- On each fresh launch, `Monitor` starts from the current system default sink
+  and the active mic starts from the current system default source.
+- After startup, newly connected devices do not silently steal control. If the
+  active monitor sink or mic disappears, WaveLinux fails over to a viable
+  hardware device and surfaces a restore action in `Settings -> Health` when
+  the displaced device returns.
+- `Stream` stays explicit and does not automatically follow `Monitor`.
 - AppImage installs can update themselves from `Settings -> Updates` using a
   signed release manifest, checksum validation, smoke test, install, and
   rollback backup.

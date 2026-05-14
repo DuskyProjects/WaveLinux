@@ -87,6 +87,10 @@ class PipeWireEngine:
         r'^(bluez_output\.[0-9A-Fa-f]{2}(?:[_:-][0-9A-Fa-f]{2}){5})(?:\..+)?$',
         re.IGNORECASE,
     )
+    _BT_SOURCE_FAMILY_RE = re.compile(
+        r'^(bluez_input\.[0-9A-Fa-f]{2}(?:[_:-][0-9A-Fa-f]{2}){5})(?:\..+)?$',
+        re.IGNORECASE,
+    )
 
     def __init__(self):
         self.virtual_sink_modules = {}   # safe_name -> pactl module id
@@ -963,7 +967,9 @@ class PipeWireEngine:
     # ── Node Discovery ──────────────────────────────────────────────
 
     def get_all_nodes(self, snap=None):
-        return snap.nodes if snap else self._parse_nodes()
+        if snap is not None and hasattr(snap, "nodes"):
+            return snap.nodes
+        return self._parse_nodes()
 
     @staticmethod
     def _is_internal_node_name(name):
@@ -988,14 +994,150 @@ class PipeWireEngine:
                 and not self._is_internal_node_name(n.name)]
 
     @classmethod
+    def _normalize_stable_component(cls, value):
+        return re.sub(r'[^a-z0-9]+', '_', str(value or "").strip().lower()).strip('_')
+
+    @classmethod
+    def _looks_like_stable_device_id(cls, value):
+        value = str(value or "").strip().lower()
+        return value.startswith(("bt:", "usb:", "hw:", "name:"))
+
+    @classmethod
+    def _normalized_bt_family(cls, name, *, source=False):
+        name = str(name or "").strip()
+        if not name:
+            return ""
+        matcher = cls._BT_SOURCE_FAMILY_RE if source else cls._BT_SINK_FAMILY_RE
+        match = matcher.match(name)
+        if not match:
+            return ""
+        return cls._normalize_stable_component(match.group(1))
+
+    @classmethod
+    def _stable_device_id_from_props(cls, prefix, name, props=None, *, source=False):
+        name = str(name or "").strip()
+        props = dict(props or {})
+        bt_family = cls._normalized_bt_family(name, source=source)
+        if bt_family:
+            return f"bt:{bt_family}"
+
+        for key in (
+            "device.string",
+            "device.api",
+            "device.description",
+            "node.description",
+            "device.name",
+        ):
+            bt_family = cls._normalized_bt_family(props.get(key), source=source)
+            if bt_family:
+                return f"bt:{bt_family}"
+
+        for key in (
+            "device.serial",
+            "device.bus-id",
+            "device.bus_id",
+            "device.product.id",
+            "device.vendor.id",
+        ):
+            token = cls._normalize_stable_component(props.get(key))
+            if token:
+                return f"usb:{token}"
+
+        for key in (
+            "device.bus-path",
+            "device.bus_path",
+            "device.path",
+            "api.alsa.path",
+            "object.path",
+            "alsa.card",
+            "api.alsa.card",
+            "api.alsa.card.longname",
+            "device.name",
+        ):
+            token = cls._normalize_stable_component(props.get(key))
+            if token:
+                return f"hw:{token}"
+
+        stem = name
+        stem = re.sub(r'^(?:output|input)\.', '', stem, flags=re.IGNORECASE)
+        stem = re.sub(r'\.monitor$', '', stem, flags=re.IGNORECASE)
+        token = cls._normalize_stable_component(stem)
+        if token:
+            return f"name:{token}"
+        return ""
+
+    @classmethod
     def stable_sink_id(cls, sink_name):
         sink_name = str(sink_name or "").strip()
         if not sink_name:
             return ""
-        match = cls._BT_SINK_FAMILY_RE.match(sink_name)
-        if match:
-            return match.group(1).lower().replace('-', '_').replace(':', '_')
-        return sink_name
+        if cls._looks_like_stable_device_id(sink_name):
+            return sink_name.lower()
+        return cls._stable_device_id_from_props("sink", sink_name, {})
+
+    def _node_by_name(self, node_name, snap=None):
+        node_name = str(node_name or "").strip()
+        if not node_name:
+            return None
+        for node in self.get_all_nodes(snap):
+            if str(getattr(node, "name", "") or "").strip() == node_name:
+                return node
+        return None
+
+    def stable_source_id(self, source_name_or_node, snap=None):
+        if isinstance(source_name_or_node, AudioNode):
+            node = source_name_or_node
+            return self._stable_device_id_from_props(
+                "source",
+                getattr(node, "name", ""),
+                getattr(node, "props", {}) or {},
+                source=True,
+            )
+        source_name = str(source_name_or_node or "").strip()
+        if not source_name:
+            return ""
+        if self._looks_like_stable_device_id(source_name):
+            return source_name.lower()
+        node = self._node_by_name(source_name, snap=snap)
+        props = getattr(node, "props", {}) or {}
+        return self._stable_device_id_from_props(
+            "source",
+            source_name,
+            props,
+            source=True,
+        )
+
+    def stable_sink_inventory(self, snap=None):
+        inventory = []
+        for sink in self.get_all_sinks(snap=snap):
+            sink_name = str(sink.get("name") or "").strip()
+            if not sink_name or self._is_internal_node_name(sink_name):
+                continue
+            node = self._node_by_name(sink_name, snap=snap)
+            stable_id = self._stable_device_id_from_props(
+                "sink",
+                sink_name,
+                getattr(node, "props", {}) or {},
+            )
+            inventory.append({
+                "name": sink_name,
+                "display_name": self.display_name_for_sink(sink_name, snap=snap),
+                "stable_id": stable_id or self.stable_sink_id(sink_name),
+            })
+        return inventory
+
+    def stable_source_inventory(self, snap=None):
+        inventory = []
+        for node in self.get_hardware_inputs(snap=snap):
+            source_name = str(getattr(node, "name", "") or "").strip()
+            if not source_name:
+                continue
+            inventory.append({
+                "name": source_name,
+                "display_name": self.friendly_name(getattr(node, "description", None)) or source_name,
+                "stable_id": self.stable_source_id(node, snap=snap),
+            })
+        return inventory
 
     def resolve_hardware_sink_name(self, sink_name, snap=None):
         """Resolve a persisted hardware sink token to a currently visible sink.
@@ -1006,16 +1148,34 @@ class PipeWireEngine:
         sink_name = str(sink_name or "").strip()
         if not sink_name:
             return None
-        all_sinks = self.get_all_sinks(snap=snap)
-        names = [sink["name"] for sink in all_sinks if sink.get("name")]
+        inventory = self.stable_sink_inventory(snap=snap)
+        names = [sink["name"] for sink in inventory if sink.get("name")]
         if sink_name in names:
             return sink_name
-        wanted = self.stable_sink_id(sink_name)
+        wanted = sink_name.lower() if self._looks_like_stable_device_id(sink_name) else self.stable_sink_id(sink_name)
         if not wanted:
             return None
-        for name in names:
-            if self.stable_sink_id(name) == wanted:
-                return name
+        for sink in inventory:
+            if sink.get("stable_id") == wanted:
+                return sink.get("name")
+        return None
+
+    def resolve_hardware_source_name(self, source_or_stable_id, snap=None):
+        source_or_stable_id = str(source_or_stable_id or "").strip()
+        if not source_or_stable_id:
+            return None
+        inventory = self.stable_source_inventory(snap=snap)
+        names = [source["name"] for source in inventory if source.get("name")]
+        if source_or_stable_id in names:
+            return source_or_stable_id
+        wanted = (
+            source_or_stable_id.lower()
+            if self._looks_like_stable_device_id(source_or_stable_id)
+            else self.stable_source_id(source_or_stable_id, snap=snap)
+        )
+        for source in inventory:
+            if source.get("stable_id") == wanted:
+                return source.get("name")
         return None
 
     def get_hardware_inputs(self, snap=None):
@@ -1594,7 +1754,8 @@ class PipeWireEngine:
             return False
         requested_sink = str(hw_sink_name or "").strip()
         resolved_sink = self.resolve_hardware_sink_name(requested_sink)
-        if not resolved_sink:
+        allow_fallback = mix_name == "Monitor"
+        if not resolved_sink and allow_fallback:
             resolved_sink = self._preferred_hardware_sink_fallback(snap=None)
             if resolved_sink and requested_sink:
                 logging.warning(
@@ -1625,7 +1786,7 @@ class PipeWireEngine:
             if out:
                 break
             candidate_sink = self.resolve_hardware_sink_name(requested_sink)
-            if not candidate_sink:
+            if not candidate_sink and allow_fallback:
                 candidate_sink = self._preferred_hardware_sink_fallback(snap=None)
             if candidate_sink:
                 adopted = self._find_loopback_for(f'{mix.sink_name}.monitor', candidate_sink)
@@ -1764,13 +1925,27 @@ class PipeWireEngine:
         return None
 
     def _preferred_hardware_source_fallback(self, snap=None):
+        def _resolve_visible_source(candidate):
+            try:
+                return self.resolve_source_name(candidate, snap=snap)
+            except TypeError:
+                return self.resolve_source_name(candidate)
+
         current_default = str(self.get_default_source() or "").strip()
-        resolved_default = self.resolve_source_name(current_default) or current_default
+        resolved_default = (
+            self.resolve_hardware_source_name(current_default, snap=snap)
+            or _resolve_visible_source(current_default)
+            or str(current_default or "").strip()
+        )
         if resolved_default and not self._is_internal_node_name(resolved_default):
             return resolved_default
         for info in getattr(self, "channel_fx", {}).values():
             for candidate in (info.get("prev_default"), info.get("capture_target")):
-                resolved = self.resolve_source_name(candidate) or str(candidate or "").strip()
+                resolved = (
+                    self.resolve_hardware_source_name(candidate, snap=snap)
+                    or _resolve_visible_source(candidate)
+                    or str(candidate or "").strip()
+                )
                 if resolved and not self._is_internal_node_name(resolved):
                     return resolved
         for node in self.get_hardware_inputs(snap=snap):
@@ -3629,7 +3804,9 @@ class PipeWireEngine:
         return 1.0
 
     def get_all_sinks(self, snap=None):
-        return snap.sinks if snap else self._parse_short_sinks()
+        if snap is not None and hasattr(snap, "sinks"):
+            return snap.sinks
+        return self._parse_short_sinks()
 
     def get_sink_description(self, sink_name, snap=None):
         """The user-facing Description field from `pactl list sinks`

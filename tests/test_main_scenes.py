@@ -130,7 +130,9 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
         snapshot = win._capture_scene_snapshot()
 
         self.assertEqual(snapshot["selected_mic"], "mic")
+        self.assertEqual(snapshot["selected_mic_id"], "name:mic")
         self.assertEqual(snapshot["monitor_hw"], "alsa_output.headphones")
+        self.assertEqual(snapshot["monitor_hw_id"], "name:alsa_output_headphones")
         self.assertEqual(snapshot["monitor_mix_volume"], 0.77)
         self.assertEqual(snapshot["stream_mix_volume"], 0.31)
         self.assertEqual(snapshot["virtual_channels"], ["Music", "Voice Chat"])
@@ -188,7 +190,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
             win.runtime.ensure_virtual_channel_calls,
             ["Music", "Voice Chat"],
         )
-        self.assertEqual(win.runtime.set_selected_mic_calls, [])
+        self.assertEqual(win.runtime.set_selected_mic_calls, ["usb_mic"])
         self.assertEqual(
             win.runtime.set_mix_hardware_sync_calls,
             [
@@ -284,7 +286,7 @@ class WaveLinuxMainScenesTests(unittest.TestCase):
             win.runtime.remove_virtual_channel_calls,
             [f"wavelinux_{PipeWireEngine._sanitize_channel_name('Old Virtual')[1]}"],
         )
-        self.assertEqual(win.runtime.set_selected_mic_calls, [])
+        self.assertEqual(win.runtime.set_selected_mic_calls, ["usb_mic"])
         self.assertEqual(win.runtime.set_mix_hardware_calls, [])
         self.assertEqual(
             win.runtime.set_mix_hardware_sync_calls,

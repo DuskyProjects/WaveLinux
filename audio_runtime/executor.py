@@ -35,6 +35,40 @@ class RuntimeExecutor:
             mics = engine.get_hardware_inputs(snap=snap)
             virtual_nodes = engine.get_virtual_sinks(snap=snap)
             all_sinks = engine.get_all_sinks(snap=snap)
+            if hasattr(engine, "stable_sink_inventory"):
+                sink_inventory = {
+                    item["name"]: item for item in engine.stable_sink_inventory(snap=snap)
+                }
+            else:
+                sink_inventory = {
+                    sink["name"]: {
+                        "name": sink["name"],
+                        "display_name": sink["name"],
+                        "stable_id": (
+                            engine.stable_sink_id(sink["name"])
+                            if hasattr(engine, "stable_sink_id") else str(sink["name"])
+                        ),
+                    }
+                    for sink in all_sinks
+                    if sink.get("name")
+                }
+            if hasattr(engine, "stable_source_inventory"):
+                source_inventory = {
+                    item["name"]: item for item in engine.stable_source_inventory(snap=snap)
+                }
+            else:
+                source_inventory = {
+                    node.name: {
+                        "name": node.name,
+                        "display_name": getattr(node, "description", None) or node.name,
+                        "stable_id": (
+                            engine.stable_source_id(node, snap=snap)
+                            if hasattr(engine, "stable_source_id") else str(node.name)
+                        ),
+                    }
+                    for node in mics
+                    if getattr(node, "name", None)
+                }
             apps = engine.get_sink_inputs(snap=snap)
             live_by_owner = engine.snapshot_sink_inputs_by_owner(snap=snap)
             tracked_names = (
@@ -42,10 +76,31 @@ class RuntimeExecutor:
                 | {node.name for node in mics}
                 | {node.name for node in virtual_nodes}
             )
+            default_sink = (
+                engine.get_default_sink()
+                if hasattr(engine, "get_default_sink")
+                else None
+            )
+            default_source = (
+                engine.get_default_source()
+                if hasattr(engine, "get_default_source")
+                else None
+            )
             observed = ObservedState(
-                default_source=engine.get_default_source(),
+                default_sink=default_sink,
+                default_source=default_source,
                 snapshot=snap,
             )
+            observed.available_sink_ids = {
+                str(item.get("stable_id") or "").strip()
+                for item in sink_inventory.values()
+                if str(item.get("stable_id") or "").strip()
+            }
+            observed.available_source_ids = {
+                str(item.get("stable_id") or "").strip()
+                for item in source_inventory.values()
+                if str(item.get("stable_id") or "").strip()
+            }
             observed.source_names = {
                 node.name for node in getattr(snap, "nodes", [])
                 if getattr(node, "media_class", "").startswith("Audio/Source")
@@ -105,6 +160,10 @@ class RuntimeExecutor:
                         sink["name"].startswith("wavelinux_mix_")
                         or sink["name"].startswith("wavelinux_src_")
                         or sink["name"].endswith(".monitor")
+                    ),
+                    stable_id=(
+                        str((sink_inventory.get(sink["name"]) or {}).get("stable_id") or "").strip()
+                        or engine.stable_sink_id(sink["name"])
                     ),
                 )
                 for sink in all_sinks
@@ -281,7 +340,10 @@ class RuntimeExecutor:
             sinks=list(observed_state.sinks),
             app_views=list(observed_state.app_views),
             present_node_names=set(observed_state.present_node_names),
+            default_sink=observed_state.default_sink,
             default_source=observed_state.default_source,
+            available_sink_ids=set(observed_state.available_sink_ids),
+            available_source_ids=set(observed_state.available_source_ids),
             fx_status_by_channel={k: v for k, v in fx_statuses.items()},
             health=dict(observed_state.health),
             pending_operations=dict(pending_operations),
@@ -641,6 +703,12 @@ class RuntimeExecutor:
             icon = "🎵"
             capture_target = f"{node_name}.monitor"
             meter_source = fx_source or capture_target
+        stable_id = ""
+        if is_mic:
+            if hasattr(engine, "stable_source_id"):
+                stable_id = engine.stable_source_id(node, snap=observed.snapshot)
+            else:
+                stable_id = str(getattr(node, "name", "") or "")
         return RuntimeChannelView(
             node_id=node_id,
             name=node_name,
@@ -660,6 +728,7 @@ class RuntimeExecutor:
             stream_mute=bool(str_mute),
             fx_effects=list(observed.fx_effects_by_channel.get(node_name, [])),
             fx_running=bool(observed.fx_sources_by_channel.get(node_name)),
+            stable_id=stable_id,
         )
 
     @staticmethod

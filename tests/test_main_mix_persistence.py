@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication, QComboBox
 from types import SimpleNamespace
 
-from main import ChannelStrip, WaveLinuxWindow
+from main import ChannelStrip, MixerStripMetrics, WaveLinuxWindow
 
 
 class _DummyCombo:
@@ -317,6 +317,240 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
         self.assertEqual(win.runtime.calls[0]["monitor_mix_volume"], 0.67)
         self.assertEqual(win.runtime.calls[0]["stream_mix_volume"], 0.28)
 
+    def test_apply_config_prefers_live_default_source_for_selected_mic(self):
+        win = self._window()
+        win.runtime = _FakeRuntime()
+        win.schedule_save = lambda: None
+        win.engine = type(
+            "Engine",
+            (),
+            {
+                "get_default_sink": lambda self: "alsa_output.live_default",
+                "get_default_source": lambda self: "alsa_input.live_default",
+                "resolve_hardware_sink_name": lambda self, sink_name: sink_name,
+                "resolve_hardware_source_name": lambda self, source_name: source_name,
+                "stable_sink_id": lambda self, sink_name: f"name:{str(sink_name).replace('.', '_')}",
+                "stable_source_id": lambda self, source_name: f"name:{str(source_name).replace('.', '_')}",
+            },
+        )()
+        win._set_engine_identity_overrides = lambda: None
+        win._prune_stale_apps = lambda: None
+
+        win._apply_config_dict(
+            {
+                "monitor_hw": "bluez_output.saved_headset",
+                "selected_mic": "alsa_input.saved_usb",
+            }
+        )
+
+        self.assertEqual(win.selected_mic, "alsa_input.live_default")
+        self.assertEqual(win.runtime.selected_mic_calls, ["alsa_input.live_default"])
+        self.assertEqual(win.runtime.calls[0]["selected_mic"], "alsa_input.live_default")
+
+    def test_reconcile_device_policy_falls_back_monitor_when_active_target_disappears(self):
+        win = self._window()
+        win.engine = type(
+            "Engine",
+            (),
+            {
+                "stable_sink_id": lambda self, sink_name: f"id:{sink_name}",
+                "stable_source_id": lambda self, source_name: f"id:{source_name}",
+            },
+        )()
+        win._desired_mix_hw["Monitor"] = "bluez_output.headset"
+        win.selected_mic = "alsa_input.internal"
+        monitor_calls = []
+        win._set_mix_output_target = lambda mix_name, sink_name, **kwargs: (
+            monitor_calls.append((mix_name, sink_name, kwargs)),
+            win._desired_mix_hw.__setitem__(mix_name, sink_name),
+        )[-1]
+        win._set_selected_mic_target = lambda *args, **kwargs: None
+        view = SimpleNamespace(
+            default_sink="alsa_output.speakers",
+            default_source="alsa_input.internal",
+            sinks=[
+                SimpleNamespace(
+                    name="alsa_output.speakers",
+                    display_name="Speakers",
+                    is_internal=False,
+                    stable_id="id:alsa_output.speakers",
+                )
+            ],
+            mic_inputs=[
+                SimpleNamespace(
+                    name="alsa_input.internal",
+                    label="Internal Mic",
+                    description="Internal Mic",
+                    stable_id="id:alsa_input.internal",
+                )
+            ],
+            mixes={},
+        )
+
+        changed = win._reconcile_device_policy(view)
+
+        self.assertTrue(changed)
+        self.assertTrue(win._active_monitor_fallback)
+        self.assertEqual(win._desired_mix_hw["Monitor"], "alsa_output.speakers")
+        self.assertEqual(win._restorable_monitor_hw_name, "bluez_output.headset")
+        self.assertEqual(monitor_calls[0][0:2], ("Monitor", "alsa_output.speakers"))
+
+    def test_reconcile_device_policy_marks_preferred_monitor_restorable_when_it_returns(self):
+        win = self._window()
+        win.engine = type(
+            "Engine",
+            (),
+            {"stable_sink_id": lambda self, sink_name: "bt:aa_bb_cc_dd_ee_ff"},
+        )()
+        win._desired_mix_hw["Monitor"] = "alsa_output.speakers"
+        win.selected_mic = "alsa_input.internal"
+        win._preferred_monitor_hw_id = "bt:aa_bb_cc_dd_ee_ff"
+        win._preferred_monitor_hw_name = "bluez_output.AA_BB_CC_DD_EE_FF.1"
+        win._active_monitor_fallback = True
+        view = SimpleNamespace(
+            default_sink="alsa_output.speakers",
+            default_source="alsa_input.internal",
+            sinks=[
+                SimpleNamespace(
+                    name="alsa_output.speakers",
+                    display_name="Speakers",
+                    is_internal=False,
+                    stable_id="id:alsa_output.speakers",
+                ),
+                SimpleNamespace(
+                    name="bluez_output.AA_BB_CC_DD_EE_FF.2",
+                    display_name="Headset",
+                    is_internal=False,
+                    stable_id="bt:aa_bb_cc_dd_ee_ff",
+                ),
+            ],
+            mic_inputs=[
+                SimpleNamespace(
+                    name="alsa_input.internal",
+                    label="Internal Mic",
+                    description="Internal Mic",
+                    stable_id="id:alsa_input.internal",
+                )
+            ],
+            mixes={},
+        )
+
+        changed = win._reconcile_device_policy(view)
+
+        self.assertFalse(changed)
+        self.assertTrue(win._active_monitor_fallback)
+        self.assertEqual(win._restorable_monitor_hw_name, "bluez_output.AA_BB_CC_DD_EE_FF.2")
+
+    def test_reconcile_device_policy_falls_back_microphone_when_active_source_disappears(self):
+        win = self._window()
+        win.engine = type(
+            "Engine",
+            (),
+            {
+                "stable_sink_id": lambda self, sink_name: f"id:{sink_name}",
+                "stable_source_id": lambda self, source_name: f"id:{source_name}",
+            },
+        )()
+        win._desired_mix_hw["Monitor"] = "alsa_output.speakers"
+        win.selected_mic = "alsa_input.usb_missing"
+        mic_calls = []
+        win._set_mix_output_target = lambda *args, **kwargs: None
+        win._set_selected_mic_target = lambda mic_name, **kwargs: (
+            mic_calls.append((mic_name, kwargs)),
+            setattr(win, "selected_mic", mic_name),
+        )[-1]
+        view = SimpleNamespace(
+            default_sink="alsa_output.speakers",
+            default_source="alsa_input.internal",
+            sinks=[
+                SimpleNamespace(
+                    name="alsa_output.speakers",
+                    display_name="Speakers",
+                    is_internal=False,
+                    stable_id="id:alsa_output.speakers",
+                )
+            ],
+            mic_inputs=[
+                SimpleNamespace(
+                    name="alsa_input.internal",
+                    label="Internal Mic",
+                    description="Internal Mic",
+                    stable_id="id:alsa_input.internal",
+                )
+            ],
+            mixes={},
+        )
+
+        changed = win._reconcile_device_policy(view)
+
+        self.assertTrue(changed)
+        self.assertTrue(win._active_mic_fallback)
+        self.assertEqual(win.selected_mic, "alsa_input.internal")
+        self.assertEqual(win._restorable_selected_mic_name, "alsa_input.usb_missing")
+        self.assertEqual(mic_calls[0][0], "alsa_input.internal")
+
+    def test_reconcile_device_policy_does_not_autopromote_new_devices_when_active_ones_still_exist(self):
+        win = self._window()
+        win.engine = type(
+            "Engine",
+            (),
+            {
+                "stable_sink_id": lambda self, sink_name: f"id:{sink_name}",
+                "stable_source_id": lambda self, source_name: f"id:{source_name}",
+            },
+        )()
+        win._desired_mix_hw["Monitor"] = "alsa_output.speakers"
+        win.selected_mic = "alsa_input.internal"
+        win._preferred_monitor_hw_id = "id:alsa_output.speakers"
+        win._preferred_monitor_hw_name = "alsa_output.speakers"
+        win._preferred_selected_mic_id = "id:alsa_input.internal"
+        win._preferred_selected_mic_name = "alsa_input.internal"
+        monitor_calls = []
+        mic_calls = []
+        win._set_mix_output_target = lambda *args, **kwargs: monitor_calls.append((args, kwargs))
+        win._set_selected_mic_target = lambda *args, **kwargs: mic_calls.append((args, kwargs))
+        view = SimpleNamespace(
+            default_sink="alsa_output.speakers",
+            default_source="alsa_input.internal",
+            sinks=[
+                SimpleNamespace(
+                    name="alsa_output.speakers",
+                    display_name="Speakers",
+                    is_internal=False,
+                    stable_id="id:alsa_output.speakers",
+                ),
+                SimpleNamespace(
+                    name="bluez_output.headset",
+                    display_name="Headset",
+                    is_internal=False,
+                    stable_id="id:bluez_output.headset",
+                ),
+            ],
+            mic_inputs=[
+                SimpleNamespace(
+                    name="alsa_input.internal",
+                    label="Internal Mic",
+                    description="Internal Mic",
+                    stable_id="id:alsa_input.internal",
+                ),
+                SimpleNamespace(
+                    name="alsa_input.usb_mic",
+                    label="USB Mic",
+                    description="USB Mic",
+                    stable_id="id:alsa_input.usb_mic",
+                ),
+            ],
+            mixes={},
+        )
+
+        changed = win._reconcile_device_policy(view)
+
+        self.assertFalse(changed)
+        self.assertEqual(win._desired_mix_hw["Monitor"], "alsa_output.speakers")
+        self.assertEqual(win.selected_mic, "alsa_input.internal")
+        self.assertEqual(monitor_calls, [])
+        self.assertEqual(mic_calls, [])
+
     def test_on_master_vol_change_updates_persisted_mix_volume(self):
         win = self._window()
         win.runtime = _FakeRuntime()
@@ -334,7 +568,21 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
     def test_channel_strip_centers_vertical_sliders_with_mute_buttons(self):
         strip = ChannelStrip("1", "mic", "Digital Microphone", "Microphone", "🎤", engine=None)
 
-        strip.apply_scale(200, 140)
+        strip.apply_scale(
+            MixerStripMetrics(
+                strip_width=200,
+                slider_height=140,
+                strip_height=0,
+                outer_margin=6,
+                inner_spacing=4,
+                fader_spacing=10,
+                peak_height=5,
+                link_button_size=24,
+                mute_button_size=28,
+                mic_gain_height=20,
+                use_horizontal_scroll=False,
+            )
+        )
         strip.show()
         self._app.processEvents()
 

@@ -11,6 +11,7 @@ import re
 import time
 import threading
 import queue
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 from PyQt6.QtWidgets import (
@@ -95,6 +96,21 @@ _QUICK_START_TEMPLATES = {
         "mic_effects": ["rnnoise", "compressor", "limiter"],
     },
 }
+
+
+@dataclass
+class MixerStripMetrics:
+    strip_width: int
+    slider_height: int
+    strip_height: int
+    outer_margin: int
+    inner_spacing: int
+    fader_spacing: int
+    peak_height: int
+    link_button_size: int
+    mute_button_size: int
+    mic_gain_height: int
+    use_horizontal_scroll: bool
 
 
 def _parse_version(v):
@@ -1136,6 +1152,8 @@ class ChannelStrip(QFrame):
 
         self.src_slider = None
         self.src_vol_lbl = None
+        self._src_box_layout = None
+        self._src_head_layout = None
         if self.is_mic:
             src_box = QVBoxLayout()
             src_box.setContentsMargins(0, 2, 0, 2)
@@ -1158,6 +1176,8 @@ class ChannelStrip(QFrame):
             self.src_slider.valueChanged.connect(self._on_src_vol)
             src_box.addWidget(self.src_slider)
             layout.addLayout(src_box)
+            self._src_box_layout = src_box
+            self._src_head_layout = src_head
 
         # Link button: when on, the two mix faders move together.
         link_row = QHBoxLayout()
@@ -1233,46 +1253,51 @@ class ChannelStrip(QFrame):
         self.fx_btn.setVisible(False)
 
     _MIN_W = 120
-    _MAX_W = 280
+    _MAX_W = 360
     _MIN_SLIDER_H = 80
-    _MAX_SLIDER_H = 200
+    _MAX_SLIDER_H = 240
     _VERT_SLIDER_END_PAD = 12
     _STRIP_HEIGHT_PAD = 12
-    _WIDTH_SCALE_CAP = 180
+    _WIDTH_SCALE_CAP = 220
+    _MAX_WIDGET_HEIGHT = 16777215
 
-    def apply_scale(self, width: int, slider_h: int, *, target_height: int | None = None):
-        """Resize this strip to `width` px and return the desired card height."""
-        self.setFixedWidth(width)
-        width_t = (width - self._MIN_W) / (self._MAX_W - self._MIN_W)
-        width_t = max(0.0, min(1.0, width_t))
-        control_width_t = (
-            (min(width, self._WIDTH_SCALE_CAP) - self._MIN_W)
-            / (self._WIDTH_SCALE_CAP - self._MIN_W)
-        )
-        control_width_t = max(0.0, min(1.0, control_width_t))
-        height_t = (slider_h - self._MIN_SLIDER_H) / (self._MAX_SLIDER_H - self._MIN_SLIDER_H)
-        height_t = max(0.0, min(1.0, height_t))
-        t = min(control_width_t, height_t)
-        margin = max(3, int(3 + t * 5))
+    def _apply_scale_metrics(self, metrics: MixerStripMetrics):
+        self.setFixedWidth(int(metrics.strip_width))
+        margin = int(metrics.outer_margin)
         self._root_layout.setContentsMargins(margin, margin, margin, margin)
-        self._root_layout.setSpacing(max(2, int(2 + t * 4)))
-        spacing = max(6, int(6 + t * 4))
-        self._faders_row.setSpacing(spacing)
-        slider_widget_h = slider_h + self._VERT_SLIDER_END_PAD
+        self._root_layout.setSpacing(int(metrics.inner_spacing))
+        self._faders_row.setSpacing(int(metrics.fader_spacing))
+        slider_widget_h = int(metrics.slider_height) + self._VERT_SLIDER_END_PAD
         self.mon_slider.setFixedHeight(slider_widget_h)
         self.str_slider.setFixedHeight(slider_widget_h)
-        self.name_lbl.setFixedHeight(24)
-        peak_h = max(4, int(4 + t * 2))
-        self.peak_bar.setFixedHeight(peak_h)
-        link_size = max(20, int(20 + t * 4))
-        self.link_btn.setFixedSize(link_size, link_size)
-        mute_size = max(24, int(24 + t * 4))
-        self.mon_mute.setFixedSize(mute_size, mute_size)
-        self.str_mute.setFixedSize(mute_size, mute_size)
+        self.name_lbl.setMinimumHeight(24)
+        self.peak_bar.setFixedHeight(int(metrics.peak_height))
+        self.link_btn.setFixedSize(int(metrics.link_button_size), int(metrics.link_button_size))
+        self.mon_mute.setFixedSize(int(metrics.mute_button_size), int(metrics.mute_button_size))
+        self.str_mute.setFixedSize(int(metrics.mute_button_size), int(metrics.mute_button_size))
+        if self._src_box_layout is not None:
+            vertical_pad = max(1, metrics.inner_spacing - 1)
+            self._src_box_layout.setContentsMargins(0, vertical_pad, 0, vertical_pad)
+            self._src_box_layout.setSpacing(max(1, metrics.inner_spacing - 1))
+        if self._src_head_layout is not None:
+            self._src_head_layout.setContentsMargins(0, 0, 0, 0)
+            self._src_head_layout.setSpacing(max(2, metrics.inner_spacing))
+        if self.src_slider is not None:
+            self.src_slider.setFixedHeight(int(metrics.mic_gain_height))
+
+    def measure_scaled_height(self, metrics: MixerStripMetrics) -> int:
+        self._apply_scale_metrics(metrics)
+        self.setMinimumHeight(0)
+        self.setMaximumHeight(self._MAX_WIDGET_HEIGHT)
         self._root_layout.activate()
-        desired_h = self._root_layout.sizeHint().height() + self._STRIP_HEIGHT_PAD
-        self.setFixedHeight(target_height if target_height is not None else desired_h)
-        return desired_h
+        self.layout().activate()
+        return self.sizeHint().height() + self._STRIP_HEIGHT_PAD
+
+    def apply_scale(self, metrics: MixerStripMetrics, target_height: int | None = None):
+        self._apply_scale_metrics(metrics)
+        if target_height is None:
+            target_height = self.measure_scaled_height(metrics)
+        self.setFixedHeight(int(target_height))
 
     def _stash_submix(self, mix_name, vol, mute):
         win = self._main_window()
@@ -2142,6 +2167,20 @@ class WaveLinuxWindow(QMainWindow):
         self._monitor_sink_fp = ()
         self._desired_mix_hw = {"Monitor": None, "Stream": None}
         self._desired_mix_volumes = {"Monitor": 1.0, "Stream": 1.0}
+        self._preferred_monitor_hw_id = ""
+        self._preferred_monitor_hw_name = ""
+        self._restorable_monitor_hw_id = ""
+        self._restorable_monitor_hw_name = ""
+        self._active_monitor_fallback = False
+        self._last_good_monitor_hw_id = ""
+        self._last_good_monitor_hw_name = ""
+        self._preferred_selected_mic_id = ""
+        self._preferred_selected_mic_name = ""
+        self._restorable_selected_mic_id = ""
+        self._restorable_selected_mic_name = ""
+        self._active_mic_fallback = False
+        self._last_good_selected_mic_id = ""
+        self._last_good_selected_mic_name = ""
         self._auto_recovery_state = {}
         self.config_path = os.path.expanduser("~/.config/wavelinux/config.json")
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
@@ -2168,11 +2207,18 @@ class WaveLinuxWindow(QMainWindow):
         self._event_refresh_timer.timeout.connect(
             lambda: self._request_runtime_refresh("pactl-event")
         )
-        self._hotplug_refresh_timer = QTimer(self)
-        self._hotplug_refresh_timer.setSingleShot(True)
-        self._hotplug_refresh_timer.setInterval(1800)
-        self._hotplug_refresh_timer.timeout.connect(
-            lambda: self._request_runtime_refresh("hotplug-settle")
+        self._device_settle_refresh_timer = QTimer(self)
+        self._device_settle_refresh_timer.setSingleShot(True)
+        self._device_settle_refresh_timer.setInterval(700)
+        self._device_settle_refresh_timer.timeout.connect(
+            lambda: self._request_runtime_refresh("device-settle")
+        )
+        self._hotplug_refresh_timer = self._device_settle_refresh_timer
+        self._bluetooth_refresh_timer = QTimer(self)
+        self._bluetooth_refresh_timer.setSingleShot(True)
+        self._bluetooth_refresh_timer.setInterval(1800)
+        self._bluetooth_refresh_timer.timeout.connect(
+            lambda: self._request_runtime_refresh("bluetooth-settle")
         )
 
         self._setup_ui()
@@ -2199,6 +2245,7 @@ class WaveLinuxWindow(QMainWindow):
 
     def _on_runtime_view_state(self, view_state):
         self._runtime_view_state = view_state
+        self._reconcile_device_policy(view_state)
         health = getattr(view_state, "health", {}) or {}
         pending_ops = getattr(view_state, "pending_operations", {}) or {}
         degraded = [name for name, state in health.items() if state]
@@ -2786,7 +2833,9 @@ class WaveLinuxWindow(QMainWindow):
         return {
             "saved_at": int(time.time()),
             "selected_mic": self.selected_mic or None,
+            "selected_mic_id": self._stable_source_id_for_name(self.selected_mic) if self.selected_mic else "",
             "monitor_hw": self._desired_mix_hw.get("Monitor"),
+            "monitor_hw_id": self._stable_sink_id_for_name(self._desired_mix_hw.get("Monitor")),
             "stream_hw": self._desired_mix_hw.get("Stream"),
             "monitor_mix_volume": self._current_mix_master_volume("Monitor"),
             "stream_mix_volume": self._current_mix_master_volume("Stream"),
@@ -2868,7 +2917,9 @@ class WaveLinuxWindow(QMainWindow):
         return {
             "saved_at": int(raw.get("saved_at") or time.time()),
             "selected_mic": raw.get("selected_mic") or None,
+            "selected_mic_id": str(raw.get("selected_mic_id") or "").strip(),
             "monitor_hw": raw.get("monitor_hw"),
+            "monitor_hw_id": str(raw.get("monitor_hw_id") or "").strip(),
             "stream_hw": raw.get("stream_hw"),
             "monitor_mix_volume": cls._normalize_mix_volume(raw.get("monitor_mix_volume", 1.0)),
             "stream_mix_volume": cls._normalize_mix_volume(raw.get("stream_mix_volume", 1.0)),
@@ -2963,8 +3014,23 @@ class WaveLinuxWindow(QMainWindow):
         for name in scene_virtuals:
             self.runtime.ensure_virtual_channel_sync(name)
 
-        selected_mic = snapshot.get("selected_mic") or None
-        self.selected_mic = selected_mic
+        selected_mic = (
+            self._resolve_hardware_source_name(snapshot.get("selected_mic_id"))
+            or self._resolve_hardware_source_name(snapshot.get("selected_mic"))
+            or snapshot.get("selected_mic")
+            or None
+        )
+        if selected_mic:
+            self._set_selected_mic_target(
+                selected_mic,
+                record_preference=True,
+                persist=False,
+                request_refresh=False,
+                view=self.__dict__.get("_runtime_view_state"),
+            )
+        else:
+            self.selected_mic = None
+            self._mic_selection_initialized = False
 
         scene_nodes = set(snapshot.get("channel_order", []) or [])
         scene_nodes.update(snapshot.get("active_effects", {}).keys())
@@ -3018,11 +3084,16 @@ class WaveLinuxWindow(QMainWindow):
         )
         self._set_mix_output_target(
             "Monitor",
-            snapshot.get("monitor_hw"),
+            (
+                self._resolve_hardware_sink_name(snapshot.get("monitor_hw_id"))
+                or self._resolve_hardware_sink_name(snapshot.get("monitor_hw"))
+                or snapshot.get("monitor_hw")
+            ),
             persist=False,
             update_combo=True,
             sync_runtime=True,
         )
+        self._record_preferred_monitor(self.__dict__.get("_desired_mix_hw", {}).get("Monitor"), view=self.__dict__.get("_runtime_view_state"))
         self._set_mix_output_target(
             "Stream",
             snapshot.get("stream_hw"),
@@ -3136,17 +3207,510 @@ class WaveLinuxWindow(QMainWindow):
     def _preferred_setup_mic(self):
         if self.selected_mic:
             return self.selected_mic
-        view = getattr(self, "_runtime_view_state", None)
+        view = self.__dict__.get("_runtime_view_state")
         default_source = getattr(view, "default_source", None) if view is not None else None
         if default_source:
-            return default_source
+            resolved = self._resolve_hardware_source_name(default_source)
+            if resolved:
+                return resolved
         mics = list(getattr(view, "mic_inputs", []) or []) if view is not None else []
         if mics:
             return getattr(mics[0], "name", "") or None
-        engine = getattr(self, "engine", None)
-        if engine is not None and hasattr(engine, "get_default_source"):
-            return engine.get_default_source()
+        return self._resolve_startup_mic_target()
+
+    @staticmethod
+    def _sink_stable_id_from_row(row):
+        return str(getattr(row, "stable_id", "") or "").strip()
+
+    @staticmethod
+    def _source_stable_id_from_row(row):
+        return str(getattr(row, "stable_id", "") or "").strip()
+
+    def _hardware_sink_rows(self, view=None):
+        view = view or self.__dict__.get("_runtime_view_state")
+        return [
+            sink for sink in (getattr(view, "sinks", []) or [])
+            if not getattr(sink, "is_internal", False)
+            and not str(getattr(sink, "name", "") or "").startswith("wavelinux_")
+        ]
+
+    def _hardware_source_rows(self, view=None):
+        view = view or self.__dict__.get("_runtime_view_state")
+        return list(getattr(view, "mic_inputs", []) or [])
+
+    def _sink_row_for_name(self, sink_name, view=None):
+        sink_name = str(sink_name or "").strip()
+        if not sink_name:
+            return None
+        for sink in self._hardware_sink_rows(view):
+            if str(getattr(sink, "name", "") or "").strip() == sink_name:
+                return sink
         return None
+
+    def _source_row_for_name(self, source_name, view=None):
+        source_name = str(source_name or "").strip()
+        if not source_name:
+            return None
+        for source in self._hardware_source_rows(view):
+            if str(getattr(source, "name", "") or "").strip() == source_name:
+                return source
+        return None
+
+    def _sink_row_for_stable_id(self, stable_id, view=None):
+        stable_id = str(stable_id or "").strip().lower()
+        if not stable_id:
+            return None
+        for sink in self._hardware_sink_rows(view):
+            if self._sink_stable_id_from_row(sink).lower() == stable_id:
+                return sink
+        return None
+
+    def _source_row_for_stable_id(self, stable_id, view=None):
+        stable_id = str(stable_id or "").strip().lower()
+        if not stable_id:
+            return None
+        for source in self._hardware_source_rows(view):
+            if self._source_stable_id_from_row(source).lower() == stable_id:
+                return source
+        return None
+
+    def _display_name_for_sink_name(self, sink_name, view=None):
+        sink_name = str(sink_name or "").strip()
+        if not sink_name:
+            return ""
+        row = self._sink_row_for_name(sink_name, view=view)
+        if row is not None:
+            return str(getattr(row, "display_name", "") or sink_name)
+        engine = self.__dict__.get("engine")
+        if engine is not None and hasattr(engine, "display_name_for_sink"):
+            return engine.display_name_for_sink(sink_name)
+        return sink_name
+
+    def _stable_sink_id_for_name(self, sink_name):
+        engine = self.__dict__.get("engine")
+        if engine is not None and hasattr(engine, "stable_sink_id"):
+            return engine.stable_sink_id(sink_name)
+        return PipeWireEngine.stable_sink_id(sink_name)
+
+    def _stable_source_id_for_name(self, source_name):
+        engine = self.__dict__.get("engine")
+        if engine is not None and hasattr(engine, "stable_source_id"):
+            return engine.stable_source_id(source_name)
+        return PipeWireEngine._stable_device_id_from_props(
+            "source",
+            source_name,
+            {},
+            source=True,
+        )
+
+    def _resolve_hardware_sink_name(self, sink_name):
+        engine = self.__dict__.get("engine")
+        if engine is not None and hasattr(engine, "resolve_hardware_sink_name"):
+            return engine.resolve_hardware_sink_name(sink_name)
+        return str(sink_name or "").strip() or None
+
+    def _resolve_hardware_source_name(self, source_name):
+        engine = self.__dict__.get("engine")
+        if engine is not None and hasattr(engine, "resolve_hardware_source_name"):
+            return engine.resolve_hardware_source_name(source_name)
+        return str(source_name or "").strip() or None
+
+    def _display_name_for_source_name(self, source_name, view=None):
+        source_name = str(source_name or "").strip()
+        if not source_name:
+            return ""
+        row = self._source_row_for_name(source_name, view=view)
+        if row is not None:
+            return str(getattr(row, "label", "") or getattr(row, "description", "") or source_name)
+        return PipeWireEngine.friendly_name(source_name) or source_name
+
+    def _visible_default_sink(self, view=None):
+        view = view or self.__dict__.get("_runtime_view_state")
+        default_sink = getattr(view, "default_sink", None) if view is not None else None
+        engine = self.__dict__.get("engine")
+        if not default_sink and engine is not None and hasattr(engine, "get_default_sink"):
+            default_sink = engine.get_default_sink()
+        if not default_sink:
+            return None
+        resolved = self._resolve_hardware_sink_name(default_sink)
+        if resolved and (view is None or self._sink_row_for_name(resolved, view=view)):
+            return resolved
+        return None
+
+    def _visible_default_source(self, view=None):
+        view = view or self.__dict__.get("_runtime_view_state")
+        default_source = getattr(view, "default_source", None) if view is not None else None
+        engine = self.__dict__.get("engine")
+        if not default_source and engine is not None and hasattr(engine, "get_default_source"):
+            default_source = engine.get_default_source()
+        if not default_source:
+            return None
+        resolved = self._resolve_hardware_source_name(default_source)
+        if resolved and (view is None or self._source_row_for_name(resolved, view=view)):
+            return resolved
+        return None
+
+    def _resolve_startup_monitor_target(self, view=None):
+        default_sink = self._visible_default_sink(view=view)
+        if default_sink:
+            return default_sink
+        rows = self._hardware_sink_rows(view=view)
+        if rows:
+            return str(getattr(rows[0], "name", "") or "") or None
+        engine = self.__dict__.get("engine")
+        if engine is not None and hasattr(engine, "stable_sink_inventory"):
+            inventory = list(engine.stable_sink_inventory() or [])
+            if inventory:
+                return str(inventory[0].get("name") or "") or None
+        return None
+
+    def _resolve_startup_mic_target(self, view=None):
+        default_source = self._visible_default_source(view=view)
+        if default_source:
+            return default_source
+        rows = self._hardware_source_rows(view=view)
+        if rows:
+            return str(getattr(rows[0], "name", "") or "") or None
+        engine = self.__dict__.get("engine")
+        if engine is not None and hasattr(engine, "stable_source_inventory"):
+            inventory = list(engine.stable_source_inventory() or [])
+            if inventory:
+                return str(inventory[0].get("name") or "") or None
+        return None
+
+    def _record_preferred_monitor(self, sink_name, *, view=None):
+        sink_name = str(sink_name or "").strip()
+        if not sink_name:
+            self._preferred_monitor_hw_id = ""
+            self._preferred_monitor_hw_name = ""
+            self._active_monitor_fallback = False
+            self._restorable_monitor_hw_id = ""
+            self._restorable_monitor_hw_name = ""
+            return
+        resolved = self._resolve_hardware_sink_name(sink_name) or sink_name
+        row = self._sink_row_for_name(resolved, view=view)
+        stable_id = self._sink_stable_id_from_row(row)
+        if not stable_id:
+            stable_id = self._stable_sink_id_for_name(resolved)
+        self._preferred_monitor_hw_name = resolved
+        self._preferred_monitor_hw_id = stable_id
+        self._last_good_monitor_hw_name = resolved
+        self._last_good_monitor_hw_id = stable_id
+        self._active_monitor_fallback = False
+        self._restorable_monitor_hw_id = ""
+        self._restorable_monitor_hw_name = ""
+
+    def _record_preferred_mic(self, source_name, *, view=None):
+        source_name = str(source_name or "").strip()
+        if not source_name:
+            self._preferred_selected_mic_id = ""
+            self._preferred_selected_mic_name = ""
+            self._active_mic_fallback = False
+            self._restorable_selected_mic_id = ""
+            self._restorable_selected_mic_name = ""
+            return
+        resolved = self._resolve_hardware_source_name(source_name) or source_name
+        row = self._source_row_for_name(resolved, view=view)
+        stable_id = self._source_stable_id_from_row(row)
+        if not stable_id:
+            stable_id = self._stable_source_id_for_name(resolved)
+        self._preferred_selected_mic_name = resolved
+        self._preferred_selected_mic_id = stable_id
+        self._last_good_selected_mic_name = resolved
+        self._last_good_selected_mic_id = stable_id
+        self._active_mic_fallback = False
+        self._restorable_selected_mic_id = ""
+        self._restorable_selected_mic_name = ""
+
+    def _resolve_monitor_fallback(self, view=None):
+        rows = self._hardware_sink_rows(view=view)
+        if not rows:
+            return None
+        default_sink = self._visible_default_sink(view=view)
+        if default_sink:
+            return default_sink
+        last_good_monitor_hw_id = self.__dict__.get("_last_good_monitor_hw_id", "")
+        if last_good_monitor_hw_id:
+            row = self._sink_row_for_stable_id(last_good_monitor_hw_id, view=view)
+            if row is not None:
+                return getattr(row, "name", None)
+        return getattr(rows[0], "name", None)
+
+    def _resolve_mic_fallback(self, view=None):
+        rows = self._hardware_source_rows(view=view)
+        if not rows:
+            return None
+        default_source = self._visible_default_source(view=view)
+        if default_source:
+            return default_source
+        last_good_selected_mic_id = self.__dict__.get("_last_good_selected_mic_id", "")
+        if last_good_selected_mic_id:
+            row = self._source_row_for_stable_id(last_good_selected_mic_id, view=view)
+            if row is not None:
+                return getattr(row, "name", None)
+        return getattr(rows[0], "name", None)
+
+    def _set_selected_mic_target(self, mic_name, *, record_preference=False, persist=True, request_refresh=True, view=None):
+        mic_name = str(mic_name or "").strip() or None
+        self.selected_mic = mic_name
+        self._mic_selection_initialized = bool(mic_name)
+        runtime = getattr(self, "runtime", None)
+        if runtime is not None:
+            runtime.set_selected_mic(mic_name)
+        if record_preference and mic_name:
+            self._record_preferred_mic(mic_name, view=view)
+        if persist:
+            self.schedule_save()
+        if request_refresh:
+            self._request_runtime_refresh("selected-mic-change")
+
+    def _restore_preferred_monitor(self):
+        target = str(
+            self.__dict__.get("_preferred_monitor_hw_name", "")
+            or self.__dict__.get("_restorable_monitor_hw_name", "")
+            or ""
+        ).strip()
+        if not target:
+            return
+        resolved = self._resolve_hardware_sink_name(
+            self.__dict__.get("_preferred_monitor_hw_id", "") or target
+        ) or self._resolve_hardware_sink_name(target)
+        if not resolved:
+            QMessageBox.information(
+                self.settings_dialog,
+                "Monitor device unavailable",
+                "WaveLinux could not find the preferred monitor device right now.",
+            )
+            return
+        self._set_mix_output_target(
+            "Monitor",
+            resolved,
+            persist=True,
+            update_combo=True,
+            sync_runtime=True,
+        )
+        self._record_preferred_monitor(resolved, view=self.__dict__.get("_runtime_view_state"))
+        self.status_lbl.setText(f"Restored monitor device: {self._display_name_for_sink_name(resolved)}")
+        self._refresh_system_tab(preflight=self._startup_preflight)
+
+    def _restore_preferred_mic(self):
+        target = str(
+            self.__dict__.get("_preferred_selected_mic_name", "")
+            or self.__dict__.get("_restorable_selected_mic_name", "")
+            or ""
+        ).strip()
+        if not target:
+            return
+        resolved = self._resolve_hardware_source_name(
+            self.__dict__.get("_preferred_selected_mic_id", "") or target
+        ) or self._resolve_hardware_source_name(target)
+        if not resolved:
+            QMessageBox.information(
+                self.settings_dialog,
+                "Microphone unavailable",
+                "WaveLinux could not find the preferred microphone right now.",
+            )
+            return
+        self._set_selected_mic_target(
+            resolved,
+            record_preference=True,
+            persist=True,
+            request_refresh=True,
+            view=self.__dict__.get("_runtime_view_state"),
+        )
+        self.status_lbl.setText(f"Restored microphone device: {self._display_name_for_source_name(resolved)}")
+        self._refresh_system_tab(preflight=self._startup_preflight)
+
+    def _reconcile_device_policy(self, view=None):
+        view = view or self.__dict__.get("_runtime_view_state")
+        if view is None:
+            return False
+        changed = False
+        preferred_monitor_hw_name = self.__dict__.get("_preferred_monitor_hw_name", "")
+        preferred_monitor_hw_id = self.__dict__.get("_preferred_monitor_hw_id", "")
+        active_monitor_fallback = bool(self.__dict__.get("_active_monitor_fallback", False))
+        preferred_selected_mic_name = self.__dict__.get("_preferred_selected_mic_name", "")
+        preferred_selected_mic_id = self.__dict__.get("_preferred_selected_mic_id", "")
+        active_mic_fallback = bool(self.__dict__.get("_active_mic_fallback", False))
+
+        desired_mix_hw = self.__dict__.get("_desired_mix_hw", {}) or {}
+        active_monitor = desired_mix_hw.get("Monitor") or getattr(view.mixes.get("Monitor"), "hardware_sink", None)
+        resolved_monitor = self._resolve_hardware_sink_name(active_monitor) if active_monitor else None
+        active_monitor_row = self._sink_row_for_name(resolved_monitor or active_monitor, view=view)
+        if active_monitor_row is not None:
+            active_monitor_name = str(getattr(active_monitor_row, "name", "") or "")
+            active_monitor_id = self._sink_stable_id_from_row(active_monitor_row)
+            self._last_good_monitor_hw_name = active_monitor_name
+            self._last_good_monitor_hw_id = active_monitor_id
+            if not preferred_monitor_hw_name:
+                self._preferred_monitor_hw_name = active_monitor_name
+                self._preferred_monitor_hw_id = active_monitor_id
+                preferred_monitor_hw_name = active_monitor_name
+                preferred_monitor_hw_id = active_monitor_id
+            preferred_monitor_row = self._sink_row_for_stable_id(preferred_monitor_hw_id, view=view)
+            if preferred_monitor_row is not None and active_monitor_name == getattr(preferred_monitor_row, "name", None):
+                self._active_monitor_fallback = False
+                self._restorable_monitor_hw_id = ""
+                self._restorable_monitor_hw_name = ""
+            elif active_monitor_fallback and preferred_monitor_row is not None:
+                self._restorable_monitor_hw_id = preferred_monitor_hw_id
+                self._restorable_monitor_hw_name = getattr(preferred_monitor_row, "name", "") or preferred_monitor_hw_name
+        elif active_monitor:
+            fallback_monitor = self._resolve_monitor_fallback(view=view)
+            if fallback_monitor and fallback_monitor != active_monitor:
+                if not active_monitor_fallback:
+                    if not preferred_monitor_hw_name:
+                        self._preferred_monitor_hw_name = str(active_monitor)
+                        preferred_monitor_hw_name = str(active_monitor)
+                    if not preferred_monitor_hw_id:
+                        self._preferred_monitor_hw_id = self._stable_sink_id_for_name(self._preferred_monitor_hw_name)
+                        preferred_monitor_hw_id = self._preferred_monitor_hw_id
+                    self._restorable_monitor_hw_name = preferred_monitor_hw_name
+                    self._restorable_monitor_hw_id = preferred_monitor_hw_id
+                self._active_monitor_fallback = True
+                self._set_mix_output_target(
+                    "Monitor",
+                    fallback_monitor,
+                    persist=True,
+                    update_combo=True,
+                    sync_runtime=True,
+                )
+                changed = True
+
+        active_mic = str(self.__dict__.get("selected_mic") or "").strip()
+        active_mic_row = self._source_row_for_name(active_mic, view=view)
+        if active_mic_row is not None:
+            active_mic_name = str(getattr(active_mic_row, "name", "") or "")
+            active_mic_id = self._source_stable_id_from_row(active_mic_row)
+            self._last_good_selected_mic_name = active_mic_name
+            self._last_good_selected_mic_id = active_mic_id
+            if not preferred_selected_mic_name:
+                self._preferred_selected_mic_name = active_mic_name
+                self._preferred_selected_mic_id = active_mic_id
+                preferred_selected_mic_name = active_mic_name
+                preferred_selected_mic_id = active_mic_id
+            preferred_mic_row = self._source_row_for_stable_id(preferred_selected_mic_id, view=view)
+            if preferred_mic_row is not None and active_mic_name == getattr(preferred_mic_row, "name", None):
+                self._active_mic_fallback = False
+                self._restorable_selected_mic_id = ""
+                self._restorable_selected_mic_name = ""
+            elif active_mic_fallback and preferred_mic_row is not None:
+                self._restorable_selected_mic_id = preferred_selected_mic_id
+                self._restorable_selected_mic_name = getattr(preferred_mic_row, "name", "") or preferred_selected_mic_name
+        else:
+            fallback_mic = self._resolve_mic_fallback(view=view)
+            if fallback_mic and fallback_mic != active_mic:
+                if not active_mic_fallback:
+                    if not preferred_selected_mic_name:
+                        self._preferred_selected_mic_name = active_mic
+                        preferred_selected_mic_name = active_mic
+                    if not preferred_selected_mic_id:
+                        self._preferred_selected_mic_id = self._stable_source_id_for_name(self._preferred_selected_mic_name)
+                        preferred_selected_mic_id = self._preferred_selected_mic_id
+                    self._restorable_selected_mic_name = preferred_selected_mic_name
+                    self._restorable_selected_mic_id = preferred_selected_mic_id
+                self._active_mic_fallback = True
+                self._set_selected_mic_target(
+                    fallback_mic,
+                    record_preference=False,
+                    persist=True,
+                    request_refresh=True,
+                    view=view,
+                )
+                changed = True
+
+        return changed
+
+    def _device_health_issues(self, view=None):
+        view = view or self.__dict__.get("_runtime_view_state")
+        issues = []
+        desired_mix_hw = self.__dict__.get("_desired_mix_hw", {}) or {}
+        active_monitor = str(desired_mix_hw.get("Monitor") or "").strip()
+        active_mic = str(self.__dict__.get("selected_mic") or "").strip()
+        if self.__dict__.get("_active_monitor_fallback", False):
+            issues.append(HealthIssue(
+                code="device.monitor_fallback_active",
+                severity="warning",
+                title="Monitor output is running on a fallback device",
+                detail=(
+                    f"WaveLinux is routing Monitor to {self._display_name_for_sink_name(active_monitor, view=view) or active_monitor} "
+                    f"because the preferred device {self._display_name_for_sink_name(self.__dict__.get('_preferred_monitor_hw_name', ''), view=view) or self.__dict__.get('_preferred_monitor_hw_name', '') or 'is unavailable'}."
+                ),
+                primary_action=(
+                    "Restore monitor device"
+                    if self.__dict__.get("_restorable_monitor_hw_name", "")
+                    else "Re-run device reconcile"
+                ),
+                secondary_action="Re-run device reconcile" if self.__dict__.get("_restorable_monitor_hw_name", "") else "",
+                context={
+                    "active_sink": active_monitor,
+                    "preferred_sink": self.__dict__.get("_preferred_monitor_hw_name", ""),
+                    "restorable_sink": self.__dict__.get("_restorable_monitor_hw_name", ""),
+                },
+            ))
+        if self.__dict__.get("_active_monitor_fallback", False) and self.__dict__.get("_restorable_monitor_hw_name", ""):
+            issues.append(HealthIssue(
+                code="device.monitor_preferred_restorable",
+                severity="info",
+                title="Preferred monitor device is available again",
+                detail=(
+                    f"{self._display_name_for_sink_name(self.__dict__.get('_restorable_monitor_hw_name', ''), view=view) or self.__dict__.get('_restorable_monitor_hw_name', '')} "
+                    "has returned. WaveLinux will not switch automatically."
+                ),
+                primary_action="Restore monitor device",
+                secondary_action="Re-run device reconcile",
+                context={"sink_name": self.__dict__.get("_restorable_monitor_hw_name", "")},
+            ))
+        if self.__dict__.get("_active_mic_fallback", False):
+            issues.append(HealthIssue(
+                code="device.mic_fallback_active",
+                severity="warning",
+                title="Microphone is running on a fallback device",
+                detail=(
+                    f"WaveLinux is using {self._display_name_for_source_name(active_mic, view=view) or active_mic} "
+                    f"because the preferred microphone {self._display_name_for_source_name(self.__dict__.get('_preferred_selected_mic_name', ''), view=view) or self.__dict__.get('_preferred_selected_mic_name', '') or 'is unavailable'}."
+                ),
+                primary_action=(
+                    "Restore microphone device"
+                    if self.__dict__.get("_restorable_selected_mic_name", "")
+                    else "Re-run device reconcile"
+                ),
+                secondary_action="Re-run device reconcile" if self.__dict__.get("_restorable_selected_mic_name", "") else "",
+                context={
+                    "active_source": active_mic,
+                    "preferred_source": self.__dict__.get("_preferred_selected_mic_name", ""),
+                    "restorable_source": self.__dict__.get("_restorable_selected_mic_name", ""),
+                },
+            ))
+        if self.__dict__.get("_active_mic_fallback", False) and self.__dict__.get("_restorable_selected_mic_name", ""):
+            issues.append(HealthIssue(
+                code="device.mic_preferred_restorable",
+                severity="info",
+                title="Preferred microphone is available again",
+                detail=(
+                    f"{self._display_name_for_source_name(self.__dict__.get('_restorable_selected_mic_name', ''), view=view) or self.__dict__.get('_restorable_selected_mic_name', '')} "
+                    "has returned. WaveLinux will not switch automatically."
+                ),
+                primary_action="Restore microphone device",
+                secondary_action="Re-run device reconcile",
+                context={"source_name": self.__dict__.get("_restorable_selected_mic_name", "")},
+            ))
+        stream_target = str(desired_mix_hw.get("Stream") or "").strip()
+        if stream_target and not self._resolve_hardware_sink_name(stream_target):
+            issues.append(HealthIssue(
+                code="device.stream_target_missing",
+                severity="warning",
+                title="Stream output target is unavailable",
+                detail=(
+                    f"WaveLinux cannot currently resolve the explicit Stream target "
+                    f"{self._display_name_for_sink_name(stream_target, view=view) or stream_target}. "
+                    "Stream does not auto-follow Monitor."
+                ),
+                primary_action="Re-run device reconcile",
+                secondary_action="Open diagnostics",
+                context={"sink_name": stream_target},
+            ))
+        return issues
 
     def _apply_quick_start_template(self, template_id):
         template = _QUICK_START_TEMPLATES.get(template_id)
@@ -3164,11 +3728,16 @@ class WaveLinuxWindow(QMainWindow):
 
         selected_mic = self._preferred_setup_mic()
         if selected_mic:
-            self.selected_mic = selected_mic
-            self.runtime.set_selected_mic(selected_mic)
+            self._set_selected_mic_target(
+                selected_mic,
+                record_preference=True,
+                persist=False,
+                request_refresh=False,
+                view=self.__dict__.get("_runtime_view_state"),
+            )
             self.active_effects[selected_mic] = list(template.get("mic_effects", []) or [])
 
-        default_sink = self.engine.get_default_sink() if hasattr(self.engine, "get_default_sink") else None
+        default_sink = self._resolve_startup_monitor_target()
         if default_sink:
             self._set_mix_output_target(
                 "Monitor",
@@ -3177,6 +3746,7 @@ class WaveLinuxWindow(QMainWindow):
                 update_combo=True,
                 sync_runtime=True,
             )
+            self._record_preferred_monitor(default_sink, view=self.__dict__.get("_runtime_view_state"))
         self._selected_setup_template = template_id
         self._onboarding_completed = True
         self._show_first_run_setup = False
@@ -4620,6 +5190,8 @@ class WaveLinuxWindow(QMainWindow):
                 context=update_issue,
             ))
 
+        issues.extend(self._device_health_issues(self.__dict__.get("_runtime_view_state")))
+
         degraded = set(self._runtime_degraded_channels())
         for node_name in sorted(degraded):
             issues.append(self._health_issue_for_channel(node_name))
@@ -4649,8 +5221,18 @@ class WaveLinuxWindow(QMainWindow):
         if action == "Retry update check":
             self._check_for_updates()
             return
+        if action == "Re-run device reconcile":
+            self._reconcile_device_policy()
+            self._request_runtime_refresh("device-reconcile")
+            return
         if action == "Restore Previous AppImage":
             self._restore_previous_appimage()
+            return
+        if action == "Restore monitor device":
+            self._restore_preferred_monitor()
+            return
+        if action == "Restore microphone device":
+            self._restore_preferred_mic()
             return
         if action == "Recover channel":
             self.recover_channel(str(issue.context.get("node_name") or ""))
@@ -4737,6 +5319,10 @@ class WaveLinuxWindow(QMainWindow):
                 "n/a" if launcher_targets_active is None
                 else ("yes" if launcher_targets_active else "no")
             ),
+            "Current system default sink: "
+            + (getattr(self._runtime_view_state, "default_sink", None) or self.engine.get_default_sink() or "unknown"),
+            "Current system default source: "
+            + (getattr(self._runtime_view_state, "default_source", None) or self.engine.get_default_source() or "unknown"),
             "Host tools present: " + ", ".join(sorted(cmd for cmd, present in preflight["deps"].items() if present)),
             f"LADSPA plugins detected: {len(getattr(self.engine, 'ladspa_plugins', set()) or set())}",
             f"Last successful update check: {self._format_timestamp(self._last_update_check_at)}",
@@ -5481,7 +6067,16 @@ class WaveLinuxWindow(QMainWindow):
             return
         self._event_refresh_timer.start()
         if payload and self._should_schedule_settle_refresh_for_pactl_event(payload):
-            self._hotplug_refresh_timer.start()
+            settle_timer = (
+                self.__dict__.get("_device_settle_refresh_timer")
+                or self.__dict__.get("_hotplug_refresh_timer")
+            )
+            if settle_timer is not None:
+                settle_timer.start()
+        if payload and self._should_schedule_bluetooth_settle_refresh_for_pactl_event(payload):
+            bluetooth_timer = self.__dict__.get("_bluetooth_refresh_timer")
+            if bluetooth_timer is not None:
+                bluetooth_timer.start()
 
     def _on_event_proc_error(self, err):
         if self._shutting_down:
@@ -5520,6 +6115,20 @@ class WaveLinuxWindow(QMainWindow):
                 continue
             target = match.group(1)
             if target in settle_targets:
+                return True
+        return False
+
+    @staticmethod
+    def _should_schedule_bluetooth_settle_refresh_for_pactl_event(payload):
+        structural_targets = {"sink", "source", "server", "card"}
+        for line in payload.splitlines():
+            text = line.strip().lower()
+            if not text or "bluez" not in text:
+                continue
+            match = re.search(r"\bon\s+([a-z-]+)\b", text)
+            if not match:
+                continue
+            if match.group(1) in structural_targets:
                 return True
         return False
 
@@ -5769,24 +6378,150 @@ class WaveLinuxWindow(QMainWindow):
 
     # ── Responsive strip scaling ────────────────────────────────────
 
-    _MIN_STRIP_W = 120
-    _MAX_STRIP_W = 280
-    _MIN_SLIDER_H = 80
-    _MAX_SLIDER_H = 200
-    _SLIDER_WIDTH_SCALE_CAP = 180
+    _MIN_STRIP_W = ChannelStrip._MIN_W
+    _MAX_STRIP_W = ChannelStrip._MAX_W
+    _MIN_SLIDER_H = ChannelStrip._MIN_SLIDER_H
+    _MAX_SLIDER_H = ChannelStrip._MAX_SLIDER_H
+    _SLIDER_WIDTH_SCALE_CAP = ChannelStrip._WIDTH_SCALE_CAP
+    _STRIP_MIN_OUTER_MARGIN = 3
+    _STRIP_MAX_OUTER_MARGIN = 8
+    _STRIP_MIN_INNER_SPACING = 2
+    _STRIP_MAX_INNER_SPACING = 6
+    _STRIP_MIN_FADER_SPACING = 6
+    _STRIP_MAX_FADER_SPACING = 12
+    _STRIP_MIN_PEAK_HEIGHT = 4
+    _STRIP_MAX_PEAK_HEIGHT = 6
+    _STRIP_MIN_LINK_SIZE = 20
+    _STRIP_MAX_LINK_SIZE = 26
+    _STRIP_MIN_MUTE_SIZE = 24
+    _STRIP_MAX_MUTE_SIZE = 30
+    _STRIP_MIN_MIC_GAIN_HEIGHT = 16
+    _STRIP_MAX_MIC_GAIN_HEIGHT = 24
 
     def eventFilter(self, obj, event):
         if obj is self.inputs_scroll.viewport() and event.type() == QEvent.Type.Resize:
             self._rescale_strips()
         return super().eventFilter(obj, event)
 
-    # Approximate fixed-height overhead in a strip (icon row, name label,
-    # peak bar, link row, MON/STR labels, %, mute buttons, margins/spacing)
-    # — everything that isn't the slider. Used to back-compute how much
-    # vertical room is left for the sliders.
-    _STRIP_VERT_OVERHEAD = 170
-    _STRIP_MIN_VIEWPORT_H = 180
-    _STRIP_MAX_VIEWPORT_H = 620
+    # Worst-case non-slider chrome budget for the strip row. This is used
+    # to derive the vertical slider budget from the actual viewport height
+    # before any clipping occurs.
+    _STRIP_NON_SLIDER_HEIGHT_BUDGET = 158
+    _STRIP_MIN_TOTAL_HEIGHT = 215
+
+    @staticmethod
+    def _clamp_int(value, minimum, maximum):
+        return max(int(minimum), min(int(maximum), int(round(value))))
+
+    def _compute_mixer_strip_metrics(self, strips=None) -> MixerStripMetrics:
+        strips = list(strips or self.channel_widgets.values())
+        count = len(strips)
+        if count == 0:
+            return MixerStripMetrics(
+                strip_width=self._MIN_STRIP_W,
+                slider_height=self._MIN_SLIDER_H,
+                strip_height=self._STRIP_MIN_TOTAL_HEIGHT,
+                outer_margin=self._STRIP_MIN_OUTER_MARGIN,
+                inner_spacing=self._STRIP_MIN_INNER_SPACING,
+                fader_spacing=self._STRIP_MIN_FADER_SPACING,
+                peak_height=self._STRIP_MIN_PEAK_HEIGHT,
+                link_button_size=self._STRIP_MIN_LINK_SIZE,
+                mute_button_size=self._STRIP_MIN_MUTE_SIZE,
+                mic_gain_height=self._STRIP_MIN_MIC_GAIN_HEIGHT,
+                use_horizontal_scroll=False,
+            )
+
+        viewport = self.inputs_scroll.viewport()
+        avail_w = max(0, int(viewport.width()))
+        avail_h = max(0, int(viewport.height()))
+        spacing = int(self.input_layout.spacing())
+        margins = self.input_layout.contentsMargins()
+        horizontal_chrome = int(margins.left()) + int(margins.right())
+        available_row_width = max(0, avail_w - horizontal_chrome - spacing * max(0, count - 1))
+        ideal_width = available_row_width // count if count else self._MAX_STRIP_W
+        use_horizontal_scroll = ideal_width < self._MIN_STRIP_W
+        strip_width = self._MIN_STRIP_W if use_horizontal_scroll else self._clamp_int(
+            ideal_width,
+            self._MIN_STRIP_W,
+            self._MAX_STRIP_W,
+        )
+
+        width_span = max(1, self._SLIDER_WIDTH_SCALE_CAP - self._MIN_STRIP_W)
+        control_width_t = (
+            min(strip_width, self._SLIDER_WIDTH_SCALE_CAP) - self._MIN_STRIP_W
+        ) / width_span
+        control_width_t = max(0.0, min(1.0, control_width_t))
+
+        slider_budget = avail_h - self._STRIP_NON_SLIDER_HEIGHT_BUDGET
+        slider_height = self._clamp_int(
+            slider_budget,
+            self._MIN_SLIDER_H,
+            self._MAX_SLIDER_H,
+        )
+        slider_span = max(1, self._MAX_SLIDER_H - self._MIN_SLIDER_H)
+        height_t = (slider_height - self._MIN_SLIDER_H) / slider_span
+        height_t = max(0.0, min(1.0, height_t))
+        control_t = min(control_width_t, height_t)
+
+        lerp = lambda lo, hi, t: lo + (hi - lo) * t
+        return MixerStripMetrics(
+            strip_width=strip_width,
+            slider_height=slider_height,
+            strip_height=0,
+            outer_margin=self._clamp_int(
+                lerp(self._STRIP_MIN_OUTER_MARGIN, self._STRIP_MAX_OUTER_MARGIN, control_t),
+                self._STRIP_MIN_OUTER_MARGIN,
+                self._STRIP_MAX_OUTER_MARGIN,
+            ),
+            inner_spacing=self._clamp_int(
+                lerp(self._STRIP_MIN_INNER_SPACING, self._STRIP_MAX_INNER_SPACING, control_t),
+                self._STRIP_MIN_INNER_SPACING,
+                self._STRIP_MAX_INNER_SPACING,
+            ),
+            fader_spacing=self._clamp_int(
+                lerp(self._STRIP_MIN_FADER_SPACING, self._STRIP_MAX_FADER_SPACING, control_t),
+                self._STRIP_MIN_FADER_SPACING,
+                self._STRIP_MAX_FADER_SPACING,
+            ),
+            peak_height=self._clamp_int(
+                lerp(self._STRIP_MIN_PEAK_HEIGHT, self._STRIP_MAX_PEAK_HEIGHT, control_t),
+                self._STRIP_MIN_PEAK_HEIGHT,
+                self._STRIP_MAX_PEAK_HEIGHT,
+            ),
+            link_button_size=self._clamp_int(
+                lerp(self._STRIP_MIN_LINK_SIZE, self._STRIP_MAX_LINK_SIZE, control_t),
+                self._STRIP_MIN_LINK_SIZE,
+                self._STRIP_MAX_LINK_SIZE,
+            ),
+            mute_button_size=self._clamp_int(
+                lerp(self._STRIP_MIN_MUTE_SIZE, self._STRIP_MAX_MUTE_SIZE, control_t),
+                self._STRIP_MIN_MUTE_SIZE,
+                self._STRIP_MAX_MUTE_SIZE,
+            ),
+            mic_gain_height=self._clamp_int(
+                lerp(self._STRIP_MIN_MIC_GAIN_HEIGHT, self._STRIP_MAX_MIC_GAIN_HEIGHT, control_t),
+                self._STRIP_MIN_MIC_GAIN_HEIGHT,
+                self._STRIP_MAX_MIC_GAIN_HEIGHT,
+            ),
+            use_horizontal_scroll=use_horizontal_scroll,
+        )
+
+    def _measure_strip_heights(self, metrics, strips) -> int:
+        strips = list(strips or [])
+        if not strips:
+            return metrics.strip_height
+        return max(strip.measure_scaled_height(metrics) for strip in strips)
+
+    def _apply_mixer_strip_metrics(self, metrics, strips) -> None:
+        policy = (
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            if metrics.use_horizontal_scroll
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.inputs_scroll.setHorizontalScrollBarPolicy(policy)
+        for strip in strips:
+            strip.apply_scale(metrics, target_height=metrics.strip_height)
+        self.inputs_container.adjustSize()
 
     def resizeEvent(self, event):
         out = super().resizeEvent(event)
@@ -5796,53 +6531,11 @@ class WaveLinuxWindow(QMainWindow):
 
     def _rescale_strips(self):
         strips = list(self.channel_widgets.values())
-        n = len(strips)
-        if n == 0:
+        if not strips:
             return
-        # Horizontal sizing
-        avail_w = self.inputs_scroll.viewport().width()
-        spacing = self.input_layout.spacing()
-        margins = (self.input_layout.contentsMargins().left()
-                   + self.input_layout.contentsMargins().right())
-        space = avail_w - spacing * (n - 1) - margins
-        ideal_w = space // n if n > 0 else self._MAX_STRIP_W
-        if ideal_w >= self._MIN_STRIP_W:
-            strip_w = min(ideal_w, self._MAX_STRIP_W)
-            self.inputs_scroll.setHorizontalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        else:
-            strip_w = self._MIN_STRIP_W
-            self.inputs_scroll.setHorizontalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        # Slider height is the min of the width-driven cap and the
-        # height-driven cap so the strip fits in both axes before
-        # scrolling kicks in.
-        width_t = (
-            (min(strip_w, self._SLIDER_WIDTH_SCALE_CAP) - self._MIN_STRIP_W)
-            / (self._SLIDER_WIDTH_SCALE_CAP - self._MIN_STRIP_W)
-        )
-        width_t = max(0.0, min(1.0, width_t))
-        slider_h_w = int(self._MIN_SLIDER_H + width_t * (self._MAX_SLIDER_H - self._MIN_SLIDER_H))
-        avail_h = self.inputs_scroll.viewport().height()
-        height_t = (
-            (avail_h - self._STRIP_MIN_VIEWPORT_H)
-            / (self._STRIP_MAX_VIEWPORT_H - self._STRIP_MIN_VIEWPORT_H)
-        )
-        height_t = max(0.0, min(1.0, height_t))
-        slider_h_h = int(
-            self._MIN_SLIDER_H
-            + height_t * (self._MAX_SLIDER_H - self._MIN_SLIDER_H)
-        )
-        slider_h = max(self._MIN_SLIDER_H,
-                       min(self._MAX_SLIDER_H, slider_h_w, slider_h_h))
-        desired_heights = [
-            strip.apply_scale(strip_w, slider_h)
-            for strip in strips
-        ]
-        target_strip_h = max(desired_heights) if desired_heights else 0
-        for strip in strips:
-            strip.apply_scale(strip_w, slider_h, target_height=target_strip_h)
-        self.inputs_container.adjustSize()
+        metrics = self._compute_mixer_strip_metrics(strips)
+        metrics.strip_height = self._measure_strip_heights(metrics, strips)
+        self._apply_mixer_strip_metrics(metrics, strips)
 
     def _refresh(self):
         """Update UI to match PipeWire state without destroying everything.
@@ -5923,6 +6616,8 @@ class WaveLinuxWindow(QMainWindow):
             update_combo=False,
             sync_runtime=(mix_name == "Monitor"),
         )
+        if mix_name == "Monitor" and hw_sink_name:
+            self._record_preferred_monitor(hw_sink_name, view=self.__dict__.get("_runtime_view_state"))
 
     def _apply_pending_clipguard_migration(self):
         """Rewrite the legacy master-bus `clipguard: true` flag as a
@@ -6301,10 +6996,13 @@ class WaveLinuxWindow(QMainWindow):
         new_mic = self.mic_in_combo.itemData(idx)
         if new_mic == self.selected_mic:
             return
-        self.selected_mic = new_mic
-        self._mic_selection_initialized = True
-        self.runtime.set_selected_mic(new_mic)
-        self.schedule_save()
+        self._set_selected_mic_target(
+            new_mic,
+            record_preference=True,
+            persist=True,
+            request_refresh=False,
+            view=self.__dict__.get("_runtime_view_state"),
+        )
         self._refresh()
 
     def _on_add_channel(self):
@@ -6352,10 +7050,15 @@ class WaveLinuxWindow(QMainWindow):
 
     def _serialize_config(self):
         scenes = self.__dict__.get('scenes', {})
+        desired_mix_hw = self.__dict__.get("_desired_mix_hw", {}) or {}
         return {
             'schema_version': 1,
-            'monitor_hw': self._desired_mix_hw.get("Monitor"),
-            'stream_hw': self._desired_mix_hw.get("Stream"),
+            'monitor_hw': desired_mix_hw.get("Monitor"),
+            'stream_hw': desired_mix_hw.get("Stream"),
+            'preferred_monitor_hw_id': self.__dict__.get('_preferred_monitor_hw_id', ""),
+            'preferred_monitor_hw_name': self.__dict__.get('_preferred_monitor_hw_name', ""),
+            'preferred_selected_mic_id': self.__dict__.get('_preferred_selected_mic_id', ""),
+            'preferred_selected_mic_name': self.__dict__.get('_preferred_selected_mic_name', ""),
             'monitor_mix_volume': self._current_mix_master_volume("Monitor"),
             'stream_mix_volume': self._current_mix_master_volume("Stream"),
             'channels': list(self.virtual_channels),
@@ -6470,7 +7173,34 @@ class WaveLinuxWindow(QMainWindow):
         self._onboarding_completed = bool(conf.get('onboarding_completed', True))
         self._selected_setup_template = str(conf.get('quick_start_template') or "")
         self.channel_order = self._dedupe_names(conf.get('channel_order', []) or [])
-        self.selected_mic = conf.get('selected_mic') or None
+        self.selected_mic = None
+        self._mic_selection_initialized = False
+        self._preferred_monitor_hw_id = str(
+            conf.get('preferred_monitor_hw_id')
+            or self._stable_sink_id_for_name(conf.get('monitor_hw'))
+            or ""
+        ).strip()
+        self._preferred_monitor_hw_name = str(
+            conf.get('preferred_monitor_hw_name')
+            or conf.get('monitor_hw')
+            or ""
+        ).strip()
+        self._preferred_selected_mic_id = str(
+            conf.get('preferred_selected_mic_id')
+            or self._stable_source_id_for_name(conf.get('selected_mic'))
+            or ""
+        ).strip()
+        self._preferred_selected_mic_name = str(
+            conf.get('preferred_selected_mic_name')
+            or conf.get('selected_mic')
+            or ""
+        ).strip()
+        self._restorable_monitor_hw_id = ""
+        self._restorable_monitor_hw_name = ""
+        self._restorable_selected_mic_id = ""
+        self._restorable_selected_mic_name = ""
+        self._active_monitor_fallback = False
+        self._active_mic_fallback = False
         self._set_mix_master_volume(
             "Monitor",
             conf.get('monitor_mix_volume', 1.0),
@@ -6524,16 +7254,22 @@ class WaveLinuxWindow(QMainWindow):
             for name in self.virtual_channels:
                 runtime.ensure_virtual_channel_sync(name)
 
-        default_sink = (
-            engine.get_default_sink()
-            if engine is not None and hasattr(engine, "get_default_sink")
-            else None
-        )
-        mon_hw = default_sink or conf.get('monitor_hw')
+        startup_mic = self._resolve_startup_mic_target()
+        if startup_mic:
+            self._set_selected_mic_target(
+                startup_mic,
+                record_preference=True,
+                persist=False,
+                request_refresh=False,
+                view=self.__dict__.get("_runtime_view_state"),
+            )
+
+        mon_hw = self._resolve_startup_monitor_target()
         str_hw = conf.get('stream_hw')
         self._set_mix_output_target(
             "Monitor", mon_hw, persist=False, update_combo=True, sync_runtime=True
         )
+        self._record_preferred_monitor(mon_hw, view=self.__dict__.get("_runtime_view_state"))
         self._set_mix_output_target(
             "Stream", str_hw, persist=False, update_combo=True, sync_runtime=True
         )
@@ -6548,11 +7284,21 @@ class WaveLinuxWindow(QMainWindow):
             self._show_first_run_setup = True
             self.runtime.ensure_output_mix_sync("Monitor")
             self.runtime.ensure_output_mix_sync("Stream")
-            def_sink = self.engine.get_default_sink()
+            startup_mic = self._resolve_startup_mic_target()
+            if startup_mic:
+                self._set_selected_mic_target(
+                    startup_mic,
+                    record_preference=True,
+                    persist=False,
+                    request_refresh=False,
+                    view=self.__dict__.get("_runtime_view_state"),
+                )
+            def_sink = self._resolve_startup_monitor_target()
             if def_sink:
                 self._set_mix_output_target(
                     "Monitor", def_sink, persist=False, update_combo=True, sync_runtime=True
                 )
+                self._record_preferred_monitor(def_sink, view=self.__dict__.get("_runtime_view_state"))
             self._seed_default_channels()
             self.save_config()
             return
@@ -7010,6 +7756,8 @@ class WaveLinuxWindow(QMainWindow):
         self.refresh_timer.stop()
         self._save_timer.stop()
         self._event_refresh_timer.stop()
+        self._device_settle_refresh_timer.stop()
+        self._bluetooth_refresh_timer.stop()
         # Stop every parec meter subprocess.
         self._stop_all_meters()
         # Flush any pending slider writes before we tear down the engine.
