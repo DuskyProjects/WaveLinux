@@ -62,14 +62,14 @@ class _FakeRuntime:
     def refresh_now(self, reason):
         self.refresh_calls.append(reason)
 
-    def ensure_output_mix_sync(self, mix_name):
+    def ensure_output_mix_sync(self, mix_name, *, refresh=True):
         self.ensure_output_mix_calls.append(mix_name)
 
-    def ensure_virtual_channel_sync(self, name):
+    def ensure_virtual_channel_sync(self, name, *, refresh=True):
         self.ensure_virtual_channel_calls.append(name)
         return name
 
-    def remove_virtual_channel_sync(self, sink_name):
+    def remove_virtual_channel_sync(self, sink_name, *, refresh=True):
         self.remove_virtual_channel_calls.append(sink_name)
 
     def set_selected_mic(self, node_name):

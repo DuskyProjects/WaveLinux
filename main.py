@@ -11,20 +11,27 @@ import re
 import time
 import threading
 import queue
-from dataclasses import dataclass
-from types import SimpleNamespace
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QSlider, QPushButton, QFrame, QScrollArea, QDialog,
+    QLabel, QPushButton, QDialog,
     QDialogButtonBox, QComboBox, QMessageBox, QSystemTrayIcon,
-    QMenu, QInputDialog, QProgressBar, QSizePolicy, QTabWidget,
+    QMenu, QInputDialog, QProgressBar, QSizePolicy,
     QFileDialog,
-    QSpinBox, QCheckBox
 )
-from PyQt6.QtCore import Qt, QTimer, QLockFile, QProcess, pyqtSignal, QObject, QEvent, QUrl
+from PyQt6.QtCore import Qt, QTimer, QLockFile, QProcess, QUrl
 from PyQt6.QtGui import QFont, QIcon, QAction, QDesktopServices
 
+from app_core import (
+    AppContext,
+    ConfigChanged,
+    EventBus,
+    FxStatusUpdated,
+    HealthBus,
+    ModuleManager,
+    RuntimeViewUpdated,
+    load_feature_flags,
+)
 from audio_runtime import AudioRuntimeAdapter, AudioRuntimeController
 from distribution import (
     APP_DESKTOP_ID,
@@ -46,7 +53,26 @@ from distribution import (
     runtime_mode,
 )
 from health import HealthIssue, RecoveryStatus
+from modules import (
+    AppRoutingModule,
+    DevicePolicyModule,
+    EffectsModule,
+    HealthModule,
+    MeteringModule,
+    MixerUiModule,
+    RuntimeModule,
+    ScenesModule,
+    SettingsUiModule,
+    StressControlModule,
+    UpdatesModule,
+)
 from pipewire_engine import PipeWireEngine
+from ui.dialogs.card_profile_dialog import CardProfileDialog
+from ui.dialogs.fx_dialog import FXSelectionDialog
+from ui.health.health_card import HealthCard
+from ui.main_window import build_main_window
+from ui.mixer import ChannelStrip, MeterWorker, MixerPanelController, MixerStripMetrics
+from ui.routing import AppRoutingPanelController, AppRoutingRow
 from updates import (
     AppImageUpdateInstaller,
     UpdateError,
@@ -58,9 +84,7 @@ from updates import (
 )
 from wavelinux_theme import STYLESHEET
 
-import struct
-
-APP_VERSION = "2.0.11"
+APP_VERSION = "3.0"
 _RUNTIME_DEPS = ["pactl", "pw-dump", "wpctl", "parec", "pipewire", "pw-cli"]
 _RUNTIME_HEALTH_MESSAGES = {
     "submix_monitor_missing": "Monitor route is missing.",
@@ -98,20 +122,13 @@ _QUICK_START_TEMPLATES = {
 }
 
 
-@dataclass
-class MixerStripMetrics:
-    strip_width: int
-    slider_height: int
-    strip_height: int
-    outer_margin: int
-    inner_spacing: int
-    fader_spacing: int
-    peak_height: int
-    link_button_size: int
-    mute_button_size: int
-    mic_gain_height: int
-    use_horizontal_scroll: bool
-
+def stress_control_enabled():
+    return str(os.environ.get("WAVELINUX_STRESS_CONTROL", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 def _parse_version(v):
     """Return a comparable tuple from a semver string like '1.2.3' or 'v1.2.3'."""
@@ -261,1842 +278,6 @@ def _handle_cli_args(argv=None):
     return None
 
 
-class MeterWorker(QObject):
-    """Emit normalized channel peaks from `parec`."""
-
-    peak = pyqtSignal(float)
-
-    def __init__(self, source_name, parent=None):
-        super().__init__(parent)
-        self.source_name = source_name
-        self._proc = None
-        self._sample_rate = 24000
-        self._frame_hz = 20
-        self._sample_bytes = self._sample_rate * 2 // self._frame_hz
-        self._decode_queue = queue.Queue(maxsize=6)
-        self._decode_stop = threading.Event()
-        self._decode_thread = None
-
-    @staticmethod
-    def _frame_peak(frame, last_peak):
-        count = len(frame) // 2
-        if count <= 0:
-            return last_peak
-        samples = struct.unpack(f"<{count}h", frame)
-        peak_int = max((abs(s) for s in samples), default=0)
-        normalized = peak_int / 32768.0
-        if normalized >= last_peak:
-            return normalized
-        return max(normalized, last_peak * 0.6)
-
-    def start(self):
-        if self._proc is not None:
-            return
-        self._decode_stop.clear()
-        self._drain_decode_queue()
-        if self._decode_thread is None or not self._decode_thread.is_alive():
-            self._decode_thread = threading.Thread(
-                target=self._decode_loop,
-                daemon=True,
-                name=f"meter:{self.source_name}",
-            )
-            self._decode_thread.start()
-        self._proc = QProcess(self)
-        self._proc.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
-        self._proc.readyReadStandardOutput.connect(self._on_bytes)
-        args = [
-            f"--device={self.source_name}",
-            f"--rate={self._sample_rate}",
-            "--format=s16le",
-            "--channels=1",
-            "--raw",
-            "--latency-msec=50",
-        ]
-        self._proc.start("parec", args)
-
-    def stop(self):
-        if self._proc is None:
-            return
-        try:
-            self._proc.kill()
-            self._proc.waitForFinished(200)
-        except Exception:
-            pass
-        self._proc = None
-        self._decode_stop.set()
-        try:
-            self._decode_queue.put_nowait(None)
-        except queue.Full:
-            try:
-                self._decode_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._decode_queue.put_nowait(None)
-            except queue.Full:
-                pass
-        thread = self._decode_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=0.3)
-        self._decode_thread = None
-        self._drain_decode_queue()
-
-    def _on_bytes(self):
-        if self._proc is None:
-            return
-        chunk = bytes(self._proc.readAllStandardOutput())
-        if not chunk:
-            return
-        try:
-            self._decode_queue.put_nowait(chunk)
-        except queue.Full:
-            try:
-                self._decode_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._decode_queue.put_nowait(chunk)
-            except queue.Full:
-                pass
-
-    def _decode_loop(self):
-        buf = bytearray()
-        last_peak = 0.0
-        while not self._decode_stop.is_set():
-            try:
-                chunk = self._decode_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if chunk is None:
-                break
-            buf.extend(chunk)
-            while len(buf) >= self._sample_bytes:
-                frame = bytes(buf[:self._sample_bytes])
-                del buf[:self._sample_bytes]
-                last_peak = self._frame_peak(frame, last_peak)
-                self.peak.emit(min(last_peak, 1.0))
-
-    def _drain_decode_queue(self):
-        while True:
-            try:
-                self._decode_queue.get_nowait()
-            except queue.Empty:
-                return
-
-
-# ── ALSA card / profile picker ────────────────────────────────────
-class CardProfileDialog(QDialog):
-    """Lets the user pick an ALSA card profile (Analog Stereo vs Pro
-    Audio, etc.) directly from WaveLinux so they don't have to drop
-    into pavucontrol."""
-
-    def __init__(self, engine, runtime=None, parent=None):
-        super().__init__(parent)
-        self.engine = engine
-        self.runtime = runtime
-        self.setWindowTitle("Sound Card Profiles")
-        self.setMinimumWidth(520)
-        self.setStyleSheet(STYLESHEET)
-        self._combos = []   # (card_name, combo)
-
-        self._layout = QVBoxLayout(self)
-        self._layout.setSpacing(12)
-        self._layout.setContentsMargins(20, 20, 20, 20)
-
-        title = QLabel("🎛 Sound Card Profiles")
-        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #fff;")
-        self._layout.addWidget(title)
-
-        desc = QLabel("Pick the ALSA profile for each card — e.g. Analog Stereo "
-                      "for headphones or Pro Audio for interfaces with many channels.")
-        desc.setStyleSheet("color: #8b8b9e; font-size: 11px;")
-        desc.setWordWrap(True)
-        self._layout.addWidget(desc)
-
-        # Placeholder while cards load on background thread.
-        self._loading_lbl = QLabel("Loading sound cards…")
-        self._loading_lbl.setStyleSheet("color: #6b6b82; padding: 24px;")
-        self._loading_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._layout.addWidget(self._loading_lbl)
-
-        self._cards_container = QWidget()
-        self._cards_layout = QVBoxLayout(self._cards_container)
-        self._cards_layout.setContentsMargins(0, 0, 0, 0)
-        self._cards_layout.setSpacing(10)
-        self._cards_container.setVisible(False)
-        self._layout.addWidget(self._cards_container)
-
-        self._btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Close
-        )
-        self._btns.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self._apply)
-        self._btns.button(QDialogButtonBox.StandardButton.Apply).setEnabled(False)
-        self._btns.button(QDialogButtonBox.StandardButton.Close).clicked.connect(self.accept)
-        self._layout.addWidget(self._btns)
-
-        # Load cards on a background thread so __init__ doesn't block.
-        self._card_queue = queue.SimpleQueue()
-        self._card_poll = QTimer(self)
-        self._card_poll.setInterval(30)
-        self._card_poll.timeout.connect(self._poll_cards)
-        self._card_poll.start()
-        threading.Thread(target=self._load_cards_bg, daemon=True).start()
-
-    def _load_cards_bg(self):
-        try:
-            cards = self.engine.list_cards()
-            self._card_queue.put(('ok', cards))
-        except Exception as e:
-            self._card_queue.put(('error', str(e)))
-
-    def _poll_cards(self):
-        try:
-            msg = self._card_queue.get_nowait()
-        except queue.Empty:
-            return
-        self._card_poll.stop()
-        self._loading_lbl.setVisible(False)
-
-        status, data = msg
-        if status == 'error' or not data:
-            empty = QLabel("No cards reported by PipeWire.")
-            empty.setStyleSheet("color: #6b6b82; padding: 24px;")
-            self._cards_layout.addWidget(empty)
-        else:
-            for card in data:
-                row = QFrame()
-                row.setObjectName("fxItemFrame")
-                row.setStyleSheet(
-                    "QFrame#fxItemFrame {"
-                    " background: rgba(255,255,255,0.03);"
-                    " border: 1px solid rgba(255,255,255,0.06);"
-                    " border-radius: 10px; padding: 10px; }"
-                )
-                rlay = QVBoxLayout(row)
-                name_lbl = QLabel(card.get('description') or card['name'])
-                name_lbl.setStyleSheet("color: #e0e0ee; font-weight: bold;")
-                rlay.addWidget(name_lbl)
-                subtle = QLabel(card['name'])
-                subtle.setStyleSheet("color: #6b6b82; font-size: 10px;")
-                rlay.addWidget(subtle)
-
-                combo = QComboBox()
-                for prof in card['profiles']:
-                    label = prof['description']
-                    if not prof['available']:
-                        label += "  (unavailable)"
-                    combo.addItem(label, prof['name'])
-                    if not prof['available']:
-                        item = combo.model().item(combo.count() - 1)
-                        if item is not None:
-                            item.setEnabled(False)
-                idx = combo.findData(card['active_profile'])
-                if idx >= 0:
-                    combo.setCurrentIndex(idx)
-                rlay.addWidget(combo)
-                self._cards_layout.addWidget(row)
-                self._combos.append((card['name'], combo))
-
-        self._cards_container.setVisible(True)
-        self._btns.button(QDialogButtonBox.StandardButton.Apply).setEnabled(bool(self._combos))
-
-    def _apply(self):
-        for card_name, combo in self._combos:
-            target = combo.currentData()
-            if target:
-                if self.runtime is not None:
-                    self.runtime.set_card_profile(card_name, target)
-                else:
-                    threading.Thread(
-                        target=self.engine.set_card_profile,
-                        args=(card_name, target),
-                        daemon=True,
-                    ).start()
-
-
-# ── FX Selection Dialog ───────────────────────────────────────────
-class FXSelectionDialog(QDialog):
-    _TOGGLE_STYLE = (
-        "QPushButton[role=\"fxToggle\"] {"
-        " background: #1a1a28; color: #8b8b9e;"
-        " border: 1px solid rgba(255,255,255,0.12);"
-        " border-radius: 6px; font-weight: bold; padding: 4px 0; }"
-        "QPushButton[role=\"fxToggle\"]:hover {"
-        " border-color: rgba(0,229,255,0.4); }"
-        "QPushButton[role=\"fxToggle\"]:checked {"
-        " background: #00e5ff; color: #0d0d14;"
-        " border-color: #00e5ff; }"
-        "QPushButton[role=\"fxToggle\"]:disabled {"
-        " background: #14141e; color: #555568;"
-        " border-color: rgba(255,255,255,0.06); }"
-    )
-    _TOGGLE_FAILED_STYLE = (
-        "QPushButton[role=\"fxToggle\"] {"
-        " background: #2a1a22; color: #ff6a8a;"
-        " border: 1px solid #ff6a8a;"
-        " border-radius: 6px; font-weight: bold; padding: 4px 0; }"
-    )
-
-    def __init__(self, node_id, node_name, capture_target, engine, runtime=None, parent=None):
-        super().__init__(parent)
-        self.node_id = str(node_id)
-        self.node_name = node_name
-        # The PipeWire source name the FX chain's first stage should pull
-        # from. For mics that's the mic's own node.name; for virtual sinks
-        # it's `<sink>.monitor`. Determined by the channel strip and passed
-        # in so the engine doesn't need to guess about media class.
-        self.capture_target = capture_target
-        self.engine = engine
-        self.runtime = runtime
-        self.setWindowTitle("Channel Effects")
-        self.setMinimumWidth(400)
-        self.setStyleSheet(STYLESHEET)
-
-        # Per-(effect_id) widgets we need to touch from _on_toggle / slider changes.
-        self._param_sliders = {}   # effect_id -> {param_key: (slider, value_lbl)}
-        self._param_frames  = {}   # effect_id -> QFrame holding the param rows
-        self._toggle_btns   = {}   # effect_id -> QPushButton
-
-        # Saved intent (which toggles were last ON) so the dialog still
-        # ticks them when the chain isn't currently running — the chain
-        # may have died from a PipeWire restart or stage crash. Keep the
-        # ORDERED list separate from the membership set: re-spawning from
-        # a set discards the user's saved chain order and may flip the
-        # canonical signal flow on rebuild.
-        win = self._main_window_static(parent)
-        self._main_win = win
-        self._saved_effects_list = list(
-            win.active_effects.get(self.node_name, []) if win else []
-        )
-        self._saved_effects = set(self._saved_effects_list)
-        self._effect_defs = list(self.engine.get_available_effects())
-        saved_params = (
-            win.effect_params.get(self.node_name, {}) if win else {}
-        ) or {}
-        self._saved_effect_params = {
-            effect_id: dict(values)
-            for effect_id, values in saved_params.items()
-            if isinstance(values, dict)
-        }
-        self._effect_available = {
-            fx["id"]: self.engine.effect_available(fx["id"])
-            for fx in self._effect_defs
-        }
-        self._effect_ui_meta = {
-            fx["id"]: {
-                "params": self.engine.get_effect_params(fx["id"]),
-                "help": self.engine.get_effect_help(fx["id"]),
-                "presets": self.engine.get_effect_presets(fx["id"]),
-            }
-            for fx in self._effect_defs
-        }
-
-        self._pending_fx_generation = 0
-        self._runtime_inflight = False
-        self._pending_close = False
-        self._initial_effects_list = list(self._saved_effects_list)
-        self._initial_effect_params = {
-            effect_id: dict(values)
-            for effect_id, values in self._saved_effect_params.items()
-        }
-        self._inflight_effects_list = []
-        self._inflight_effect_params = {}
-        if self.runtime is not None:
-            self.runtime.fx_status_changed.connect(self._on_runtime_fx_status)
-
-        self._param_timer = QTimer(self)
-        self._param_timer.setSingleShot(True)
-        self._param_timer.setInterval(120)
-        self._param_timer.timeout.connect(self._commit_live_patch)
-
-        root = QVBoxLayout(self)
-        root.setSpacing(12)
-        root.setContentsMargins(20, 20, 20, 20)
-
-        title = QLabel("✨ Channel Effects")
-        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #fff;")
-        root.addWidget(title)
-
-        desc = QLabel("Processing is live per-channel. Parameters save automatically.")
-        desc.setStyleSheet("color: #8b8b9e; font-size: 11px;")
-        root.addWidget(desc)
-
-        self._status_lbl = QLabel("")
-        self._status_lbl.setWordWrap(True)
-        self._status_lbl.setVisible(False)
-        self._status_lbl.setStyleSheet("color: #ffb26a; font-size: 11px;")
-        root.addWidget(self._status_lbl)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        inner = QWidget()
-        scroll_layout = QVBoxLayout(inner)
-        scroll_layout.setSpacing(10)
-
-        for fx in self._effect_defs:
-            scroll_layout.addWidget(self._build_effect_card(fx))
-
-        scroll_layout.addStretch()
-        scroll.setWidget(inner)
-        root.addWidget(scroll, 1)
-
-        self.close_btn = QPushButton("Apply")
-        self.close_btn.setObjectName("addBtn")
-        self.close_btn.clicked.connect(self._on_done)
-        root.addWidget(self.close_btn)
-
-        # Use runtime controller status instead of probing engine state for
-        # every effect while the dialog is opening.
-        self._refresh_toggle_status()
-
-    @staticmethod
-    def _main_window_static(parent):
-        """Walk up to find the WaveLinuxWindow. Static because we need it
-        before instance state is fully wired."""
-        p = parent
-        while p is not None and not hasattr(p, 'effect_params'):
-            p = p.parent()
-        return p
-
-    def _on_done(self):
-        if self._param_timer.isActive():
-            self._param_timer.stop()
-            self._commit_live_patch()
-        if self._runtime_inflight:
-            self.close_btn.setText("Applying...")
-            self.close_btn.setEnabled(False)
-            self._pending_close = True
-            return
-
-        self.accept()
-
-    # ── Card construction ──────────────────────────────────────────
-
-    def _build_effect_card(self, fx):
-        fid = fx['id']
-        frame = QFrame()
-        frame.setObjectName("fxItemFrame")
-        frame.setStyleSheet(
-            "QFrame#fxItemFrame {"
-            " background: rgba(255,255,255,0.03);"
-            " border: 1px solid rgba(255,255,255,0.06);"
-            " border-radius: 10px; padding: 10px; }"
-        )
-        vlay = QVBoxLayout(frame)
-
-        header = QHBoxLayout()
-        icon_lbl = QLabel(fx['icon'])
-        icon_lbl.setStyleSheet("font-size: 20px;")
-        header.addWidget(icon_lbl)
-
-        text_col = QVBoxLayout()
-        name_lbl = QLabel(fx['name'])
-        name_lbl.setStyleSheet("color: #e0e0ee; font-weight: bold; font-size: 13px;")
-        text_col.addWidget(name_lbl)
-        info_lbl = QLabel(fx['desc'])
-        info_lbl.setStyleSheet("color: #6b6b82; font-size: 10px;")
-        text_col.addWidget(info_lbl)
-        header.addLayout(text_col, 1)
-
-        toggle_btn = QPushButton()
-        toggle_btn.setCheckable(True)
-        toggle_btn.setProperty("role", "fxToggle")
-        toggle_btn.setStyleSheet(self._TOGGLE_STYLE)
-        active = fid in self._saved_effects
-        toggle_btn.setChecked(active)
-        toggle_btn.setFixedWidth(60)
-
-        available = self._effect_available.get(fid, False)
-        if not available:
-            toggle_btn.setText("N/A")
-            toggle_btn.setEnabled(False)
-            toggle_btn.setToolTip(
-                "LADSPA plugin not installed.\n"
-                "rnnoise needs librnnoise_ladspa; "
-                "compressor/gate/limiter need swh-plugins. "
-                "highpass uses PipeWire's built-in biquad."
-            )
-            info_lbl.setStyleSheet("color: #ff6a8a; font-size: 10px;")
-            info_lbl.setText(fx['desc'] + " — plugin missing")
-        else:
-            toggle_btn.setText("ON" if active else "OFF")
-            toggle_btn.clicked.connect(
-                lambda checked, fid=fid: self._on_toggle(fid)
-            )
-
-        header.addWidget(toggle_btn)
-        self._toggle_btns[fid] = toggle_btn
-        vlay.addLayout(header)
-
-        # Help text (plain-English description of what this effect does)
-        # and preset buttons live together in the expanding panel.
-        meta = self._effect_ui_meta.get(fid, {})
-        params = meta.get("params", [])
-        help_text = meta.get("help", "")
-        presets = meta.get("presets", [])
-
-        if params or help_text or presets:
-            param_frame = QFrame()
-            param_frame.setStyleSheet("background: transparent;")
-            pf_layout = QVBoxLayout(param_frame)
-            pf_layout.setContentsMargins(16, 6, 4, 2)
-            pf_layout.setSpacing(6)
-
-            if help_text:
-                help_lbl = QLabel(help_text)
-                help_lbl.setObjectName("effectHelp")
-                help_lbl.setWordWrap(True)
-                help_lbl.setStyleSheet(
-                    "color: #8b8b9e; font-size: 11px;"
-                    " background: rgba(0,229,255,0.04);"
-                    " border-left: 2px solid rgba(0,229,255,0.3);"
-                    " padding: 6px 8px; border-radius: 4px;"
-                )
-                pf_layout.addWidget(help_lbl)
-
-            if presets:
-                preset_row = QHBoxLayout()
-                preset_row.setSpacing(6)
-                label_lbl = QLabel("Presets:")
-                label_lbl.setStyleSheet("color: #6b6b82; font-size: 10px; font-weight: 700;")
-                preset_row.addWidget(label_lbl)
-                for pname, pvalues in presets:
-                    btn = QPushButton(pname)
-                    btn.setObjectName("presetBtn")
-                    btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                    btn.clicked.connect(
-                        lambda checked, fid=fid, pv=pvalues: self._apply_preset(fid, pv)
-                    )
-                    preset_row.addWidget(btn)
-                preset_row.addStretch()
-                pf_layout.addLayout(preset_row)
-
-            if params:
-                stored = self._current_params(fid)
-                self._param_sliders[fid] = {}
-                for key, label, pmin, pmax, default, suffix in params:
-                    row = QHBoxLayout()
-                    lbl = QLabel(label)
-                    lbl.setStyleSheet("color: #a0a0b8; font-size: 11px; min-width: 80px;")
-                    row.addWidget(lbl)
-
-                    slider = QSlider(Qt.Orientation.Horizontal)
-                    slider.setRange(0, 1000)
-                    val = float(stored.get(key, default))
-                    frac = 0.0 if pmax == pmin else (val - pmin) / (pmax - pmin)
-                    slider.setValue(max(0, min(1000, int(round(frac * 1000)))))
-                    slider.setProperty("pmin", pmin)
-                    slider.setProperty("pmax", pmax)
-                    slider.setProperty("pkey", key)
-                    slider.setProperty("psuffix", suffix)
-                    row.addWidget(slider, 1)
-
-                    value_lbl = QLabel(self._fmt_value(val, suffix))
-                    value_lbl.setStyleSheet("color: #e0e0ee; font-size: 11px; min-width: 64px;")
-                    value_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                    row.addWidget(value_lbl)
-
-                    slider.valueChanged.connect(
-                        lambda v, fid=fid, s=slider, lbl=value_lbl: self._on_param_changed(fid, s, lbl)
-                    )
-                    self._param_sliders[fid][key] = (slider, value_lbl)
-                    pf_layout.addLayout(row)
-
-            param_frame.setVisible(active and available)
-            self._param_frames[fid] = param_frame
-            vlay.addWidget(param_frame)
-
-        return frame
-
-    @staticmethod
-    def _fmt_value(val, suffix):
-        if abs(val) >= 10:
-            return f"{val:.0f}{suffix}"
-        return f"{val:.2f}{suffix}"
-
-    def _current_params(self, effect_id):
-        """Look up the cached saved effect params for this node."""
-        return dict(self._saved_effect_params.get(effect_id, {}))
-
-    def _main_window(self):
-        """Walk up to the WaveLinuxWindow (only place that has effect_params)."""
-        return self._main_win or self._main_window_static(self.parent())
-
-    def _collect_params(self, effect_id):
-        out = {}
-        for key, (slider, _lbl) in self._param_sliders.get(effect_id, {}).items():
-            pmin = float(slider.property("pmin"))
-            pmax = float(slider.property("pmax"))
-            val = pmin + (pmax - pmin) * (slider.value() / 1000.0)
-            out[key] = val
-        return out
-
-    # Toggle, preset pick, and slider drag all feed the live-patch path.
-    # The dialog debounces those edits so rapid churn stays last-write-wins.
-
-    def _active_effect_ids(self):
-        """Return the effect ids whose toggle buttons are currently ON,
-        in the order they appear in the engine's available list."""
-        wanted = []
-        for fx in self._effect_defs:
-            fid = fx['id']
-            btn = self._toggle_btns.get(fid)
-            if btn is not None and btn.isChecked() and btn.isEnabled():
-                wanted.append(fid)
-        return wanted
-
-    def _all_params_map(self):
-        """Snapshot every effect's current slider values (including OFF
-        effects) so toggling back ON resumes the user's last tweak."""
-        out = {}
-        for fid in self._param_sliders.keys():
-            out[fid] = self._collect_params(fid)
-        return out
-
-    def _has_pending_changes(self, wanted=None, params_map=None):
-        wanted = list(wanted if wanted is not None else self._active_effect_ids())
-        params_map = dict(params_map if params_map is not None else self._all_params_map())
-        normalized = {
-            fid: dict(values)
-            for fid, values in params_map.items()
-            if values
-        }
-        return (
-            wanted != list(self._initial_effects_list)
-            or normalized != self._initial_effect_params
-        )
-
-    def _queue_live_patch(self):
-        if self.runtime is None:
-            return
-        self._param_timer.start()
-
-    def _commit_live_patch(self):
-        if self.runtime is None:
-            return
-        if self._runtime_inflight:
-            self._param_timer.start()
-            return
-        wanted = self._active_effect_ids()
-        params_map = self._all_params_map()
-        if not self._has_pending_changes(wanted, params_map):
-            return
-        self._save_chain_state(wanted, params_map)
-        self._start_fx_worker(wanted, params_map)
-
-    def _start_fx_worker(self, wanted, params_map):
-        self._inflight_effects_list = list(wanted or [])
-        self._inflight_effect_params = {
-            fid: dict(vals)
-            for fid, vals in (params_map or {}).items()
-            if vals
-        }
-        if wanted:
-            self._pending_fx_generation = self.runtime.set_channel_fx(
-                self.node_name, self.capture_target, wanted, params_map
-            )
-        else:
-            self._pending_fx_generation = self.runtime.clear_channel_fx(
-                self.node_name
-            )
-        self._runtime_inflight = True
-
-    def _on_runtime_fx_status(self, status):
-        if getattr(status, "node_name", None) != self.node_name:
-            return
-        if self._pending_fx_generation and status.generation:
-            if status.generation < self._pending_fx_generation:
-                return
-        self._runtime_inflight = status.state in {"building", "cutover_pending", "clearing"}
-        if status.state == "degraded":
-            recovery_note = ""
-            win = self._main_window()
-            if hasattr(win, "fx_recovery_status_message"):
-                recovery_note = (win.fx_recovery_status_message(self.node_name) or "").strip()
-            status_text = (status.message or "").strip()
-            if hasattr(win, "format_fx_status_message"):
-                status_text = (win.format_fx_status_message(status) or "").strip()
-            parts = [
-                "WaveLinux could not apply one or more effects.",
-                status_text,
-            ]
-            if recovery_note:
-                parts.append(recovery_note)
-            self._status_lbl.setText("\n\n".join(part for part in parts if part))
-            self._status_lbl.setVisible(True)
-        elif status.state in {"active", "idle"}:
-            self._status_lbl.clear()
-            self._status_lbl.setVisible(False)
-        if status.state not in {"building", "cutover_pending", "clearing"}:
-            self.close_btn.setText("Apply")
-            self.close_btn.setEnabled(True)
-            self._refresh_toggle_status()
-            if status.state in {"active", "idle"}:
-                self._initial_effects_list = list(self._inflight_effects_list)
-                self._initial_effect_params = {
-                    fid: dict(vals)
-                    for fid, vals in self._inflight_effect_params.items()
-                }
-                has_more_changes = self._has_pending_changes()
-                if has_more_changes:
-                    self._queue_live_patch()
-            if self._pending_close and status.state in {"active", "idle"} and not has_more_changes:
-                self._pending_close = False
-                self.accept()
-            elif status.state == "degraded":
-                self._pending_close = False
-
-    def reject(self):
-        if self._param_timer.isActive():
-            self._param_timer.stop()
-            self._commit_live_patch()
-        if self._runtime_inflight:
-            self._pending_close = True
-            self.close_btn.setText("Applying...")
-            self.close_btn.setEnabled(False)
-            return
-        super().reject()
-
-    def closeEvent(self, event):
-        if self.runtime is None:
-            super().closeEvent(event)
-            return
-        try:
-            self.runtime.fx_status_changed.disconnect(self._on_runtime_fx_status)
-        except TypeError:
-            pass
-        super().closeEvent(event)
-
-    def _refresh_toggle_status(self):
-        """Annotate toggles from runtime status without blocking on engine probes."""
-        if self.runtime is None:
-            for btn in self._toggle_btns.values():
-                if btn.isEnabled():
-                    btn.setStyleSheet(self._TOGGLE_STYLE)
-                    btn.setToolTip("")
-            return
-        status = self.runtime.fx_status_for(self.node_name)
-        degraded = getattr(status, "state", "") == "degraded"
-        message = (status.message or "").strip()
-        for fid, btn in self._toggle_btns.items():
-            if not btn.isEnabled():
-                continue
-            if degraded and btn.isChecked():
-                btn.setStyleSheet(self._TOGGLE_FAILED_STYLE)
-                btn.setToolTip(message or "FX chain degraded. Re-apply or recover the channel.")
-            else:
-                btn.setStyleSheet(self._TOGGLE_STYLE)
-                btn.setToolTip("")
-
-    def _save_chain_state(self, effects, params_map):
-        """Mirror chain into main-window state: `active_effects` (ordered
-        ids) and `effect_params` (slider positions)."""
-        win = self._main_window()
-        if win is None:
-            return
-        if effects:
-            win.active_effects[self.node_name] = list(effects)
-        else:
-            win.active_effects.pop(self.node_name, None)
-        # Save params for OFF effects too so re-enable resumes the tweak.
-        # Drop the per-effect dict when its slider stash is empty, and
-        # drop the whole node entry when nothing is left — the previous
-        # version's `if not stash` check ran AFTER unconditionally writing
-        # every key, so it never fired.
-        if params_map:
-            stash = win.effect_params.setdefault(self.node_name, {})
-            for fid, vals in params_map.items():
-                if vals:
-                    stash[fid] = dict(vals)
-                else:
-                    stash.pop(fid, None)
-            if not stash:
-                win.effect_params.pop(self.node_name, None)
-        self._saved_effect_params = {
-            fid: dict(vals) for fid, vals in params_map.items() if vals
-        }
-        if hasattr(win, 'schedule_save'):
-            win.schedule_save()
-        elif hasattr(win, 'save_config'):
-            win.save_config()
-
-    # ── Handlers ───────────────────────────────────────────────────
-
-    def _on_toggle(self, effect_id):
-        btn = self._toggle_btns[effect_id]
-        frame = self._param_frames.get(effect_id)
-        btn.setText("ON" if btn.isChecked() else "OFF")
-        if frame:
-            frame.setVisible(btn.isChecked())
-        self._queue_live_patch()
-
-    def _apply_preset(self, effect_id, values):
-        """Snap the effect's sliders to a labelled preset and live-patch it."""
-        sliders = self._param_sliders.get(effect_id, {})
-        for key, (slider, value_lbl) in sliders.items():
-            if key not in values:
-                continue
-            pmin = float(slider.property("pmin"))
-            pmax = float(slider.property("pmax"))
-            target = float(values[key])
-            frac = 0.0 if pmax == pmin else (target - pmin) / (pmax - pmin)
-            slider.blockSignals(True)
-            slider.setValue(max(0, min(1000, int(round(frac * 1000)))))
-            slider.blockSignals(False)
-            suffix = slider.property("psuffix") or ""
-            value_lbl.setText(self._fmt_value(target, suffix))
-        self._queue_live_patch()
-
-    def _on_param_changed(self, effect_id, slider, value_lbl):
-        pmin = float(slider.property("pmin"))
-        pmax = float(slider.property("pmax"))
-        suffix = slider.property("psuffix") or ""
-        val = pmin + (pmax - pmin) * (slider.value() / 1000.0)
-        value_lbl.setText(self._fmt_value(val, suffix))
-        self._queue_live_patch()
-
-
-# ── Channel Strip Widget ───────────────────────────────────────────
-class ChannelStrip(QFrame):
-    """A single mixer channel: icon, name, vertical fader, mute, FX."""
-
-    def __init__(self, node_id, node_name, name, ch_type, icon, engine, parent=None):
-        super().__init__(parent)
-        self.setObjectName("channelStrip")
-        self.setFixedWidth(self._MAX_W)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.node_id = node_id          # PipeWire numeric id (ephemeral)
-        self.node_name = node_name      # PipeWire node.name (stable across restarts)
-        self.ch_name = name
-        self.ch_type = ch_type
-        self.engine = engine
-        self.is_mic = ch_type.lower() == "microphone"
-        self._muted = False
-        self._mon_muted = False
-        self._str_muted = False
-        self._main_win = None
-        self._last_rendered_state = None
-        self._last_fx_indicator_active = None
-        self._last_runtime_issue_active = None
-
-        # Slider-commit debouncers — UI moves at full Qt rate but only
-        # the final value reaches `pactl set-sink-input-volume`.
-        self._mon_commit_timer = QTimer(self)
-        self._mon_commit_timer.setSingleShot(True)
-        self._mon_commit_timer.setInterval(40)
-        self._mon_commit_timer.timeout.connect(self._commit_mon_vol)
-        self._str_commit_timer = QTimer(self)
-        self._str_commit_timer.setSingleShot(True)
-        self._str_commit_timer.setInterval(40)
-        self._str_commit_timer.timeout.connect(self._commit_str_vol)
-        self._src_commit_timer = QTimer(self)
-        self._src_commit_timer.setSingleShot(True)
-        self._src_commit_timer.setInterval(40)
-        self._src_commit_timer.timeout.connect(self._commit_src_vol)
-        # Pending values held until the timer fires.
-        self._pending_mon_vol = None
-        self._pending_str_vol = None
-        self._pending_src_vol = None
-        self._src_muted = False
-
-        layout = QVBoxLayout(self)
-        self._root_layout = layout
-        layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(4)
-
-        # Icon + optional FX indicator. Other actions live in right-click.
-        head_row = QHBoxLayout()
-        head_row.setContentsMargins(0, 0, 0, 0)
-        self.health_indicator = QLabel("!")
-        self.health_indicator.setObjectName("healthIndicator")
-        self.health_indicator.setToolTip("Runtime issue detected — right-click for recovery tools")
-        self.health_indicator.setVisible(False)
-        head_row.addWidget(self.health_indicator)
-        head_row.addStretch()
-        icon_lbl = QLabel(icon)
-        icon_lbl.setObjectName("channelIcon")
-        head_row.addWidget(icon_lbl)
-        head_row.addStretch()
-        self.fx_indicator = QLabel("✨")
-        self.fx_indicator.setObjectName("fxIndicator")
-        self.fx_indicator.setToolTip("Effect active — right-click → Effects to edit")
-        self.fx_indicator.setVisible(False)
-        head_row.addWidget(self.fx_indicator)
-        layout.addLayout(head_row)
-
-        # Right-click menu — where reorder / hide / rename / effects / remove live.
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.customContextMenuRequested.connect(self._show_context_menu)
-
-        # Name (click to rename for virtual channels; mics keep their alsa name).
-        self.name_lbl = QLabel(name)
-        self.name_lbl.setObjectName("channelName")
-        self.name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.name_lbl.setWordWrap(True)
-        self.name_lbl.setMinimumHeight(24)  # allow 2 lines
-        layout.addWidget(self.name_lbl)
-
-        layout.addSpacing(4)
-
-        # Peak meter — placed between the name and the faders so it
-        # reads as "this channel's level", not "this fader's level".
-        self.peak_bar = QProgressBar()
-        self.peak_bar.setObjectName("peakBar")
-        self.peak_bar.setRange(0, 1000)
-        self.peak_bar.setTextVisible(False)
-        self.peak_bar.setFixedHeight(5)
-        self.peak_bar.setValue(0)
-        layout.addWidget(self.peak_bar)
-
-        self.src_slider = None
-        self.src_vol_lbl = None
-        self._src_box_layout = None
-        self._src_head_layout = None
-        if self.is_mic:
-            src_box = QVBoxLayout()
-            src_box.setContentsMargins(0, 2, 0, 2)
-            src_box.setSpacing(2)
-            src_head = QHBoxLayout()
-            src_head.setContentsMargins(0, 0, 0, 0)
-            src_label = QLabel("MIC")
-            src_label.setObjectName("mixTagMic")
-            src_head.addWidget(src_label)
-            src_head.addStretch()
-            self.src_vol_lbl = QLabel("100%")
-            self.src_vol_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            self.src_vol_lbl.setObjectName("volumeLabel")
-            src_head.addWidget(self.src_vol_lbl)
-            src_box.addLayout(src_head)
-            self.src_slider = QSlider(Qt.Orientation.Horizontal)
-            self.src_slider.setRange(0, 100)
-            self.src_slider.setValue(100)
-            self.src_slider.setToolTip("Hardware mic gain")
-            self.src_slider.valueChanged.connect(self._on_src_vol)
-            src_box.addWidget(self.src_slider)
-            layout.addLayout(src_box)
-            self._src_box_layout = src_box
-            self._src_head_layout = src_head
-
-        # Link button: when on, the two mix faders move together.
-        link_row = QHBoxLayout()
-        link_row.addStretch()
-        self.link_btn = QPushButton("🔗")
-        self.link_btn.setObjectName("linkBtn")
-        self.link_btn.setCheckable(True)
-        self.link_btn.setFixedSize(24, 24)
-        self.link_btn.setToolTip("Link the Monitor and Stream faders")
-        self.link_btn.clicked.connect(self._on_link_toggle)
-        link_row.addWidget(self.link_btn)
-        link_row.addStretch()
-        layout.addLayout(link_row)
-
-        # Two-column fader layout (Headphones + Stream).
-        faders_row = QHBoxLayout()
-        faders_row.setSpacing(10)
-        self._faders_row = faders_row
-
-        mon_col = QVBoxLayout()
-        mon_col.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        mon_label = QLabel("MON")
-        mon_label.setObjectName("mixTagMon")
-        mon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        mon_col.addWidget(mon_label)
-        self.mon_vol_lbl = QLabel("100%")
-        self.mon_vol_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.mon_vol_lbl.setObjectName("volumeLabel")
-        mon_col.addWidget(self.mon_vol_lbl)
-        self.mon_slider = QSlider(Qt.Orientation.Vertical)
-        self.mon_slider.setRange(0, 100)
-        self.mon_slider.setValue(100)
-        self.mon_slider.setMinimumHeight(140)
-        self.mon_slider.valueChanged.connect(self._on_mon_vol)
-        mon_col.addWidget(self.mon_slider, 1, Qt.AlignmentFlag.AlignHCenter)
-        self.mon_mute = QPushButton("🎧")
-        self.mon_mute.setObjectName("muteBtn")
-        self.mon_mute.setFixedSize(28, 28)
-        self.mon_mute.setToolTip("Mute in Monitor mix")
-        self.mon_mute.clicked.connect(self._on_mon_mute)
-        mon_col.addWidget(self.mon_mute, 0, Qt.AlignmentFlag.AlignHCenter)
-        faders_row.addLayout(mon_col)
-
-        str_col = QVBoxLayout()
-        str_col.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        str_label = QLabel("STR")
-        str_label.setObjectName("mixTagStr")
-        str_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        str_col.addWidget(str_label)
-        self.str_vol_lbl = QLabel("100%")
-        self.str_vol_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.str_vol_lbl.setObjectName("volumeLabel")
-        str_col.addWidget(self.str_vol_lbl)
-        self.str_slider = QSlider(Qt.Orientation.Vertical)
-        self.str_slider.setRange(0, 100)
-        self.str_slider.setValue(100)
-        self.str_slider.setMinimumHeight(140)
-        self.str_slider.valueChanged.connect(self._on_str_vol)
-        str_col.addWidget(self.str_slider, 1, Qt.AlignmentFlag.AlignHCenter)
-        self.str_mute = QPushButton("📡")
-        self.str_mute.setObjectName("muteBtn")
-        self.str_mute.setFixedSize(28, 28)
-        self.str_mute.setToolTip("Mute in Stream mix")
-        self.str_mute.clicked.connect(self._on_str_mute)
-        str_col.addWidget(self.str_mute, 0, Qt.AlignmentFlag.AlignHCenter)
-        faders_row.addLayout(str_col)
-
-        layout.addLayout(faders_row, 1)
-
-        # Hidden no-op kept so callers that touch `strip.fx_btn.setProperty(...)`
-        # don't fail. The real FX entry point is the right-click menu.
-        self.fx_btn = QPushButton()
-        self.fx_btn.setVisible(False)
-
-    _MIN_W = 120
-    _MAX_W = 360
-    _MIN_SLIDER_H = 80
-    _MAX_SLIDER_H = 240
-    _VERT_SLIDER_END_PAD = 12
-    _STRIP_HEIGHT_PAD = 12
-    _WIDTH_SCALE_CAP = 220
-    _MAX_WIDGET_HEIGHT = 16777215
-
-    def _apply_scale_metrics(self, metrics: MixerStripMetrics):
-        self.setFixedWidth(int(metrics.strip_width))
-        margin = int(metrics.outer_margin)
-        self._root_layout.setContentsMargins(margin, margin, margin, margin)
-        self._root_layout.setSpacing(int(metrics.inner_spacing))
-        self._faders_row.setSpacing(int(metrics.fader_spacing))
-        slider_widget_h = int(metrics.slider_height) + self._VERT_SLIDER_END_PAD
-        self.mon_slider.setFixedHeight(slider_widget_h)
-        self.str_slider.setFixedHeight(slider_widget_h)
-        self.name_lbl.setMinimumHeight(24)
-        self.peak_bar.setFixedHeight(int(metrics.peak_height))
-        self.link_btn.setFixedSize(int(metrics.link_button_size), int(metrics.link_button_size))
-        self.mon_mute.setFixedSize(int(metrics.mute_button_size), int(metrics.mute_button_size))
-        self.str_mute.setFixedSize(int(metrics.mute_button_size), int(metrics.mute_button_size))
-        if self._src_box_layout is not None:
-            vertical_pad = max(1, metrics.inner_spacing - 1)
-            self._src_box_layout.setContentsMargins(0, vertical_pad, 0, vertical_pad)
-            self._src_box_layout.setSpacing(max(1, metrics.inner_spacing - 1))
-        if self._src_head_layout is not None:
-            self._src_head_layout.setContentsMargins(0, 0, 0, 0)
-            self._src_head_layout.setSpacing(max(2, metrics.inner_spacing))
-        if self.src_slider is not None:
-            self.src_slider.setFixedHeight(int(metrics.mic_gain_height))
-
-    def measure_scaled_height(self, metrics: MixerStripMetrics) -> int:
-        self._apply_scale_metrics(metrics)
-        self.setMinimumHeight(0)
-        self.setMaximumHeight(self._MAX_WIDGET_HEIGHT)
-        self._root_layout.activate()
-        self.layout().activate()
-        return self.sizeHint().height() + self._STRIP_HEIGHT_PAD
-
-    def apply_scale(self, metrics: MixerStripMetrics, target_height: int | None = None):
-        self._apply_scale_metrics(metrics)
-        if target_height is None:
-            target_height = self.measure_scaled_height(metrics)
-        self.setFixedHeight(int(target_height))
-
-    def _stash_submix(self, mix_name, vol, mute):
-        win = self._main_window()
-        if not hasattr(win, 'submix_state') or not self.node_name:
-            return
-        win.submix_state[f"{self.node_name}_{mix_name}"] = {'vol': vol, 'mute': mute}
-        if hasattr(win, 'schedule_save'):
-            win.schedule_save()
-
-    def _on_link_toggle(self):
-        linked = self.link_btn.isChecked()
-        if linked:
-            self.str_slider.setValue(self.mon_slider.value())
-        # Persist regardless of direction so unlink isn't silently lost.
-        self._save_link_state(linked)
-
-    def _save_link_state(self, linked):
-        win = self._main_window()
-        if hasattr(win, 'submix_state') and self.node_name:
-            win.submix_state[f"{self.node_name}_linked"] = bool(linked)
-            if hasattr(win, 'schedule_save'):
-                win.schedule_save()
-
-    def _on_mon_vol(self, value):
-        # Visual update is immediate; engine write is debounced 40ms.
-        self.mon_vol_lbl.setText(f"{value}%")
-        self._pending_mon_vol = value
-        self._mon_commit_timer.start()
-        if self.link_btn.isChecked() and self.str_slider.value() != value:
-            self.str_slider.setValue(value)
-
-    def _on_src_vol(self, value):
-        if self.src_vol_lbl is not None:
-            self.src_vol_lbl.setText(f"{value}%")
-        self._pending_src_vol = value
-        self._src_commit_timer.start()
-
-    def _on_str_vol(self, value):
-        self.str_vol_lbl.setText(f"{value}%")
-        self._pending_str_vol = value
-        self._str_commit_timer.start()
-        if self.link_btn.isChecked() and self.mon_slider.value() != value:
-            self.mon_slider.setValue(value)
-
-    def _commit_mon_vol(self):
-        """Fire the deferred Monitor-fader write."""
-        v = self._pending_mon_vol
-        self._pending_mon_vol = None
-        if v is None or not self.node_id:
-            return
-        win = self._main_window()
-        runtime = getattr(win, "runtime", None)
-        if runtime is None:
-            return
-        runtime.set_submix_state(
-            self.node_id,
-            "Monitor",
-            v / 100.0,
-            self._mon_muted,
-            node_name=self.node_name,
-        )
-        self._stash_submix("Monitor", v / 100.0, self._mon_muted)
-
-    def _commit_str_vol(self):
-        v = self._pending_str_vol
-        self._pending_str_vol = None
-        if v is None or not self.node_id:
-            return
-        win = self._main_window()
-        runtime = getattr(win, "runtime", None)
-        if runtime is None:
-            return
-        runtime.set_submix_state(
-            self.node_id,
-            "Stream",
-            v / 100.0,
-            self._str_muted,
-            node_name=self.node_name,
-        )
-        self._stash_submix("Stream", v / 100.0, self._str_muted)
-
-    def _commit_src_vol(self):
-        v = self._pending_src_vol
-        self._pending_src_vol = None
-        if v is None or not self.node_name:
-            return
-        win = self._main_window()
-        runtime = getattr(win, "runtime", None)
-        if runtime is None or not hasattr(runtime, "set_source_volume"):
-            return
-        runtime.set_source_volume(self.node_name, v / 100.0)
-
-    def flush_pending_state(self):
-        for timer, commit in (
-            (getattr(self, "_mon_commit_timer", None), self._commit_mon_vol),
-            (getattr(self, "_str_commit_timer", None), self._commit_str_vol),
-            (getattr(self, "_src_commit_timer", None), self._commit_src_vol),
-        ):
-            if timer is not None and timer.isActive():
-                timer.stop()
-                commit()
-
-    def _apply_mute_style(self, btn, muted):
-        if btn == self.mon_mute:
-            icon = "🎧"
-        else:
-            icon = "📡"
-        target_text = "🔇" if muted else icon
-        target_state = "true" if muted else "false"
-        if btn.text() == target_text and btn.property("muted") == target_state:
-            return
-        btn.setText(target_text)
-        btn.setProperty("muted", target_state)
-        btn.style().unpolish(btn)
-        btn.style().polish(btn)
-
-    def _on_mon_mute(self):
-        self._mon_muted = not self._mon_muted
-        if self.node_id:
-            win = self._main_window()
-            runtime = getattr(win, "runtime", None)
-            if runtime is None:
-                return
-            runtime.set_submix_state(
-                self.node_id,
-                "Monitor",
-                self.mon_slider.value() / 100.0,
-                self._mon_muted,
-                node_name=self.node_name,
-            )
-            self._stash_submix("Monitor", self.mon_slider.value() / 100.0, self._mon_muted)
-        self._apply_mute_style(self.mon_mute, self._mon_muted)
-
-    def _on_str_mute(self):
-        self._str_muted = not self._str_muted
-        if self.node_id:
-            win = self._main_window()
-            runtime = getattr(win, "runtime", None)
-            if runtime is None:
-                return
-            runtime.set_submix_state(
-                self.node_id,
-                "Stream",
-                self.str_slider.value() / 100.0,
-                self._str_muted,
-                node_name=self.node_name,
-            )
-            self._stash_submix("Stream", self.str_slider.value() / 100.0, self._str_muted)
-        self._apply_mute_style(self.str_mute, self._str_muted)
-
-    def fx_capture_target(self):
-        """Source the FX chain's first stage pulls from. Mics → mic
-        node.name; virtual sinks → `<sink>.monitor`."""
-        if self.is_mic:
-            return self.node_name
-        return f"{self.node_name}.monitor"
-
-    def _main_window(self):
-        win = self._main_win
-        if win is None:
-            win = self.window()
-            self._main_win = win
-        return win
-
-    def _on_fx_toggle(self):
-        """Open the effects dialog and refresh the ✨ indicator."""
-        win = self._main_window()
-        runtime = getattr(win, "runtime", None)
-        if runtime is None:
-            QMessageBox.warning(
-                self,
-                "Audio runtime unavailable",
-                "WaveLinux's audio runtime is not available, so channel "
-                "effects cannot be edited right now.",
-            )
-            return
-        dlg = FXSelectionDialog(
-            self.node_id, self.node_name, self.fx_capture_target(),
-            self.engine, runtime, self,
-        )
-        dlg.exec()
-        self._refresh_fx_indicator()
-
-    def _refresh_fx_indicator(self, active=None):
-        if not self.node_name:
-            self.fx_indicator.setVisible(False)
-            self._last_fx_indicator_active = False
-            return
-        if active is None:
-            win = self._main_window()
-            if hasattr(win, "active_effects"):
-                active = bool(win.active_effects.get(self.node_name))
-            else:
-                active = False
-        visible = bool(active)
-        if visible == self._last_fx_indicator_active:
-            return
-        self.fx_indicator.setVisible(visible)
-        self._last_fx_indicator_active = visible
-
-    def set_runtime_issue(self, active, message=""):
-        active = bool(active)
-        if active != self._last_runtime_issue_active:
-            self.health_indicator.setVisible(active)
-            self.setProperty("degraded", "true" if active else "false")
-            self.style().unpolish(self)
-            self.style().polish(self)
-            self._last_runtime_issue_active = active
-        tip = message or "Runtime issue detected — right-click for recovery tools."
-        self.health_indicator.setToolTip(tip if active else "")
-
-    def _show_context_menu(self, pos):
-        """Right-click menu for channel-strip actions."""
-        win = self._main_window()
-        runtime = getattr(win, "runtime", None)
-        menu = QMenu(self)
-        menu.setStyleSheet(
-            "QMenu { background: #1a1a28; color: #e0e0ee;"
-            " border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 4px; }"
-            "QMenu::item { padding: 6px 20px; }"
-            "QMenu::item:selected { background: rgba(0,229,255,0.15); }"
-            "QMenu::separator { background: rgba(255,255,255,0.08); height: 1px; margin: 4px 6px; }"
-        )
-
-        fx_act = menu.addAction("✨ Effects…")
-        fx_act.triggered.connect(self._on_fx_toggle)
-
-        if self.node_name:
-            issue = (
-                win.channel_runtime_issue(self.node_name)
-                if hasattr(win, "channel_runtime_issue")
-                else {"degraded": False}
-            )
-            if issue.get("degraded"):
-                summary = issue.get("summary") or "Runtime issue detected."
-                status_act = menu.addAction(summary)
-                status_act.setEnabled(False)
-                retry_act = menu.addAction("Retry FX Now")
-                retry_act.triggered.connect(self._request_recover)
-                diag_act = menu.addAction("Open Diagnostics")
-                diag_act.triggered.connect(self._open_diagnostics)
-                menu.addSeparator()
-
-        # Carla VST/LV2 host — only shown when `carla` is on $PATH.
-        if shutil.which("carla"):
-            vst_act = menu.addAction("🎹 Open VST plugin (Carla)…")
-            vst_act.triggered.connect(self._launch_carla)
-
-        menu.addSeparator()
-
-        move_left = menu.addAction("◀ Move Left")
-        move_left.triggered.connect(lambda: self._request_move(-1))
-        move_right = menu.addAction("▶ Move Right")
-        move_right.triggered.connect(lambda: self._request_move(1))
-
-        menu.addSeparator()
-
-        if self.ch_type.lower() == "virtual":
-            rename_act = menu.addAction("✏️ Rename…")
-            rename_act.triggered.connect(self._request_rename)
-            remove_act = menu.addAction("❌ Remove Channel")
-            remove_act.triggered.connect(self._request_remove)
-
-        hide_act = menu.addAction("👁 Hide")
-        hide_act.triggered.connect(self._request_hide)
-
-        menu.exec(self.mapToGlobal(pos))
-
-    def _request_remove(self):
-        """Remove a virtual channel (only valid for ch_type == 'virtual')."""
-        win = self._main_window()
-        if hasattr(win, "_remove_sink") and self.node_name:
-            win._remove_sink(self.node_name)
-
-    def _launch_carla(self):
-        """Spawn Carla. The user wires plugin I/O in Carla itself —
-        WaveLinux doesn't supervise the process."""
-        try:
-            subprocess.Popen(["carla"])
-        except FileNotFoundError:
-            QMessageBox.information(
-                self, "Carla not found",
-                "Install Carla from your distro or upstream package source to host VST3 / "
-                "LV2 plugins. WaveLinux bridges to Carla rather than hosting "
-                "those plugin formats directly."
-            )
-
-    def _request_hide(self):
-        """Request parent window to hide this channel."""
-        win = self._main_window()
-        if hasattr(win, 'hide_node') and self.node_name:
-            win.hide_node(self.node_name)
-
-    def _request_move(self, delta):
-        win = self._main_window()
-        if hasattr(win, 'move_channel') and self.node_name:
-            win.move_channel(self.node_name, delta)
-
-    def _request_recover(self):
-        win = self._main_window()
-        if hasattr(win, 'recover_channel') and self.node_name:
-            win.recover_channel(self.node_name)
-
-    def _open_diagnostics(self):
-        win = self._main_window()
-        if hasattr(win, "open_channel_diagnostics") and self.node_name:
-            win.open_channel_diagnostics(self.node_name)
-
-    def _request_rename(self):
-        win = self._main_window()
-        if hasattr(win, 'rename_channel') and self.node_name:
-            win.rename_channel(self.node_name)
-
-    def on_peak(self, peak_01):
-        """Receive a 0..1 peak from the MeterWorker and drive the bar."""
-        self.peak_bar.setValue(int(max(0.0, min(peak_01, 1.0)) * 1000))
-
-    def update_from_node(self, mon_vol, mon_mute, str_vol, str_mute, is_hidden,
-                         source_vol=1.0, source_mute=False):
-        """Update strip UI from stored state. `is_hidden` is informational;
-        the parent window controls visibility, not this widget."""
-        self._mon_muted = mon_mute
-        self._str_muted = str_mute
-        self._src_muted = bool(source_mute)
-        mon_pct = int(mon_vol * 100)
-        str_pct = int(str_vol * 100)
-        src_pct = int(source_vol * 100)
-        win = self._main_window()
-        is_linked = False
-        if hasattr(win, 'submix_state') and self.node_name:
-            is_linked = bool(win.submix_state.get(f"{self.node_name}_linked", False))
-        state = (
-            mon_pct,
-            bool(mon_mute),
-            str_pct,
-            bool(str_mute),
-            bool(is_linked),
-            src_pct if self.is_mic else None,
-            bool(source_mute) if self.is_mic else None,
-        )
-        if state == self._last_rendered_state:
-            return
-
-        if self.mon_slider.value() != mon_pct:
-            self.mon_slider.blockSignals(True)
-            self.mon_slider.setValue(mon_pct)
-            self.mon_slider.blockSignals(False)
-        if self.str_slider.value() != str_pct:
-            self.str_slider.blockSignals(True)
-            self.str_slider.setValue(str_pct)
-            self.str_slider.blockSignals(False)
-        if self.src_slider is not None and self.src_slider.value() != src_pct:
-            self.src_slider.blockSignals(True)
-            self.src_slider.setValue(src_pct)
-            self.src_slider.blockSignals(False)
-
-        if self.link_btn.isChecked() != is_linked:
-            self.link_btn.blockSignals(True)
-            self.link_btn.setChecked(is_linked)
-            self.link_btn.blockSignals(False)
-
-        mon_text = f"{mon_pct}%"
-        if self.mon_vol_lbl.text() != mon_text:
-            self.mon_vol_lbl.setText(mon_text)
-        str_text = f"{str_pct}%"
-        if self.str_vol_lbl.text() != str_text:
-            self.str_vol_lbl.setText(str_text)
-        if self.src_vol_lbl is not None:
-            src_text = f"{src_pct}%"
-            if self.src_vol_lbl.text() != src_text:
-                self.src_vol_lbl.setText(src_text)
-        if self.src_slider is not None:
-            tip = "Hardware mic gain"
-            if source_mute:
-                tip += " (currently muted at the source)"
-            if self.src_slider.toolTip() != tip:
-                self.src_slider.setToolTip(tip)
-
-        self._apply_mute_style(self.mon_mute, mon_mute)
-        self._apply_mute_style(self.str_mute, str_mute)
-        self._last_rendered_state = state
-
-
-# ── App Routing Row ────────────────────────────────────────────────
-class AppRoutingRow(QWidget):
-    """A row showing an app name and a dropdown to choose which sink it goes to."""
-
-    _GENERIC_APP_ICON_CANDIDATES = [
-        "audio-x-generic",
-        "multimedia-player",
-        "applications-multimedia",
-    ]
-    _SYSTEM_ICON_CANDIDATES = [
-        "preferences-system-sound",
-        "audio-volume-high",
-        "audio-card",
-    ]
-
-    def __init__(self, app_id, display_name, engine, sinks, main_win=None, parent=None):
-        super().__init__(parent)
-        self.engine = engine
-        self.app_id = app_id
-        self.app_name = display_name
-        self.resolved_app_id = app_id
-        self.resolved_app_name = display_name
-        self.identity_source = ""
-        self.override_applied = False
-        self.manual_override_active = False
-        self.reset_source_app_id = ""
-        self._main_win = main_win
-        self._active_indices = [] # Current sink-input indices for this app
-        self._last_active_state = None
-        self._last_sink_selection = object()
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 4, 0, 4)
-        layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
-
-        self.icon_lbl = QLabel("🎵")
-        self.icon_lbl.setObjectName("channelIcon")
-        self.icon_lbl.setFixedSize(28, 24)
-        self.icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.icon_lbl)
-        
-        self.name_lbl = QLabel(display_name)
-        self.name_lbl.setObjectName("appName")
-        self.name_lbl.setMinimumWidth(150)
-        self.name_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        layout.addWidget(self.name_lbl)
-        
-        layout.addStretch()
-
-        # Direct App Volume Control
-        self.vol_slider = QSlider(Qt.Orientation.Horizontal)
-        self.vol_slider.setRange(0, 100)
-        self.vol_slider.setFixedWidth(100)
-        self.vol_slider.setValue(100)
-        self.vol_slider.valueChanged.connect(self._on_vol_change)
-        
-        self.vol_lbl = QLabel("Vol:")
-        self.vol_lbl.setObjectName("volumeLabel")
-        self.vol_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.vol_lbl)
-        layout.addWidget(self.vol_slider)
-        
-        layout.addSpacing(10)
-        
-        self.combo = QComboBox()
-        self.combo.setFixedWidth(220)
-        self.combo.currentIndexChanged.connect(self._on_route_change)
-        layout.addWidget(self.combo)
-
-        self.manage_btn = QPushButton("⋯")
-        self.manage_btn.setObjectName("forgetBtn")
-        self.manage_btn.setFixedWidth(26)
-        self.manage_btn.setToolTip("Pin, merge, or reset this app identity")
-        self.manage_btn.clicked.connect(self._show_identity_menu)
-        layout.addWidget(self.manage_btn)
-
-        self.forget_btn = QPushButton("✕")
-        self.forget_btn.setObjectName("forgetBtn")
-        self.forget_btn.setFixedWidth(26)
-        self.forget_btn.setToolTip("Forget this app so it stops showing up in the list")
-        self.forget_btn.clicked.connect(self._on_forget)
-        layout.addWidget(self.forget_btn)
-
-        # 40ms volume-write debouncer (same reasoning as the channel strip).
-        self._pending_app_vol = None
-        self._app_commit_timer = QTimer(self)
-        self._app_commit_timer.setSingleShot(True)
-        self._app_commit_timer.setInterval(40)
-        self._app_commit_timer.timeout.connect(self._commit_app_vol)
-
-        self.update_state(display_name, [], sinks, None)
-
-    def _set_icon_candidates(self, icon_candidates, *, is_system):
-        ordered = []
-        seen = set()
-        for candidate in list(icon_candidates or []) + (
-            self._SYSTEM_ICON_CANDIDATES if is_system else self._GENERIC_APP_ICON_CANDIDATES
-        ):
-            key = str(candidate or "").strip()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            ordered.append(key)
-        for candidate in ordered:
-            icon = QIcon.fromTheme(candidate)
-            if icon.isNull():
-                continue
-            self.icon_lbl.clear()
-            self.icon_lbl.setPixmap(icon.pixmap(20, 20))
-            self.icon_lbl.setToolTip(candidate)
-            return
-        self.icon_lbl.clear()
-        self.icon_lbl.setText("🔔" if is_system else "🎵")
-        self.icon_lbl.setToolTip("")
-
-    def _on_vol_change(self, value):
-        self._pending_app_vol = value
-        self._app_commit_timer.start()
-
-    def _commit_app_vol(self):
-        v = self._pending_app_vol
-        self._pending_app_vol = None
-        if v is None:
-            return
-        normalized = max(0.0, min(float(v) / 100.0, 1.0))
-        win = self._main_win
-        if win is not None:
-            app_volumes = getattr(win, "app_volumes", None)
-            if (
-                app_volumes is not None
-                and PipeWireEngine.is_persistent_app_id(self.app_id)
-                and app_volumes.get(self.app_id) != normalized
-            ):
-                app_volumes[self.app_id] = normalized
-                win._sync_runtime_persistent_state()
-                win.schedule_save()
-        runtime = getattr(win, "runtime", None)
-        if runtime is None:
-            return
-        for idx in self._active_indices:
-            runtime.set_app_volume(idx, normalized)
-
-    def flush_pending_state(self):
-        timer = getattr(self, "_app_commit_timer", None)
-        if timer is not None and timer.isActive():
-            timer.stop()
-            self._commit_app_vol()
-
-    def _on_route_change(self, idx):
-        sink_name = self.combo.itemData(idx)
-        win = self._main_win
-        runtime = getattr(win, "runtime", None)
-        if runtime is None:
-            return
-        runtime.set_app_route(self.app_id, sink_name)
-        if win is not None:
-            win.app_routing[self.app_id] = sink_name
-            win.save_config()
-
-    def _on_forget(self):
-        """Permanently remove this app from the routing list."""
-        win = self._main_win
-        if win is not None:
-            win.forget_app(self.app_id)
-
-    def _identity_source_app_id(self):
-        if PipeWireEngine.is_persistent_app_id(self.resolved_app_id):
-            return self.resolved_app_id
-        if PipeWireEngine.is_persistent_app_id(self.app_id):
-            return self.app_id
-        return ""
-
-    def _show_identity_menu(self):
-        win = self._main_win
-        if win is None:
-            return
-        menu = QMenu(self)
-        persistent_source = self._identity_source_app_id()
-        is_system = self.app_id == PipeWireEngine.SYSTEM_SOUNDS_BUCKET
-        can_pin_merge = bool(persistent_source) and not is_system
-        can_reset = bool(self.manual_override_active) and not is_system
-
-        if not can_pin_merge:
-            info_act = menu.addAction(
-                "WaveLinux needs a stable app signature before it can pin or merge this stream."
-            )
-            info_act.setEnabled(False)
-            menu.addSeparator()
-
-        pin_act = menu.addAction("Pin / Rename App…")
-        pin_act.setEnabled(can_pin_merge)
-        pin_act.triggered.connect(lambda checked=False: win._pin_app_identity(self))
-
-        merge_act = menu.addAction("Merge Into Existing App…")
-        merge_act.setEnabled(can_pin_merge)
-        merge_act.triggered.connect(lambda checked=False: win._merge_app_identity(self))
-
-        reset_act = menu.addAction("Reset to Auto Detection")
-        reset_act.setEnabled(can_reset)
-        reset_act.triggered.connect(lambda checked=False: win._reset_app_identity_override(self))
-
-        menu.exec(self.manage_btn.mapToGlobal(self.manage_btn.rect().bottomLeft()))
-
-    def update_state(self, display_name, active_indices, sinks, current_sink,
-                     current_volume=None, saved_volume=None,
-                     resolved_app_id=None, resolved_app_name=None,
-                     identity_source="", override_applied=False,
-                     manual_override_active=False, reset_source_app_id="",
-                     icon_candidates=None):
-        self.app_name = display_name or self.app_name
-        self._active_indices = active_indices
-        self.resolved_app_id = str(resolved_app_id or self.app_id)
-        self.resolved_app_name = str(resolved_app_name or self.app_name)
-        self.identity_source = str(identity_source or "")
-        self.override_applied = bool(override_applied)
-        self.manual_override_active = bool(manual_override_active)
-        self.reset_source_app_id = str(reset_source_app_id or "")
-        is_active = len(active_indices) > 0
-        is_system = (self.app_id == PipeWireEngine.SYSTEM_SOUNDS_BUCKET)
-
-        derived_icon_candidates = list(icon_candidates or [])
-        for app_token, app_label in (
-            (self.app_id, self.app_name),
-            (self.resolved_app_id, self.resolved_app_name),
-        ):
-            for candidate in PipeWireEngine.theme_icon_candidates_for_app_id(
-                app_token,
-                fallback_name=app_label,
-            ):
-                if candidate not in derived_icon_candidates:
-                    derived_icon_candidates.append(candidate)
-        self._set_icon_candidates(derived_icon_candidates, is_system=is_system)
-        label_text = (
-            f"{self.app_name} (Idle)" if (is_system and not is_active)
-            else f"{self.app_name} (Offline)" if not is_active
-            else self.app_name
-        )
-        active_state = (label_text, is_active, is_system)
-        if active_state != self._last_active_state:
-            self.name_lbl.setText(label_text)
-            self.vol_slider.setEnabled(True)
-            self.vol_lbl.setStyleSheet("" if is_active else "color: #666;")
-            self.name_lbl.setStyleSheet("" if is_active else "color: #888;")
-            self._last_active_state = active_state
-
-        self.forget_btn.setVisible(not is_system)
-        self.manage_btn.setVisible(not is_system)
-        if not is_system:
-            self.manage_btn.setEnabled(True)
-            self.manage_btn.setToolTip("Pin, merge, or reset this app identity")
-            self.forget_btn.setEnabled(True)
-            self.forget_btn.setToolTip(
-                "Permanently hide this app from the routing list. "
-                "Drops its saved volume / destination too."
-            )
-        tooltip_lines = [
-            f"Canonical app ID: {self.app_id}",
-            f"Resolved app ID: {self.resolved_app_id or 'n/a'}",
-            "Identity source: " + (self.identity_source or "n/a"),
-            "Manual override active: " + ("yes" if self.manual_override_active else "no"),
-        ]
-        tooltip = "\n".join(tooltip_lines)
-        self.name_lbl.setToolTip(tooltip)
-        self.manage_btn.setToolTip("Pin, merge, or reset this app identity\n\n" + tooltip)
-
-        vol = current_volume
-        if vol is None:
-            vol = saved_volume
-        if vol is None and is_active:
-            vol = self.engine.get_sink_input_volume(active_indices[0])
-        if vol is not None and not self.vol_slider.isSliderDown():
-            vol_pct = int(vol * 100)
-            if self.vol_slider.value() != vol_pct:
-                self.vol_slider.blockSignals(True)
-                self.vol_slider.setValue(vol_pct)
-                self.vol_slider.blockSignals(False)
-
-        # Combo: hardware sinks + user-created WaveLinux channels.
-        # Internal mix/source nodes stay hidden. Rebuild only when the
-        # sink list actually changes (cached via a fingerprint).
-        if not self.combo.view().isVisible():
-            sink_fp = tuple(
-                (s.get('name'), s.get('display_name')) if isinstance(s, dict)
-                else (getattr(s, 'name', None), getattr(s, 'display_name', None))
-                for s in sinks
-            )
-            if getattr(self, '_combo_sink_fp', None) != sink_fp:
-                self._combo_sink_fp = sink_fp
-                self.combo.blockSignals(True)
-                curr_data = self.combo.currentData()
-                self.combo.clear()
-                self.combo.addItem("System Default", None)
-                for s in sinks:
-                    if isinstance(s, dict):
-                        name = s['name']
-                        display_name = s.get('display_name')
-                    else:
-                        name = getattr(s, 'name', None)
-                        display_name = getattr(s, 'display_name', None)
-                    if name is None:
-                        continue
-                    if name.startswith('wavelinux_mix_') or name.startswith('wavelinux_src_'):
-                        continue
-                    if name.endswith('.monitor'):
-                        continue
-                    if name.startswith('wavelinux_'):
-                        pretty = name.replace('wavelinux_', '').replace('_', ' ').title()
-                        display = display_name or pretty
-                    else:
-                        display = display_name or self.engine.display_name_for_sink(name)
-                    self.combo.addItem(display, name)
-
-                target_sink = current_sink or curr_data
-                idx = self.combo.findData(target_sink)
-                if idx >= 0:
-                    self.combo.setCurrentIndex(idx)
-                self.combo.blockSignals(False)
-                self._last_sink_selection = target_sink
-            elif current_sink != self._last_sink_selection:
-                # Sink list unchanged but the current selection may have
-                # changed — sync the combobox cheaply.
-                idx = self.combo.findData(current_sink)
-                if idx >= 0 and idx != self.combo.currentIndex():
-                    self.combo.blockSignals(True)
-                    self.combo.setCurrentIndex(idx)
-                    self.combo.blockSignals(False)
-                self._last_sink_selection = current_sink
-
-
-class HealthCard(QFrame):
-    """Small status card used by the Health settings tab."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("healthCard")
-        self.setProperty("severity", "info")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-
-        head = QHBoxLayout()
-        head.setContentsMargins(0, 0, 0, 0)
-        head.setSpacing(8)
-
-        self.badge_lbl = QLabel("INFO")
-        self.badge_lbl.setObjectName("healthBadge")
-        self.badge_lbl.setProperty("severity", "info")
-        head.addWidget(self.badge_lbl, 0, Qt.AlignmentFlag.AlignTop)
-
-        self.title_lbl = QLabel()
-        self.title_lbl.setObjectName("healthTitle")
-        self.title_lbl.setWordWrap(True)
-        head.addWidget(self.title_lbl, 1)
-        layout.addLayout(head)
-
-        self.detail_lbl = QLabel()
-        self.detail_lbl.setObjectName("healthDetail")
-        self.detail_lbl.setWordWrap(True)
-        layout.addWidget(self.detail_lbl)
-
-        action_row = QHBoxLayout()
-        action_row.setContentsMargins(0, 0, 0, 0)
-        action_row.setSpacing(8)
-        self.primary_btn = QPushButton()
-        self.primary_btn.setObjectName("showHiddenBtn")
-        action_row.addWidget(self.primary_btn)
-        self.secondary_btn = QPushButton()
-        self.secondary_btn.setObjectName("showHiddenBtn")
-        action_row.addWidget(self.secondary_btn)
-        action_row.addStretch()
-        layout.addLayout(action_row)
-
-    def configure(self, issue: HealthIssue, *, primary_handler=None,
-                  secondary_handler=None):
-        severity = (issue.severity or "info").strip().lower()
-        badge_text = severity.upper()
-        self.setProperty("severity", severity)
-        self.badge_lbl.setText(badge_text)
-        self.badge_lbl.setProperty("severity", severity)
-        self.title_lbl.setText(issue.title or issue.code)
-        self.detail_lbl.setText(issue.detail or "")
-        self._refresh_style()
-
-        self._configure_button(
-            self.primary_btn,
-            issue.primary_action,
-            primary_handler,
-        )
-        self._configure_button(
-            self.secondary_btn,
-            issue.secondary_action,
-            secondary_handler,
-        )
-
-    @staticmethod
-    def _disconnect_button(button):
-        try:
-            button.clicked.disconnect()
-        except TypeError:
-            pass
-
-    def _configure_button(self, button, text, handler):
-        self._disconnect_button(button)
-        text = str(text or "").strip()
-        visible = bool(text and handler is not None)
-        button.setVisible(visible)
-        if not visible:
-            return
-        button.setText(text)
-        button.clicked.connect(handler)
-
-    def _refresh_style(self):
-        for widget in (self, self.badge_lbl):
-            widget.style().unpolish(widget)
-            widget.style().polish(widget)
-
 
 # ── Main Window ────────────────────────────────────────────────────
 class WaveLinuxWindow(QMainWindow):
@@ -2105,6 +286,7 @@ class WaveLinuxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("WaveLinux")
+        self._app_version = APP_VERSION
         
         self.resize(1200, 720)
         
@@ -2130,6 +312,11 @@ class WaveLinuxWindow(QMainWindow):
         self.runtime.fx_status_changed.connect(self._on_runtime_fx_status)
         self._runtime_view_state = None
         self._shutting_down = False
+        self._event_bus = EventBus()
+        self._module_health_bus = HealthBus()
+        self._feature_flags = load_feature_flags()
+        self.module_manager = None
+        self._module_feature_enabled = {}
         # ── State ──
         self.channel_widgets = {}   # node_id -> ChannelStrip
         self.app_widgets = {}       # app_id -> AppRoutingRow
@@ -2167,6 +354,7 @@ class WaveLinuxWindow(QMainWindow):
         self._monitor_sink_fp = ()
         self._desired_mix_hw = {"Monitor": None, "Stream": None}
         self._desired_mix_volumes = {"Monitor": 1.0, "Stream": 1.0}
+        self._stress_control_server = None
         self._preferred_monitor_hw_id = ""
         self._preferred_monitor_hw_name = ""
         self._restorable_monitor_hw_id = ""
@@ -2207,6 +395,14 @@ class WaveLinuxWindow(QMainWindow):
         self._event_refresh_timer.timeout.connect(
             lambda: self._request_runtime_refresh("pactl-event")
         )
+        self._event_proc_restart_timer = QTimer(self)
+        self._event_proc_restart_timer.setSingleShot(True)
+        self._event_proc_restart_timer.setInterval(1000)
+        self._event_proc_restart_timer.timeout.connect(
+            self._restart_event_subscriber_if_needed
+        )
+        self._bluetooth_profile_reassert_retries = 0
+        self._pending_bluetooth_reconnect_macs = set()
         self._device_settle_refresh_timer = QTimer(self)
         self._device_settle_refresh_timer.setSingleShot(True)
         self._device_settle_refresh_timer.setInterval(700)
@@ -2218,13 +414,65 @@ class WaveLinuxWindow(QMainWindow):
         self._bluetooth_refresh_timer.setSingleShot(True)
         self._bluetooth_refresh_timer.setInterval(1800)
         self._bluetooth_refresh_timer.timeout.connect(
-            lambda: self._request_runtime_refresh("bluetooth-settle")
+            self._handle_bluetooth_settle_refresh
         )
+        self._monitor_route_reassert_timer = QTimer(self)
+        self._monitor_route_reassert_timer.setSingleShot(True)
+        self._monitor_route_reassert_timer.setInterval(350)
+        self._monitor_route_reassert_timer.timeout.connect(
+            lambda: self._reassert_persistent_state_after_monitor_switch("monitor-route-reassert")
+        )
+        self._monitor_route_bluetooth_reassert_timer = QTimer(self)
+        self._monitor_route_bluetooth_reassert_timer.setSingleShot(True)
+        self._monitor_route_bluetooth_reassert_timer.setInterval(1800)
+        self._monitor_route_bluetooth_reassert_timer.timeout.connect(
+            lambda: self._reassert_persistent_state_after_monitor_switch("monitor-route-reassert-bluetooth")
+        )
+        self._runtime_view_refresh_timer = QTimer(self)
+        self._runtime_view_refresh_timer.setSingleShot(True)
+        self._runtime_view_refresh_timer.setInterval(40)
+        self._runtime_view_refresh_timer.timeout.connect(
+            self._apply_scheduled_runtime_view_refresh
+        )
+        self._settings_tab_refresh_timer = QTimer(self)
+        self._settings_tab_refresh_timer.setSingleShot(True)
+        self._settings_tab_refresh_timer.setInterval(60)
+        self._settings_tab_refresh_timer.timeout.connect(
+            self._apply_scheduled_settings_tab_refresh
+        )
+        self._settings_tab_last_refresh_at = {}
+        self._pending_settings_tab_refresh = ""
+        self._last_selected_mic_change_at = 0.0
+        self._install_state_cache = None
+        self._install_state_cache_at = 0.0
+        self._install_state_refresh_inflight = False
+        self._install_state_refresh_tabs = set()
+        self._install_state_refresh_queue = queue.SimpleQueue()
+        self._install_state_refresh_poll_timer = QTimer(self)
+        self._install_state_refresh_poll_timer.setInterval(40)
+        self._install_state_refresh_poll_timer.timeout.connect(
+            self._poll_install_state_refresh
+        )
+        self._mic_cutover_refresh_timer = QTimer(self)
+        self._mic_cutover_refresh_timer.setSingleShot(True)
+        self._mic_cutover_refresh_timer.setInterval(250)
+        self._mic_cutover_refresh_timer.timeout.connect(
+            lambda: self._request_runtime_refresh("mic-cutover-followup")
+        )
+        self._pactl_event_suppressed_until = 0.0
+        self._quit_in_progress = False
+        self._runtime_stopped = False
 
         self._setup_ui()
+        self._setup_feature_modules()
         self._run_startup_preflight()
         self.load_config()
+        self._start_feature_modules()
+        self._prime_bluetooth_playback_profile()
+        self._wait_for_startup_audio_ready()
         self._refresh()
+        QTimer.singleShot(300, lambda: self._request_runtime_refresh("startup-followup-1"))
+        QTimer.singleShot(1200, lambda: self._request_runtime_refresh("startup-followup-2"))
         if self._show_first_run_setup:
             QTimer.singleShot(400, self._open_quick_start_setup)
         # 5s backstop interval — subscribe-driven refreshes carry the
@@ -2242,12 +490,28 @@ class WaveLinuxWindow(QMainWindow):
         self._recent_recovery_status = {}
         # Silent update check 30 s after startup so it never blocks startup.
         QTimer.singleShot(30_000, self._check_for_updates_bg)
+        # Prime install-state cache off the UI path so heavy settings tabs can
+        # paint immediately from cached data later.
+        QTimer.singleShot(
+            1500,
+            lambda: self._schedule_install_state_refresh(
+                target_tabs=("Health", "Updates"),
+                force=True,
+            ),
+        )
 
     def _on_runtime_view_state(self, view_state):
         self._runtime_view_state = view_state
-        self._reconcile_device_policy(view_state)
+        event_bus = self.__dict__.get("_event_bus")
+        if event_bus is not None:
+            event_bus.publish(RuntimeViewUpdated(view_state=view_state))
+        manager = self.__dict__.get("module_manager")
+        if manager is not None:
+            manager.on_runtime_view(view_state)
         health = getattr(view_state, "health", {}) or {}
         pending_ops = getattr(view_state, "pending_operations", {}) or {}
+        if not self._selected_mic_transition_in_progress(health, pending_ops):
+            self._reconcile_device_policy(view_state)
         degraded = [name for name, state in health.items() if state]
         if degraded:
             self.status_lbl.setText(
@@ -2261,23 +525,31 @@ class WaveLinuxWindow(QMainWindow):
             self.status_lbl.setText("PipeWire connected")
         elif self.status_lbl.text().startswith("Applying audio changes"):
             self.status_lbl.setText("PipeWire connected")
-        hidden_to_tray = self.tray is not None and not self.isVisible()
-        settings_open = self._settings_dialog_visible()
-        if settings_open:
-            self._refresh_advanced_tab()
-            self._refresh_system_tab(preflight=self._startup_preflight)
-        if hidden_to_tray and not settings_open:
-            return
-        if self._any_slider_dragging():
-            return
-        self._refresh_runtime_view()
+        if self._selected_mic_needs_followup_refresh(health, pending_ops):
+            timer = self.__dict__.get("_mic_cutover_refresh_timer")
+            if timer is not None and not timer.isActive():
+                timer.start()
+        refresh_timer = self.__dict__.get("_runtime_view_refresh_timer")
+        if refresh_timer is not None:
+            refresh_timer.setInterval(
+                self._runtime_view_refresh_delay_ms(
+                    health=health,
+                    pending_ops=pending_ops,
+                )
+            )
+        self._schedule_runtime_view_refresh()
 
     def _request_runtime_refresh(self, reason=""):
+        if bool(self.__dict__.get("_shutting_down", False)):
+            return
         runtime = getattr(self, "runtime", None)
         if runtime is not None and hasattr(runtime, "refresh_now"):
             runtime.refresh_now(reason or "runtime-refresh")
 
     def _on_runtime_fx_status(self, status):
+        event_bus = self.__dict__.get("_event_bus")
+        if event_bus is not None:
+            event_bus.publish(FxStatusUpdated(status=status))
         node_name = getattr(status, "node_name", "")
         state = getattr(status, "state", "")
         if state in {"building", "cutover_pending", "clearing"}:
@@ -2285,19 +557,228 @@ class WaveLinuxWindow(QMainWindow):
         elif state in {"active", "idle"}:
             self._clear_auto_recovery_state(node_name)
             if node_name and not getattr(self, "_shutting_down", False):
-                self._request_runtime_refresh(f"fx-status:{state}:{node_name}")
+                if self._selected_mic_change_settling():
+                    self._schedule_runtime_view_refresh()
+                else:
+                    self._request_runtime_refresh(f"fx-status:{state}:{node_name}")
         if state == "degraded":
             self.status_lbl.setText(
                 self.format_fx_status_message(status) or "FX runtime degraded"
             )
             self._schedule_auto_recovery(status)
         if self._settings_dialog_visible():
-            self._refresh_system_tab(preflight=self._startup_preflight)
+            self._mark_settings_tab_stale("Health")
+            if self._active_settings_tab_name() == "Health":
+                self._schedule_active_settings_tab_refresh(force=True)
         self._refresh_channel_runtime_status(node_name)
 
     def _settings_dialog_visible(self):
         dialog = self.__dict__.get("settings_dialog")
         return bool(dialog is not None and dialog.isVisible())
+
+    def _suppress_pactl_events_for(self, duration_s):
+        duration_s = max(0.0, float(duration_s or 0.0))
+        if duration_s <= 0.0:
+            return
+        self._pactl_event_suppressed_until = max(
+            float(self.__dict__.get("_pactl_event_suppressed_until", 0.0) or 0.0),
+            time.monotonic() + duration_s,
+        )
+
+    def _pactl_events_suppressed(self):
+        return time.monotonic() < float(
+            self.__dict__.get("_pactl_event_suppressed_until", 0.0) or 0.0
+        )
+
+    def _schedule_runtime_view_refresh(self):
+        timer = self.__dict__.get("_runtime_view_refresh_timer")
+        if timer is not None:
+            timer.start()
+
+    def _runtime_view_refresh_delay_ms(self, *, health=None, pending_ops=None):
+        delay_ms = 40
+        if pending_ops:
+            delay_ms = 180
+        elif health:
+            delay_ms = 90
+        if self._settings_dialog_visible():
+            delay_ms = max(delay_ms, 80)
+        return delay_ms
+
+    def _runtime_view_has_pending_ops(self, view=None):
+        view = view or self.__dict__.get("_runtime_view_state")
+        if view is None:
+            return False
+        return bool(getattr(view, "pending_operations", {}) or {})
+
+    def _selected_mic_change_settling(self, *, window_s=3.0):
+        changed_at = float(self.__dict__.get("_last_selected_mic_change_at", 0.0) or 0.0)
+        if changed_at <= 0.0:
+            return False
+        return (time.monotonic() - changed_at) < max(0.0, float(window_s or 0.0))
+
+    def _selected_mic_needs_followup_refresh(self, health, pending_ops):
+        if pending_ops or bool(self.__dict__.get("_shutting_down", False)):
+            return False
+        selected_mic = str(self.__dict__.get("selected_mic", "") or "").strip()
+        if not selected_mic:
+            return False
+        health_code = str((health or {}).get(selected_mic) or "").strip()
+        return health_code in {
+            "default_source_mismatch",
+            "default_source_expected_fx_missing",
+            "desired_fx_missing",
+            "fx_source_not_present",
+        }
+
+    def _selected_mic_transition_in_progress(self, health, pending_ops):
+        if bool(self.__dict__.get("_shutting_down", False)):
+            return False
+        selected_mic = str(self.__dict__.get("selected_mic", "") or "").strip()
+        if not selected_mic or not self._selected_mic_change_settling():
+            return False
+        if pending_ops:
+            return True
+        health_code = str((health or {}).get(selected_mic) or "").strip()
+        return health_code in {
+            "default_source_mismatch",
+            "default_source_expected_fx_missing",
+            "desired_fx_missing",
+            "fx_source_not_present",
+        }
+
+    def _startup_graph_health_blockers(self, view=None):
+        view = view or self.__dict__.get("_runtime_view_state")
+        if view is None:
+            return {}
+        health = getattr(view, "health", {}) or {}
+        managed_names = set(self._virtual_channel_specs().keys())
+        selected_mic = str(self.__dict__.get("selected_mic", "") or "").strip()
+        if selected_mic:
+            managed_names.add(selected_mic)
+        blockers = {}
+        for node_name in managed_names:
+            code = str(health.get(node_name) or "").strip()
+            if code in {
+                "submix_monitor_missing",
+                "submix_stream_missing",
+                "submix_monitor_dead",
+                "submix_stream_dead",
+                "default_source_mismatch",
+                "default_source_expected_fx_missing",
+                "desired_fx_missing",
+                "fx_source_not_present",
+            }:
+                blockers[node_name] = code
+        return blockers
+
+    def _startup_audio_ready(self, view=None):
+        selected_mic = str(self.__dict__.get("selected_mic", "") or "").strip()
+        view = view or self.__dict__.get("_runtime_view_state")
+        runtime = self.__dict__.get("runtime")
+        if view is None and runtime is not None:
+            view = getattr(runtime, "latest_view_state", None)
+        if view is None:
+            return False
+        if self._startup_graph_health_blockers(view=view):
+            return False
+        if not selected_mic:
+            return True
+        mic_names = {
+            str(getattr(mic_view, "name", "") or "").strip()
+            for mic_view in (getattr(view, "mic_inputs", []) or [])
+        }
+        if mic_names and selected_mic not in mic_names:
+            return False
+        health = getattr(view, "health", {}) or {}
+        health_code = str(health.get(selected_mic) or "").strip()
+        if health_code in {
+            "default_source_mismatch",
+            "default_source_expected_fx_missing",
+            "desired_fx_missing",
+            "fx_source_not_present",
+        }:
+            return False
+        default_source = str(getattr(view, "default_source", "") or "").strip()
+        if not default_source:
+            return False
+        active_fx = list((self.__dict__.get("active_effects", {}) or {}).get(selected_mic, []) or [])
+        if not active_fx:
+            return default_source == selected_mic
+        engine = self.__dict__.get("engine")
+        expected_source = ""
+        if engine is not None and hasattr(engine, "get_channel_fx_source"):
+            expected_source = str(engine.get_channel_fx_source(selected_mic) or "").strip()
+        if not expected_source:
+            return False
+        return default_source == expected_source
+
+    def _wait_for_startup_audio_ready(self, timeout_s=8.0):
+        if bool(self.__dict__.get("_shutting_down", False)):
+            return True
+        deadline = time.monotonic() + max(0.0, float(timeout_s or 0.0))
+        next_refresh_at = 0.0
+        while time.monotonic() < deadline:
+            view = self.__dict__.get("_runtime_view_state")
+            runtime = self.__dict__.get("runtime")
+            if view is None and runtime is not None:
+                view = getattr(runtime, "latest_view_state", None)
+            if self._startup_audio_ready(view=view):
+                return True
+            now = time.monotonic()
+            if now >= next_refresh_at:
+                self._request_runtime_refresh("startup-audio-ready")
+                next_refresh_at = now + 0.2
+            QApplication.processEvents()
+            time.sleep(0.05)
+        return self._startup_audio_ready()
+
+    def _apply_scheduled_runtime_view_refresh(self):
+        hidden_to_tray = self.tray is not None and not self.isVisible()
+        settings_open = self._settings_dialog_visible()
+        active_settings_tab = self._active_settings_tab_name() if settings_open else ""
+        if settings_open:
+            self._schedule_active_settings_tab_refresh()
+        if hidden_to_tray and not settings_open:
+            return
+        if self._any_slider_dragging():
+            return
+        if self._runtime_view_has_pending_ops():
+            timer = self.__dict__.get("_runtime_view_refresh_timer")
+            view = self.__dict__.get("_runtime_view_state")
+            if timer is not None and view is not None:
+                timer.setInterval(
+                    self._runtime_view_refresh_delay_ms(
+                        health=getattr(view, "health", {}) or {},
+                        pending_ops=getattr(view, "pending_operations", {}) or {},
+                    )
+                )
+                timer.start()
+            return
+        if settings_open and self._selected_mic_change_settling():
+            self._apply_lightweight_runtime_view_refresh()
+            timer = self.__dict__.get("_runtime_view_refresh_timer")
+            if timer is not None:
+                timer.setInterval(120)
+                timer.start()
+            return
+        self._refresh_runtime_view()
+
+    def _apply_lightweight_runtime_view_refresh(self):
+        view = self.__dict__.get("_runtime_view_state")
+        if view is None:
+            self.status_lbl.setText("PipeWire syncing...")
+            return
+        mics = list(getattr(view, "mic_inputs", []) or [])
+        self._mixer_panel_controller().sync_mic_picker(
+            mics,
+            default_src=getattr(view, "default_source", None),
+        )
+        if not getattr(view, "health", {}):
+            self.status_lbl.setText(
+                f"PipeWire connected · {getattr(view, 'node_count', 0)} nodes · "
+                f"{getattr(view, 'app_count', 0)} apps"
+            )
 
     def _make_auto_recovery_timer(self):
         timer = QTimer(self)
@@ -2623,143 +1104,661 @@ class WaveLinuxWindow(QMainWindow):
         except OSError as exc:
             logging.warning(f"Could not clear runtime pid file {pid_path}: {exc}")
 
-    def _open_settings(self):
-        self._refresh_scenes_tab()
-        self._refresh_hidden_list()
-        self._refresh_system_tab()
-        self._refresh_advanced_tab()
-        self._refresh_update_tab()
-        self.settings_dialog.show()
-        self.settings_dialog.raise_()
+    def _setup_stress_control(self):
+        if not stress_control_enabled():
+            return
+        try:
+            from stress_control import StressControlServer
 
-    def _build_system_tab(self):
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+            socket_path = str(os.environ.get("WAVELINUX_STRESS_SOCKET_PATH", "") or "").strip() or None
+            self._stress_control_server = StressControlServer(self, socket_path=socket_path)
+            self._stress_control_server.start()
+            logging.info(
+                "Stress control enabled on %s",
+                self._stress_control_server.socket_path,
+            )
+        except Exception as exc:
+            logging.exception("Could not start stress control server: %s", exc)
+            self._stress_control_server = None
 
-        title = QLabel("HEALTH")
-        title.setObjectName("sectionLabel")
-        layout.addWidget(title)
-
-        self._system_summary_lbl = QLabel()
-        self._system_summary_lbl.setWordWrap(True)
-        self._system_summary_lbl.setStyleSheet("color: #e0e0ee; font-size: 13px; font-weight: bold;")
-        layout.addWidget(self._system_summary_lbl)
-
-        self._system_runtime_lbl = QLabel()
-        self._system_runtime_lbl.setWordWrap(True)
-        self._system_runtime_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
-        layout.addWidget(self._system_runtime_lbl)
-
-        btn_row = QHBoxLayout()
-        self._rerun_system_check_btn = QPushButton("Re-run System Check")
-        self._rerun_system_check_btn.setObjectName("showHiddenBtn")
-        self._rerun_system_check_btn.clicked.connect(self._rerun_system_check)
-        btn_row.addWidget(self._rerun_system_check_btn)
-
-        self._repair_launcher_btn = QPushButton("Repair Desktop Launchers")
-        self._repair_launcher_btn.setObjectName("showHiddenBtn")
-        self._repair_launcher_btn.clicked.connect(self._repair_installed_launchers)
-        btn_row.addWidget(self._repair_launcher_btn)
-
-        self._health_recover_btn = QPushButton("Recover degraded channels")
-        self._health_recover_btn.setObjectName("showHiddenBtn")
-        self._health_recover_btn.clicked.connect(self._recover_all_degraded_channels)
-        btn_row.addWidget(self._health_recover_btn)
-
-        self._health_diag_btn = QPushButton("Open diagnostics folder")
-        self._health_diag_btn.setObjectName("showHiddenBtn")
-        self._health_diag_btn.clicked.connect(self._open_diagnostics_folder)
-        btn_row.addWidget(self._health_diag_btn)
-
-        self._health_restart_btn = QPushButton("Restart WaveLinux")
-        self._health_restart_btn.setObjectName("showHiddenBtn")
-        self._health_restart_btn.clicked.connect(self._restart_app)
-        btn_row.addWidget(self._health_restart_btn)
-
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        self._health_cards_scroll = QScrollArea()
-        self._health_cards_scroll.setWidgetResizable(True)
-        self._health_cards_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._health_cards_scroll.setStyleSheet("background: transparent;")
-        self._health_cards_container = QWidget()
-        self._health_cards_layout = QVBoxLayout(self._health_cards_container)
-        self._health_cards_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self._health_cards_layout.setContentsMargins(0, 0, 0, 0)
-        self._health_cards_layout.setSpacing(10)
-        self._health_cards_scroll.setWidget(self._health_cards_container)
-        layout.addWidget(self._health_cards_scroll, 1)
-
-        return tab
-
-    def _build_scenes_tab(self):
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
-
-        title = QLabel("SCENES")
-        title.setObjectName("sectionLabel")
-        layout.addWidget(title)
-
-        desc = QLabel(
-            "Save a full routing snapshot and restore it later. Scenes capture "
-            "virtual channels, output targets, app routing, levels, FX chains, "
-            "and effect parameters."
+    def _setup_feature_modules(self):
+        ctx = AppContext(
+            runtime=self.runtime,
+            engine=self.engine,
+            config_store=self,
+            event_bus=self._event_bus,
+            module_manager=None,
+            diagnostics=getattr(self.runtime, "diagnostics", None),
+            main_window=self,
         )
-        desc.setWordWrap(True)
-        desc.setStyleSheet("color: #8b8b9e; font-size: 11px;")
-        layout.addWidget(desc)
+        manager = ModuleManager(
+            ctx,
+            feature_flags=self._feature_flags,
+            health_bus=self._module_health_bus,
+        )
+        ctx.module_manager = manager
+        self.module_manager = manager
+        for module in (
+            RuntimeModule(self),
+            MixerUiModule(self),
+            MeteringModule(self),
+            AppRoutingModule(self),
+            EffectsModule(self),
+            DevicePolicyModule(self),
+            SettingsUiModule(self),
+            ScenesModule(self),
+            UpdatesModule(self),
+            HealthModule(self),
+            StressControlModule(self),
+        ):
+            manager.register(module)
 
-        pick_row = QHBoxLayout()
-        pick_row.addWidget(QLabel("Saved scene:"))
-        self._scene_combo = QComboBox()
-        self._scene_combo.currentIndexChanged.connect(self._on_scene_selection_change)
-        pick_row.addWidget(self._scene_combo, 1)
-        layout.addLayout(pick_row)
+    def _start_feature_modules(self):
+        manager = getattr(self, "module_manager", None)
+        if manager is None:
+            return
+        manager.start_all()
 
-        self._scene_summary_lbl = QLabel("No saved scenes yet.")
-        self._scene_summary_lbl.setWordWrap(True)
-        self._scene_summary_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
-        layout.addWidget(self._scene_summary_lbl)
+    def _stop_stress_control(self):
+        server = self.__dict__.get("_stress_control_server")
+        if server is None:
+            return
+        try:
+            server.stop()
+        except Exception as exc:
+            logging.warning("Could not stop stress control server cleanly: %s", exc)
+        self._stress_control_server = None
 
-        btn_row = QHBoxLayout()
-        self._apply_scene_btn = QPushButton("Apply Scene")
-        self._apply_scene_btn.setObjectName("addBtn")
-        self._apply_scene_btn.clicked.connect(self._apply_selected_scene)
-        btn_row.addWidget(self._apply_scene_btn)
+    def _module_enabled(self, module_id):
+        key = str(module_id or "").strip().lower()
+        return (self.__dict__.get("_module_feature_enabled") or {}).get(key, True)
 
-        self._save_scene_btn = QPushButton("Save Current As…")
-        self._save_scene_btn.setObjectName("showHiddenBtn")
-        self._save_scene_btn.clicked.connect(self._save_current_scene_as)
-        btn_row.addWidget(self._save_scene_btn)
+    def _set_feature_module_enabled(self, module_id, enabled, *, reason=""):
+        key = str(module_id or "").strip().lower()
+        previous = self._module_feature_enabled.get(key, True)
+        self._module_feature_enabled[key] = bool(enabled)
+        if previous == bool(enabled) and reason != "restore":
+            return
+        if key == "metering":
+            if not enabled:
+                self._stop_all_meters()
+            else:
+                self._restart_metering_module()
+        elif key == "effects":
+            if not enabled:
+                self._disable_effects_module_runtime(reason=reason)
+        elif key == "settings_ui":
+            if not enabled:
+                self._stress_close_settings()
+        elif key == "mixer_ui":
+            inputs_scroll = getattr(self, "inputs_scroll", None)
+            if inputs_scroll is not None:
+                inputs_scroll.setVisible(bool(enabled))
+        elif key == "app_routing":
+            self._set_app_routing_controls_enabled(bool(enabled))
+        elif key == "updates":
+            self._set_update_controls_enabled(bool(enabled))
+        elif key == "health":
+            system_tab = getattr(self, "_system_tab_widget", None)
+            if system_tab is not None:
+                system_tab.setEnabled(bool(enabled))
+        elif key == "scenes":
+            scenes_tab = getattr(self, "_scenes_tab_widget", None)
+            if scenes_tab is not None:
+                scenes_tab.setEnabled(bool(enabled))
 
-        self._overwrite_scene_btn = QPushButton("Update Selected")
-        self._overwrite_scene_btn.setObjectName("showHiddenBtn")
-        self._overwrite_scene_btn.clicked.connect(self._overwrite_selected_scene)
-        btn_row.addWidget(self._overwrite_scene_btn)
+    def _restart_metering_module(self):
+        if not self._module_enabled("metering"):
+            return
+        view = getattr(self, "_runtime_view_state", None)
+        if view is None:
+            return
+        self._refresh_runtime_view()
 
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
+    def _disable_effects_module_runtime(self, *, reason=""):
+        active_channels = set(getattr(self, "active_effects", {}).keys()) | set(
+            getattr(self, "effect_params", {}).keys()
+        )
+        runtime = getattr(self, "runtime", None)
+        if runtime is not None:
+            for node_name in sorted(active_channels):
+                runtime.clear_channel_fx(node_name)
+        self.active_effects = {}
+        if reason:
+            logging.info("Effects module disabled: %s", reason)
+        self.schedule_save()
 
-        edit_row = QHBoxLayout()
-        self._rename_scene_btn = QPushButton("Rename")
-        self._rename_scene_btn.setObjectName("showHiddenBtn")
-        self._rename_scene_btn.clicked.connect(self._rename_selected_scene)
-        edit_row.addWidget(self._rename_scene_btn)
+    def _enable_effects_module_runtime(self):
+        self._set_feature_module_enabled("effects", True, reason="restore")
+        self._sync_runtime_persistent_state(immediate=True)
+        self._request_runtime_refresh("effects-module-restore")
 
-        self._delete_scene_btn = QPushButton("Delete")
-        self._delete_scene_btn.setObjectName("removeBtn")
-        self._delete_scene_btn.clicked.connect(self._delete_selected_scene)
-        edit_row.addWidget(self._delete_scene_btn)
+    def _set_app_routing_controls_enabled(self, enabled):
+        for row in list(getattr(self, "app_widgets", {}).values()):
+            try:
+                row.combo.setEnabled(bool(enabled))
+                row.manage_btn.setEnabled(bool(enabled))
+                row.forget_btn.setEnabled(bool(enabled))
+            except Exception:
+                continue
 
-        edit_row.addStretch()
-        layout.addLayout(edit_row)
-        layout.addStretch(1)
-        return tab
+    def _set_update_controls_enabled(self, enabled):
+        for attr in (
+            "_check_update_btn",
+            "_download_update_btn",
+            "_install_runtime_btn",
+            "_rollback_update_btn",
+            "_download_install_btn",
+            "_install_current_btn",
+            "_restore_backup_btn",
+        ):
+            widget = self.__dict__.get(attr)
+            if widget is not None:
+                widget.setEnabled(bool(enabled))
+
+    def _module_health_issues(self):
+        manager = self.__dict__.get("module_manager")
+        if manager is None:
+            return []
+        issues = []
+        for health in manager.list_modules():
+            if health.state == "running":
+                continue
+            severity = "warning" if health.state in {"degraded", "failed"} else "info"
+            title = f"Module {health.module_id} is {health.state}"
+            detail = health.summary or f"The {health.module_id} module is currently {health.state}."
+            primary_action = ""
+            if health.state == "disabled":
+                primary_action = "Enable module"
+            elif health.restartable and health.state in {"degraded", "failed", "stopped"}:
+                primary_action = "Restart module"
+            issues.append(
+                HealthIssue(
+                    code=f"module.{health.module_id}.{health.state}",
+                    severity=severity,
+                    title=title,
+                    detail=detail,
+                    primary_action=primary_action,
+                    context={"module_id": health.module_id},
+                )
+            )
+        return issues
+
+    def _stress_runtime_summary(self):
+        default_sink = None
+        default_source = None
+        monitor_output = self._desired_mix_hw.get("Monitor")
+        stream_output = self._desired_mix_hw.get("Stream")
+        live_monitor_output = None
+        live_stream_output = None
+        selected_fx_source = None
+        graph_nodes = []
+        sink_inventory = []
+        source_inventory = []
+        try:
+            with self.engine.session() as engine:
+                snap = engine.create_snapshot(force=True)
+                default_sink = engine.get_default_sink()
+                default_source = engine.get_default_source()
+                live_monitor_output = engine.get_live_mix_hardware_route("Monitor", snap=snap)
+                live_stream_output = engine.get_live_mix_hardware_route("Stream", snap=snap)
+                if self.selected_mic:
+                    selected_fx_source = engine.get_channel_fx_source(self.selected_mic, snap=snap)
+                if hasattr(engine, "stable_sink_inventory"):
+                    sink_inventory = list(engine.stable_sink_inventory(snap=snap) or [])
+                if hasattr(engine, "stable_source_inventory"):
+                    source_inventory = list(engine.stable_source_inventory(snap=snap) or [])
+                for node in getattr(snap, "nodes", []) or []:
+                    node_name = str(getattr(node, "name", "") or "").strip()
+                    if not node_name:
+                        continue
+                    if (
+                        node_name.startswith("wavelinux")
+                        or node_name.startswith("output.wavelinux")
+                        or node_name.startswith("input.wavelinux")
+                    ):
+                        graph_nodes.append(node_name)
+        except Exception:
+            logging.exception("Could not build stress runtime summary")
+        view = self.__dict__.get("_runtime_view_state")
+        app_routes = {}
+        app_summaries = []
+        degraded_channels = []
+        current_default_sink = default_sink
+        current_default_source = default_source
+        graph_blockers = {}
+        if view is not None:
+            current_default_sink = getattr(view, "default_sink", None) or current_default_sink
+            current_default_source = getattr(view, "default_source", None) or current_default_source
+            for app_view in getattr(view, "app_views", []) or []:
+                app_summary = {
+                    "app_id": str(getattr(app_view, "app_id", "") or ""),
+                    "app_name": str(getattr(app_view, "app_name", "") or ""),
+                    "resolved_app_id": str(getattr(app_view, "resolved_app_id", "") or ""),
+                    "resolved_app_name": str(getattr(app_view, "resolved_app_name", "") or ""),
+                    "identity_source": str(getattr(app_view, "identity_source", "") or ""),
+                    "current_sink": getattr(app_view, "current_sink", None),
+                    "current_volume": getattr(app_view, "current_volume", None),
+                    "active_indices": list(getattr(app_view, "active_indices", []) or []),
+                }
+                app_summaries.append(app_summary)
+                if app_summary["app_id"]:
+                    app_routes[app_summary["app_id"]] = app_summary["current_sink"]
+            degraded_channels = list(self._runtime_degraded_channels())
+            graph_blockers = self._startup_graph_health_blockers(view=view)
+        expected_default_source = selected_fx_source or self.selected_mic
+        ready = bool(
+            not self.__dict__.get("_runtime_stopped", False)
+            and view is not None
+            and graph_nodes
+            and monitor_output
+            and current_default_sink
+            and not graph_blockers
+            and (
+                not expected_default_source
+                or current_default_source == expected_default_source
+            )
+        )
+        return {
+            "running": not bool(self.__dict__.get("_runtime_stopped", False)),
+            "ready": ready,
+            "selected_mic": self.selected_mic,
+            "selected_mic_fx_source": selected_fx_source,
+            "expected_default_source": expected_default_source,
+            "active_default_sink": current_default_sink,
+            "active_default_source": current_default_source,
+            "monitor_output": monitor_output,
+            "stream_output": stream_output,
+            "live_monitor_output": live_monitor_output,
+            "live_stream_output": live_stream_output,
+            "wave_modules_loaded": len(set(graph_nodes)),
+            "graph_present": bool(graph_nodes),
+            "graph_nodes": sorted(set(graph_nodes)),
+            "degraded_channels": degraded_channels,
+            "graph_blockers": dict(graph_blockers),
+            "app_routes": app_routes,
+            "apps": app_summaries,
+            "modules": self._stress_list_modules(),
+            "known_sinks": sink_inventory,
+            "known_sources": source_inventory,
+            "settings_tab": self._active_settings_tab_name(),
+            "settings_visible": self._settings_dialog_visible(),
+        }
+
+    def _stress_health_summary(self):
+        issues = self._collect_health_issues(
+            preflight=self.__dict__.get("_startup_preflight") or startup_preflight_report(),
+            state=install_state(),
+        )
+        return [
+            {
+                "code": issue.code,
+                "severity": issue.severity,
+                "title": issue.title,
+                "detail": issue.detail,
+                "primary_action": issue.primary_action,
+                "secondary_action": issue.secondary_action,
+                "context": dict(issue.context or {}),
+            }
+            for issue in issues
+        ]
+
+    def _stress_list_modules(self):
+        manager = getattr(self, "module_manager", None)
+        if manager is None:
+            return []
+        return [
+            {
+                "module_id": health.module_id,
+                "state": health.state,
+                "summary": health.summary,
+                "issues": list(health.issues),
+                "restartable": bool(health.restartable),
+            }
+            for health in manager.list_modules()
+        ]
+
+    def _stress_get_module_health(self, module_id):
+        manager = getattr(self, "module_manager", None)
+        if manager is None:
+            return {}
+        health = manager.module_health(str(module_id or ""))
+        return {
+            "module_id": health.module_id,
+            "state": health.state,
+            "summary": health.summary,
+            "issues": list(health.issues),
+            "restartable": bool(health.restartable),
+        }
+
+    def _stress_disable_module(self, module_id, *, reason="stress-disable"):
+        manager = getattr(self, "module_manager", None)
+        if manager is None:
+            return {"accepted": False}
+        manager.disable_module(str(module_id or ""), reason)
+        return self._stress_get_module_health(module_id)
+
+    def _stress_enable_module(self, module_id):
+        manager = getattr(self, "module_manager", None)
+        if manager is None:
+            return {"accepted": False}
+        manager.enable_module(str(module_id or ""))
+        return self._stress_get_module_health(module_id)
+
+    def _stress_restart_module(self, module_id, *, reason="stress-restart"):
+        manager = getattr(self, "module_manager", None)
+        if manager is None:
+            return {"accepted": False}
+        manager.restart_module(str(module_id or ""), reason)
+        return self._stress_get_module_health(module_id)
+
+    def _stress_list_known_sinks(self):
+        summary = self._stress_runtime_summary()
+        return list(summary.get("known_sinks") or [])
+
+    def _stress_list_known_sources(self):
+        summary = self._stress_runtime_summary()
+        return list(summary.get("known_sources") or [])
+
+    def _stress_set_monitor_output(self, sink_name, *, persist=True, include_summary=False):
+        sink_name = str(sink_name or "").strip() or None
+        self._set_mix_output_target(
+            "Monitor",
+            sink_name,
+            persist=bool(persist),
+            update_combo=True,
+            sync_runtime=True,
+            sync_runtime_refresh=False,
+        )
+        if sink_name:
+            self._record_preferred_monitor(sink_name, view=self.__dict__.get("_runtime_view_state"))
+            self._schedule_monitor_route_followups(sink_name)
+        if include_summary:
+            return self._stress_runtime_summary()
+        return {
+            "monitor_output": sink_name,
+            "requested": True,
+        }
+
+    def _stress_set_stream_output(self, sink_name, *, persist=True, include_summary=False):
+        sink_name = str(sink_name or "").strip() or None
+        self._set_mix_output_target(
+            "Stream",
+            sink_name,
+            persist=bool(persist),
+            update_combo=True,
+            sync_runtime=False,
+            sync_runtime_refresh=False,
+        )
+        if include_summary:
+            return self._stress_runtime_summary()
+        return {
+            "stream_output": sink_name,
+            "requested": True,
+        }
+
+    def _stress_set_selected_mic(self, mic_name, *, persist=True, include_summary=False):
+        self._set_selected_mic_target(
+            str(mic_name or "").strip() or None,
+            record_preference=True,
+            persist=bool(persist),
+            request_refresh=True,
+            view=self.__dict__.get("_runtime_view_state"),
+        )
+        if include_summary:
+            return self._stress_runtime_summary()
+        return {
+            "selected_mic": self.selected_mic,
+            "requested": True,
+        }
+
+    def _stress_open_settings_tab(self, tab_name):
+        if not self._settings_dialog_visible():
+            self._open_settings()
+        tabs = self.__dict__.get("_settings_tabs")
+        names = tuple(self.__dict__.get("_settings_tab_names", ()) or ())
+        tab_name = str(tab_name or "").strip()
+        if tabs is not None and tab_name:
+            for index, name in enumerate(names):
+                if str(name or "").strip().lower() == tab_name.lower():
+                    tabs.setCurrentIndex(index)
+                    break
+        self._schedule_active_settings_tab_refresh(force=False)
+        return {
+            "active_tab": self._active_settings_tab_name(),
+            "visible": self._settings_dialog_visible(),
+        }
+
+    def _stress_close_settings(self):
+        dialog = self.__dict__.get("settings_dialog")
+        if dialog is not None:
+            dialog.hide()
+        return {"visible": self._settings_dialog_visible()}
+
+    def _open_settings(self):
+        if not self._module_enabled("settings_ui"):
+            QMessageBox.information(
+                self,
+                "Settings disabled",
+                "The settings module is currently disabled for diagnostics.",
+            )
+            return
+        was_visible = self._settings_dialog_visible()
+        if not was_visible:
+            self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        if not was_visible:
+            self._schedule_active_settings_tab_refresh(force=False)
+
+    def _active_settings_tab_name(self):
+        tabs = self.__dict__.get("_settings_tabs")
+        if tabs is None:
+            return ""
+        try:
+            index = tabs.currentIndex()
+        except Exception:
+            return ""
+        names = self.__dict__.get("_settings_tab_names", ())
+        if 0 <= index < len(names):
+            return str(names[index] or "")
+        try:
+            return str(tabs.tabText(index) or "")
+        except Exception:
+            return ""
+
+    def _refresh_settings_tab_by_name(self, tab_name):
+        tab_name = str(tab_name or "").strip()
+        if tab_name == "Hidden":
+            self._refresh_hidden_list()
+        elif tab_name == "Scenes":
+            if not self._module_enabled("scenes"):
+                return
+            self._refresh_scenes_tab()
+        elif tab_name == "Health":
+            if not self._module_enabled("health"):
+                return
+            self._refresh_system_tab(preflight=self._startup_preflight)
+        elif tab_name == "Advanced":
+            self._refresh_advanced_tab()
+        elif tab_name == "Updates":
+            if not self._module_enabled("updates"):
+                return
+            self._refresh_update_tab()
+
+    def _install_state_cache_is_stale(self, *, max_age_s=5.0):
+        stamp = float(self.__dict__.get("_install_state_cache_at", 0.0) or 0.0)
+        if stamp <= 0.0:
+            return True
+        return (time.monotonic() - stamp) >= max(0.0, float(max_age_s or 0.0))
+
+    def _invalidate_install_state_cache(self):
+        self._install_state_cache = None
+        self._install_state_cache_at = 0.0
+
+    def _cached_install_state(self, *, target_tabs=(), max_age_s=5.0, allow_async=True):
+        state = self.__dict__.get("_install_state_cache")
+        if (
+            allow_async
+            and "_install_state_refresh_queue" in self.__dict__
+            and (state is None or self._install_state_cache_is_stale(max_age_s=max_age_s))
+        ):
+            self._schedule_install_state_refresh(
+                target_tabs=target_tabs,
+                force=(state is None),
+            )
+        return state
+
+    def _schedule_install_state_refresh(self, *, target_tabs=(), force=False):
+        pending_tabs = set(self.__dict__.get("_install_state_refresh_tabs", set()) or set())
+        pending_tabs.update(
+            str(tab_name or "").strip()
+            for tab_name in (target_tabs or ())
+            if str(tab_name or "").strip()
+        )
+        self._install_state_refresh_tabs = pending_tabs
+        if self.__dict__.get("_install_state_refresh_inflight", False):
+            return
+        cached = self.__dict__.get("_install_state_cache")
+        if not force and cached is not None and not self._install_state_cache_is_stale():
+            return
+        self._install_state_refresh_inflight = True
+        poll_timer = self.__dict__.get("_install_state_refresh_poll_timer")
+        if poll_timer is not None and not poll_timer.isActive():
+            poll_timer.start()
+        threading.Thread(
+            target=self._load_install_state_refresh_worker,
+            name="wavelinux-install-state",
+            daemon=True,
+        ).start()
+
+    def _load_install_state_refresh_worker(self):
+        queue_obj = self.__dict__.get("_install_state_refresh_queue")
+        if queue_obj is None:
+            return
+        try:
+            state = install_state()
+        except Exception as exc:
+            queue_obj.put(("error", str(exc)))
+        else:
+            queue_obj.put(("result", state))
+
+    def _poll_install_state_refresh(self):
+        queue_obj = self.__dict__.get("_install_state_refresh_queue")
+        if queue_obj is None:
+            return
+        handled_result = False
+        while True:
+            try:
+                kind, payload = queue_obj.get_nowait()
+            except queue.Empty:
+                break
+            handled_result = True
+            self._install_state_refresh_inflight = False
+            if kind == "result":
+                self._install_state_cache = payload
+                self._install_state_cache_at = time.monotonic()
+            else:
+                logging.warning("Install-state refresh failed: %s", payload)
+        if not handled_result and self.__dict__.get("_install_state_refresh_inflight", False):
+            return
+        timer = self.__dict__.get("_install_state_refresh_poll_timer")
+        if timer is not None:
+            timer.stop()
+        if handled_result:
+            self._apply_install_state_refresh()
+
+    def _apply_install_state_refresh(self):
+        state = self.__dict__.get("_install_state_cache")
+        if state is None:
+            return
+        pending_tabs = set(self.__dict__.get("_install_state_refresh_tabs", set()) or set())
+        self._install_state_refresh_tabs = set()
+        if not self._settings_dialog_visible():
+            return
+        active_tab = self._active_settings_tab_name()
+        if active_tab == "Updates" and "Updates" in pending_tabs:
+            self._refresh_update_tab(state=state, allow_async=False)
+        elif active_tab == "Health" and "Health" in pending_tabs:
+            self._refresh_system_tab(
+                preflight=self._startup_preflight,
+                state=state,
+                allow_async=False,
+            )
+
+    def _settings_tab_stale_seconds(self, tab_name):
+        tab_name = str(tab_name or "").strip()
+        return {
+            "Hidden": 0.5,
+            "Scenes": 0.5,
+            "Health": 1.0,
+            "Advanced": 1.0,
+            "Updates": 5.0,
+        }.get(tab_name, 1.0)
+
+    def _settings_tab_refresh_is_stale(self, tab_name, *, force=False):
+        if force:
+            return True
+        tab_name = str(tab_name or "").strip()
+        if not tab_name:
+            return False
+        last_refresh = float((self.__dict__.get("_settings_tab_last_refresh_at", {}) or {}).get(tab_name, 0.0) or 0.0)
+        if last_refresh <= 0.0:
+            return True
+        return (time.monotonic() - last_refresh) >= self._settings_tab_stale_seconds(tab_name)
+
+    def _mark_settings_tab_refreshed(self, tab_name):
+        tab_name = str(tab_name or "").strip()
+        if not tab_name:
+            return
+        refreshed = dict(self.__dict__.get("_settings_tab_last_refresh_at", {}) or {})
+        refreshed[tab_name] = time.monotonic()
+        self._settings_tab_last_refresh_at = refreshed
+
+    def _mark_settings_tab_stale(self, tab_name):
+        tab_name = str(tab_name or "").strip()
+        if not tab_name:
+            return
+        refreshed = dict(self.__dict__.get("_settings_tab_last_refresh_at", {}) or {})
+        refreshed.pop(tab_name, None)
+        self._settings_tab_last_refresh_at = refreshed
+
+    def _refresh_active_settings_tab(self, *, force=False):
+        if not force and not self._settings_dialog_visible():
+            return
+        tab_name = self._active_settings_tab_name()
+        if not self._settings_tab_refresh_is_stale(tab_name, force=force):
+            return
+        self._refresh_settings_tab_by_name(tab_name)
+        self._mark_settings_tab_refreshed(tab_name)
+
+    def _schedule_active_settings_tab_refresh(self, *, force=False):
+        if not force and not self._settings_dialog_visible():
+            return
+        tab_name = self._active_settings_tab_name()
+        if not tab_name:
+            return
+        if not self._settings_tab_refresh_is_stale(tab_name, force=force):
+            return
+        self._pending_settings_tab_refresh = tab_name
+        timer = self.__dict__.get("_settings_tab_refresh_timer")
+        if timer is not None:
+            timer.start()
+        else:
+            self._apply_scheduled_settings_tab_refresh()
+
+    def _apply_scheduled_settings_tab_refresh(self):
+        if not self._settings_dialog_visible():
+            return
+        pending = str(self.__dict__.get("_pending_settings_tab_refresh", "") or "").strip()
+        active = self._active_settings_tab_name()
+        if pending and pending != active:
+            return
+        self._pending_settings_tab_refresh = ""
+        self._refresh_active_settings_tab(force=False)
+
+    def _on_settings_tab_changed(self, index):
+        del index
+        self._schedule_active_settings_tab_refresh(force=False)
 
     @staticmethod
     def _dedupe_names(values):
@@ -2975,6 +1974,8 @@ class WaveLinuxWindow(QMainWindow):
         self._refresh_scenes_tab()
 
     def _refresh_scenes_tab(self, selected_name=None):
+        if not self._module_enabled("scenes"):
+            return
         combo = getattr(self, "_scene_combo", None)
         summary_lbl = getattr(self, "_scene_summary_lbl", None)
         if combo is None or summary_lbl is None:
@@ -3003,6 +2004,7 @@ class WaveLinuxWindow(QMainWindow):
             btn = getattr(self, attr, None)
             if btn is not None:
                 btn.setEnabled(has_scene)
+        self._mark_settings_tab_refreshed("Scenes")
 
     def _apply_scene_snapshot(self, snapshot, *, scene_name=""):
         snapshot = self._normalize_scene_snapshot(snapshot)
@@ -3012,7 +2014,7 @@ class WaveLinuxWindow(QMainWindow):
         existing_virtuals = [name for name in self.virtual_channels if name not in scene_virtuals]
         self.virtual_channels = scene_virtuals + existing_virtuals
         for name in scene_virtuals:
-            self.runtime.ensure_virtual_channel_sync(name)
+            self.runtime.ensure_virtual_channel_sync(name, refresh=False)
 
         selected_mic = (
             self._resolve_hardware_source_name(snapshot.get("selected_mic_id"))
@@ -3092,6 +2094,7 @@ class WaveLinuxWindow(QMainWindow):
             persist=False,
             update_combo=True,
             sync_runtime=True,
+            sync_runtime_refresh=False,
         )
         self._record_preferred_monitor(self.__dict__.get("_desired_mix_hw", {}).get("Monitor"), view=self.__dict__.get("_runtime_view_state"))
         self._set_mix_output_target(
@@ -3100,8 +2103,9 @@ class WaveLinuxWindow(QMainWindow):
             persist=False,
             update_combo=True,
             sync_runtime=True,
+            sync_runtime_refresh=False,
         )
-        self._sync_runtime_persistent_state()
+        self._sync_runtime_persistent_state(immediate=True)
         self.schedule_save()
         if hasattr(self, "_refresh_hidden_list"):
             self._refresh_hidden_list()
@@ -3322,6 +2326,9 @@ class WaveLinuxWindow(QMainWindow):
         row = self._source_row_for_name(source_name, view=view)
         if row is not None:
             return str(getattr(row, "label", "") or getattr(row, "description", "") or source_name)
+        engine = self.__dict__.get("engine")
+        if engine is not None and hasattr(engine, "display_name_for_source"):
+            return engine.display_name_for_source(source_name) or source_name
         return PipeWireEngine.friendly_name(source_name) or source_name
 
     def _visible_default_sink(self, view=None):
@@ -3450,12 +2457,40 @@ class WaveLinuxWindow(QMainWindow):
                 return getattr(row, "name", None)
         return getattr(rows[0], "name", None)
 
+    def _normalize_effect_request_for_node(self, node_name, active_effects, params_map):
+        wanted = [str(fid) for fid in list(active_effects or []) if fid]
+        normalized = {
+            str(fid): dict(values or {})
+            for fid, values in dict(params_map or {}).items()
+        }
+        return wanted, normalized
+
+    def _normalize_loaded_effect_state(self):
+        normalized_effects = {}
+        normalized_params = {}
+        node_names = set((self.active_effects or {}).keys()) | set((self.effect_params or {}).keys())
+        for node_name in node_names:
+            wanted, params_map = self._normalize_effect_request_for_node(
+                node_name,
+                (self.active_effects or {}).get(node_name, []),
+                (self.effect_params or {}).get(node_name, {}),
+            )
+            if wanted:
+                normalized_effects[node_name] = wanted
+            if params_map:
+                normalized_params[node_name] = params_map
+        self.active_effects = normalized_effects
+        self.effect_params = normalized_params
+
     def _set_selected_mic_target(self, mic_name, *, record_preference=False, persist=True, request_refresh=True, view=None):
         mic_name = str(mic_name or "").strip() or None
+        if mic_name != self.__dict__.get("selected_mic"):
+            self._last_selected_mic_change_at = time.monotonic()
         self.selected_mic = mic_name
         self._mic_selection_initialized = bool(mic_name)
         runtime = getattr(self, "runtime", None)
         if runtime is not None:
+            self._suppress_pactl_events_for(1.5)
             runtime.set_selected_mic(mic_name)
         if record_preference and mic_name:
             self._record_preferred_mic(mic_name, view=view)
@@ -3522,6 +2557,8 @@ class WaveLinuxWindow(QMainWindow):
         self._refresh_system_tab(preflight=self._startup_preflight)
 
     def _reconcile_device_policy(self, view=None):
+        if not self._module_enabled("device_policy"):
+            return False
         view = view or self.__dict__.get("_runtime_view_state")
         if view is None:
             return False
@@ -3724,7 +2761,7 @@ class WaveLinuxWindow(QMainWindow):
             template_order.append(f"wavelinux_{safe}")
         self.channel_order = self._dedupe_names(template_order + list(self.channel_order))
         for display_name in template_channels:
-            self.runtime.ensure_virtual_channel_sync(display_name)
+            self.runtime.ensure_virtual_channel_sync(display_name, refresh=False)
 
         selected_mic = self._preferred_setup_mic()
         if selected_mic:
@@ -3745,12 +2782,13 @@ class WaveLinuxWindow(QMainWindow):
                 persist=False,
                 update_combo=True,
                 sync_runtime=True,
+                sync_runtime_refresh=False,
             )
             self._record_preferred_monitor(default_sink, view=self.__dict__.get("_runtime_view_state"))
         self._selected_setup_template = template_id
         self._onboarding_completed = True
         self._show_first_run_setup = False
-        self._sync_runtime_persistent_state()
+        self._sync_runtime_persistent_state(immediate=True)
         self.schedule_save()
         self._refresh()
         self.status_lbl.setText(f"Applied quick start: {template['title']}")
@@ -3824,196 +2862,6 @@ class WaveLinuxWindow(QMainWindow):
             return
         if self._apply_quick_start_template(combo.currentData()):
             self.save_config()
-
-    def _build_advanced_tab(self):
-        """Settings → Advanced tab. Each control writes through to
-        config.json immediately."""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(12)
-
-        def _heading(text):
-            lbl = QLabel(text)
-            lbl.setObjectName("sectionLabel")
-            layout.addWidget(lbl)
-
-        # App prune cutoff
-        _heading("APP CLEANUP")
-        prune_row = QHBoxLayout()
-        prune_row.addWidget(QLabel("Forget offline apps after (days):"))
-        self.prune_spin = QSpinBox()
-        self.prune_spin.setRange(1, 365)
-        self.prune_spin.setValue(self.app_prune_days)
-        self.prune_spin.valueChanged.connect(self._on_prune_days_change)
-        prune_row.addWidget(self.prune_spin)
-        prune_row.addStretch()
-        layout.addLayout(prune_row)
-
-        forget_all_btn = QPushButton("Forget all offline apps now")
-        forget_all_btn.setObjectName("removeBtn")
-        forget_all_btn.clicked.connect(self._forget_all_offline)
-        layout.addWidget(forget_all_btn, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        # Recovery for the ✕ blocklist (otherwise the only way out is
-        # editing config.json by hand). Enabled state is set by
-        # `_refresh_advanced_tab`.
-        self.restore_forgotten_btn = QPushButton("Restore forgotten apps")
-        self.restore_forgotten_btn.setObjectName("showHiddenBtn")
-        self.restore_forgotten_btn.setToolTip(
-            "Clear the per-app ✕ blocklist so apps you've previously "
-            "forgotten can show up in the routing tab again."
-        )
-        self.restore_forgotten_btn.clicked.connect(self._restore_forgotten_apps)
-        layout.addWidget(self.restore_forgotten_btn, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        # Startup / tray
-        _heading("STARTUP & TRAY")
-        self.autostart_check = QCheckBox("Start WaveLinux at login")
-        self.autostart_check.setChecked(self.is_autostart_enabled())
-        self.autostart_check.toggled.connect(self.set_autostart)
-        layout.addWidget(self.autostart_check)
-
-        quick_start_btn = QPushButton("Quick Start Setup…")
-        quick_start_btn.setObjectName("showHiddenBtn")
-        quick_start_btn.clicked.connect(self._open_quick_start_setup)
-        layout.addWidget(quick_start_btn, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        profiles_btn = QPushButton("Sound Card Profiles…")
-        profiles_btn.setObjectName("showHiddenBtn")
-        profiles_btn.clicked.connect(self._open_card_profiles)
-        layout.addWidget(profiles_btn, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        _heading("CONFIG")
-        config_btn_row = QHBoxLayout()
-        import_config_btn = QPushButton("Import Full Config…")
-        import_config_btn.setObjectName("showHiddenBtn")
-        import_config_btn.setToolTip(
-            "Replace the current WaveLinux configuration with a saved JSON export."
-        )
-        import_config_btn.clicked.connect(self._import_full_config)
-        config_btn_row.addWidget(import_config_btn)
-
-        export_config_btn = QPushButton("Export Full Config…")
-        export_config_btn.setObjectName("showHiddenBtn")
-        export_config_btn.setToolTip(
-            "Save the current WaveLinux configuration, scenes, routing, and FX state to JSON."
-        )
-        export_config_btn.clicked.connect(self._export_full_config)
-        config_btn_row.addWidget(export_config_btn)
-        config_btn_row.addStretch()
-        layout.addLayout(config_btn_row)
-
-        # LADSPA / diagnostics
-        _heading("DIAGNOSTICS")
-        probed = len(self.engine.ladspa_plugins)
-        ladspa_lbl = QLabel(
-            f"LADSPA plugins detected: {probed}\n"
-            f"Paths searched: $LADSPA_PATH + standard host LADSPA directories.\n"
-            f"AppImage bundled LADSPA is disabled by default; opt in with "
-            f"WAVELINUX_ENABLE_BUNDLED_LADSPA=1."
-        )
-        ladspa_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
-        ladspa_lbl.setWordWrap(True)
-        layout.addWidget(ladspa_lbl)
-
-        export_diag_btn = QPushButton("Export Runtime Diagnostics")
-        export_diag_btn.setObjectName("showHiddenBtn")
-        export_diag_btn.clicked.connect(self._export_runtime_diagnostics)
-        layout.addWidget(export_diag_btn, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        self.recover_degraded_btn = QPushButton("Recover degraded channels")
-        self.recover_degraded_btn.setObjectName("showHiddenBtn")
-        self.recover_degraded_btn.setToolTip(
-            "Request runtime recovery for each channel currently "
-            "marked degraded."
-        )
-        self.recover_degraded_btn.clicked.connect(self._recover_all_degraded_channels)
-        layout.addWidget(self.recover_degraded_btn, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        emergency_btn = QPushButton("Emergency Reset (unload all WaveLinux modules)")
-        emergency_btn.setObjectName("removeBtn")
-        emergency_btn.clicked.connect(self._on_emergency_reset)
-        layout.addWidget(emergency_btn, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        layout.addStretch(1)
-        return tab
-
-    # ── Update tab ────────────────────────────────────────────────
-
-    def _build_update_tab(self):
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
-
-        ver_lbl = QLabel(f"Current running version: <b>{APP_VERSION}</b>")
-        ver_lbl.setStyleSheet("color: #e0e0ee; font-size: 13px;")
-        layout.addWidget(ver_lbl)
-
-        self._update_status_lbl = QLabel("Click 'Check for Updates' to see if a newer version is available.")
-        self._update_status_lbl.setWordWrap(True)
-        self._update_status_lbl.setStyleSheet("color: #8b8b9e; font-size: 12px;")
-        layout.addWidget(self._update_status_lbl)
-
-        self._update_policy_lbl = QLabel()
-        self._update_policy_lbl.setWordWrap(True)
-        self._update_policy_lbl.setStyleSheet("color: #5a5a72; font-size: 11px;")
-        layout.addWidget(self._update_policy_lbl)
-
-        btn_row = QHBoxLayout()
-        self._check_update_btn = QPushButton("Check for Updates")
-        self._check_update_btn.setObjectName("showHiddenBtn")
-        self._check_update_btn.clicked.connect(self._check_for_updates)
-        btn_row.addWidget(self._check_update_btn)
-
-        self._open_release_btn = QPushButton("Open Releases Page")
-        self._open_release_btn.setObjectName("addBtn")
-        self._open_release_btn.clicked.connect(self._open_release_page)
-        btn_row.addWidget(self._open_release_btn)
-
-        self._download_update_btn = QPushButton("Download && Install Latest AppImage")
-        self._download_update_btn.setObjectName("showHiddenBtn")
-        self._download_update_btn.clicked.connect(self._download_and_install_update)
-        btn_row.addWidget(self._download_update_btn)
-
-        self._install_runtime_btn = QPushButton()
-        self._install_runtime_btn.setObjectName("showHiddenBtn")
-        self._install_runtime_btn.clicked.connect(self._install_current_runtime_launcher)
-        btn_row.addWidget(self._install_runtime_btn)
-
-        self._rollback_update_btn = QPushButton("Restore Previous AppImage")
-        self._rollback_update_btn.setObjectName("showHiddenBtn")
-        self._rollback_update_btn.clicked.connect(self._restore_previous_appimage)
-        btn_row.addWidget(self._rollback_update_btn)
-
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        self._install_state_lbl = QLabel()
-        self._install_state_lbl.setWordWrap(True)
-        self._install_state_lbl.setStyleSheet("color: #8b8b9e; font-size: 11px;")
-        layout.addWidget(self._install_state_lbl)
-
-        self._install_warning_lbl = QLabel()
-        self._install_warning_lbl.setWordWrap(True)
-        self._install_warning_lbl.setStyleSheet("color: #d28b26; font-size: 11px;")
-        layout.addWidget(self._install_warning_lbl)
-
-        self._update_progress = QProgressBar()
-        self._update_progress.setVisible(False)
-        self._update_progress.setTextVisible(True)
-        self._update_progress.setRange(0, 100)
-        self._update_progress.setValue(0)
-        layout.addWidget(self._update_progress)
-
-        self._update_note_lbl = QLabel()
-        self._update_note_lbl.setWordWrap(True)
-        self._update_note_lbl.setStyleSheet("color: #5a5a72; font-size: 11px;")
-        layout.addWidget(self._update_note_lbl)
-
-        layout.addStretch(1)
-        return tab
 
     def _check_for_updates(self):
         self._check_update_btn.setEnabled(False)
@@ -4618,25 +3466,45 @@ class WaveLinuxWindow(QMainWindow):
             self._pending_update_url = str(self._last_update_issue.get("release_url") or release_page_url())
             self._last_update_attempt_result = f"Background update check failed: {self._last_update_issue.get('message') or 'unknown error'}"
 
-    def _refresh_update_tab(self):
+    def _refresh_update_tab(self, *, state=None, allow_async=True):
+        if not self._module_enabled("updates"):
+            return
         btn = getattr(self, "_install_runtime_btn", None)
-        state = install_state()
+        state = state or self._cached_install_state(
+            target_tabs=("Updates",),
+            max_age_s=5.0,
+            allow_async=allow_async,
+        )
+        state_ready = state is not None
         mode, description, guidance = self._runtime_mode_detail()
-        backup_path = getattr(state, "installed_appimage_backup_path", installed_appimage_backup_path())
-        backup_exists = bool(getattr(state, "installed_appimage_backup_exists", os.path.exists(backup_path)))
-        launcher_targets_active = self._launcher_targets_active_runtime(state=state, mode=mode)
+        backup_path = getattr(
+            state,
+            "installed_appimage_backup_path",
+            installed_appimage_backup_path(),
+        )
+        backup_exists = bool(
+            getattr(state, "installed_appimage_backup_exists", os.path.exists(backup_path))
+        )
+        launcher_targets_active = (
+            self._launcher_targets_active_runtime(state=state, mode=mode)
+            if state_ready else None
+        )
         if btn is not None:
             if mode.kind == "appimage":
                 btn.setVisible(True)
                 btn.setText(
-                    "Reinstall This AppImage" if state.installed_appimage_exists else "Install This AppImage"
+                    "Reinstall This AppImage"
+                    if state_ready and state.installed_appimage_exists
+                    else "Install This AppImage"
                 )
                 btn.setToolTip("Install the currently running AppImage into ~/.local/bin and refresh its desktop launcher.")
             elif mode.kind == "bundle":
                 btn.setVisible(True)
                 btn.setText(
                     "Reinstall This Local Build"
-                    if state.wrapper_mode == "bundle" and getattr(state, "wrapper_bundle_exec", None) == mode.running_path
+                    if state_ready
+                    and state.wrapper_mode == "bundle"
+                    and getattr(state, "wrapper_bundle_exec", None) == mode.running_path
                     else "Install This Local Build"
                 )
                 btn.setToolTip("Install or refresh the desktop launcher for the current local bundled WaveLinux binary.")
@@ -4690,7 +3558,9 @@ class WaveLinuxWindow(QMainWindow):
             lines = []
             lines.append(f"Current running version: v{APP_VERSION}")
             lines.append(f"Runtime mode: {mode.kind}")
-            if state.wrapper_mode == "source":
+            if not state_ready:
+                lines.append("Install state: refreshing in background…")
+            elif state.wrapper_mode == "source":
                 lines.append(
                     "Installed launcher mode: source checkout"
                     + (
@@ -4708,46 +3578,47 @@ class WaveLinuxWindow(QMainWindow):
                 )
             elif state.wrapper_mode == "appimage":
                 lines.append("Installed launcher mode: AppImage")
-            if state.running_appimage_path:
-                lines.append(f"Running AppImage: {state.running_appimage_path}")
-            elif getattr(sys, "frozen", False):
-                lines.append(f"Running binary: {os.path.abspath(sys.executable)}")
-            else:
-                lines.append(f"Running from source: {resource_path('main.py')}")
-            lines.append(
-                "Installed AppImage: "
-                + (state.installed_appimage_path if state.installed_appimage_exists else "not installed")
-            )
-            lines.append(
-                "Backup AppImage: "
-                + (backup_path if backup_exists else "not available")
-            )
-            lines.append(
-                "Desktop launcher: "
-                + (
-                    (state.desktop_exec_target or state.desktop_path)
-                    if state.desktop_exists
-                    else "not installed"
-                )
-            )
-            if launcher_targets_active is None:
-                lines.append("Launcher targets active runtime: n/a")
-            else:
+            if state_ready:
+                if state.running_appimage_path:
+                    lines.append(f"Running AppImage: {state.running_appimage_path}")
+                elif getattr(sys, "frozen", False):
+                    lines.append(f"Running binary: {os.path.abspath(sys.executable)}")
+                else:
+                    lines.append(f"Running from source: {resource_path('main.py')}")
                 lines.append(
-                    "Launcher targets active runtime: "
-                    + ("yes" if launcher_targets_active else "no")
+                    "Installed AppImage: "
+                    + (state.installed_appimage_path if state.installed_appimage_exists else "not installed")
                 )
-            if state.stale_launcher_entries:
-                stale_names = ", ".join(
-                    os.path.basename(entry.path)
-                    for entry in state.stale_launcher_entries[:3]
+                lines.append(
+                    "Backup AppImage: "
+                    + (backup_path if backup_exists else "not available")
                 )
-                lines.append(f"Extra launchers: {stale_names}")
+                lines.append(
+                    "Desktop launcher: "
+                    + (
+                        (state.desktop_exec_target or state.desktop_path)
+                        if state.desktop_exists
+                        else "not installed"
+                    )
+                )
+                if launcher_targets_active is None:
+                    lines.append("Launcher targets active runtime: n/a")
+                else:
+                    lines.append(
+                        "Launcher targets active runtime: "
+                        + ("yes" if launcher_targets_active else "no")
+                    )
+                if state.stale_launcher_entries:
+                    stale_names = ", ".join(
+                        os.path.basename(entry.path)
+                        for entry in state.stale_launcher_entries[:3]
+                    )
+                    lines.append(f"Extra launchers: {stale_names}")
             info_lbl.setText("\n".join(lines))
         warning_lbl = getattr(self, "_install_warning_lbl", None)
         if warning_lbl is not None:
-            warning_lbl.setVisible(bool(state.warnings))
-            warning_lbl.setText("\n".join(state.warnings))
+            warning_lbl.setVisible(bool(state_ready and state.warnings))
+            warning_lbl.setText("\n".join(getattr(state, "warnings", ()) or ()))
         note_lbl = getattr(self, "_update_note_lbl", None)
         if note_lbl is not None:
             if mode.allows_self_update:
@@ -4764,9 +3635,11 @@ class WaveLinuxWindow(QMainWindow):
         repair_btn = getattr(self, "_repair_launcher_btn", None)
         if repair_btn is not None:
             needs_repair = bool(
-                state.warnings
-                or state.stale_launcher_entries
-                or (
+                state_ready
+                and (
+                    state.warnings
+                    or state.stale_launcher_entries
+                    or (
                     state.wrapper_mode == "appimage" and state.installed_appimage_exists
                     and (
                         not state.wrapper_exists
@@ -4777,9 +3650,11 @@ class WaveLinuxWindow(QMainWindow):
                             state.wrapper_path,
                         }
                     )
+                    )
                 )
             )
             repair_btn.setEnabled(needs_repair or is_running_in_appimage())
+        self._mark_settings_tab_refreshed("Updates")
 
     @staticmethod
     def _format_timestamp(stamp):
@@ -5191,6 +4066,7 @@ class WaveLinuxWindow(QMainWindow):
             ))
 
         issues.extend(self._device_health_issues(self.__dict__.get("_runtime_view_state")))
+        issues.extend(self._module_health_issues())
 
         degraded = set(self._runtime_degraded_channels())
         for node_name in sorted(degraded):
@@ -5240,6 +4116,20 @@ class WaveLinuxWindow(QMainWindow):
         if action == "Open diagnostics":
             self.open_channel_diagnostics(str(issue.context.get("node_name") or ""))
             return
+        if action == "Restart module":
+            module_id = str(issue.context.get("module_id") or "").strip()
+            if module_id and getattr(self, "module_manager", None) is not None:
+                self.module_manager.restart_module(module_id, "health-action")
+                self._request_runtime_refresh(f"module-restart:{module_id}")
+                self._schedule_active_settings_tab_refresh(force=True)
+            return
+        if action == "Enable module":
+            module_id = str(issue.context.get("module_id") or "").strip()
+            if module_id and getattr(self, "module_manager", None) is not None:
+                self.module_manager.enable_module(module_id)
+                self._request_runtime_refresh(f"module-enable:{module_id}")
+                self._schedule_active_settings_tab_refresh(force=True)
+            return
 
     def _render_health_cards(self, issues):
         layout = getattr(self, "_health_cards_layout", None)
@@ -5278,19 +4168,38 @@ class WaveLinuxWindow(QMainWindow):
             f"WaveLinux stores runtime diagnostics here:\n{path}",
         )
 
-    def _refresh_system_tab(self, *, preflight=None, state=None):
+    def _refresh_system_tab(self, *, preflight=None, state=None, allow_async=True):
+        if not self._module_enabled("health"):
+            return
         preflight = preflight or startup_preflight_report()
         self._startup_preflight = preflight
-        state = state or install_state()
-        backup_path = getattr(state, "installed_appimage_backup_path", installed_appimage_backup_path())
-        backup_exists = bool(getattr(state, "installed_appimage_backup_exists", os.path.exists(backup_path)))
-        launcher_targets_active = self._launcher_targets_active_runtime(state=state)
+        state = state or self._cached_install_state(
+            target_tabs=("Health",),
+            max_age_s=5.0,
+            allow_async=allow_async,
+        )
+        state_ready = state is not None
+        backup_path = getattr(
+            state,
+            "installed_appimage_backup_path",
+            installed_appimage_backup_path(),
+        )
+        backup_exists = bool(
+            getattr(state, "installed_appimage_backup_exists", os.path.exists(backup_path))
+        )
+        launcher_targets_active = (
+            self._launcher_targets_active_runtime(state=state)
+            if state_ready else None
+        )
 
         summary_lbl = getattr(self, "_system_summary_lbl", None)
         runtime_lbl = getattr(self, "_system_runtime_lbl", None)
         if not all((summary_lbl, runtime_lbl)):
             return
-        issues = self._collect_health_issues(preflight=preflight, state=state)
+        if state_ready:
+            issues = self._collect_health_issues(preflight=preflight, state=state)
+        else:
+            issues = self._device_health_issues(self.__dict__.get("_runtime_view_state"))
         active_issues = [
             issue for issue in issues
             if issue.severity in {"warning", "error"}
@@ -5307,13 +4216,19 @@ class WaveLinuxWindow(QMainWindow):
 
         runtime_lines = [
             f"Current running version: v{APP_VERSION}",
-            f"Running binary: {self._running_binary_path(state)}",
+            f"Running binary: {self._running_binary_path(state) if state_ready else self._current_runtime_mode().running_path}",
             "Installed AppImage: "
-            + (state.installed_appimage_path if state.installed_appimage_exists else "not installed"),
+            + (
+                state.installed_appimage_path
+                if state_ready and state.installed_appimage_exists
+                else ("not installed" if state_ready else "refreshing…")
+            ),
             "Backup AppImage: "
             + (backup_path if backup_exists else "not available"),
-            "Desktop launcher target: " + (state.desktop_exec_target or "not installed"),
-            "Wrapper target: " + (state.wrapper_target or "not installed"),
+            "Desktop launcher target: "
+            + ((state.desktop_exec_target or "not installed") if state_ready else "refreshing…"),
+            "Wrapper target: "
+            + ((state.wrapper_target or "not installed") if state_ready else "refreshing…"),
             "Launcher targets active runtime: "
             + (
                 "n/a" if launcher_targets_active is None
@@ -5335,7 +4250,10 @@ class WaveLinuxWindow(QMainWindow):
         repair_btn = getattr(self, "_repair_launcher_btn", None)
         if repair_btn is not None:
             repair_btn.setEnabled(
-                bool(state.stale_launcher_entries or state.wrapper_mismatch or state.desktop_mismatch)
+                bool(
+                    state_ready
+                    and (state.stale_launcher_entries or state.wrapper_mismatch or state.desktop_mismatch)
+                )
                 or is_running_in_appimage()
             )
         recover_btn = getattr(self, "_health_recover_btn", None)
@@ -5345,6 +4263,7 @@ class WaveLinuxWindow(QMainWindow):
             recover_btn.setText(
                 f"Recover degraded channels ({degraded})" if degraded else "Recover degraded channels"
             )
+        self._mark_settings_tab_refreshed("Health")
 
     def _rerun_system_check(self):
         self._refresh_system_tab()
@@ -5379,7 +4298,7 @@ class WaveLinuxWindow(QMainWindow):
                 f"Recover degraded channels ({n})" if n
                 else "Recover degraded channels"
             )
-        self._refresh_update_tab()
+        self._mark_settings_tab_refreshed("Advanced")
 
     def _restore_forgotten_apps(self):
         """Clear the persistent ✕ blocklist so apps the user has clicked
@@ -5524,6 +4443,7 @@ class WaveLinuxWindow(QMainWindow):
             empty_lbl = QLabel("No hidden channels")
             empty_lbl.setStyleSheet("color: #5a5a72; font-size: 11px; font-style: italic;")
             self.hidden_list_layout.addWidget(empty_lbl)
+            self._mark_settings_tab_refreshed("Hidden")
             return
 
         for node_name in sorted(self.hidden_nodes):
@@ -5544,6 +4464,7 @@ class WaveLinuxWindow(QMainWindow):
             row_widget = QWidget()
             row_widget.setLayout(row)
             self.hidden_list_layout.addWidget(row_widget)
+        self._mark_settings_tab_refreshed("Hidden")
 
     def _unhide_from_settings(self, node_name):
         self.unhide_node(node_name)
@@ -5575,13 +4496,14 @@ class WaveLinuxWindow(QMainWindow):
             specs[f"wavelinux_{safe}"] = clean
         return specs
 
-    def _sync_runtime_persistent_state(self):
+    def _sync_runtime_persistent_state(self, *, immediate=False):
         monitor_hw = self._desired_mix_hw.get("Monitor")
         stream_hw = self._desired_mix_hw.get("Stream")
         if monitor_hw is None and hasattr(self, "mon_out_combo"):
             monitor_hw = self.mon_out_combo.currentData()
         if stream_hw is None and hasattr(self, "str_out_combo"):
             stream_hw = self.str_out_combo.currentData()
+        self._suppress_pactl_events_for(1.5)
         self.runtime.sync_persistent_state(
             selected_mic=self.selected_mic,
             submix_state=self.submix_state,
@@ -5596,6 +4518,7 @@ class WaveLinuxWindow(QMainWindow):
             stream_hw=stream_hw,
             monitor_mix_volume=self._current_mix_master_volume("Monitor"),
             stream_mix_volume=self._current_mix_master_volume("Stream"),
+            apply_now=bool(immediate),
         )
 
     @staticmethod
@@ -5855,7 +4778,7 @@ class WaveLinuxWindow(QMainWindow):
 
     def _apply_app_identity_changes(self, status_message):
         self._set_engine_identity_overrides()
-        self._sync_runtime_persistent_state()
+        self._sync_runtime_persistent_state(immediate=True)
         self.save_config()
         runtime = getattr(self, "runtime", None)
         if runtime is not None and hasattr(runtime, "refresh_now"):
@@ -6049,6 +4972,7 @@ class WaveLinuxWindow(QMainWindow):
         self._event_proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self._event_proc.readyReadStandardOutput.connect(self._on_pactl_event)
         self._event_proc.errorOccurred.connect(self._on_event_proc_error)
+        self._event_proc.finished.connect(self._on_event_proc_finished)
         try:
             self._event_proc.start("pactl", ["subscribe"])
         except Exception as e:
@@ -6063,6 +4987,8 @@ class WaveLinuxWindow(QMainWindow):
             )
         except Exception:
             payload = ""
+        if self._pactl_events_suppressed():
+            return
         if payload and not self._should_refresh_for_pactl_event(payload):
             return
         self._event_refresh_timer.start()
@@ -6082,6 +5008,317 @@ class WaveLinuxWindow(QMainWindow):
         if self._shutting_down:
             return
         logging.warning(f"pactl subscribe error: {err}")
+        self._schedule_audio_server_recovery()
+
+    def _on_event_proc_finished(self, exit_code, exit_status):
+        if self._shutting_down:
+            return
+        logging.warning(
+            "pactl subscribe exited (code=%s, status=%s)",
+            exit_code,
+            exit_status,
+        )
+        self._schedule_audio_server_recovery()
+
+    def _schedule_audio_server_recovery(self):
+        if self._shutting_down:
+            return
+        self._bluetooth_profile_reassert_retries = max(
+            int(self.__dict__.get("_bluetooth_profile_reassert_retries", 0) or 0),
+            6,
+        )
+        reconnect_scheduled = False
+        if not self._selected_mic_uses_bluetooth_input():
+            reconnect_scheduled = self._schedule_known_bluetooth_monitor_reconnect(
+                disconnect_first=False,
+                settle_delay_ms=250,
+            )
+        restart_timer = self.__dict__.get("_event_proc_restart_timer")
+        if restart_timer is not None:
+            restart_timer.start()
+        event_timer = self.__dict__.get("_event_refresh_timer")
+        if event_timer is not None:
+            event_timer.start()
+        bluetooth_timer = self.__dict__.get("_bluetooth_refresh_timer")
+        if bluetooth_timer is not None:
+            if reconnect_scheduled:
+                bluetooth_timer.start(600)
+            else:
+                bluetooth_timer.start()
+
+    def _restart_event_subscriber_if_needed(self):
+        if self._shutting_down:
+            return
+        proc = self.__dict__.get("_event_proc")
+        if proc is not None and proc.state() != QProcess.ProcessState.NotRunning:
+            return
+        if proc is not None:
+            try:
+                proc.deleteLater()
+            except Exception:
+                pass
+            self._event_proc = None
+        self._start_event_subscriber()
+
+    @staticmethod
+    def _preferred_bluetooth_playback_profile_name(profiles):
+        available = [
+            str(profile_name or "").strip()
+            for profile_name in (profiles or [])
+            if str(profile_name or "").strip()
+        ]
+        if "a2dp-sink" in available:
+            return "a2dp-sink"
+        for profile_name in available:
+            if profile_name.startswith("a2dp-sink"):
+                return profile_name
+        return ""
+
+    @staticmethod
+    def _bluetooth_mac_from_card_name(card_name):
+        raw = str(card_name or "").strip()
+        if raw.startswith("bluez_card."):
+            raw = raw.split(".", 1)[1]
+        match = re.search(r"([0-9A-Fa-f]{2}(?:[_:-][0-9A-Fa-f]{2}){5})", raw)
+        if not match:
+            return ""
+        return match.group(1).replace("_", ":").replace("-", ":").upper()
+
+    @staticmethod
+    def _run_bluetoothctl_commands(*commands, timeout=8):
+        script = "\n".join(str(cmd) for cmd in commands if str(cmd or "").strip()) + "\nquit\n"
+        if not script.strip():
+            return None
+        return subprocess.run(
+            ["bluetoothctl"],
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    def _complete_bluetooth_reconnect(self, mac):
+        mac = str(mac or "").strip().upper()
+        pending = self.__dict__.setdefault("_pending_bluetooth_reconnect_macs", set())
+        try:
+            if self._shutting_down or not mac:
+                return
+            self._run_bluetoothctl_commands(f"connect {mac}", timeout=10)
+        except Exception as exc:
+            logging.warning("Bluetooth reconnect failed for %s: %s", mac, exc)
+        finally:
+            pending.discard(mac)
+            timer = self.__dict__.get("_bluetooth_refresh_timer")
+            if timer is not None and not self._shutting_down:
+                timer.start()
+
+    def _schedule_bluetooth_reconnect_mac(
+        self,
+        mac,
+        *,
+        disconnect_first=True,
+        settle_delay_ms=900,
+    ):
+        mac = str(mac or "").strip().upper()
+        if not mac or self._shutting_down:
+            return False
+        pending = self.__dict__.setdefault("_pending_bluetooth_reconnect_macs", set())
+        if mac in pending:
+            return False
+        pending.add(mac)
+        if disconnect_first:
+            try:
+                self._run_bluetoothctl_commands(f"disconnect {mac}", timeout=8)
+            except Exception as exc:
+                logging.warning("Bluetooth disconnect failed for %s: %s", mac, exc)
+        delay_ms = max(0, int(settle_delay_ms or 0))
+        QTimer.singleShot(delay_ms, lambda mac=mac: self._complete_bluetooth_reconnect(mac))
+        logging.info(
+            "Scheduled Bluetooth reconnect for %s (disconnect_first=%s, delay_ms=%s)",
+            mac,
+            disconnect_first,
+            delay_ms,
+        )
+        return True
+
+    def _schedule_bluetooth_reconnect(
+        self,
+        card_name,
+        *,
+        disconnect_first=True,
+        settle_delay_ms=900,
+    ):
+        return self._schedule_bluetooth_reconnect_mac(
+            self._bluetooth_mac_from_card_name(card_name),
+            disconnect_first=disconnect_first,
+            settle_delay_ms=settle_delay_ms,
+        )
+
+    def _known_bluetooth_target_macs(self):
+        candidates = [
+            self.__dict__.get("_desired_mix_hw", {}).get("Monitor", ""),
+            self.__dict__.get("_preferred_monitor_hw_name", ""),
+            self.__dict__.get("_preferred_monitor_hw_id", ""),
+            self.__dict__.get("_restorable_monitor_hw_name", ""),
+            self.__dict__.get("_restorable_monitor_hw_id", ""),
+        ]
+        macs = []
+        seen = set()
+        for candidate in candidates:
+            mac = self._bluetooth_mac_from_card_name(candidate)
+            if not mac or mac in seen:
+                continue
+            seen.add(mac)
+            macs.append(mac)
+        return macs
+
+    def _selected_mic_uses_bluetooth_input(self):
+        selected_mic = str(self.__dict__.get("selected_mic", "") or "").strip().lower()
+        if selected_mic.startswith("bluez_input."):
+            return True
+        view = self.__dict__.get("_runtime_view_state")
+        runtime_selected = str(getattr(view, "selected_mic", "") or "").strip().lower()
+        return runtime_selected.startswith("bluez_input.")
+
+    def _schedule_known_bluetooth_monitor_reconnect(
+        self,
+        *,
+        disconnect_first,
+        settle_delay_ms,
+    ):
+        reconnect_scheduled = False
+        for mac in self._known_bluetooth_target_macs():
+            reconnect_scheduled = (
+                self._schedule_bluetooth_reconnect_mac(
+                    mac,
+                    disconnect_first=disconnect_first,
+                    settle_delay_ms=settle_delay_ms,
+                )
+                or reconnect_scheduled
+            )
+        return reconnect_scheduled
+
+    def _has_bluetooth_playback_cards(self):
+        engine = self.__dict__.get("engine")
+        if engine is None or not hasattr(engine, "list_cards"):
+            return False
+        try:
+            cards = list(engine.list_cards() or [])
+        except Exception:
+            return False
+        return any(
+            str((card or {}).get("name") or "").strip().startswith("bluez_card.")
+            for card in cards
+        )
+
+    def _reassert_bluetooth_playback_profile(self):
+        if self._shutting_down:
+            return False, False
+        engine = self.__dict__.get("engine")
+        if engine is None:
+            return False, False
+        try:
+            if hasattr(engine, "lock_bluetooth_to_a2dp"):
+                engine.lock_bluetooth_to_a2dp()
+        except Exception as exc:
+            logging.warning("Failed to re-lock Bluetooth autoswitch: %s", exc)
+        if self._selected_mic_uses_bluetooth_input():
+            return False, False
+        if not hasattr(engine, "list_cards") or not hasattr(engine, "set_card_profile"):
+            return False, False
+        changed = False
+        retry_needed = False
+        try:
+            cards = list(engine.list_cards() or [])
+        except Exception as exc:
+            logging.warning("Failed to inspect Bluetooth cards after server churn: %s", exc)
+            return False, False
+        bluetooth_cards = [
+            card
+            for card in cards
+            if str((card or {}).get("name") or "").strip().startswith("bluez_card.")
+        ]
+        retries_left = int(self.__dict__.get("_bluetooth_profile_reassert_retries", 0) or 0)
+        if not bluetooth_cards and retries_left > 0:
+            reconnect_scheduled = self._schedule_known_bluetooth_monitor_reconnect(
+                disconnect_first=False,
+                settle_delay_ms=250,
+            )
+            if reconnect_scheduled:
+                return False, True
+        for card in cards:
+            card_name = str((card or {}).get("name") or "").strip()
+            if not card_name.startswith("bluez_card."):
+                continue
+            active_profile = str((card or {}).get("active_profile") or "").strip()
+            if (
+                active_profile in {"", "off", "headset-head-unit", "headset-head-unit-cvsd"}
+                and retries_left > 0
+            ):
+                self._schedule_bluetooth_reconnect(card_name)
+                retry_needed = True
+            target_profile = self._preferred_bluetooth_playback_profile_name(
+                [
+                    profile.get("name")
+                    for profile in ((card or {}).get("profiles") or [])
+                    if bool(profile.get("available"))
+                ]
+            )
+            if active_profile.startswith("a2dp-sink"):
+                continue
+            if not target_profile:
+                retry_needed = retry_needed or active_profile in {
+                    "",
+                    "off",
+                    "headset-head-unit",
+                    "headset-head-unit-cvsd",
+                }
+                if retry_needed:
+                    self._schedule_bluetooth_reconnect(card_name)
+                continue
+            try:
+                changed = bool(engine.set_card_profile(card_name, target_profile)) or changed
+                retry_needed = True
+            except Exception as exc:
+                logging.warning(
+                    "Failed to restore Bluetooth playback profile on %s: %s",
+                    card_name,
+                    exc,
+                )
+                retry_needed = True
+        return changed, retry_needed
+
+    def _prime_bluetooth_playback_profile(self):
+        if self._shutting_down or self._selected_mic_uses_bluetooth_input():
+            return False
+        if not self._has_bluetooth_playback_cards():
+            return False
+        self._bluetooth_profile_reassert_retries = max(
+            int(self.__dict__.get("_bluetooth_profile_reassert_retries", 0) or 0),
+            4,
+        )
+        changed, retry_needed = self._reassert_bluetooth_playback_profile()
+        if changed:
+            self._request_runtime_refresh("startup-bt-profile")
+        timer = self.__dict__.get("_bluetooth_refresh_timer")
+        if timer is not None and hasattr(timer, "start"):
+            timer.start()
+        return changed or retry_needed
+
+    def _handle_bluetooth_settle_refresh(self):
+        if self._shutting_down:
+            return
+        self._restart_event_subscriber_if_needed()
+        _, retry_needed = self._reassert_bluetooth_playback_profile()
+        self._request_runtime_refresh("bluetooth-settle")
+        retries_left = int(self.__dict__.get("_bluetooth_profile_reassert_retries", 0) or 0)
+        if retry_needed and retries_left > 0:
+            self._bluetooth_profile_reassert_retries = retries_left - 1
+            timer = self.__dict__.get("_bluetooth_refresh_timer")
+            if timer is not None:
+                timer.start(600)
+        else:
+            self._bluetooth_profile_reassert_retries = 0
 
     @staticmethod
     def _should_refresh_for_pactl_event(payload):
@@ -6133,238 +5370,21 @@ class WaveLinuxWindow(QMainWindow):
         return False
 
     def _setup_ui(self):
-        self._setup_tray()
-        central_scroll = QScrollArea()
-        central_scroll.setWidgetResizable(True)
-        central_scroll.setObjectName("centralScroll")
-        self.setCentralWidget(central_scroll)
+        build_main_window(self)
 
-        central = QWidget()
-        central.setObjectName("central")
-        central_scroll.setWidget(central)
-        
-        root = QVBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+    def _mixer_panel_controller(self):
+        controller = self.__dict__.get("_mixer_panel")
+        if controller is None:
+            controller = MixerPanelController(self)
+            self._mixer_panel = controller
+        return controller
 
-        # ── Header ──
-        header = QFrame()
-        header.setObjectName("header")
-        h_layout = QHBoxLayout(header)
-        h_layout.setContentsMargins(0, 0, 0, 0)
-
-        logo_col = QVBoxLayout()
-        logo_col.setSpacing(0)
-        logo_lbl = QLabel("🌊  WaveLinux")
-        logo_lbl.setObjectName("logoLabel")
-        logo_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        logo_col.addWidget(logo_lbl)
-        sub_lbl = QLabel("PipeWire Audio Router")
-        sub_lbl.setObjectName("subtitleLabel")
-        sub_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        logo_col.addWidget(sub_lbl)
-        h_layout.addLayout(logo_col)
-
-        h_layout.addStretch()
-
-        self.settings_btn = QPushButton("⚙️ Settings")
-        self.settings_btn.setObjectName("showHiddenBtn")
-        self.settings_btn.setToolTip("Open App Routing settings")
-        self.settings_btn.clicked.connect(self._open_settings)
-        h_layout.addWidget(self.settings_btn)
-
-        self.add_btn = QPushButton("+ Add Channel")
-        self.add_btn.setObjectName("addBtn")
-        self.add_btn.clicked.connect(self._on_add_channel)
-        h_layout.addWidget(self.add_btn)
-
-        root.addWidget(header)
-
-        # ── Body (Inputs) ──
-        body = QVBoxLayout()
-        body.setContentsMargins(20, 6, 20, 0)
-        body.setSpacing(0)
-
-        input_lbl = QLabel("AUDIO SOURCES")
-        input_lbl.setObjectName("sectionLabel")
-        body.addWidget(input_lbl)
-
-        # Inputs row — horizontally scrolling so the strips stay usable
-        # below 1200px window width. `setWidgetResizable(False)` so the
-        # inner widget keeps its natural size (strip count × ~160px).
-        self.inputs_scroll = QScrollArea()
-        self.inputs_scroll.setObjectName("inputsScroll")
-        self.inputs_scroll.setWidgetResizable(False)
-        self.inputs_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.inputs_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.inputs_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.inputs_container = QWidget()
-        self.inputs_container.setObjectName("inputsContainer")
-        self.input_layout = QHBoxLayout(self.inputs_container)
-        self.input_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self.input_layout.setContentsMargins(4, 4, 4, 4)
-        self.input_layout.setSpacing(10)
-        self.inputs_scroll.setWidget(self.inputs_container)
-        self.inputs_scroll.viewport().installEventFilter(self)
-        body.addWidget(self.inputs_scroll, 1)
-
-        root.addLayout(body, 1)
-
-        # ── Outputs & App Routing ──
-        bottom_widget = QWidget()
-        bottom_outer = QVBoxLayout(bottom_widget)
-        bottom_outer.setContentsMargins(0, 0, 0, 0)
-        bottom_outer.setSpacing(0)
-
-        bottom_container = QHBoxLayout()
-        bottom_container.setContentsMargins(20, 4, 20, 4)
-        bottom_container.setSpacing(20)
-        
-        # Outputs Assignment Panel
-        out_frame = QFrame()
-        out_frame.setObjectName("routingPanel")
-        o_layout = QVBoxLayout(out_frame)
-        o_layout.setContentsMargins(12, 8, 12, 8)
-        o_title = QLabel("MASTER")
-        o_title.setObjectName("sectionLabel")
-        o_layout.addWidget(o_title)
-        o_layout.addSpacing(4)
-
-        # Mic picker — single-mic mode. Per-mic state is keyed by
-        # node.name so it survives swaps. Labelled "Microphone Input"
-        # rather than "Microphone Source" for less-technical users.
-        mic_row = QHBoxLayout()
-        mic_lbl = QLabel("🎤 Microphone Input")
-        mic_lbl.setObjectName("masterMixLabel")
-        self.mic_in_combo = QComboBox()
-        self.mic_in_combo.setToolTip("Pick which physical mic the mixer uses")
-        self.mic_in_combo.currentIndexChanged.connect(self._on_mic_input_change)
-        mic_row.addWidget(mic_lbl)
-        mic_row.addWidget(self.mic_in_combo, 1)
-        o_layout.addLayout(mic_row)
-        o_layout.addSpacing(4)
-
-        # Monitor output — labelled "Monitor" instead of "Headphones"
-        # since many users monitor through speakers.
-        mon_row = QHBoxLayout()
-        mon_lbl = QLabel("🎧 Monitor Output")
-        mon_lbl.setObjectName("masterMixLabel")
-        self.mon_out_combo = QComboBox()
-        self.mon_out_combo.setToolTip("Pick the physical output you listen on (headphones / speakers)")
-        self.mon_out_combo.currentIndexChanged.connect(
-            lambda idx: self._on_mix_out_change("Monitor", self.mon_out_combo.itemData(idx))
-        )
-        mon_row.addWidget(mon_lbl)
-        mon_row.addWidget(self.mon_out_combo, 1)
-        o_layout.addLayout(mon_row)
-
-        self.mon_master_slider = QSlider(Qt.Orientation.Horizontal)
-        self.mon_master_slider.setRange(0, 100)
-        self.mon_master_slider.setFixedHeight(20)
-        self.mon_master_slider.valueChanged.connect(lambda v: self._on_master_vol_change("Monitor", v))
-        o_layout.addWidget(self.mon_master_slider)
-        o_layout.addSpacing(6)
-
-        # Stream — fixed to the virtual `WaveLinux-Stream` device so OBS
-        # has one stable source to pick (matching Wave Link).
-        str_row = QHBoxLayout()
-        str_lbl = QLabel("📡 Stream")
-        str_lbl.setObjectName("masterMixLabel")
-        str_row.addWidget(str_lbl)
-        self.str_out_label = QLabel("OBS input: WaveLinux-Stream")
-        self.str_out_label.setObjectName("streamHintLabel")
-        str_row.addWidget(self.str_out_label, 1)
-        # Kept for save/load compatibility; hidden.
-        self.str_out_combo = QComboBox()
-        self.str_out_combo.hide()
-        o_layout.addLayout(str_row)
-
-        str_master_row = QHBoxLayout()
-        self.str_master_slider = QSlider(Qt.Orientation.Horizontal)
-        self.str_master_slider.setRange(0, 100)
-        self.str_master_slider.setFixedHeight(20)
-        self.str_master_slider.valueChanged.connect(lambda v: self._on_master_vol_change("Stream", v))
-        str_master_row.addWidget(self.str_master_slider, 1)
-
-        # Clipguard lives on the per-channel FX chain (`limiter` effect),
-        # not the master Stream bus. The master row is just fader + OBS hint.
-        o_layout.addLayout(str_master_row)
-
-        bottom_container.addWidget(out_frame, 1)
-
-        # Settings dialog — tabbed (Apps / Hidden / Scenes / Health / Advanced / Updates).
-        self.settings_dialog = QDialog(self)
-        self.settings_dialog.setWindowTitle("WaveLinux Settings")
-        self.settings_dialog.setMinimumSize(640, 480)
-        self.settings_dialog.setStyleSheet(STYLESHEET)
-        sd_layout = QVBoxLayout(self.settings_dialog)
-        sd_layout.setContentsMargins(16, 16, 16, 16)
-        tabs = QTabWidget(self.settings_dialog)
-        sd_layout.addWidget(tabs)
-
-        # — Apps tab —
-        apps_tab = QWidget()
-        apps_layout = QVBoxLayout(apps_tab)
-        apps_layout.setContentsMargins(8, 8, 8, 8)
-        r_title = QLabel("APP ROUTING")
-        r_title.setObjectName("sectionLabel")
-        apps_layout.addWidget(r_title)
-        self.routing_scroll = QScrollArea()
-        self.routing_scroll.setWidgetResizable(True)
-        self.routing_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.routing_scroll.setStyleSheet("background: transparent;")
-        self.routing_container = QWidget()
-        self.routing_layout = QVBoxLayout(self.routing_container)
-        self.routing_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.routing_layout.setContentsMargins(0, 0, 0, 0)
-        self.routing_scroll.setWidget(self.routing_container)
-        apps_layout.addWidget(self.routing_scroll, 1)
-        tabs.addTab(apps_tab, "Apps")
-
-        # — Hidden channels tab —
-        hidden_tab = QWidget()
-        hidden_layout = QVBoxLayout(hidden_tab)
-        hidden_layout.setContentsMargins(8, 8, 8, 8)
-        hidden_title = QLabel("HIDDEN CHANNELS")
-        hidden_title.setObjectName("sectionLabel")
-        hidden_layout.addWidget(hidden_title)
-        self.hidden_list_container = QWidget()
-        self.hidden_list_layout = QVBoxLayout(self.hidden_list_container)
-        self.hidden_list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.hidden_list_layout.setContentsMargins(0, 0, 0, 0)
-        self.hidden_list_layout.setSpacing(4)
-        hidden_layout.addWidget(self.hidden_list_container, 1)
-        tabs.addTab(hidden_tab, "Hidden")
-
-        # — Scenes tab —
-        tabs.addTab(self._build_scenes_tab(), "Scenes")
-
-        # — Health tab —
-        tabs.addTab(self._build_system_tab(), "Health")
-
-        # — Advanced tab —
-        tabs.addTab(self._build_advanced_tab(), "Advanced")
-
-        # — Updates tab —
-        tabs.addTab(self._build_update_tab(), "Updates")
-
-        bottom_outer.addLayout(bottom_container)
-
-        # ── Status Bar ──
-        status = QFrame()
-        status.setObjectName("statusBar")
-        s_layout = QHBoxLayout(status)
-        s_layout.setContentsMargins(0, 0, 0, 0)
-        dot = QLabel("●")
-        dot.setObjectName("statusDot")
-        s_layout.addWidget(dot)
-        self.status_lbl = QLabel("PipeWire connected")
-        self.status_lbl.setObjectName("statusLabel")
-        s_layout.addWidget(self.status_lbl)
-        s_layout.addStretch()
-        bottom_outer.addWidget(status)
-
-        root.addWidget(bottom_widget, 0)
+    def _app_routing_panel_controller(self):
+        controller = self.__dict__.get("_app_routing_panel")
+        if controller is None:
+            controller = AppRoutingPanelController(self)
+            self._app_routing_panel = controller
+        return controller
 
     def _clear_layout(self, layout):
         while layout.count():
@@ -6378,150 +5398,46 @@ class WaveLinuxWindow(QMainWindow):
 
     # ── Responsive strip scaling ────────────────────────────────────
 
-    _MIN_STRIP_W = ChannelStrip._MIN_W
-    _MAX_STRIP_W = ChannelStrip._MAX_W
-    _MIN_SLIDER_H = ChannelStrip._MIN_SLIDER_H
-    _MAX_SLIDER_H = ChannelStrip._MAX_SLIDER_H
-    _SLIDER_WIDTH_SCALE_CAP = ChannelStrip._WIDTH_SCALE_CAP
-    _STRIP_MIN_OUTER_MARGIN = 3
-    _STRIP_MAX_OUTER_MARGIN = 8
-    _STRIP_MIN_INNER_SPACING = 2
-    _STRIP_MAX_INNER_SPACING = 6
-    _STRIP_MIN_FADER_SPACING = 6
-    _STRIP_MAX_FADER_SPACING = 12
-    _STRIP_MIN_PEAK_HEIGHT = 4
-    _STRIP_MAX_PEAK_HEIGHT = 6
-    _STRIP_MIN_LINK_SIZE = 20
-    _STRIP_MAX_LINK_SIZE = 26
-    _STRIP_MIN_MUTE_SIZE = 24
-    _STRIP_MAX_MUTE_SIZE = 30
-    _STRIP_MIN_MIC_GAIN_HEIGHT = 16
-    _STRIP_MAX_MIC_GAIN_HEIGHT = 24
+    _MIN_STRIP_W = MixerPanelController._MIN_STRIP_W
+    _MAX_STRIP_W = MixerPanelController._MAX_STRIP_W
+    _MIN_SLIDER_H = MixerPanelController._MIN_SLIDER_H
+    _MAX_SLIDER_H = MixerPanelController._MAX_SLIDER_H
+    _SLIDER_WIDTH_SCALE_CAP = MixerPanelController._SLIDER_WIDTH_SCALE_CAP
+    _STRIP_CARD_GAP = MixerPanelController._STRIP_CARD_GAP
+    _STRIP_ROW_MARGIN = MixerPanelController._STRIP_ROW_MARGIN
+    _STRIP_MIN_OUTER_MARGIN = MixerPanelController._STRIP_MIN_OUTER_MARGIN
+    _STRIP_MAX_OUTER_MARGIN = MixerPanelController._STRIP_MAX_OUTER_MARGIN
+    _STRIP_MIN_INNER_SPACING = MixerPanelController._STRIP_MIN_INNER_SPACING
+    _STRIP_MAX_INNER_SPACING = MixerPanelController._STRIP_MAX_INNER_SPACING
+    _STRIP_MIN_FADER_SPACING = MixerPanelController._STRIP_MIN_FADER_SPACING
+    _STRIP_MAX_FADER_SPACING = MixerPanelController._STRIP_MAX_FADER_SPACING
+    _STRIP_MIN_PEAK_HEIGHT = MixerPanelController._STRIP_MIN_PEAK_HEIGHT
+    _STRIP_MAX_PEAK_HEIGHT = MixerPanelController._STRIP_MAX_PEAK_HEIGHT
+    _STRIP_MIN_LINK_SIZE = MixerPanelController._STRIP_MIN_LINK_SIZE
+    _STRIP_MAX_LINK_SIZE = MixerPanelController._STRIP_MAX_LINK_SIZE
+    _STRIP_MIN_MUTE_SIZE = MixerPanelController._STRIP_MIN_MUTE_SIZE
+    _STRIP_MAX_MUTE_SIZE = MixerPanelController._STRIP_MAX_MUTE_SIZE
+    _STRIP_MIN_MIC_GAIN_HEIGHT = MixerPanelController._STRIP_MIN_MIC_GAIN_HEIGHT
+    _STRIP_MAX_MIC_GAIN_HEIGHT = MixerPanelController._STRIP_MAX_MIC_GAIN_HEIGHT
 
     def eventFilter(self, obj, event):
-        if obj is self.inputs_scroll.viewport() and event.type() == QEvent.Type.Resize:
-            self._rescale_strips()
+        self._mixer_panel_controller().handle_event_filter(obj, event)
         return super().eventFilter(obj, event)
 
     # Worst-case non-slider chrome budget for the strip row. This is used
     # to derive the vertical slider budget from the actual viewport height
     # before any clipping occurs.
-    _STRIP_NON_SLIDER_HEIGHT_BUDGET = 158
-    _STRIP_MIN_TOTAL_HEIGHT = 215
-
-    @staticmethod
-    def _clamp_int(value, minimum, maximum):
-        return max(int(minimum), min(int(maximum), int(round(value))))
+    _STRIP_NON_SLIDER_HEIGHT_BUDGET = MixerPanelController._STRIP_NON_SLIDER_HEIGHT_BUDGET
+    _STRIP_MIN_TOTAL_HEIGHT = MixerPanelController._STRIP_MIN_TOTAL_HEIGHT
 
     def _compute_mixer_strip_metrics(self, strips=None) -> MixerStripMetrics:
-        strips = list(strips or self.channel_widgets.values())
-        count = len(strips)
-        if count == 0:
-            return MixerStripMetrics(
-                strip_width=self._MIN_STRIP_W,
-                slider_height=self._MIN_SLIDER_H,
-                strip_height=self._STRIP_MIN_TOTAL_HEIGHT,
-                outer_margin=self._STRIP_MIN_OUTER_MARGIN,
-                inner_spacing=self._STRIP_MIN_INNER_SPACING,
-                fader_spacing=self._STRIP_MIN_FADER_SPACING,
-                peak_height=self._STRIP_MIN_PEAK_HEIGHT,
-                link_button_size=self._STRIP_MIN_LINK_SIZE,
-                mute_button_size=self._STRIP_MIN_MUTE_SIZE,
-                mic_gain_height=self._STRIP_MIN_MIC_GAIN_HEIGHT,
-                use_horizontal_scroll=False,
-            )
-
-        viewport = self.inputs_scroll.viewport()
-        avail_w = max(0, int(viewport.width()))
-        avail_h = max(0, int(viewport.height()))
-        spacing = int(self.input_layout.spacing())
-        margins = self.input_layout.contentsMargins()
-        horizontal_chrome = int(margins.left()) + int(margins.right())
-        available_row_width = max(0, avail_w - horizontal_chrome - spacing * max(0, count - 1))
-        ideal_width = available_row_width // count if count else self._MAX_STRIP_W
-        use_horizontal_scroll = ideal_width < self._MIN_STRIP_W
-        strip_width = self._MIN_STRIP_W if use_horizontal_scroll else self._clamp_int(
-            ideal_width,
-            self._MIN_STRIP_W,
-            self._MAX_STRIP_W,
-        )
-
-        width_span = max(1, self._SLIDER_WIDTH_SCALE_CAP - self._MIN_STRIP_W)
-        control_width_t = (
-            min(strip_width, self._SLIDER_WIDTH_SCALE_CAP) - self._MIN_STRIP_W
-        ) / width_span
-        control_width_t = max(0.0, min(1.0, control_width_t))
-
-        slider_budget = avail_h - self._STRIP_NON_SLIDER_HEIGHT_BUDGET
-        slider_height = self._clamp_int(
-            slider_budget,
-            self._MIN_SLIDER_H,
-            self._MAX_SLIDER_H,
-        )
-        slider_span = max(1, self._MAX_SLIDER_H - self._MIN_SLIDER_H)
-        height_t = (slider_height - self._MIN_SLIDER_H) / slider_span
-        height_t = max(0.0, min(1.0, height_t))
-        control_t = min(control_width_t, height_t)
-
-        lerp = lambda lo, hi, t: lo + (hi - lo) * t
-        return MixerStripMetrics(
-            strip_width=strip_width,
-            slider_height=slider_height,
-            strip_height=0,
-            outer_margin=self._clamp_int(
-                lerp(self._STRIP_MIN_OUTER_MARGIN, self._STRIP_MAX_OUTER_MARGIN, control_t),
-                self._STRIP_MIN_OUTER_MARGIN,
-                self._STRIP_MAX_OUTER_MARGIN,
-            ),
-            inner_spacing=self._clamp_int(
-                lerp(self._STRIP_MIN_INNER_SPACING, self._STRIP_MAX_INNER_SPACING, control_t),
-                self._STRIP_MIN_INNER_SPACING,
-                self._STRIP_MAX_INNER_SPACING,
-            ),
-            fader_spacing=self._clamp_int(
-                lerp(self._STRIP_MIN_FADER_SPACING, self._STRIP_MAX_FADER_SPACING, control_t),
-                self._STRIP_MIN_FADER_SPACING,
-                self._STRIP_MAX_FADER_SPACING,
-            ),
-            peak_height=self._clamp_int(
-                lerp(self._STRIP_MIN_PEAK_HEIGHT, self._STRIP_MAX_PEAK_HEIGHT, control_t),
-                self._STRIP_MIN_PEAK_HEIGHT,
-                self._STRIP_MAX_PEAK_HEIGHT,
-            ),
-            link_button_size=self._clamp_int(
-                lerp(self._STRIP_MIN_LINK_SIZE, self._STRIP_MAX_LINK_SIZE, control_t),
-                self._STRIP_MIN_LINK_SIZE,
-                self._STRIP_MAX_LINK_SIZE,
-            ),
-            mute_button_size=self._clamp_int(
-                lerp(self._STRIP_MIN_MUTE_SIZE, self._STRIP_MAX_MUTE_SIZE, control_t),
-                self._STRIP_MIN_MUTE_SIZE,
-                self._STRIP_MAX_MUTE_SIZE,
-            ),
-            mic_gain_height=self._clamp_int(
-                lerp(self._STRIP_MIN_MIC_GAIN_HEIGHT, self._STRIP_MAX_MIC_GAIN_HEIGHT, control_t),
-                self._STRIP_MIN_MIC_GAIN_HEIGHT,
-                self._STRIP_MAX_MIC_GAIN_HEIGHT,
-            ),
-            use_horizontal_scroll=use_horizontal_scroll,
-        )
+        return self._mixer_panel_controller().compute_strip_metrics(strips)
 
     def _measure_strip_heights(self, metrics, strips) -> int:
-        strips = list(strips or [])
-        if not strips:
-            return metrics.strip_height
-        return max(strip.measure_scaled_height(metrics) for strip in strips)
+        return self._mixer_panel_controller().measure_strip_heights(metrics, strips)
 
     def _apply_mixer_strip_metrics(self, metrics, strips) -> None:
-        policy = (
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-            if metrics.use_horizontal_scroll
-            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self.inputs_scroll.setHorizontalScrollBarPolicy(policy)
-        for strip in strips:
-            strip.apply_scale(metrics, target_height=metrics.strip_height)
-        self.inputs_container.adjustSize()
+        self._mixer_panel_controller().apply_strip_metrics(metrics, strips)
 
     def resizeEvent(self, event):
         out = super().resizeEvent(event)
@@ -6530,12 +5446,7 @@ class WaveLinuxWindow(QMainWindow):
         return out
 
     def _rescale_strips(self):
-        strips = list(self.channel_widgets.values())
-        if not strips:
-            return
-        metrics = self._compute_mixer_strip_metrics(strips)
-        metrics.strip_height = self._measure_strip_heights(metrics, strips)
-        self._apply_mixer_strip_metrics(metrics, strips)
+        self._mixer_panel_controller().rescale_strips()
 
     def _refresh(self):
         """Update UI to match PipeWire state without destroying everything.
@@ -6586,12 +5497,17 @@ class WaveLinuxWindow(QMainWindow):
             self.runtime.set_mix_volume(mix_name, vol)
 
     def _set_mix_output_target(self, mix_name, hw_sink_name, *, persist=True, update_combo=False,
-                               sync_runtime=False):
+                               sync_runtime=False, sync_runtime_refresh=True):
         self._desired_mix_hw[mix_name] = hw_sink_name
         runtime = getattr(self, "runtime", None)
         if runtime is not None:
+            self._suppress_pactl_events_for(1.0)
             if sync_runtime and hasattr(runtime, "set_mix_hardware_route_sync"):
-                runtime.set_mix_hardware_route_sync(mix_name, hw_sink_name)
+                runtime.set_mix_hardware_route_sync(
+                    mix_name,
+                    hw_sink_name,
+                    refresh=bool(sync_runtime_refresh),
+                )
             else:
                 runtime.set_mix_hardware_route(mix_name, hw_sink_name)
         if update_combo:
@@ -6615,9 +5531,50 @@ class WaveLinuxWindow(QMainWindow):
             persist=True,
             update_combo=False,
             sync_runtime=(mix_name == "Monitor"),
+            sync_runtime_refresh=(mix_name != "Monitor"),
         )
         if mix_name == "Monitor" and hw_sink_name:
             self._record_preferred_monitor(hw_sink_name, view=self.__dict__.get("_runtime_view_state"))
+            self._schedule_monitor_route_followups(hw_sink_name)
+
+    def _schedule_monitor_route_followups(self, hw_sink_name):
+        """Reassert app routing after a manual Monitor output switch.
+
+        Changing the default sink can trigger a delayed pulse-side move of
+        active app streams onto the hardware sink after the initial sync
+        route already completed. Schedule the existing settle refresh passes
+        so those streams get moved back onto their WaveLinux buses without
+        doing more synchronous work on the UI thread.
+        """
+        settle_timer = (
+            self.__dict__.get("_device_settle_refresh_timer")
+            or self.__dict__.get("_hotplug_refresh_timer")
+        )
+        if settle_timer is not None and hasattr(settle_timer, "start"):
+            settle_timer.start()
+        reassert_timer = self.__dict__.get("_monitor_route_reassert_timer")
+        if reassert_timer is not None and hasattr(reassert_timer, "start"):
+            reassert_timer.start()
+        target = str(hw_sink_name or "").strip().lower()
+        stable_id = ""
+        if target and not target.startswith("bt:"):
+            try:
+                stable_id = str(self._stable_sink_id_for_name(hw_sink_name) or "").strip().lower()
+            except Exception:
+                stable_id = ""
+        if "bluez_output." not in target and not target.startswith("bt:") and not stable_id.startswith("bt:"):
+            return
+        bluetooth_timer = self.__dict__.get("_bluetooth_refresh_timer")
+        if bluetooth_timer is not None and hasattr(bluetooth_timer, "start"):
+            bluetooth_timer.start()
+        bluetooth_reassert_timer = self.__dict__.get("_monitor_route_bluetooth_reassert_timer")
+        if bluetooth_reassert_timer is not None and hasattr(bluetooth_reassert_timer, "start"):
+            bluetooth_reassert_timer.start()
+
+    def _reassert_persistent_state_after_monitor_switch(self, reason):
+        if bool(self.__dict__.get("_shutting_down", False)):
+            return
+        self._request_runtime_refresh(reason)
 
     def _apply_pending_clipguard_migration(self):
         """Rewrite the legacy master-bus `clipguard: true` flag as a
@@ -6634,355 +5591,26 @@ class WaveLinuxWindow(QMainWindow):
             logging.info(
                 f"Migrated master-bus clipguard=true → per-mic limiter on {mic}"
             )
-            self._sync_runtime_persistent_state()
+            self._sync_runtime_persistent_state(immediate=True)
             self.schedule_save()
         self._pending_clipguard_migration = False
 
     def _sync_mic_picker(self, mics, default_src=None):
-        """Refresh the master mic combo. Cheap on each tick — only
-        rebuilds items when the mic list changes. Falls back to
-        `pactl get-default-source` when nothing's saved yet."""
-        combo = self.mic_in_combo
-        mic_names = {m.name for m in mics}
-        if self.selected_mic and self.selected_mic in mic_names:
-            self._mic_selection_initialized = True
-
-        # Resolve the mic only during the initial selection pass. Once the
-        # user has an active mic locked, later hotplug churn should not
-        # silently promote another device into the selection.
-        if mics and not getattr(self, "_mic_selection_initialized", False):
-            if default_src is None:
-                default_src = (
-                    self.engine.get_default_source()
-                    if hasattr(self.engine, 'get_default_source') else None
-                )
-            if self.selected_mic in mic_names:
-                self._mic_selection_initialized = True
-            else:
-                if default_src and default_src in mic_names:
-                    self.selected_mic = default_src
-                else:
-                    self.selected_mic = mics[0].name
-                self.runtime.set_selected_mic(self.selected_mic)
-                self._mic_selection_initialized = True
-                self.schedule_save()
-
-        mic_fp = tuple((m.name, m.description or '') for m in mics)
-        if self.__dict__.get('_mic_combo_fp') != mic_fp:
-            self._mic_combo_fp = mic_fp
-            combo.blockSignals(True)
-            combo.clear()
-            for m in mics:
-                label = PipeWireEngine.friendly_name(getattr(m, 'description', None)) or m.name
-                combo.addItem(label, m.name)
-            if not mics:
-                combo.addItem("(no microphone detected)", None)
-            combo.blockSignals(False)
-
-        # Sync selection to the saved mic, if it's in the combo.
-        idx = combo.findData(self.selected_mic)
-        if idx >= 0 and combo.currentIndex() != idx:
-            combo.blockSignals(True)
-            combo.setCurrentIndex(idx)
-            combo.blockSignals(False)
+        self._mixer_panel_controller().sync_mic_picker(mics, default_src=default_src)
 
     def _input_display_sort_key(self, node_name, *, is_mic=False):
-        order = list(self.__dict__.get("channel_order", []) or [])
-        order_index = {nm: i for i, nm in enumerate(order)}
-        return (
-            0 if is_mic else 1,
-            order_index.get(node_name, len(order_index) + 1),
-            str(node_name or "").lower(),
-        )
+        return self._mixer_panel_controller().input_display_sort_key(node_name, is_mic=is_mic)
 
     def _sorted_input_nodes(self, mic_nodes, virtual_nodes):
-        combined = list(mic_nodes or []) + list(virtual_nodes or [])
-        return sorted(
-            combined,
-            key=lambda node: self._input_display_sort_key(
-                getattr(node, "name", ""),
-                is_mic=bool(getattr(node, "is_mic", False)),
-            ),
-        )
+        return self._mixer_panel_controller().sorted_input_nodes(mic_nodes, virtual_nodes)
 
     def _refresh_runtime_view(self):
         view = self._runtime_view_state
         if view is None:
             self.status_lbl.setText("PipeWire syncing...")
             return
-
-        mics = list(getattr(view, "mic_inputs", []) or [])
-        virtuals = list(getattr(view, "virtual_channels", []) or [])
-        self._sync_mic_picker(mics, default_src=getattr(view, "default_source", None))
-        if getattr(self, '_pending_clipguard_migration', False) and self.selected_mic:
-            self._apply_pending_clipguard_migration()
-
-        present_names = set(getattr(view, "present_node_names", set()) or set())
-        if self._known_node_names:
-            added = present_names - self._known_node_names
-            removed = self._known_node_names - present_names
-            if added:
-                self._notify_hotplug(added, added=True)
-            if removed:
-                self._notify_hotplug(removed, added=False)
-        self._known_node_names = present_names
-
-        current_node_ids = set()
-        visible_strip_ids = []
-        input_layout_changed = False
-        selected_mic_node = next((m for m in mics if m.name == self.selected_mic), None)
-        shown_mics = [selected_mic_node] if selected_mic_node is not None else []
-        sorted_nodes = self._sorted_input_nodes(shown_mics, virtuals)
-
-        for node in sorted_nodes:
-            pw_id = str(node.node_id)
-            current_node_ids.add(pw_id)
-            nname = node.name
-            is_hidden = nname in self.hidden_nodes
-            if is_hidden and not self.show_hidden:
-                if pw_id in self.channel_widgets:
-                    strip = self.channel_widgets[pw_id]
-                    if not strip.isHidden():
-                        strip.hide()
-                        input_layout_changed = True
-                meter = self.meters.pop(pw_id, None)
-                if meter is not None:
-                    meter.stop()
-                continue
-            visible_strip_ids.append(pw_id)
-
-            mon_key = f"{nname}_Monitor"
-            str_key = f"{nname}_Stream"
-            fresh_mon = mon_key not in self.submix_state
-            fresh_str = str_key not in self.submix_state
-            if fresh_mon:
-                self.submix_state[mon_key] = {
-                    'vol': float(node.monitor_volume),
-                    'mute': bool(node.monitor_mute),
-                }
-            if fresh_str:
-                self.submix_state[str_key] = {
-                    'vol': float(node.stream_volume),
-                    'mute': bool(node.stream_mute),
-                }
-            if fresh_mon or fresh_str:
-                self.schedule_save()
-
-            if pw_id not in self.channel_widgets:
-                strip = ChannelStrip(
-                    pw_id,
-                    nname,
-                    node.label,
-                    node.channel_type,
-                    node.icon,
-                    self.engine,
-                )
-                self.channel_widgets[pw_id] = strip
-                self.input_layout.addWidget(strip)
-                input_layout_changed = True
-
-            strip = self.channel_widgets[pw_id]
-            strip.node_id = pw_id
-            if strip.isHidden():
-                strip.show()
-                input_layout_changed = True
-            strip.update_from_node(
-                float(node.monitor_volume),
-                bool(node.monitor_mute),
-                float(node.stream_volume),
-                bool(node.stream_mute),
-                is_hidden,
-                source_vol=float(getattr(node, "source_volume", 1.0)),
-                source_mute=bool(getattr(node, "source_mute", False)),
-            )
-            strip._refresh_fx_indicator(active=getattr(node, "fx_running", False))
-            issue = self.channel_runtime_issue(nname)
-            strip.set_runtime_issue(issue["degraded"], issue["tooltip"])
-            strip.setToolTip(issue["tooltip"] if issue["degraded"] else "")
-
-            meter = self.meters.get(pw_id)
-            meter_source = node.meter_source
-            if meter is None or meter.source_name != meter_source:
-                if meter is not None:
-                    meter.stop()
-                meter = MeterWorker(meter_source, self)
-                meter.peak.connect(strip.on_peak)
-                meter.start()
-                self.meters[pw_id] = meter
-
-        for stale in [pid for pid in self.channel_widgets if pid not in current_node_ids]:
-            widget = self.channel_widgets.pop(stale)
-            widget.setParent(None)
-            widget.deleteLater()
-            meter = self.meters.pop(stale, None)
-            if meter is not None:
-                meter.stop()
-            input_layout_changed = True
-
-        visible_strip_sig = tuple(visible_strip_ids)
-        if input_layout_changed or visible_strip_sig != self._visible_strip_ids:
-            self._visible_strip_ids = visible_strip_sig
-            self._rescale_strips()
-            self.inputs_container.adjustSize()
-
-        sink_rows = [
-            {'name': sink.name, 'display_name': sink.display_name}
-            for sink in getattr(view, "sinks", []) or []
-        ]
-        apps_by_id = {
-            app.app_id: app for app in (getattr(view, "app_views", []) or [])
-        }
-        now = int(time.time())
-        identity_migrated = False
-        for app in apps_by_id.values():
-            identity_migrated |= self._migrate_legacy_app_identity(app.app_id, app.app_name)
-            if app.active_indices:
-                self.app_last_seen[app.app_id] = now
-        cutoff = int(time.time()) - max(1, self.app_prune_days) * 24 * 3600
-        recently_seen = {
-            app_id for app_id, ts in self.app_last_seen.items()
-            if ts >= cutoff
-        }
-        all_display_app_ids = (
-            set(apps_by_id.keys())
-            | set(self.app_routing.keys())
-            | set(getattr(self, "app_volumes", {}).keys())
-            | recently_seen
-            | {PipeWireEngine.SYSTEM_SOUNDS_BUCKET}
-        )
-        all_display_app_ids -= self.forgotten_apps
-        sys_bucket = PipeWireEngine.SYSTEM_SOUNDS_BUCKET
-        ordered_display_apps = sorted(
-            all_display_app_ids,
-            key=lambda app_id: (
-                0 if app_id == sys_bucket else 1,
-                self._display_name_for_app_id(
-                    app_id,
-                    apps_by_id.get(app_id).app_name if app_id in apps_by_id else None,
-                ).lower(),
-            ),
-        )
-        routing_layout_changed = tuple(ordered_display_apps) != self._app_widget_order
-        for app_id in ordered_display_apps:
-            runtime_app = apps_by_id.get(app_id)
-            active_indices = list(runtime_app.active_indices) if runtime_app is not None else []
-            if runtime_app is not None:
-                row_identity = runtime_app
-            else:
-                reset_sources = self._override_sources_for_target(app_id)
-                row_identity = SimpleNamespace(
-                    app_id=app_id,
-                    app_name=self._display_name_for_app_id(app_id),
-                    resolved_app_id=reset_sources[0] if len(reset_sources) == 1 else app_id,
-                    resolved_app_name=self._display_name_for_app_id(
-                        reset_sources[0] if len(reset_sources) == 1 else app_id,
-                    ),
-                    identity_source="remembered",
-                    override_applied=bool(reset_sources),
-                    manual_override_active=bool(reset_sources or app_id in self.app_label_overrides),
-                    reset_source_app_id=reset_sources[0] if len(reset_sources) == 1 else "",
-                )
-            display_name = self._display_name_for_app_id(
-                app_id,
-                getattr(row_identity, "app_name", None),
-            )
-            ctx = self._app_identity_context(row_identity)
-            preferred_sink = self.app_routing.get(app_id)
-            live_sink = runtime_app.current_sink if runtime_app is not None else None
-            current_sink = preferred_sink or live_sink
-            current_volume = runtime_app.current_volume if runtime_app is not None else None
-            saved_volume = getattr(self, "app_volumes", {}).get(app_id)
-            if app_id not in self.app_widgets:
-                row = AppRoutingRow(app_id, display_name, self.engine, sink_rows, main_win=self)
-                self.app_widgets[app_id] = row
-                self.routing_layout.addWidget(row)
-                routing_layout_changed = True
-            self.app_widgets[app_id].update_state(
-                display_name,
-                active_indices,
-                sink_rows,
-                current_sink,
-                current_volume=current_volume,
-                saved_volume=saved_volume,
-                resolved_app_id=ctx["resolved_app_id"],
-                resolved_app_name=ctx["resolved_app_name"],
-                identity_source=ctx["identity_source"],
-                override_applied=ctx["override_applied"],
-                manual_override_active=ctx["manual_override_active"],
-                reset_source_app_id=ctx["reset_source_app_id"],
-                icon_candidates=list(getattr(row_identity, "icon_candidates", []) or []),
-            )
-        for app_id in list(self.app_widgets.keys()):
-            if app_id not in all_display_app_ids:
-                self.app_widgets[app_id].setParent(None)
-                self.app_widgets[app_id].deleteLater()
-                del self.app_widgets[app_id]
-                routing_layout_changed = True
-        if routing_layout_changed:
-            self._app_widget_order = tuple(ordered_display_apps)
-            self.routing_container.updateGeometry()
-            self.routing_container.adjustSize()
-        if identity_migrated:
-            self._sync_runtime_persistent_state()
-            self.schedule_save()
-
-        combo = self.mon_out_combo
-        if not combo.view().isVisible():
-            current_hw = getattr(view.mixes.get("Monitor"), "hardware_sink", None)
-            desired_hw = self._desired_mix_hw.get("Monitor")
-            current_data = combo.currentData()
-            combo_updated = False
-            sink_fp = tuple(
-                (sink.name, sink.display_name)
-                for sink in (getattr(view, "sinks", []) or [])
-                if not sink.is_internal and not sink.name.startswith("wavelinux_")
-            )
-            if sink_fp != self._monitor_sink_fp:
-                self._monitor_sink_fp = sink_fp
-                combo.blockSignals(True)
-                combo.clear()
-                combo.addItem("None", None)
-                for sink_name, display_name in sink_fp:
-                    combo.addItem(display_name, sink_name)
-                idx = combo.findData(desired_hw)
-                if idx < 0:
-                    idx = combo.findData(current_data)
-                if idx < 0 and desired_hw is None:
-                    idx = combo.findData(current_hw)
-                if idx >= 0:
-                    combo.setCurrentIndex(idx)
-                    combo_updated = True
-                combo.blockSignals(False)
-            elif desired_hw != current_data:
-                idx = combo.findData(desired_hw)
-                if idx >= 0 and idx != combo.currentIndex():
-                    combo.blockSignals(True)
-                    combo.setCurrentIndex(idx)
-                    combo.blockSignals(False)
-                    combo_updated = True
-
-        mon_mix = view.mixes.get("Monitor")
-        if mon_mix and not self.mon_master_slider.isSliderDown():
-            self._set_mix_master_volume(
-                "Monitor",
-                getattr(mon_mix, "master_volume", 1.0),
-                persist=False,
-                update_slider=False,
-            )
-            self.mon_master_slider.blockSignals(True)
-            self.mon_master_slider.setValue(int(mon_mix.master_volume * 100))
-            self.mon_master_slider.blockSignals(False)
-        str_mix = view.mixes.get("Stream")
-        if str_mix and not self.str_master_slider.isSliderDown():
-            self._set_mix_master_volume(
-                "Stream",
-                getattr(str_mix, "master_volume", 1.0),
-                persist=False,
-                update_slider=False,
-            )
-            self.str_master_slider.blockSignals(True)
-            self.str_master_slider.setValue(int(str_mix.master_volume * 100))
-            self.str_master_slider.blockSignals(False)
+        self._mixer_panel_controller().refresh_view(view)
+        self._app_routing_panel_controller().refresh_view(view)
 
         if not getattr(view, "health", {}):
             self.status_lbl.setText(
@@ -6991,8 +5619,8 @@ class WaveLinuxWindow(QMainWindow):
             )
 
     def _on_mic_input_change(self, idx):
-        """Persist a mic-picker change and refresh immediately so the
-        strip swaps to the new mic on the same tick."""
+        """Persist a mic-picker change and request an immediate runtime
+        reconcile without forcing a synchronous full UI refresh."""
         new_mic = self.mic_in_combo.itemData(idx)
         if new_mic == self.selected_mic:
             return
@@ -7000,10 +5628,9 @@ class WaveLinuxWindow(QMainWindow):
             new_mic,
             record_preference=True,
             persist=True,
-            request_refresh=False,
+            request_refresh=True,
             view=self.__dict__.get("_runtime_view_state"),
         )
-        self._refresh()
 
     def _on_add_channel(self):
         text, ok = QInputDialog.getText(self, "Add Virtual Channel", "Channel Name:")
@@ -7235,24 +5862,15 @@ class WaveLinuxWindow(QMainWindow):
                     _comp[_new] = _comp.pop(_old)
                 elif _old in _comp:
                     _comp.pop(_old, None)
+        self._normalize_loaded_effect_state()
 
         if runtime is not None:
-            runtime.ensure_output_mix_sync("Monitor")
-            runtime.ensure_output_mix_sync("Stream")
+            runtime.ensure_output_mix_sync("Monitor", refresh=False)
+            runtime.ensure_output_mix_sync("Stream", refresh=False)
 
         self._pending_clipguard_migration = bool(conf.get('clipguard'))
         if self._pending_clipguard_migration and self.selected_mic:
             self._apply_pending_clipguard_migration()
-
-        if remove_missing_virtuals and runtime is not None:
-            for name in previous_virtuals:
-                if name in self.virtual_channels:
-                    continue
-                _, safe = PipeWireEngine._sanitize_channel_name(name)
-                runtime.remove_virtual_channel_sync(f"wavelinux_{safe}")
-        if runtime is not None:
-            for name in self.virtual_channels:
-                runtime.ensure_virtual_channel_sync(name)
 
         startup_mic = self._resolve_startup_mic_target()
         if startup_mic:
@@ -7267,13 +5885,46 @@ class WaveLinuxWindow(QMainWindow):
         mon_hw = self._resolve_startup_monitor_target()
         str_hw = conf.get('stream_hw')
         self._set_mix_output_target(
-            "Monitor", mon_hw, persist=False, update_combo=True, sync_runtime=True
+            "Monitor",
+            mon_hw,
+            persist=False,
+            update_combo=True,
+            sync_runtime=True,
+            sync_runtime_refresh=False,
         )
         self._record_preferred_monitor(mon_hw, view=self.__dict__.get("_runtime_view_state"))
         self._set_mix_output_target(
-            "Stream", str_hw, persist=False, update_combo=True, sync_runtime=True
+            "Stream",
+            str_hw,
+            persist=False,
+            update_combo=True,
+            sync_runtime=True,
+            sync_runtime_refresh=False,
         )
-        self._sync_runtime_persistent_state()
+        if remove_missing_virtuals and runtime is not None:
+            for name in previous_virtuals:
+                if name in self.virtual_channels:
+                    continue
+                _, safe = PipeWireEngine._sanitize_channel_name(name)
+                runtime.remove_virtual_channel_sync(f"wavelinux_{safe}", refresh=False)
+        if runtime is not None:
+            for name in self.virtual_channels:
+                runtime.ensure_virtual_channel_sync(name, refresh=False)
+        # Materialize config-backed virtual sinks before the immediate
+        # startup reconcile. Otherwise startup can spend several seconds
+        # bringing up the selected mic FX/default-source path while the
+        # app buses do not exist yet, and routed playback opens into a
+        # silent graph.
+        self._sync_runtime_persistent_state(immediate=True)
+        if runtime is not None:
+            self._request_runtime_refresh("post-config-virtual-sync")
+        config = self._serialize_config()
+        event_bus = self.__dict__.get("_event_bus")
+        if event_bus is not None:
+            event_bus.publish(ConfigChanged(config=config))
+        manager = self.__dict__.get("module_manager")
+        if manager is not None:
+            manager.on_config_changed(config)
 
     def load_config(self):
         if not os.path.exists(self.config_path):
@@ -7282,8 +5933,8 @@ class WaveLinuxWindow(QMainWindow):
             self._onboarding_completed = False
             self._selected_setup_template = ""
             self._show_first_run_setup = True
-            self.runtime.ensure_output_mix_sync("Monitor")
-            self.runtime.ensure_output_mix_sync("Stream")
+            self.runtime.ensure_output_mix_sync("Monitor", refresh=False)
+            self.runtime.ensure_output_mix_sync("Stream", refresh=False)
             startup_mic = self._resolve_startup_mic_target()
             if startup_mic:
                 self._set_selected_mic_target(
@@ -7296,10 +5947,16 @@ class WaveLinuxWindow(QMainWindow):
             def_sink = self._resolve_startup_monitor_target()
             if def_sink:
                 self._set_mix_output_target(
-                    "Monitor", def_sink, persist=False, update_combo=True, sync_runtime=True
+                    "Monitor",
+                    def_sink,
+                    persist=False,
+                    update_combo=True,
+                    sync_runtime=True,
+                    sync_runtime_refresh=False,
                 )
                 self._record_preferred_monitor(def_sink, view=self.__dict__.get("_runtime_view_state"))
             self._seed_default_channels()
+            self._sync_runtime_persistent_state(immediate=True)
             self.save_config()
             return
 
@@ -7348,7 +6005,14 @@ class WaveLinuxWindow(QMainWindow):
         # been replaced by the per-mic `limiter` effect.
         try:
             self._flush_pending_ui_state()
-            self._write_config_file(self.config_path, self._serialize_config())
+            config = self._serialize_config()
+            self._write_config_file(self.config_path, config)
+            event_bus = self.__dict__.get("_event_bus")
+            if event_bus is not None:
+                event_bus.publish(ConfigChanged(config=config))
+            manager = self.__dict__.get("module_manager")
+            if manager is not None:
+                manager.on_config_changed(config)
         except Exception as e:
             logging.error(f"Error saving config: {e}")
 
@@ -7526,23 +6190,7 @@ class WaveLinuxWindow(QMainWindow):
 
     def _relayout_channel_strips(self):
         """Re-home existing ChannelStrips in `channel_order`."""
-        widgets = list(self.channel_widgets.values())
-        for w in widgets:
-            self.input_layout.removeWidget(w)
-        name_to_widget = {w.node_name: w for w in widgets if w.node_name}
-        ordered_names = sorted(
-            list(name_to_widget.keys()),
-            key=lambda nm: self._input_display_sort_key(
-                nm,
-                is_mic=bool(getattr(name_to_widget.get(nm), "is_mic", False)),
-            ),
-        )
-        for nm in ordered_names:
-            w = name_to_widget.pop(nm, None)
-            if w is not None:
-                self.input_layout.addWidget(w)
-        self._rescale_strips()
-        self.inputs_container.adjustSize()
+        self._mixer_panel_controller().relayout_channel_strips()
 
     def rename_channel(self, old_node_name):
         """Rename a user-created virtual channel. Hardware mic
@@ -7663,9 +6311,24 @@ class WaveLinuxWindow(QMainWindow):
         """Show a tray bubble (if available) so the user knows WaveLinux saw
         a device come or go — the refresh loop already rebuilds routes, but
         silence here is confusing."""
+        view = self.__dict__.get("_runtime_view_state")
+        pretty_names = []
+        for node_name in list(node_names)[:3]:
+            source_label = self._display_name_for_source_name(node_name, view=view)
+            if source_label and source_label != node_name:
+                pretty_names.append(source_label)
+                continue
+            sink_label = self._display_name_for_sink_name(node_name, view=view)
+            if sink_label and sink_label != node_name:
+                pretty_names.append(sink_label)
+                continue
+            pretty_names.append(
+                PipeWireEngine.friendly_name(
+                    node_name.replace("wavelinux_", "").replace("_", " ")
+                )
+            )
         pretty = ", ".join(
-            PipeWireEngine.friendly_name(n.replace("wavelinux_", "").replace("_", " "))
-            for n in list(node_names)[:3]
+            pretty_names
         )
         suffix = "" if len(node_names) <= 3 else f" (+{len(node_names) - 3} more)"
         if added:
@@ -7712,7 +6375,7 @@ class WaveLinuxWindow(QMainWindow):
 
         menu.addSeparator()
         quit_act = QAction("Quit WaveLinux", self)
-        quit_act.triggered.connect(self._quit_app)
+        quit_act.triggered.connect(self._request_quit_app)
         menu.addAction(quit_act)
 
         self.tray.setContextMenu(menu)
@@ -7735,46 +6398,94 @@ class WaveLinuxWindow(QMainWindow):
         super().showEvent(event)
         QTimer.singleShot(0, self._refresh)
 
+    def _request_quit_app(self):
+        if getattr(self, "_quit_in_progress", False):
+            return
+        self._quit_in_progress = True
+        self._shutting_down = True
+        self._suppress_pactl_events_for(3.0)
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText("Shutting down WaveLinux...")
+        self._close_open_dialogs_for_quit()
+        if self.tray is not None:
+            self.tray.hide()
+        self.setEnabled(False)
+        QTimer.singleShot(0, self._quit_app)
+
     def closeEvent(self, event):
         """Minimize to tray when one is available; otherwise actually quit."""
+        if getattr(self, "_quit_in_progress", False):
+            event.accept()
+            return
         if self.tray is not None and self.tray.isVisible():
             event.ignore()
             self.hide()
             return
-        self._quit_app()
+        self._request_quit_app()
         event.accept()
 
+    def _close_open_dialogs_for_quit(self):
+        app = QApplication.instance()
+        if app is None:
+            return
+        for widget in list(app.topLevelWidgets()):
+            if widget is None or widget is self:
+                continue
+            if isinstance(widget, QDialog):
+                try:
+                    widget.hide()
+                    widget.done(QDialog.DialogCode.Rejected)
+                    widget.close()
+                except Exception:
+                    pass
+
     def _stop_all_meters(self):
-        for meter in list(self.meters.values()):
-            meter.stop()
-        self.meters.clear()
+        self._mixer_panel_controller().stop_all_meters()
 
     def _quit_app(self):
         """Cleanly save state, unload all modules, and exit."""
+        if getattr(self, "_runtime_stopped", False):
+            QApplication.instance().quit()
+            return
         logging.info("Shutting down WaveLinux...")
         self._shutting_down = True
+        manager = getattr(self, "module_manager", None)
+        if manager is not None:
+            manager.stop_all("app-quit")
         self.refresh_timer.stop()
         self._save_timer.stop()
         self._event_refresh_timer.stop()
+        self._event_proc_restart_timer.stop()
         self._device_settle_refresh_timer.stop()
         self._bluetooth_refresh_timer.stop()
+        runtime_view_timer = getattr(self, "_runtime_view_refresh_timer", None)
+        if runtime_view_timer is not None:
+            runtime_view_timer.stop()
+        mic_cutover_timer = getattr(self, "_mic_cutover_refresh_timer", None)
+        if mic_cutover_timer is not None:
+            mic_cutover_timer.stop()
         # Stop every parec meter subprocess.
         self._stop_all_meters()
         # Flush any pending slider writes before we tear down the engine.
         self.save_config()
         proc = getattr(self, "_event_proc", None)
         if proc is not None and proc.state() != QProcess.ProcessState.NotRunning:
-            proc.kill()
-            proc.waitForFinished(500)
+            proc.terminate()
+            if not proc.waitForFinished(300):
+                proc.kill()
+                proc.waitForFinished(500)
         self._clear_runtime_pid()
-        self.runtime.full_audio_reset_sync()
+        self.runtime.full_audio_reset_sync(refresh=False)
         self.runtime.shutdown()
+        self._runtime_stopped = True
         logging.info("Audio reset complete. Exiting.")
         QApplication.instance().quit()
 
     def _cleanup_before_exit(self):
+        self._stop_stress_control()
         self._clear_runtime_pid()
-        self.runtime.cleanup_sync()
+        if not getattr(self, "_runtime_stopped", False):
+            self.runtime.cleanup_sync()
 
 
 # ── Entry Point ────────────────────────────────────────────────────

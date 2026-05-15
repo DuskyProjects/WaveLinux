@@ -42,6 +42,7 @@ class FakeEngine:
         self.mute_calls = []
         self.source_volume_calls = []
         self.default_source_calls = []
+        self.default_sink_calls = []
         self.cleared = False
         self.submix_loopbacks = {}
         self.submix_sources = {}
@@ -105,8 +106,13 @@ class FakeEngine:
         self.last_fx = (node_name, capture_target, list(effects), dict(params_map))
         return dict(self.fx_apply_result)
 
-    def clear_channel_fx_transaction(self, node_name):
+    def clear_channel_fx_transaction(self, node_name, target_source=None, keep_proxy=False):
         self.cleared = True
+        self.clear_args = {
+            "node_name": node_name,
+            "target_source": target_source,
+            "keep_proxy": keep_proxy,
+        }
         return dict(self.fx_clear_result)
 
     def route_input_to_submix(self, node_id, node_name, media_class, mix_name,
@@ -127,6 +133,23 @@ class FakeEngine:
 
     def set_default_source(self, source_name):
         self.default_source_calls.append(source_name)
+
+    def resolve_hardware_sink_name(self, sink_name):
+        return sink_name
+
+    def set_default_sink(self, sink_name):
+        self.default_sink_calls.append(sink_name)
+
+    def route_mix_to_hardware(self, mix_name, sink_name):
+        self.output_mixes.setdefault(mix_name, SimpleNamespace(sink_name=f"wavelinux_mix_{mix_name.lower()}"))
+        self.output_mixes[mix_name].hardware_output = sink_name
+        return True
+
+    def unroute_mix_from_hardware(self, mix_name):
+        mix = self.output_mixes.get(mix_name)
+        if mix is not None:
+            mix.hardware_output = None
+        return True
 
 
 class RuntimeExecutorTests(unittest.TestCase):
@@ -216,6 +239,7 @@ class RuntimeExecutorTests(unittest.TestCase):
         )
 
         self.assertTrue(engine.cleared)
+        self.assertTrue(engine.clear_args["keep_proxy"])
         self.assertEqual(engine.route_calls, [])
 
     def test_set_default_source_calls_engine(self):
@@ -225,6 +249,71 @@ class RuntimeExecutorTests(unittest.TestCase):
         executor._set_default_source({"source_name": "wavelinux.fx.mic.source"})
 
         self.assertEqual(engine.default_source_calls, ["wavelinux.fx.mic.source"])
+
+    def test_set_default_sink_calls_engine(self):
+        engine = FakeEngine()
+        executor = RuntimeExecutor(FakeAdapter(engine), DummyDiagnostics())
+
+        executor._set_default_sink({"sink_name": "alsa_output.speakers"})
+
+        self.assertEqual(engine.default_sink_calls, ["alsa_output.speakers"])
+
+    def test_set_mix_hardware_route_updates_default_sink_for_monitor(self):
+        engine = FakeEngine()
+        executor = RuntimeExecutor(FakeAdapter(engine), DummyDiagnostics())
+
+        executor._set_mix_hardware_route(
+            {"mix_name": "Monitor", "sink_name": "bluez_output.headset"}
+        )
+
+        self.assertEqual(
+            getattr(engine.output_mixes["Monitor"], "hardware_output", None),
+            "bluez_output.headset",
+        )
+        self.assertEqual(engine.default_sink_calls, ["bluez_output.headset"])
+
+    def test_set_mix_hardware_route_does_not_update_default_sink_for_stream(self):
+        engine = FakeEngine()
+        executor = RuntimeExecutor(FakeAdapter(engine), DummyDiagnostics())
+
+        executor._set_mix_hardware_route(
+            {"mix_name": "Stream", "sink_name": "alsa_output.stream"}
+        )
+
+        self.assertEqual(
+            getattr(engine.output_mixes["Stream"], "hardware_output", None),
+            "alsa_output.stream",
+        )
+        self.assertEqual(engine.default_sink_calls, [])
+
+    def test_set_mix_hardware_route_uses_fallback_route_for_default_sink(self):
+        class _FallbackEngine(FakeEngine):
+            def route_mix_to_hardware(self, mix_name, sink_name):
+                self.output_mixes.setdefault(
+                    mix_name,
+                    SimpleNamespace(sink_name=f"wavelinux_mix_{mix_name.lower()}"),
+                )
+                self.output_mixes[mix_name].hardware_output = "alsa_output.speakers"
+                return True
+
+            def get_live_mix_hardware_route(self, mix_name, snap=None):
+                return "alsa_output.speakers"
+
+            def resolve_hardware_sink_name(self, sink_name):
+                return sink_name if sink_name == "alsa_output.speakers" else None
+
+        engine = _FallbackEngine()
+        executor = RuntimeExecutor(FakeAdapter(engine), DummyDiagnostics())
+
+        executor._set_mix_hardware_route(
+            {"mix_name": "Monitor", "sink_name": "bluez_output.headset"}
+        )
+
+        self.assertEqual(
+            getattr(engine.output_mixes["Monitor"], "hardware_output", None),
+            "alsa_output.speakers",
+        )
+        self.assertEqual(engine.default_sink_calls, ["alsa_output.speakers"])
 
     def test_check_invariants_flags_effect_mismatch(self):
         desired = DesiredState(

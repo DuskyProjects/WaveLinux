@@ -97,7 +97,6 @@ QFrame#channelStrip {
     background: rgba(22,21,36,0.85);
     border: 1px solid rgba(255,255,255,0.06);
     border-radius: 14px;
-    padding: 6px 6px;
 }
 QFrame#channelStrip[degraded="true"] {
     background: rgba(44,20,28,0.92);
@@ -545,6 +544,18 @@ QFrame#divider {
 QScrollArea#centralScroll {
     border: none;
     background: transparent;
+}
+QScrollArea#inputsScroll {
+    border: none;
+    background: transparent;
+}
+QWidget#inputsViewport {
+    background: #12111f;
+    border: none;
+}
+QWidget#inputsContainer {
+    background: transparent;
+    border: none;
 }
 QScrollBar:horizontal {
     background: transparent;

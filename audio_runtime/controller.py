@@ -215,6 +215,35 @@ class AudioRuntimeController(QObject):
 
     view_state_changed = pyqtSignal(object)
     fx_status_changed = pyqtSignal(object)
+    _SYNC_CONVERGENCE_HEALTH_CODES = frozenset({
+        "submix_monitor_missing",
+        "submix_stream_missing",
+        "submix_monitor_dead",
+        "submix_stream_dead",
+        "default_source_mismatch",
+        "default_source_expected_fx_missing",
+        "desired_fx_missing",
+        "fx_source_not_present",
+    })
+
+    @staticmethod
+    def _resolved_monitor_default_sink(engine, requested_sink, *, mix_name="Monitor"):
+        resolved_sink = None
+        if hasattr(engine, "get_live_mix_hardware_route"):
+            resolved_sink = engine.get_live_mix_hardware_route(mix_name)
+        if not resolved_sink:
+            mix = getattr(engine, "output_mixes", {}).get(mix_name)
+            resolved_sink = getattr(mix, "hardware_output", None)
+        if hasattr(engine, "resolve_hardware_sink_name"):
+            resolved_sink = engine.resolve_hardware_sink_name(resolved_sink) or resolved_sink
+            if not resolved_sink:
+                resolved_sink = (
+                    engine.resolve_hardware_sink_name(requested_sink)
+                    or requested_sink
+                )
+        elif not resolved_sink:
+            resolved_sink = requested_sink
+        return str(resolved_sink or "").strip()
 
     def __init__(self, adapter, parent=None):
         super().__init__(parent)
@@ -338,7 +367,7 @@ class AudioRuntimeController(QObject):
     def set_mix_hardware_route(self, mix_name, sink_name):
         self.enqueue_intent(SetMixHardwareRoute(mix_name=mix_name, sink_name=sink_name))
 
-    def set_mix_hardware_route_sync(self, mix_name, sink_name):
+    def set_mix_hardware_route_sync(self, mix_name, sink_name, *, refresh=True):
         with self._worker.state_lock:
             mix = self._worker.desired_state.mixes.setdefault(
                 mix_name,
@@ -350,44 +379,52 @@ class AudioRuntimeController(QObject):
                 if sink_name:
                     out = engine.route_mix_to_hardware(mix_name, sink_name)
                     if out and mix_name == "Monitor" and hasattr(engine, "set_default_sink"):
-                        resolved_sink = engine.resolve_hardware_sink_name(sink_name) or sink_name
+                        resolved_sink = self._resolved_monitor_default_sink(
+                            engine,
+                            sink_name,
+                            mix_name=mix_name,
+                        )
                         if resolved_sink:
                             engine.set_default_sink(resolved_sink)
                 else:
                     out = engine.unroute_mix_from_hardware(mix_name)
-        self.refresh_now(f"set-mix-hardware-route:{mix_name}")
+        if refresh:
+            self.refresh_now(f"set-mix-hardware-route:{mix_name}")
         return out
 
     def set_mix_volume(self, mix_name, volume):
         self.enqueue_intent(SetMixVolume(mix_name=mix_name, volume=float(volume)))
 
-    def ensure_output_mix_sync(self, mix_name):
+    def ensure_output_mix_sync(self, mix_name, *, refresh=True):
         with self._worker.state_lock:
             self._worker.desired_state.mixes.setdefault(mix_name, MixSpec(name=mix_name))
             with self.adapter.session() as engine:
                 out = engine.create_output_mix(mix_name)
-        self.refresh_now(f"ensure-output-mix:{mix_name}")
+        if refresh:
+            self.refresh_now(f"ensure-output-mix:{mix_name}")
         return out
 
-    def ensure_virtual_channel_sync(self, display_name):
+    def ensure_virtual_channel_sync(self, display_name, *, refresh=True):
         with self._worker.state_lock:
             with self.adapter.session() as engine:
                 out = engine.create_virtual_sink(display_name)
             if out:
                 self._worker.desired_state.virtual_channels[out] = display_name
-        self.refresh_now(f"ensure-virtual-channel:{display_name}")
+        if refresh:
+            self.refresh_now(f"ensure-virtual-channel:{display_name}")
         return out
 
-    def remove_virtual_channel_sync(self, sink_name):
+    def remove_virtual_channel_sync(self, sink_name, *, refresh=True):
         with self._worker.state_lock:
             self._drop_channel_state(sink_name)
             self._worker.desired_state.virtual_channels.pop(sink_name, None)
             with self.adapter.session() as engine:
                 out = engine.remove_virtual_sink(sink_name)
-        self.refresh_now(f"remove-virtual-channel:{sink_name}")
+        if refresh:
+            self.refresh_now(f"remove-virtual-channel:{sink_name}")
         return out
 
-    def rename_virtual_channel_sync(self, old_sink_name, new_display_name):
+    def rename_virtual_channel_sync(self, old_sink_name, new_display_name, *, refresh=True):
         with self._worker.state_lock:
             with self.adapter.session() as engine:
                 out = engine.rename_virtual_sink(old_sink_name, new_display_name)
@@ -395,15 +432,17 @@ class AudioRuntimeController(QObject):
                 self._worker.desired_state.virtual_channels.pop(old_sink_name, None)
                 self._worker.desired_state.virtual_channels[out] = new_display_name
                 self._rename_channel_state(old_sink_name, out)
-        self.refresh_now(f"rename-virtual-channel:{old_sink_name}")
+        if refresh:
+            self.refresh_now(f"rename-virtual-channel:{old_sink_name}")
         return out
 
-    def full_audio_reset_sync(self):
+    def full_audio_reset_sync(self, *, refresh=True):
         with self._worker.state_lock:
             with self.adapter.session() as engine:
                 engine.full_audio_reset()
             self._reset_runtime_state()
-        self.refresh_now("full-audio-reset")
+        if refresh:
+            self.refresh_now("full-audio-reset")
 
     def cleanup_sync(self):
         with self._worker.state_lock:
@@ -433,10 +472,85 @@ class AudioRuntimeController(QObject):
         self._desired_selected_mic = node_name
         self.enqueue_intent(SetSelectedMic(node_name=node_name))
 
+    def _reconcile_refresh_sync(self, reason="sync-persistent-state"):
+        intent = RefreshNow(reason=reason)
+        max_passes = 4 if reason == "sync-persistent-state" else 1
+        with self._worker.state_lock:
+            self._worker._mark_pending(intent, active=True)
+            try:
+                observed = None
+                for pass_index in range(max_passes):
+                    observed = self._worker.executor.observe(self._worker.desired_state)
+                    observed.stale_channel_ids = {
+                        name: old_id
+                        for name, old_id in self._worker._last_observed_channel_ids.items()
+                        if observed.channel_ids_by_name.get(name) != old_id
+                    }
+                    self._worker._last_observed_channel_ids = dict(observed.channel_ids_by_name)
+                    actions = self._worker.planner.reconcile(
+                        self._worker.desired_state,
+                        observed,
+                        intent,
+                    )
+                    observed = self._worker.executor.execute(
+                        actions,
+                        desired_state=self._worker.desired_state,
+                        observed_state=observed,
+                        status_callback=self._worker._handle_status,
+                    )
+                    if pass_index + 1 >= max_passes:
+                        break
+                    if not self._sync_observed_requires_followup(observed):
+                        break
+            finally:
+                self._worker._mark_pending(intent, active=False)
+                self._worker._clear_refresh_pending()
+            self._worker._last_observed_state = observed
+            self._latest_view_state = self._worker.executor.build_view_state(
+                self._worker.desired_state,
+                observed,
+                self._worker._fx_statuses,
+                self._worker._pending_operations,
+            )
+        self.view_state_changed.emit(self._latest_view_state)
+
+    def _sync_observed_requires_followup(self, observed):
+        desired = self._worker.desired_state
+        observed_mix_names = set((getattr(observed, "mix_hardware_routes", {}) or {}).keys())
+        if any(mix_name not in observed_mix_names for mix_name in desired.mixes.keys()):
+            return True
+
+        desired_virtual_names = set((desired.virtual_channels or {}).keys())
+        observed_virtual_names = {
+            str(getattr(view, "name", "") or "").strip()
+            for view in (getattr(observed, "virtual_channels", []) or [])
+        }
+        if desired_virtual_names - observed_virtual_names:
+            return True
+
+        selected_mic = str(getattr(desired, "selected_mic", "") or "").strip()
+        if selected_mic:
+            observed_mic_names = {
+                str(getattr(view, "name", "") or "").strip()
+                for view in (getattr(observed, "mic_inputs", []) or [])
+            }
+            if selected_mic not in observed_mic_names:
+                return True
+
+        managed_names = set(desired_virtual_names)
+        if selected_mic:
+            managed_names.add(selected_mic)
+        health = getattr(observed, "health", {}) or {}
+        for node_name in managed_names:
+            code = str(health.get(node_name) or "").strip()
+            if code in self._SYNC_CONVERGENCE_HEALTH_CODES:
+                return True
+        return False
+
     def sync_persistent_state(self, *, selected_mic, submix_state, active_effects,
                               effect_params, app_routing, app_volumes, virtual_channels,
                               monitor_hw, stream_hw, monitor_mix_volume=1.0,
-                              stream_mix_volume=1.0):
+                              stream_mix_volume=1.0, apply_now=False):
         with self._worker.state_lock:
             desired = self._worker.desired_state
             desired.selected_mic = selected_mic
@@ -502,6 +616,8 @@ class AudioRuntimeController(QObject):
                 new_channels[node_name] = chan
             desired.channels = new_channels
             self._desired_selected_mic = selected_mic
+        if apply_now:
+            self._reconcile_refresh_sync("sync-persistent-state")
 
     def refresh_now(self, reason=""):
         self.enqueue_intent(RefreshNow(reason=reason))

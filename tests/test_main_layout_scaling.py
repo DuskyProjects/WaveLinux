@@ -10,27 +10,41 @@ from main import ChannelStrip, WaveLinuxWindow
 
 
 class _FakeMargins:
-    def __init__(self, left=4, right=4):
+    def __init__(self, left=2, top=2, right=2, bottom=2):
         self._left = left
+        self._top = top
         self._right = right
+        self._bottom = bottom
 
     def left(self):
         return self._left
 
+    def top(self):
+        return self._top
+
     def right(self):
         return self._right
 
+    def bottom(self):
+        return self._bottom
+
 
 class _FakeLayout:
-    def __init__(self, spacing=10, left=4, right=4):
+    def __init__(self, spacing=2, left=2, top=2, right=2, bottom=2):
         self._spacing = spacing
-        self._margins = _FakeMargins(left=left, right=right)
+        self._margins = _FakeMargins(left=left, top=top, right=right, bottom=bottom)
 
     def spacing(self):
         return self._spacing
 
+    def setSpacing(self, spacing):
+        self._spacing = spacing
+
     def contentsMargins(self):
         return self._margins
+
+    def setContentsMargins(self, left, top, right, bottom):
+        self._margins = _FakeMargins(left=left, top=top, right=right, bottom=bottom)
 
 
 class _FakeViewport:
@@ -52,16 +66,23 @@ class _FakeViewport:
 class _FakeScroll:
     def __init__(self, width, height):
         self._viewport = _FakeViewport(width, height)
-        self._policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        self._h_policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        self._v_policy = Qt.ScrollBarPolicy.ScrollBarAlwaysOff
 
     def viewport(self):
         return self._viewport
 
     def setHorizontalScrollBarPolicy(self, policy):
-        self._policy = policy
+        self._h_policy = policy
 
     def horizontalScrollBarPolicy(self):
-        return self._policy
+        return self._h_policy
+
+    def setVerticalScrollBarPolicy(self, policy):
+        self._v_policy = policy
+
+    def verticalScrollBarPolicy(self):
+        return self._v_policy
 
 
 class MixerLayoutScalingTests(unittest.TestCase):
@@ -136,6 +157,16 @@ class MixerLayoutScalingTests(unittest.TestCase):
             all(strip.width() == win._MIN_STRIP_W for strip in win.channel_widgets.values())
         )
 
+    def test_rescale_keeps_card_gap_tight(self):
+        win = self._window(1400, 620, strip_count=6)
+
+        win._rescale_strips()
+
+        self.assertLessEqual(win.input_layout.spacing(), 3)
+        margins = win.input_layout.contentsMargins()
+        self.assertLessEqual(margins.left(), 3)
+        self.assertLessEqual(margins.right(), 3)
+
     def test_rescale_compacts_strip_and_slider_height_when_viewport_shortens(self):
         win = self._window(1400, 620, strip_count=6)
 
@@ -151,6 +182,20 @@ class MixerLayoutScalingTests(unittest.TestCase):
         short_strip = next(iter(win.channel_widgets.values()))
         self.assertLess(short_strip.height(), tall_strip_height)
         self.assertLess(short_strip.mon_slider.height(), tall_slider_height)
+
+    def test_rescale_uses_vertical_scroll_only_after_minimum_compaction(self):
+        win = self._window(1400, 180, strip_count=6)
+
+        win._rescale_strips()
+        self._app.processEvents()
+
+        self.assertEqual(
+            win.inputs_scroll.verticalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+        )
+        self.assertTrue(
+            all(strip.mon_slider.height() <= 48 for strip in win.channel_widgets.values())
+        )
 
     def test_rescale_is_idempotent_for_same_viewport(self):
         win = self._window(1280, 420, strip_count=5)

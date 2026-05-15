@@ -24,6 +24,25 @@ class RuntimeExecutor:
         "set_submix_state",
     }
 
+    @staticmethod
+    def _resolved_monitor_default_sink(engine, requested_sink, *, mix_name="Monitor"):
+        resolved_sink = None
+        if hasattr(engine, "get_live_mix_hardware_route"):
+            resolved_sink = engine.get_live_mix_hardware_route(mix_name)
+        if not resolved_sink:
+            mix = getattr(engine, "output_mixes", {}).get(mix_name)
+            resolved_sink = getattr(mix, "hardware_output", None)
+        if hasattr(engine, "resolve_hardware_sink_name"):
+            resolved_sink = engine.resolve_hardware_sink_name(resolved_sink) or resolved_sink
+            if not resolved_sink:
+                resolved_sink = (
+                    engine.resolve_hardware_sink_name(requested_sink)
+                    or requested_sink
+                )
+        elif not resolved_sink:
+            resolved_sink = requested_sink
+        return str(resolved_sink or "").strip()
+
     def __init__(self, adapter, diagnostics):
         self.adapter = adapter
         self.diagnostics = diagnostics
@@ -200,6 +219,8 @@ class RuntimeExecutor:
                 self._set_mix_volume(payload)
             elif kind == "set_source_volume":
                 self._set_source_volume(payload)
+            elif kind == "set_default_sink":
+                self._set_default_sink(payload)
             elif kind == "set_default_source":
                 self._set_default_source(payload)
             elif kind == "set_app_route":
@@ -422,7 +443,14 @@ class RuntimeExecutor:
             ),
         )
         with self.adapter.session() as engine:
-            result = engine.clear_channel_fx_transaction(node_name)
+            keep_proxy = bool(
+                node_name
+                and node_name == getattr(desired_state, "selected_mic", None)
+            )
+            result = engine.clear_channel_fx_transaction(
+                node_name,
+                keep_proxy=keep_proxy,
+            )
         if not result.get("success"):
             bundle = self.diagnostics.export_failure(
                 "fx_clear_verification_failed",
@@ -497,7 +525,19 @@ class RuntimeExecutor:
     def _set_mix_hardware_route(self, payload):
         with self.adapter.session() as engine:
             if payload["sink_name"]:
-                engine.route_mix_to_hardware(payload["mix_name"], payload["sink_name"])
+                out = engine.route_mix_to_hardware(payload["mix_name"], payload["sink_name"])
+                if (
+                    out
+                    and payload["mix_name"] == "Monitor"
+                    and hasattr(engine, "set_default_sink")
+                ):
+                    resolved_sink = self._resolved_monitor_default_sink(
+                        engine,
+                        payload["sink_name"],
+                        mix_name=payload["mix_name"],
+                    )
+                    if resolved_sink:
+                        engine.set_default_sink(resolved_sink)
             else:
                 engine.unroute_mix_from_hardware(payload["mix_name"])
 
@@ -513,6 +553,13 @@ class RuntimeExecutor:
             return
         with self.adapter.session() as engine:
             engine.set_source_volume_by_name(node_name, payload["volume"])
+
+    def _set_default_sink(self, payload):
+        sink_name = payload.get("sink_name")
+        if not sink_name:
+            return
+        with self.adapter.session() as engine:
+            engine.set_default_sink(sink_name)
 
     def _set_default_source(self, payload):
         source_name = payload.get("source_name")
@@ -692,7 +739,10 @@ class RuntimeExecutor:
         )
         fx_source = observed.fx_sources_by_channel.get(node_name)
         if is_mic:
-            label = engine.friendly_name(node.description)
+            if hasattr(engine, "display_name_for_source"):
+                label = engine.display_name_for_source(node, snap=observed.snapshot)
+            else:
+                label = engine.friendly_name(node.description)
             channel_type = "Microphone"
             icon = "🎤"
             capture_target = node_name

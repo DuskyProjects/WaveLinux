@@ -49,14 +49,14 @@ class _FakeRuntime:
         self.set_mix_hardware_sync_calls = []
         self.sync_calls = []
 
-    def ensure_virtual_channel_sync(self, name):
+    def ensure_virtual_channel_sync(self, name, *, refresh=True):
         self.ensure_virtual_channel_calls.append(name)
         return name
 
-    def remove_virtual_channel_sync(self, sink_name):
+    def remove_virtual_channel_sync(self, sink_name, *, refresh=True):
         self.remove_virtual_channel_calls.append(sink_name)
 
-    def ensure_output_mix_sync(self, mix_name):
+    def ensure_output_mix_sync(self, mix_name, *, refresh=True):
         self.ensure_output_mix_calls.append(mix_name)
 
     def set_selected_mic(self, node_name):
@@ -65,7 +65,7 @@ class _FakeRuntime:
     def set_mix_hardware_route(self, mix_name, sink_name):
         self.set_mix_hardware_calls.append((mix_name, sink_name))
 
-    def set_mix_hardware_route_sync(self, mix_name, sink_name):
+    def set_mix_hardware_route_sync(self, mix_name, sink_name, *, refresh=True):
         self.set_mix_hardware_sync_calls.append((mix_name, sink_name))
 
     def sync_persistent_state(self, **kwargs):

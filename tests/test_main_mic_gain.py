@@ -93,8 +93,8 @@ class ChannelStripMicGainTests(unittest.TestCase):
 
         self.assertLess(strip.height(), tall_height)
         self.assertLess(strip.mon_slider.height(), tall_slider)
-        self.assertEqual(strip.mon_slider.height(), 102)
-        self.assertEqual(strip.str_slider.height(), 102)
+        self.assertEqual(strip.mon_slider.height(), 98)
+        self.assertEqual(strip.str_slider.height(), 98)
 
     def test_mic_and_virtual_strips_share_the_same_scaled_card_height(self):
         mic = ChannelStrip("55", "mic", "Mic", "Microphone", "mic", engine=None)

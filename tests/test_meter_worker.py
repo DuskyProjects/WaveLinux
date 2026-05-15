@@ -22,6 +22,14 @@ class MeterWorkerTests(unittest.TestCase):
         self.assertGreater(first, 0.99)
         self.assertAlmostEqual(second, first * 0.6, places=3)
 
+    def test_take_latest_frame_discards_stale_full_frames(self):
+        buf = bytearray(b"aaaabbbbccccZ")
+
+        frame = MeterWorker._take_latest_frame(buf, 4)
+
+        self.assertEqual(frame, b"cccc")
+        self.assertEqual(buf, bytearray(b"Z"))
+
 
 if __name__ == "__main__":
     unittest.main()

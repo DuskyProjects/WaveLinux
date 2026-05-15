@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from audio_runtime.controller import AudioRuntimeController
 from audio_runtime.models import (
+    Action,
     ChannelSpec,
     DesiredState,
     OperationStatus,
@@ -26,6 +27,8 @@ class RuntimeControllerStateTests(unittest.TestCase):
         controller._last_requested_fx = {}
         controller._fx_generations = {}
         controller._desired_selected_mic = None
+        controller.view_state_changed = SimpleNamespace(emit=lambda *args, **kwargs: None)
+        controller.fx_status_changed = SimpleNamespace(emit=lambda *args, **kwargs: None)
         return controller
 
     def test_drop_channel_state_clears_desired_and_fx_caches(self):
@@ -178,6 +181,7 @@ class RuntimeControllerStateTests(unittest.TestCase):
             [
                 ("create_output_mix", "Monitor"),
                 ("route_mix_to_hardware", "Monitor", "bluez_output.headset"),
+                ("resolve_hardware_sink_name", None),
                 ("resolve_hardware_sink_name", "bluez_output.headset"),
                 ("set_default_sink", "bluez_output.headset"),
                 ("refresh_now", "set-mix-hardware-route:Monitor"),
@@ -186,6 +190,93 @@ class RuntimeControllerStateTests(unittest.TestCase):
         self.assertEqual(
             controller._worker.desired_state.mixes["Monitor"].hardware_sink,
             "bluez_output.headset",
+        )
+
+    def test_set_mix_hardware_route_sync_uses_fallback_route_for_default_sink(self):
+        calls = []
+
+        class _Engine:
+            output_mixes = {
+                "Monitor": SimpleNamespace(hardware_output="alsa_output.speakers")
+            }
+
+            def create_output_mix(self, mix_name):
+                calls.append(("create_output_mix", mix_name))
+                return True
+
+            def route_mix_to_hardware(self, mix_name, sink_name):
+                calls.append(("route_mix_to_hardware", mix_name, sink_name))
+                self.output_mixes[mix_name].hardware_output = "alsa_output.speakers"
+                return True
+
+            def get_live_mix_hardware_route(self, mix_name):
+                calls.append(("get_live_mix_hardware_route", mix_name))
+                return "alsa_output.speakers"
+
+            def resolve_hardware_sink_name(self, sink_name):
+                calls.append(("resolve_hardware_sink_name", sink_name))
+                return sink_name if sink_name == "alsa_output.speakers" else None
+
+            def set_default_sink(self, sink_name):
+                calls.append(("set_default_sink", sink_name))
+
+        class _Session:
+            def __enter__(self_inner):
+                return _Engine()
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                return False
+
+        controller = self._controller()
+        controller._worker.state_lock = _Session()
+        controller._worker.desired_state = DesiredState()
+        controller.adapter = SimpleNamespace(session=lambda: _Session())
+        controller.refresh_now = lambda reason: calls.append(("refresh_now", reason))
+
+        result = controller.set_mix_hardware_route_sync(
+            "Monitor",
+            "bluez_output.headset",
+        )
+
+        self.assertTrue(result)
+        self.assertIn(("set_default_sink", "alsa_output.speakers"), calls)
+        self.assertNotIn(("set_default_sink", "bluez_output.headset"), calls)
+
+    def test_full_audio_reset_sync_can_skip_refresh(self):
+        calls = []
+
+        class _Engine:
+            def full_audio_reset(self):
+                calls.append(("full_audio_reset",))
+
+        class _Lock:
+            def __enter__(self_inner):
+                return None
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                return False
+
+        class _Session:
+            def __enter__(self_inner):
+                return _Engine()
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                return False
+
+        controller = self._controller()
+        controller._worker.state_lock = _Lock()
+        controller.adapter = SimpleNamespace(session=lambda: _Session())
+        controller._reset_runtime_state = lambda: calls.append(("reset_runtime_state",))
+        controller.refresh_now = lambda reason: calls.append(("refresh_now", reason))
+
+        controller.full_audio_reset_sync(refresh=False)
+
+        self.assertEqual(
+            calls,
+            [
+                ("full_audio_reset",),
+                ("reset_runtime_state",),
+            ],
         )
 
     def test_sync_persistent_state_persists_mix_master_volumes(self):
@@ -226,6 +317,116 @@ class RuntimeControllerStateTests(unittest.TestCase):
             controller._worker.desired_state.mixes["Stream"].master_volume,
             0.27,
         )
+
+    def test_sync_persistent_state_apply_now_reconciles_immediately(self):
+        controller = self._controller()
+
+        class _Lock:
+            def __enter__(self_inner):
+                return None
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                return False
+
+        calls = []
+        controller._worker.state_lock = _Lock()
+        controller._reconcile_refresh_sync = lambda reason: calls.append(reason)
+
+        controller.sync_persistent_state(
+            selected_mic="usb_mic",
+            submix_state={},
+            active_effects={},
+            effect_params={},
+            app_routing={},
+            app_volumes={},
+            virtual_channels={},
+            monitor_hw="alsa_output.headphones",
+            stream_hw="alsa_output.stream",
+            apply_now=True,
+        )
+
+        self.assertEqual(calls, ["sync-persistent-state"])
+
+    def test_reconcile_refresh_sync_runs_followup_passes_until_virtual_routes_exist(self):
+        controller = self._controller()
+
+        class _Lock:
+            def __enter__(self_inner):
+                return None
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                return False
+
+        observe_states = [
+            SimpleNamespace(
+                channel_ids_by_name={},
+                virtual_channels=[],
+                mic_inputs=[],
+                mix_hardware_routes={"Monitor": "sink", "Stream": "sink"},
+                health={},
+            ),
+            SimpleNamespace(
+                channel_ids_by_name={"wavelinux_music": "42"},
+                virtual_channels=[SimpleNamespace(name="wavelinux_music")],
+                mic_inputs=[],
+                mix_hardware_routes={"Monitor": "sink", "Stream": "sink"},
+                health={"wavelinux_music": "submix_monitor_missing"},
+            ),
+            SimpleNamespace(
+                channel_ids_by_name={"wavelinux_music": "42"},
+                virtual_channels=[SimpleNamespace(name="wavelinux_music")],
+                mic_inputs=[],
+                mix_hardware_routes={"Monitor": "sink", "Stream": "sink"},
+                health={},
+            ),
+        ]
+        action_batches = [
+            [Action("ensure_virtual_channel", {"sink_name": "wavelinux_music", "display_name": "Music"})],
+            [
+                Action("ensure_submix_route", {
+                    "node_id": "42",
+                    "node_name": "wavelinux_music",
+                    "media_class": "Audio/Sink",
+                    "mix_name": "Monitor",
+                    "initial_state": {},
+                }),
+                Action("ensure_submix_route", {
+                    "node_id": "42",
+                    "node_name": "wavelinux_music",
+                    "media_class": "Audio/Sink",
+                    "mix_name": "Stream",
+                    "initial_state": {},
+                }),
+            ],
+        ]
+        executed_batches = []
+        controller._worker.state_lock = _Lock()
+        controller._worker.desired_state.virtual_channels = {"wavelinux_music": "Music"}
+        controller._worker.desired_state.mixes["Monitor"] = SimpleNamespace()
+        controller._worker.desired_state.mixes["Stream"] = SimpleNamespace()
+        controller._worker._handle_status = lambda status: None
+        controller._worker._mark_pending = lambda intent, active: None
+        controller._worker._clear_refresh_pending = lambda: None
+        controller._worker.planner = SimpleNamespace(
+            reconcile=lambda desired_state, observed_state, intent: (
+                action_batches.pop(0) if action_batches else []
+            )
+        )
+        controller._worker.executor = SimpleNamespace(
+            observe=lambda desired_state: observe_states.pop(0),
+            execute=lambda actions, **kwargs: executed_batches.append(list(actions)) or kwargs["observed_state"],
+            build_view_state=lambda desired_state, observed_state, fx_statuses, pending: RuntimeViewState(),
+        )
+
+        controller._reconcile_refresh_sync("sync-persistent-state")
+
+        self.assertEqual(len(executed_batches), 3)
+        self.assertEqual([action.kind for action in executed_batches[0]], ["ensure_virtual_channel"])
+        self.assertEqual(
+            [action.kind for action in executed_batches[1]],
+            ["ensure_submix_route", "ensure_submix_route"],
+        )
+        self.assertEqual(executed_batches[2], [])
 
 
 if __name__ == "__main__":

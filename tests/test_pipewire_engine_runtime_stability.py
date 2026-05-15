@@ -18,6 +18,66 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         engine.rnnoise_processes = {}
         return engine
 
+    def test_rnnoise_params_include_grace_controls(self):
+        params = PipeWireEngine.get_effect_params("rnnoise")
+
+        self.assertEqual(
+            [entry[0] for entry in params],
+            [
+                "VAD Threshold (%)",
+                "VAD Grace Period (ms)",
+                "Retroactive VAD Grace (ms)",
+            ],
+        )
+
+    def test_resolved_rnnoise_params_fill_grace_defaults(self):
+        engine = self._engine()
+
+        resolved = engine._resolved_params("rnnoise", {"VAD Threshold (%)": 75.0})
+
+        self.assertEqual(resolved["VAD Threshold (%)"], 75.0)
+        self.assertEqual(resolved["VAD Grace Period (ms)"], 200.0)
+        self.assertEqual(resolved["Retroactive VAD Grace (ms)"], 0.0)
+
+    def test_ensure_fx_proxy_creates_mono_sink_and_source(self):
+        engine = self._engine()
+        run_calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            run_calls.append(cmd)
+            if cmd[:3] == ["pactl", "load-module", "module-null-sink"]:
+                return "501"
+            if cmd[:3] == ["pactl", "load-module", "module-virtual-source"]:
+                return "502"
+            return ""
+
+        engine._run = fake_run
+        engine._find_module_by_arg = lambda arg: None
+        engine.invalidate_snapshot = lambda: None
+        engine._wait_source_visible = lambda source_name, attempts=20, delay=0.05: source_name
+        engine.resolve_source_name = lambda source_name: source_name
+
+        proxy = engine._ensure_fx_proxy("mic")
+
+        self.assertIsNotNone(proxy)
+        self.assertIn("channels=1", run_calls[0])
+        self.assertIn("channel_map=mono", run_calls[0])
+        self.assertIn("channels=1", run_calls[3])
+        self.assertIn("channel_map=mono", run_calls[3])
+
+    def test_source_names_match_treats_output_alias_as_same_source(self):
+        engine = self._engine()
+        engine._source_id_to_name = lambda: {
+            "1": "output.wavelinux.fx.mic.source",
+        }
+
+        self.assertTrue(
+            engine._source_names_match(
+                "wavelinux.fx.mic.source",
+                "output.wavelinux.fx.mic.source",
+            )
+        )
+
     def test_route_mix_to_hardware_keeps_old_route_if_new_route_fails(self):
         engine = self._engine()
         mix = OutputMix("Monitor", sink_name="wavelinux_mix_monitor")
@@ -177,6 +237,22 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
 
         self.assertEqual(stable_id, "usb:abc123")
         self.assertEqual(resolved, "alsa_input.usb-renamed")
+
+    def test_display_name_for_source_prefers_device_label_over_profile_text(self):
+        engine = self._engine()
+        dji_mic = AudioNode(
+            145,
+            "alsa_input.usb-dji",
+            "Wireless Mic Rx Digital Stereo (IEC958)",
+            "Audio/Source",
+            props={
+                "device.description": "Wireless Mic Rx",
+                "node.nick": "Wireless Mic Rx",
+                "device.profile.description": "Digital Stereo (IEC958)",
+            },
+        )
+
+        self.assertEqual(engine.display_name_for_source(dji_mic), "Wireless Mic Rx")
 
     def test_route_input_to_submix_keeps_old_loopback_if_replacement_fails(self):
         engine = self._engine()
@@ -348,8 +424,8 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         )
         engine._fx_log_path = lambda safe_key, suffix: "/tmp/wavelinux-fx.log"
         engine._spawn_fx = lambda config_path, log_path, proc_key: True
-        engine._wait_source_visible = lambda source_name, attempts=20, delay=0.05: True
-        engine._wait_load_loopback = lambda source, sink: "300"
+        engine._wait_source_visible = lambda source_name, attempts=20, delay=0.05: source_name
+        engine._wait_load_loopback = lambda source, sink, **kwargs: "300"
         engine._create_submix_replacement = lambda source_name, mix_name, initial_state=None: (
             "401" if mix_name == "Monitor" else "402"
         )
@@ -359,7 +435,7 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
             "source_name": "wavelinux.fx.mic.source",
             "source_module_id": "502",
         }
-        engine._load_loopback_module = lambda source_name, sink_name, latency_msec=20: "301"
+        engine._load_loopback_module = lambda source_name, sink_name, latency_msec=20, **kwargs: "301"
         engine._module_is_alive = lambda module_id, short_text=None: True
         engine.get_default_source = lambda: current_default["value"]
         engine.set_default_source = lambda source_name: (
@@ -418,8 +494,8 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         )
         engine._fx_log_path = lambda safe_key, suffix: "/tmp/wavelinux-fx.log"
         engine._spawn_fx = lambda config_path, log_path, proc_key: True
-        engine._wait_source_visible = lambda source_name, attempts=20, delay=0.05: True
-        engine._wait_load_loopback = lambda source, sink: "300"
+        engine._wait_source_visible = lambda source_name, attempts=20, delay=0.05: source_name
+        engine._wait_load_loopback = lambda source, sink, **kwargs: "300"
         engine._snapshot_submix_bindings = lambda source_name: {}
         engine._ensure_fx_proxy = lambda safe_key: {
             "sink_name": "wavelinux.fx.mic.sink",
@@ -427,7 +503,7 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
             "source_name": "wavelinux.fx.mic.source",
             "source_module_id": "502",
         }
-        engine._load_loopback_module = lambda source_name, sink_name, latency_msec=20: "301"
+        engine._load_loopback_module = lambda source_name, sink_name, latency_msec=20, **kwargs: "301"
         engine._module_is_alive = lambda module_id, short_text=None: True
         engine.snapshot_external_source_outputs = lambda source_name, exclude_modules=None: ["900"]
         engine.invalidate_snapshot = lambda: None
@@ -470,6 +546,7 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
     def test_apply_channel_fx_exposes_stable_proxy_source(self):
         engine = self._engine()
         current_default = {"value": "mic"}
+        loopback_ids = iter(["300", "301"])
         engine._ordered_chain = lambda effects: effects
         engine.effect_available = lambda effect_id: True
         engine.invalidate_snapshot = lambda: None
@@ -484,15 +561,15 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         )
         engine._fx_log_path = lambda safe_key, suffix: "/tmp/wavelinux-fx.log"
         engine._spawn_fx = lambda config_path, log_path, proc_key: True
-        engine._wait_source_visible = lambda source_name, attempts=20, delay=0.05: True
-        engine._wait_load_loopback = lambda source, sink: "300"
+        engine._wait_source_visible = lambda source_name, attempts=20, delay=0.05: source_name
+        engine._wait_load_loopback = lambda source, sink, **kwargs: next(loopback_ids)
         engine._ensure_fx_proxy = lambda safe_key: {
             "sink_name": "wavelinux.fx.mic.sink",
             "sink_module_id": "501",
             "source_name": "wavelinux.fx.mic.source",
             "source_module_id": "502",
         }
-        engine._load_loopback_module = lambda source_name, sink_name, latency_msec=20: "301"
+        engine._load_loopback_module = lambda source_name, sink_name, latency_msec=20, **kwargs: "301"
         engine._module_is_alive = lambda module_id, short_text=None: True
         engine._snapshot_submix_bindings = lambda source_name: {}
         engine.snapshot_external_source_outputs = lambda source_name, exclude_modules=None: []
@@ -511,6 +588,68 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         self.assertEqual(engine.channel_fx["mic"]["source"], "wavelinux.fx.mic.source")
         self.assertEqual(engine.channel_fx["mic"]["active_chain_source"], "wavelinux.fx.chain.source")
         self.assertEqual(engine.channel_fx["mic"]["loopbacks"], ["300", "301"])
+
+    def test_apply_channel_fx_waits_for_proxy_feed_loopback(self):
+        engine = self._engine()
+        current_default = {"value": "mic"}
+        wait_calls = []
+        engine._ordered_chain = lambda effects: effects
+        engine.effect_available = lambda effect_id: True
+        engine.invalidate_snapshot = lambda: None
+        engine._safe_channel_key = lambda node_name: "mic"
+        engine._build_unified_chain_config = (
+            lambda safe_key, ordered, params_map, stamp: (
+                "/tmp/wavelinux-fx.conf",
+                "wavelinux.fx.chain.input",
+                "wavelinux.fx.chain.source",
+                ordered,
+            )
+        )
+        engine._fx_log_path = lambda safe_key, suffix: "/tmp/wavelinux-fx.log"
+        engine._spawn_fx = lambda config_path, log_path, proc_key: True
+        engine._wait_source_visible = lambda source_name, attempts=20, delay=0.05: source_name
+
+        def fake_wait_load_loopback(source_name, sink_name, **kwargs):
+            wait_calls.append(
+                (
+                    source_name,
+                    sink_name,
+                    kwargs.get("channels"),
+                    kwargs.get("channel_map"),
+                )
+            )
+            return "300" if len(wait_calls) == 1 else "301"
+
+        engine._wait_load_loopback = fake_wait_load_loopback
+        engine._ensure_fx_proxy = lambda safe_key: {
+            "sink_name": "wavelinux.fx.mic.sink",
+            "sink_module_id": "501",
+            "source_name": "wavelinux.fx.mic.source",
+            "source_module_id": "502",
+        }
+        engine._load_loopback_module = lambda *args, **kwargs: self.fail(
+            "proxy feed should use _wait_load_loopback so the sink-input gets normalized"
+        )
+        engine._module_is_alive = lambda module_id, short_text=None: True
+        engine._snapshot_submix_bindings = lambda source_name: {}
+        engine.snapshot_external_source_outputs = lambda source_name, exclude_modules=None: []
+        engine._move_known_source_outputs = lambda *args, **kwargs: True
+        engine.get_default_source = lambda: current_default["value"]
+        engine.set_default_source = lambda source_name: (
+            current_default.__setitem__("value", source_name),
+            True,
+        )[-1]
+
+        result = engine.apply_channel_fx_transaction("mic", "mic", ["rnnoise"], {})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(
+            wait_calls,
+            [
+                ("mic", "wavelinux.fx.chain.input", 1, "mono"),
+                ("wavelinux.fx.chain.source", "wavelinux.fx.mic.sink", 1, "mono"),
+            ],
+        )
 
     def test_apply_channel_fx_reuses_existing_proxy_source_on_live_update(self):
         engine = self._engine()
@@ -545,12 +684,15 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         )
         engine._fx_log_path = lambda safe_key, suffix: "/tmp/wavelinux-fx.log"
         engine._spawn_fx = lambda config_path, log_path, proc_key: True
-        engine._wait_source_visible = lambda source_name, attempts=20, delay=0.05: True
-        engine._wait_load_loopback = lambda source, sink: "300"
+        engine._wait_source_visible = lambda source_name, attempts=20, delay=0.05: source_name
+        engine._wait_load_loopback = lambda source, sink, **kwargs: "300"
         engine._load_loopback_module = lambda source_name, sink_name, latency_msec=20: "301"
         engine._module_is_alive = lambda module_id, short_text=None: True
         engine.get_default_source = lambda: "wavelinux.fx.mic.source"
-        engine.set_default_source = lambda source_name: True
+        engine.set_default_source = lambda source_name: (
+            current_default.__setitem__("value", source_name),
+            True,
+        )[-1]
         engine.stop_rnnoise = lambda key="default": True
         engine._run = lambda cmd, *args, **kwargs: ""
         engine._move_known_source_outputs = lambda *args, **kwargs: move_calls.append(args) or True
@@ -567,7 +709,12 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         engine._source_id_to_name = lambda: {
             "1": "output.wavelinux.fx.mic.source",
         }
-        engine._run = lambda cmd, *args, **kwargs: (run_calls.append(cmd), "ok")[-1]
+        engine._run = lambda cmd, *args, **kwargs: (
+            run_calls.append(cmd),
+            "output.wavelinux.fx.mic.source"
+            if cmd[:2] == ["pactl", "get-default-source"]
+            else "ok",
+        )[-1]
 
         success = engine.set_default_source("wavelinux.fx.mic.source")
 
@@ -739,6 +886,77 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         self.assertEqual(engine.virtual_sink_modules, {})
         self.assertEqual(engine.output_mixes, {})
 
+    def test_full_audio_reset_tears_down_fx_state_and_clears_runtime_caches(self):
+        engine = self._engine()
+        calls = []
+        engine.channel_fx = {"mic": {"source": "output.wavelinux.fx.mic.source"}}
+        engine.rnnoise_processes = {"chain_mic": object()}
+        engine.submix_loopbacks = {"55->Monitor": "201"}
+        engine.submix_sources = {"55->Monitor": "output.wavelinux.fx.mic.source"}
+        engine.submix_state_cache = {"55->Monitor": {"vol": 1.0, "mute": False}}
+        engine._pending_submix_state_reapply = {"55->Monitor"}
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[:4] == ["pactl", "list", "short", "modules"]:
+                return ""
+            if cmd[:3] == ["pactl", "list", "modules"]:
+                return "\n".join([
+                    "Module #301",
+                    "\tArgument: source_name=output.wavelinux.fx.mic.source",
+                ])
+            return "ok"
+
+        cleared = []
+        stopped = []
+        engine._run = fake_run
+        engine.create_snapshot = lambda force=True: object()
+        engine._restore_physical_defaults_before_reset = lambda snap=None: None
+        engine.clear_channel_fx = lambda node_name: cleared.append(node_name)
+        engine.stop_rnnoise = lambda key='default': stopped.append(key)
+        engine.invalidate_snapshot = lambda: calls.append(["invalidate_snapshot"])
+        engine.unlock_bluetooth_autoswitch = lambda: calls.append(["unlock_bluetooth_autoswitch"])
+
+        engine.full_audio_reset()
+
+        self.assertEqual(cleared, ["mic"])
+        self.assertEqual(stopped, ["chain_mic"])
+        self.assertEqual(engine.channel_fx, {})
+        self.assertEqual(engine.submix_loopbacks, {})
+        self.assertEqual(engine.submix_sources, {})
+        self.assertEqual(engine.submix_state_cache, {})
+        self.assertEqual(engine._pending_submix_state_reapply, set())
+        self.assertIn(["unlock_bluetooth_autoswitch"], calls)
+        self.assertIn(["invalidate_snapshot"], calls)
+        self.assertIn(["pactl", "unload-module", "301"], calls)
+
+    def test_full_audio_reset_reaps_orphan_fx_processes(self):
+        engine = self._engine()
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[:4] == ["pactl", "list", "short", "modules"]:
+                return ""
+            if cmd[:3] == ["pactl", "list", "modules"]:
+                return ""
+            return "ok"
+
+        reaped = []
+        engine._run = fake_run
+        engine.create_snapshot = lambda force=True: object()
+        engine._restore_physical_defaults_before_reset = lambda snap=None: None
+        engine.clear_channel_fx = lambda node_name: None
+        engine.stop_rnnoise = lambda key='default': None
+        engine.invalidate_snapshot = lambda: calls.append(["invalidate_snapshot"])
+        engine.unlock_bluetooth_autoswitch = lambda: calls.append(["unlock_bluetooth_autoswitch"])
+        engine._reap_orphan_fx_processes = lambda: reaped.append(True)
+
+        engine.full_audio_reset()
+
+        self.assertEqual(reaped, [True])
+        self.assertIn(["invalidate_snapshot"], calls)
+
     def test_set_source_volume_by_name_resolves_virtual_source_alias(self):
         engine = self._engine()
         run_calls = []
@@ -777,6 +995,95 @@ class PipeWireEngineRuntimeStabilityTests(unittest.TestCase):
         self.assertNotIn("mic", engine.channel_fx)
         self.assertEqual(run_calls[0][:4], ["pw-cli", "s", "55", "Props"])
         self.assertIn('"audioconvert.filter-graph" ""', run_calls[0][4])
+
+    def test_clear_proxy_channel_fx_rebinds_mono_proxy_feed(self):
+        engine = self._engine()
+        engine.channel_fx["mic"] = {
+            "mode": "proxy",
+            "source": "output.wavelinux.fx.mic.source",
+            "capture_target": "alsa_input.mic",
+            "proxy_sink_name": "wavelinux.fx.mic.sink",
+            "proxy_source_name": "output.wavelinux.fx.mic.source",
+            "proxy_source_module_id": "501",
+            "proxy_sink_module_id": "502",
+            "loopbacks": ["601", "602"],
+            "procs": ["chain_mic"],
+            "prev_default": "alsa_input.mic",
+        }
+        load_calls = []
+        engine._load_loopback_module = (
+            lambda source_name, sink_name, latency_msec=20, **kwargs: (
+                load_calls.append((source_name, sink_name, kwargs.get("channels"), kwargs.get("channel_map"))),
+                "777",
+            )[-1]
+        )
+        engine._module_is_alive = lambda module_id, short_text=None: True
+        engine._snapshot_submix_bindings = lambda source_name: {}
+        engine.snapshot_external_source_outputs = lambda source_name, exclude_modules=None: []
+        current_default = {"value": "output.wavelinux.fx.mic.source"}
+        engine.get_default_source = lambda: current_default["value"]
+        engine.set_default_source = lambda source_name: (
+            current_default.__setitem__("value", source_name),
+            True,
+        )[-1]
+        engine._teardown_fx_plumbing = lambda info: None
+        engine._destroy_fx_proxy = lambda info: None
+        engine.invalidate_snapshot = lambda: None
+        engine._run = lambda cmd, *args, **kwargs: ""
+
+        result = engine.clear_channel_fx_transaction("mic")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(
+            load_calls,
+            [("alsa_input.mic", "wavelinux.fx.mic.sink", 1, "mono")],
+        )
+
+    def test_clear_proxy_channel_fx_can_keep_passthrough_proxy_for_selected_mic(self):
+        engine = self._engine()
+        engine.channel_fx["mic"] = {
+            "mode": "proxy",
+            "effects": ["rnnoise"],
+            "params": {"rnnoise": {"VAD Threshold (%)": 50.0}},
+            "source": "output.wavelinux.fx.mic.source",
+            "capture_target": "alsa_input.mic",
+            "proxy_sink_name": "wavelinux.fx.mic.sink",
+            "proxy_source_name": "output.wavelinux.fx.mic.source",
+            "proxy_source_request_name": "wavelinux.fx.mic.source",
+            "proxy_source_module_id": "501",
+            "proxy_sink_module_id": "502",
+            "loopbacks": ["601", "602"],
+            "procs": ["chain_mic"],
+            "safe_key": "mic",
+            "prev_default": "alsa_input.mic",
+        }
+        teardown_calls = []
+        load_calls = []
+        engine._load_loopback_module = (
+            lambda source_name, sink_name, latency_msec=20, **kwargs: (
+                load_calls.append((source_name, sink_name, kwargs.get("channels"), kwargs.get("channel_map"))),
+                "777",
+            )[-1]
+        )
+        engine._module_is_alive = lambda module_id, short_text=None: True
+        engine._teardown_fx_plumbing = lambda info: teardown_calls.append(info)
+        engine.invalidate_snapshot = lambda: None
+
+        result = engine.clear_channel_fx_transaction("mic", keep_proxy=True)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["active_source"], "output.wavelinux.fx.mic.source")
+        self.assertEqual(engine.channel_fx["mic"]["mode"], "proxy_passthrough")
+        self.assertEqual(engine.channel_fx["mic"]["effects"], [])
+        self.assertEqual(engine.channel_fx["mic"]["loopbacks"], ["777"])
+        self.assertEqual(
+            load_calls,
+            [("alsa_input.mic", "wavelinux.fx.mic.sink", 1, "mono")],
+        )
+        self.assertEqual(
+            teardown_calls,
+            [{"loopbacks": ["601", "602"], "procs": ["chain_mic"]}],
+        )
 
 
 if __name__ == "__main__":

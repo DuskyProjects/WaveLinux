@@ -234,7 +234,7 @@ class RuntimePlanner:
         if isinstance(intent, RefreshNow):
             return self._reconcile_refresh(desired_state, observed_state)
         if isinstance(intent, SetSelectedMic):
-            return []
+            return self._reconcile_refresh(desired_state, observed_state)
         return []
 
     def _reconcile_refresh(self, desired_state, observed_state):
@@ -249,6 +249,13 @@ class RuntimePlanner:
                 actions.append(Action("set_mix_hardware_route", {
                     "mix_name": mix_name,
                     "sink_name": mix.hardware_sink,
+                }))
+            elif mix_name == "Monitor" and current_hw and not self._sink_names_match(
+                observed_state.default_sink,
+                current_hw,
+            ):
+                actions.append(Action("set_default_sink", {
+                    "sink_name": current_hw,
                 }))
 
         present_virtual_names = {view.name for view in observed_state.virtual_channels}
@@ -267,6 +274,27 @@ class RuntimePlanner:
             )
         managed_channels.extend(observed_state.virtual_channels)
         present_managed = {view.name for view in managed_channels}
+
+        # Tear down non-selected mic FX/routing first so live mic swaps
+        # rebuild the newly selected mic against a clean graph instead of
+        # overlapping with the old mic's proxy/filter-chain teardown.
+        for mic_view in observed_state.mic_inputs:
+            if mic_view.name == selected_mic:
+                continue
+            route_owners = observed_state.submix_owner_by_channel.get(mic_view.name, {})
+            if any(route_owners.get(mix_name) for mix_name in ("Monitor", "Stream")):
+                actions.append(Action("remove_node_routing", {
+                    "node_id": str(mic_view.node_id),
+                }))
+            if observed_state.fx_sources_by_channel.get(mic_view.name):
+                generation = int(
+                    getattr(desired_state.channels.get(mic_view.name), "fx", FxSpec()).generation
+                )
+                actions.append(Action("clear_channel_fx", {
+                    "node_name": mic_view.name,
+                    "generation": generation,
+                }))
+                cleared_fx.add(mic_view.name)
 
         for channel in managed_channels:
             chan_spec = desired_state.channels.get(channel.name)
@@ -342,7 +370,13 @@ class RuntimePlanner:
                         "fx_spec": chan_spec.fx,
                         "previous_effects": current_effects,
                     }))
-            elif observed_state.fx_sources_by_channel.get(channel.name):
+            elif (
+                observed_state.fx_sources_by_channel.get(channel.name)
+                and (
+                    channel.name != selected_mic
+                    or bool(observed_state.fx_effects_by_channel.get(channel.name))
+                )
+            ):
                 generation = int(chan_spec.fx.generation) if chan_spec else 0
                 actions.append(Action("clear_channel_fx", {
                     "node_name": channel.name,
@@ -352,33 +386,17 @@ class RuntimePlanner:
 
         if selected_mic and selected_mic in present_managed:
             selected_spec = desired_state.channels.get(selected_mic)
-            expected_default = selected_mic
-            if selected_spec and selected_spec.fx.effects:
-                expected_default = observed_state.fx_sources_by_channel.get(selected_mic)
-            elif selected_spec and selected_spec.capture_target:
-                expected_default = selected_spec.capture_target
+            expected_default = (
+                observed_state.fx_sources_by_channel.get(selected_mic)
+                or selected_mic
+            )
+            if not observed_state.fx_sources_by_channel.get(selected_mic):
+                if selected_spec and selected_spec.capture_target:
+                    expected_default = selected_spec.capture_target
             if expected_default and observed_state.default_source != expected_default:
                 actions.append(Action("set_default_source", {
                     "source_name": expected_default,
                 }))
-
-        for mic_view in observed_state.mic_inputs:
-            if mic_view.name == selected_mic:
-                continue
-            route_owners = observed_state.submix_owner_by_channel.get(mic_view.name, {})
-            if any(route_owners.get(mix_name) for mix_name in ("Monitor", "Stream")):
-                actions.append(Action("remove_node_routing", {
-                    "node_id": str(mic_view.node_id),
-                }))
-            if observed_state.fx_sources_by_channel.get(mic_view.name):
-                generation = int(
-                    getattr(desired_state.channels.get(mic_view.name), "fx", FxSpec()).generation
-                )
-                actions.append(Action("clear_channel_fx", {
-                    "node_name": mic_view.name,
-                    "generation": generation,
-                }))
-                cleared_fx.add(mic_view.name)
 
         for node_name, old_node_id in observed_state.stale_channel_ids.items():
             actions.append(Action("remove_node_routing", {

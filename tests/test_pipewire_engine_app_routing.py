@@ -49,6 +49,32 @@ class PipeWireEngineAppRoutingTests(unittest.TestCase):
         self.assertEqual(identity["app_id"], "name:ferdium")
         self.assertEqual(identity["app_name"], "Ferdium")
 
+    def test_resolve_app_identity_prefers_explicit_application_name_over_parent_wrapper_cmdline(self):
+        engine = self._engine()
+        current = {
+            "node.id": "78",
+            "application.name": "StressMusic",
+            "application.process.binary": "stressmusic",
+            "media.name": "StressMusic",
+            "node.name": "StressMusic",
+        }
+        antigravity = PipeWireEngine._candidate_from_raw(
+            "binary", "antigravity", "Antigravity", 98, "cmdline-index:5"
+        )
+        stress_binary = PipeWireEngine._candidate_from_raw(
+            "binary", "stressmusic", "stressmusic", 70, "application.process.binary"
+        )
+        with patch.object(PipeWireEngine, "_gio_identity_candidate", return_value=None), \
+             patch.object(PipeWireEngine, "_sandbox_identity_candidate", return_value=None), \
+             patch.object(PipeWireEngine, "_path_identity_candidate", return_value=None), \
+             patch.object(PipeWireEngine, "_window_identity_candidates", return_value=[]), \
+             patch.object(PipeWireEngine, "_cmdline_identity_candidates", return_value=[antigravity]), \
+             patch.object(PipeWireEngine, "_binary_identity_candidates", return_value=[stress_binary]):
+            identity = engine._resolve_app_identity(current)
+
+        self.assertEqual(identity["app_id"], "name:stressmusic")
+        self.assertEqual(identity["app_name"], "StressMusic")
+
     def test_resolve_app_identity_uses_window_title_for_generic_wrapper_when_needed(self):
         engine = self._engine()
         current = {

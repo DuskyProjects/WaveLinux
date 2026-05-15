@@ -98,6 +98,8 @@ class WaveLinuxUpdateTabTests(unittest.TestCase):
         win._pending_update_tag = None
         win._pending_update_asset_url = ""
         win._pending_verified_release = None
+        win._install_state_cache = None
+        win._install_state_cache_at = 0.0
         return win
 
     def test_refresh_update_tab_enables_rollback_when_backup_exists(self):
@@ -121,9 +123,8 @@ class WaveLinuxUpdateTabTests(unittest.TestCase):
             warnings=(),
         )
 
-        with mock.patch("main.install_state", return_value=state):
-            with mock.patch("main.is_running_in_appimage", return_value=True):
-                win._refresh_update_tab()
+        with mock.patch("main.is_running_in_appimage", return_value=True):
+            win._refresh_update_tab(state=state, allow_async=False)
 
         self.assertTrue(win._rollback_update_btn.visible)
         self.assertTrue(win._rollback_update_btn.enabled)
@@ -151,9 +152,8 @@ class WaveLinuxUpdateTabTests(unittest.TestCase):
             warnings=(),
         )
 
-        with mock.patch("main.install_state", return_value=state):
-            with mock.patch("main.is_running_in_appimage", return_value=False):
-                win._refresh_update_tab()
+        with mock.patch("main.is_running_in_appimage", return_value=False):
+            win._refresh_update_tab(state=state, allow_async=False)
 
         self.assertFalse(win._rollback_update_btn.visible)
         self.assertFalse(win._download_update_btn.enabled)
@@ -190,6 +190,29 @@ class WaveLinuxUpdateTabTests(unittest.TestCase):
         )
         self.assertEqual(win._update_progress.format, "Checking latest release…")
         self.assertTrue(win._update_install_poll_timer.started)
+
+    def test_refresh_update_tab_uses_cached_placeholder_when_state_not_ready(self):
+        win = self._window(mode_kind="appimage", allows_self_update=True)
+
+        with mock.patch("main.is_running_in_appimage", return_value=True):
+            win._refresh_update_tab(state=None, allow_async=False)
+
+        self.assertIn("Install state: refreshing in background", win._install_state_lbl.text)
+        self.assertTrue(win._rollback_update_btn.visible)
+
+    def test_set_update_controls_enabled_touches_current_widget_names(self):
+        win = WaveLinuxWindow.__new__(WaveLinuxWindow)
+        win._check_update_btn = _FakeWidget()
+        win._download_update_btn = _FakeWidget()
+        win._install_runtime_btn = _FakeWidget()
+        win._rollback_update_btn = _FakeWidget()
+
+        win._set_update_controls_enabled(False)
+
+        self.assertFalse(win._check_update_btn.enabled)
+        self.assertFalse(win._download_update_btn.enabled)
+        self.assertFalse(win._install_runtime_btn.enabled)
+        self.assertFalse(win._rollback_update_btn.enabled)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from audio_runtime.models import (
     SetCardProfile,
     SetChannelFx,
     SetMixHardwareRoute,
+    SetSelectedMic,
     SetSourceVolume,
     SetSubmixState,
 )
@@ -249,6 +250,70 @@ class RuntimePlannerTests(unittest.TestCase):
         self.assertEqual(kinds.count("ensure_submix_route"), 2)
         self.assertIn("apply_channel_fx", kinds)
 
+    def test_set_selected_mic_reconciles_routes_and_default_source_immediately(self):
+        planner = RuntimePlanner()
+        desired = DesiredState(
+            selected_mic="mic_a",
+            channels={
+                "mic_b": ChannelSpec(
+                    node_name="mic_b",
+                    capture_target="mic_b",
+                )
+            },
+        )
+        observed = ObservedState(
+            default_source="mic_a",
+            mic_inputs=[
+                RuntimeChannelView(
+                    node_id="10",
+                    name="mic_a",
+                    description="Mic A",
+                    media_class="Audio/Source",
+                    label="Mic A",
+                    channel_type="Microphone",
+                    icon="mic",
+                    is_mic=True,
+                    capture_target="mic_a",
+                    meter_source="mic_a",
+                ),
+                RuntimeChannelView(
+                    node_id="11",
+                    name="mic_b",
+                    description="Mic B",
+                    media_class="Audio/Source",
+                    label="Mic B",
+                    channel_type="Microphone",
+                    icon="mic",
+                    is_mic=True,
+                    capture_target="mic_b",
+                    meter_source="mic_b",
+                ),
+            ],
+            submix_owner_by_channel={
+                "mic_a": {"Monitor": "201", "Stream": "202"},
+                "mic_b": {"Monitor": None, "Stream": None},
+            },
+            submix_live_by_channel={
+                "mic_a": {"Monitor": True, "Stream": True},
+                "mic_b": {"Monitor": False, "Stream": False},
+            },
+            submix_source_by_channel={
+                "mic_a": {"Monitor": "mic_a", "Stream": "mic_a"},
+                "mic_b": {"Monitor": None, "Stream": None},
+            },
+            present_node_names={"mic_a", "mic_b"},
+        )
+        intent = SetSelectedMic(node_name="mic_b")
+
+        planner.apply_intent(desired, intent)
+        actions = planner.reconcile(desired, observed, intent)
+
+        kinds = [action.kind for action in actions]
+        self.assertEqual(desired.selected_mic, "mic_b")
+        self.assertEqual(kinds.count("ensure_submix_route"), 2)
+        self.assertIn("remove_node_routing", kinds)
+        self.assertIn("set_default_source", kinds)
+
     def test_refresh_now_rebuilds_when_only_params_change(self):
         planner = RuntimePlanner()
         desired = DesiredState(
@@ -464,6 +529,34 @@ class RuntimePlannerTests(unittest.TestCase):
         self.assertEqual(kinds.count("ensure_output_mix"), 2)
         self.assertEqual(kinds.count("set_mix_hardware_route"), 2)
 
+    def test_refresh_now_reasserts_default_sink_when_monitor_route_matches_but_default_drifted(self):
+        planner = RuntimePlanner()
+        desired = DesiredState(
+            mixes={
+                "Monitor": MixSpec(
+                    name="Monitor",
+                    hardware_sink="alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink",
+                ),
+            }
+        )
+        observed = ObservedState(
+            default_sink="bluez_output.AC_80_0A_72_BD_10.1",
+            mix_hardware_routes={
+                "Monitor": "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink",
+            },
+        )
+
+        actions = planner.reconcile(desired, observed, RefreshNow("tick"))
+
+        self.assertEqual(
+            [action.kind for action in actions],
+            ["set_default_sink"],
+        )
+        self.assertEqual(
+            actions[0].payload["sink_name"],
+            "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink",
+        )
+
     def test_refresh_now_skips_submix_route_when_route_is_live_and_correct(self):
         planner = RuntimePlanner()
         desired = DesiredState(
@@ -665,6 +758,123 @@ class RuntimePlannerTests(unittest.TestCase):
         self.assertEqual(len(clear_actions), 1)
         self.assertEqual(clear_actions[0].payload["node_name"], "built_in_mic")
         self.assertEqual(clear_actions[0].payload["generation"], 4)
+
+    def test_refresh_now_clears_old_mic_fx_before_applying_new_selected_mic_fx(self):
+        planner = RuntimePlanner()
+        desired = DesiredState(
+            selected_mic="internal_mic",
+            channels={
+                "internal_mic": ChannelSpec(
+                    node_name="internal_mic",
+                    capture_target="internal_mic",
+                    fx=FxSpec(effects=["compressor"], generation=2),
+                ),
+                "usb_mic": ChannelSpec(
+                    node_name="usb_mic",
+                    capture_target="usb_mic",
+                    fx=FxSpec(effects=["compressor"], generation=5),
+                ),
+            },
+        )
+        observed = ObservedState(
+            mic_inputs=[
+                RuntimeChannelView(
+                    node_id="55",
+                    name="internal_mic",
+                    description="Internal Mic",
+                    media_class="Audio/Source",
+                    label="Internal Mic",
+                    channel_type="Microphone",
+                    icon="mic",
+                    is_mic=True,
+                    capture_target="internal_mic",
+                    meter_source="internal_mic",
+                ),
+                RuntimeChannelView(
+                    node_id="77",
+                    name="usb_mic",
+                    description="USB Mic",
+                    media_class="Audio/Source",
+                    label="USB Mic",
+                    channel_type="Microphone",
+                    icon="mic",
+                    is_mic=True,
+                    capture_target="usb_mic",
+                    meter_source="wavelinux.fx.usb_mic.source",
+                ),
+            ],
+            fx_sources_by_channel={
+                "internal_mic": None,
+                "usb_mic": "wavelinux.fx.usb_mic.source",
+            },
+            fx_effects_by_channel={
+                "internal_mic": [],
+                "usb_mic": ["compressor"],
+            },
+        )
+
+        actions = planner.reconcile(desired, observed, RefreshNow("tick"))
+        kinds = [action.kind for action in actions]
+
+        self.assertIn("clear_channel_fx", kinds)
+        self.assertIn("apply_channel_fx", kinds)
+
+    def test_refresh_now_keeps_selected_mic_passthrough_proxy_when_no_fx_desired(self):
+        planner = RuntimePlanner()
+        desired = DesiredState(
+            selected_mic="internal_mic",
+            channels={
+                "internal_mic": ChannelSpec(
+                    node_name="internal_mic",
+                    capture_target="internal_mic",
+                    fx=FxSpec(effects=[], generation=3),
+                ),
+            },
+        )
+        observed = ObservedState(
+            default_source="wavelinux.fx.internal_mic.source",
+            mic_inputs=[
+                RuntimeChannelView(
+                    node_id="55",
+                    name="internal_mic",
+                    description="Internal Mic",
+                    media_class="Audio/Source",
+                    label="Internal Mic",
+                    channel_type="Microphone",
+                    icon="mic",
+                    is_mic=True,
+                    capture_target="internal_mic",
+                    meter_source="wavelinux.fx.internal_mic.source",
+                ),
+            ],
+            fx_sources_by_channel={
+                "internal_mic": "wavelinux.fx.internal_mic.source",
+            },
+            fx_effects_by_channel={
+                "internal_mic": [],
+            },
+            submix_owner_by_channel={
+                "internal_mic": {"Monitor": "11", "Stream": "12"},
+            },
+            submix_live_by_channel={
+                "internal_mic": {"Monitor": True, "Stream": True},
+            },
+            submix_source_by_channel={
+                "internal_mic": {
+                    "Monitor": "wavelinux.fx.internal_mic.source",
+                    "Stream": "wavelinux.fx.internal_mic.source",
+                },
+            },
+        )
+
+        actions = planner.reconcile(desired, observed, RefreshNow("tick"))
+
+        self.assertFalse(any(action.kind == "clear_channel_fx" for action in actions))
+        self.assertFalse(any(
+            action.kind == "set_default_source"
+            and action.payload["source_name"] != "wavelinux.fx.internal_mic.source"
+            for action in actions
+        ))
 
     def test_refresh_now_clears_unwanted_fx_for_managed_channel(self):
         planner = RuntimePlanner()
