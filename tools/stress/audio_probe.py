@@ -32,6 +32,77 @@ def generate_probe_wav(*, duration_s=2.0, sample_rate=48000, amplitude=0.03, fre
     return path
 
 
+def generate_speech_like_probe_wav(*, duration_s=2.0, sample_rate=48000, amplitude=0.10, path=None):
+    """Generate deterministic vowel-like test audio that RNNoise should treat as speech."""
+    if path is None:
+        fd, path = tempfile.mkstemp(prefix="wavelinux-voice-probe-", suffix=".wav")
+        os.close(fd)
+
+    formant_sets = (
+        (720.0, 1220.0, 2600.0),
+        (300.0, 2150.0, 3000.0),
+        (520.0, 950.0, 2450.0),
+        (390.0, 1900.0, 2550.0),
+    )
+    total_frames = int(sample_rate * duration_s)
+    # Synthesize one repeating phrase instead of doing expensive formant math
+    # across long stress runs. RNNoise still sees speech-like content, but
+    # runner startup stays fast enough for tight diagnostics.
+    phrase_frames = min(total_frames, int(sample_rate * 3.36))
+    phase = 0.0
+    noise_state = 0x5EED1234
+    frames = []
+
+    for frame_index in range(phrase_frames):
+        t = frame_index / float(sample_rate)
+        syllable_pos = t % 0.42
+        syllable_index = int(t / 0.42) % len(formant_sets)
+        formants = formant_sets[syllable_index]
+        voiced = 0.045 <= syllable_pos <= 0.34
+        if voiced:
+            attack = min(1.0, max(0.0, (syllable_pos - 0.045) / 0.045))
+            release = min(1.0, max(0.0, (0.34 - syllable_pos) / 0.07))
+            envelope = min(attack, release)
+        else:
+            envelope = 0.0
+
+        f0 = 118.0 + 18.0 * math.sin(2.0 * math.pi * 2.1 * t) + 5.0 * math.sin(2.0 * math.pi * 5.3 * t)
+        phase += 2.0 * math.pi * f0 / sample_rate
+        voiced_sample = 0.0
+        for harmonic in range(1, 28):
+            freq = harmonic * f0
+            formant_gain = 0.035
+            formant_gain += 1.20 * math.exp(-0.5 * ((freq - formants[0]) / 110.0) ** 2)
+            formant_gain += 0.75 * math.exp(-0.5 * ((freq - formants[1]) / 170.0) ** 2)
+            formant_gain += 0.35 * math.exp(-0.5 * ((freq - formants[2]) / 260.0) ** 2)
+            voiced_sample += (formant_gain / harmonic) * math.sin(phase * harmonic)
+
+        noise_state = (1664525 * noise_state + 1013904223) & 0xFFFFFFFF
+        breath = ((noise_state / 0xFFFFFFFF) * 2.0 - 1.0)
+        consonant = 0.0
+        if syllable_pos < 0.035:
+            consonant = breath * (1.0 - syllable_pos / 0.035)
+
+        sample = amplitude * ((0.82 * envelope * voiced_sample) + (0.10 * consonant))
+        sample = max(-1.0, min(1.0, sample))
+        pcm = int(sample * 32767)
+        frames.append(struct.pack("<hh", pcm, pcm))
+
+    phrase = b"".join(frames)
+    if total_frames > phrase_frames and phrase_frames > 0:
+        repeats, remainder = divmod(total_frames, phrase_frames)
+        payload = phrase * repeats + phrase[:remainder * 4]
+    else:
+        payload = phrase
+
+    with wave.open(path, "wb") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(payload)
+    return path
+
+
 def spawn_probe_stream(wav_path, *, sink_name=None, app_name, stream_name, media_role="music", volume=65536):
     cmd = [
         "paplay",

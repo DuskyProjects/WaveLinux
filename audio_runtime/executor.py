@@ -233,6 +233,8 @@ class RuntimeExecutor:
                 self._ensure_output_mix(payload)
             elif kind == "ensure_virtual_channel":
                 self._ensure_virtual_channel(payload)
+            elif kind == "reprime_channel_fx":
+                self._reprime_channel_fx(payload, desired_state, status_callback)
         if self._can_finalize_optimistically(actions):
             self._apply_optimistic_updates(observed_state, actions)
             return self._finalize_observed(
@@ -484,6 +486,95 @@ class RuntimeExecutor:
                 state="idle",
                 generation=generation,
                 message="FX chain cleared",
+            ),
+        )
+
+    def _reprime_channel_fx(self, payload, desired_state, status_callback):
+        node_name = str(payload.get("node_name") or "").strip()
+        if not node_name:
+            return
+        channel = getattr(desired_state, "channels", {}).get(node_name)
+        fx = getattr(channel, "fx", None)
+        current_generation = int(getattr(fx, "generation", 0) or 0)
+        wanted_effects = list(getattr(fx, "effects", []) or [])
+        requested_generation = int(payload.get("generation", 0) or 0)
+        settle_s = float(payload.get("settle_s", 1.0) or 1.0)
+        if getattr(desired_state, "selected_mic", None) != node_name or not wanted_effects:
+            return
+        if requested_generation and current_generation and requested_generation != current_generation:
+            return
+        generation = current_generation or requested_generation
+        self._emit_status(
+            status_callback,
+            OperationStatus(
+                node_name=node_name,
+                state="cutover_pending",
+                generation=generation,
+                message="Re-priming FX capture",
+            ),
+        )
+        reprime_ok = False
+        verification = None
+        with self.adapter.session() as engine:
+            if hasattr(engine, "reprime_channel_fx_capture"):
+                reprime_ok = bool(engine.reprime_channel_fx_capture(node_name, settle_s=settle_s))
+            if reprime_ok and hasattr(engine, "verify_channel_fx_runtime"):
+                snap = engine.create_snapshot(force=True)
+                verification = engine.verify_channel_fx_runtime(
+                    node_name,
+                    expected_default=(node_name == getattr(desired_state, "selected_mic", None)),
+                    snap=snap,
+                    fx_status={
+                        "state": "active",
+                        "generation": generation,
+                        "message": "FX capture re-primed",
+                        "error": "",
+                    },
+                    requested_effects=wanted_effects,
+                )
+        if reprime_ok and (verification is None or bool(getattr(verification, "ready", False))):
+            self._emit_status(
+                status_callback,
+                OperationStatus(
+                    node_name=node_name,
+                    state="active",
+                    generation=generation,
+                    message="FX capture re-primed",
+                ),
+            )
+            return
+        bundle = self.diagnostics.export_failure(
+            "fx_reprime_verification_failed",
+            desired=desired_state,
+            observed=self.observe(desired_state),
+            actions=[payload],
+            health={"channel": node_name},
+            status={
+                "reprime_ok": bool(reprime_ok),
+                "verification": (
+                    verification.to_dict() if verification is not None else {}
+                ),
+            },
+        )
+        details = []
+        if not reprime_ok:
+            details.append("upstream capture reprime failed")
+        if verification is not None and not verification.ready:
+            details.extend(
+                str(reason.detail or reason.code).strip()
+                for reason in (getattr(verification, "reasons", []) or [])
+                if str(reason.detail or reason.code).strip()
+            )
+        error = "; ".join(details) or "FX capture reprime failed"
+        self._emit_status(
+            status_callback,
+            OperationStatus(
+                node_name=node_name,
+                state="degraded",
+                generation=generation,
+                message=f"FX capture reprime failed; diagnostics: {bundle} ({error})",
+                error=error,
+                diagnostics_path=bundle,
             ),
         )
 

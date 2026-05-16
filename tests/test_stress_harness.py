@@ -1,7 +1,9 @@
 import json
 import os
+import struct
 import tempfile
 import unittest
+import wave
 from types import SimpleNamespace
 from unittest import mock
 
@@ -12,6 +14,7 @@ from tools.stress.run_stress_suite import (
     parse_loop_overrides,
     parse_phase_selection,
 )
+from tools.stress.assertions import StressAssertionFailure
 from tools.stress import audio_probe
 from tools.stress import bluetooth_ops
 from tools.stress import system_snapshot
@@ -19,6 +22,15 @@ from tools.stress.system_snapshot import write_snapshot_artifacts
 
 
 class StressHarnessTests(unittest.TestCase):
+    class _MonotonicClock:
+        def __init__(self, start=0.0, step=0.25):
+            self.current = float(start) - float(step)
+            self.step = float(step)
+
+        def __call__(self):
+            self.current += self.step
+            return self.current
+
     def _profile_payload(self):
         return {
             "profile_name": "test-rig",
@@ -179,6 +191,21 @@ class StressHarnessTests(unittest.TestCase):
         self.assertGreater(stats["rms"], 0.0)
         self.assertEqual(stats["stderr"], "/tmp/test.raw")
 
+    def test_generate_speech_like_probe_wav_has_non_silent_pcm(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "voice.wav")
+            generated = audio_probe.generate_speech_like_probe_wav(
+                duration_s=0.25,
+                sample_rate=48000,
+                path=path,
+            )
+
+            with wave.open(generated, "rb") as handle:
+                data = handle.readframes(handle.getnframes())
+
+        samples = struct.unpack("<" + "h" * (len(data) // 2), data)
+        self.assertGreater(max(abs(sample) for sample in samples), 100)
+
     def test_capture_source_audio_falls_back_to_parec_when_pw_record_missing(self):
         fallback_proc = object()
         with mock.patch.object(audio_probe.subprocess, "Popen", side_effect=FileNotFoundError), \
@@ -293,6 +320,41 @@ Settings:
         self.assertEqual(events[-1][0], "ensure_a2dp")
         self.assertTrue(events[-1][1]["result"]["ok"])
 
+    def test_runner_run_preflight_skips_bluetooth_when_phases_do_not_need_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = StressRunner(
+                self._profile_payload(),
+                run_root=temp_dir,
+                phase_names=("cold_launch", "quit_loop"),
+            )
+            snapshot = {"wpctl_status": "PipeWire 'pipewire-0'"}
+
+            with mock.patch.object(runner, "_lock_bluetooth_playback_policy"), \
+                    mock.patch.object(runner, "capture_snapshot", return_value=snapshot), \
+                    mock.patch("tools.stress.run_stress_suite.assert_pipewire_stack_healthy"), \
+                    mock.patch.object(runner, "_ensure_a2dp", side_effect=AssertionError("should not run")):
+                runner.run_preflight()
+
+        self.assertFalse(runner._bluetooth_ready)
+        self.assertEqual(runner.summary["artifacts"]["preflight"], "preflight.json")
+
+    def test_runner_monitor_targets_only_use_speaker_when_bluetooth_not_ready(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = StressRunner(
+                self._profile_payload(),
+                run_root=temp_dir,
+                phase_names=("app_route",),
+            )
+
+        runner._bluetooth_ready = False
+        self.assertEqual(runner._monitor_targets(), ("alsa_output.speakers",))
+
+        runner._bluetooth_ready = True
+        self.assertEqual(
+            runner._monitor_targets(),
+            ("alsa_output.speakers", "bluez_output.test.1"),
+        )
+
     def test_runner_resolve_runtime_app_ids_retries_until_expected_apps_appear(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             runner = StressRunner(self._profile_payload(), run_root=temp_dir, phase_names=())
@@ -319,6 +381,67 @@ Settings:
         self.assertEqual(requests[1][0], "refresh_now")
         self.assertEqual(requests[2][0], "get_runtime_summary")
 
+    def test_wait_for_selected_mic_fx_ready_rejects_active_without_verification(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = StressRunner(self._profile_payload(), run_root=temp_dir, phase_names=())
+
+            class _Client:
+                def request(self, command, args=None, timeout_s=None):
+                    self_command = command
+                    if self_command != "get_runtime_summary":
+                        raise AssertionError(f"unexpected command {self_command}")
+                    return {
+                        "selected_mic": "alsa_input.usb_test",
+                        "selected_mic_fx_source": "output.wavelinux.fx.usb_test.source",
+                        "selected_mic_fx_status": {"state": "active"},
+                        "selected_mic_fx_ready": False,
+                        "selected_mic_fx_verification": {
+                            "ready": False,
+                            "reasons": [{"code": "fx_process_dead"}],
+                        },
+                    }
+
+            runner._client = _Client()
+            with mock.patch("tools.stress.run_stress_suite.time.sleep"), \
+                    mock.patch("tools.stress.run_stress_suite.time.monotonic", side_effect=self._MonotonicClock(step=0.35)):
+                with self.assertRaises(StressAssertionFailure) as ctx:
+                    runner._wait_for_selected_mic_fx_ready("alsa_input.usb_test", timeout_s=1.0)
+
+        self.assertEqual(ctx.exception.bucket, "fx.activation_timeout")
+
+    def test_wait_for_selected_mic_fx_ready_requires_signal_when_requested(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = StressRunner(self._profile_payload(), run_root=temp_dir, phase_names=())
+
+            class _Client:
+                def request(self, command, args=None, timeout_s=None):
+                    if command != "get_runtime_summary":
+                        raise AssertionError(f"unexpected command {command}")
+                    return {
+                        "selected_mic": "alsa_input.usb_test",
+                        "selected_mic_fx_source": "output.wavelinux.fx.usb_test.source",
+                        "selected_mic_fx_status": {"state": "active"},
+                        "selected_mic_fx_ready": True,
+                        "selected_mic_fx_verification": {"ready": True, "reasons": []},
+                    }
+
+            runner._client = _Client()
+            with mock.patch.object(
+                runner,
+                "_capture_selected_mic_probe",
+                side_effect=StressAssertionFailure("fx.signal_silent", "still silent"),
+            ), \
+                    mock.patch("tools.stress.run_stress_suite.time.sleep"), \
+                    mock.patch("tools.stress.run_stress_suite.time.monotonic", side_effect=self._MonotonicClock(step=0.1)):
+                with self.assertRaises(StressAssertionFailure) as ctx:
+                    runner._wait_for_selected_mic_fx_ready(
+                        "alsa_input.usb_test",
+                        timeout_s=2.0,
+                        require_signal=True,
+                    )
+
+        self.assertEqual(ctx.exception.bucket, "fx.signal_silent")
+
     def test_phase_module_isolation_exercises_module_controls(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             runner = StressRunner(self._profile_payload(), run_root=temp_dir, phase_names=())
@@ -332,6 +455,14 @@ Settings:
                         return {"module_id": "metering", "state": "disabled"}
                     if command == "enable_module":
                         return {"module_id": "metering", "state": "running"}
+                    if command == "set_channel_fx":
+                        return {
+                            "selected_mic": "wavelinux_stress_fx_module",
+                            "selected_mic_fx_source": "output.wavelinux.fx.module.source",
+                            "fx_status": {"state": "active"},
+                        }
+                    if command == "set_selected_mic":
+                        return {"requested": True}
                     if command == "open_settings_tab":
                         return {"active_tab": args.get("tab_name"), "visible": True}
                     if command == "restart_module":
@@ -341,20 +472,34 @@ Settings:
                             req[0] == "restart_module" and req[1].get("module_id") == "updates"
                             for req in requests
                         ) else "Health"
-                        return {"settings_visible": True, "settings_tab": tab_name}
+                        return {
+                            "settings_visible": True,
+                            "settings_tab": tab_name,
+                            "selected_mic": "wavelinux_stress_fx_module",
+                            "selected_mic_fx_source": "output.wavelinux.fx.module.source",
+                            "selected_mic_fx_status": {"state": "active"},
+                            "selected_mic_fx_ready": True,
+                            "selected_mic_fx_verification": {"ready": True, "reasons": []},
+                            "selected_mic_fx_requested": {"effects": ["rnnoise"]},
+                        }
                     if command == "close_settings":
                         return {"visible": False}
                     raise AssertionError(f"unexpected command {command}")
 
             runner._client = _Client()
-            with mock.patch.object(runner, "launch_app", return_value={"active_default_sink": "alsa_output.speakers"}), \
+            with mock.patch.object(runner, "launch_app", return_value={"active_default_sink": "alsa_output.speakers", "selected_mic": "alsa_input.usb_test"}), \
+                    mock.patch.object(runner, "_ensure_synthetic_fixture", return_value=SimpleNamespace(source_name="wavelinux_stress_fx_module", sink_name="wavelinux_stress_fx_sink")), \
+                    mock.patch.object(runner, "_start_synthetic_input_signal"), \
                     mock.patch.object(runner, "_start_direct_streams"), \
                     mock.patch.object(runner, "_probe_monitor_path", return_value={"ok": True}), \
+                    mock.patch.object(runner, "_capture_selected_mic_probe", return_value={"bytes": 64}), \
                     mock.patch.object(runner, "quit_app"), \
                     mock.patch.object(runner, "_stop_all_probe_streams"):
                 checks = runner.phase_module_isolation(1)
 
         self.assertTrue(any(name == "baseline_monitor_probe" for name in [check["name"] for check in checks]))
+        self.assertIn(("set_selected_mic", {"source_name": "wavelinux_stress_fx_module", "include_summary": True}, 20.0), requests)
+        self.assertIn(("set_channel_fx", {"node_name": "wavelinux_stress_fx_module", "effects": ["rnnoise"], "params_map": {"rnnoise": {"VAD Threshold (%)": 75.0, "VAD Grace Period (ms)": 200.0, "Retroactive VAD Grace (ms)": 0.0}}, "persist": False, "include_summary": True}, 20.0), requests)
         self.assertIn(("disable_module", {"module_id": "metering", "reason": "stress-module-isolation"}, 10.0), requests)
         self.assertIn(("restart_module", {"module_id": "settings_ui", "reason": "stress-module-isolation"}, 10.0), requests)
         self.assertIn(("restart_module", {"module_id": "updates", "reason": "stress-module-isolation"}, 10.0), requests)
@@ -362,6 +507,99 @@ Settings:
         self.assertIn(("restart_module", {"module_id": "app_routing", "reason": "stress-module-isolation"}, 10.0), requests)
         self.assertIn(("restart_module", {"module_id": "effects", "reason": "stress-module-isolation"}, 10.0), requests)
         self.assertIn(("restart_module", {"module_id": "device_policy", "reason": "stress-module-isolation"}, 10.0), requests)
+
+    def test_phase_mic_swap_enables_effects_before_switching(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = StressRunner(self._profile_payload(), run_root=temp_dir, phase_names=())
+            runner.loop_counts["mic_swaps"] = 4
+            requests = []
+
+            class _Client:
+                def request(self, command, args=None, timeout_s=None):
+                    args = dict(args or {})
+                    requests.append((command, args, timeout_s))
+                    if command == "set_channel_fx":
+                        return {"requested": True}
+                    if command == "get_runtime_summary":
+                        target = next(
+                            (
+                                req[1].get("source_name")
+                                for req in reversed(requests)
+                                if req[0] == "set_selected_mic"
+                            ),
+                            "alsa_input.usb_test",
+                        )
+                        suffix = target.split(".")[-1]
+                        return {
+                            "selected_mic": target,
+                            "expected_default_source": f"output.wavelinux.fx.{suffix}.source",
+                            "selected_mic_fx_source": f"output.wavelinux.fx.{suffix}.source",
+                            "selected_mic_fx_status": {"state": "active"},
+                            "selected_mic_fx_ready": True,
+                            "selected_mic_fx_verification": {"ready": True, "reasons": []},
+                            "selected_mic_fx_requested": {"effects": ["rnnoise"]},
+                        }
+                    if command == "set_selected_mic":
+                        return {"requested": True}
+                    raise AssertionError(f"unexpected command {command}")
+
+            runner._client = _Client()
+            with mock.patch.object(runner, "launch_app"), \
+                    mock.patch.object(runner, "_capture_selected_mic_probe", return_value={"bytes": 64}), \
+                    mock.patch.object(runner, "quit_app"):
+                checks = runner.phase_mic_swap(1)
+
+        self.assertTrue(any(check["name"] == "mic_fx_baseline" for check in checks))
+        self.assertEqual(requests[0][0], "set_channel_fx")
+        self.assertEqual(requests[0][1]["node_name"], "alsa_input.usb_test")
+        self.assertEqual(requests[1][0], "set_channel_fx")
+        self.assertEqual(requests[1][1]["node_name"], "alsa_input.internal_test")
+        self.assertEqual(requests[2][0], "set_selected_mic")
+
+    def test_phase_effects_cycle_reenables_and_clears_fx(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = StressRunner(self._profile_payload(), run_root=temp_dir, phase_names=())
+            runner.loop_counts["effects_cycles"] = 3
+            activation_calls = []
+            set_fx_calls = []
+            clear_calls = []
+
+            def _activate(key, *, stream_key, effects=None, params_map=None, timeout_s=12.0):
+                activation_calls.append((key, stream_key, tuple(effects or ("rnnoise",)), dict(params_map or {})))
+                fixture = SimpleNamespace(source_name=f"wavelinux_stress_fx_{key}")
+                summary = {
+                    "selected_mic": fixture.source_name,
+                    "selected_mic_fx_source": f"output.{fixture.source_name}.source",
+                    "selected_mic_fx_ready": True,
+                }
+                return fixture, summary
+
+            def _set_channel_fx(node_name, *, effects=None, params_map=None, include_summary=False):
+                resolved_effects = list(effects) if effects is not None else ["rnnoise"]
+                set_fx_calls.append((node_name, resolved_effects, dict(params_map or {}), include_summary))
+                return {"ok": True}
+
+            def _wait_cleared(expected_mic=None, *, timeout_s=10.0, interval_s=0.2):
+                clear_calls.append((expected_mic, timeout_s))
+                return {"selected_mic": expected_mic, "active_default_source": expected_mic}
+
+            with mock.patch.object(runner, "launch_app"), \
+                    mock.patch.object(runner, "_ensure_synthetic_fixture", side_effect=lambda key: SimpleNamespace(source_name=f"wavelinux_stress_fx_{key}", sink_name=f"wavelinux_stress_fx_{key}_sink")), \
+                    mock.patch.object(runner, "_start_synthetic_input_signal"), \
+                    mock.patch.object(runner, "_activate_fx_on_synthetic_fixture", side_effect=_activate), \
+                    mock.patch.object(runner, "_set_channel_fx", side_effect=_set_channel_fx), \
+                    mock.patch.object(runner, "_wait_for_selected_mic_fx_ready", return_value={"selected_mic": "wavelinux_stress_fx_a", "selected_mic_fx_source": "output.wavelinux_stress_fx_a.source"}), \
+                    mock.patch.object(runner, "_wait_for_selected_mic_fx_cleared", side_effect=_wait_cleared), \
+                    mock.patch.object(runner, "_capture_selected_mic_probe", return_value={"bytes": 128, "peak": 32, "rms": 5.0}), \
+                    mock.patch.object(runner, "quit_app"), \
+                    mock.patch.object(runner, "_stop_all_probe_streams"):
+                checks = runner.phase_effects_cycle(1)
+
+        self.assertEqual(len([check for check in checks if check["name"].endswith("_initial")]), 3)
+        self.assertEqual(len(clear_calls), 3)
+        self.assertTrue(any(call[1] == [] for call in set_fx_calls))
+        self.assertTrue(any(call[1] == ["rnnoise"] for call in set_fx_calls))
+        self.assertEqual([call[0] for call in activation_calls], ["a", "b", "a"])
 
 
 if __name__ == "__main__":

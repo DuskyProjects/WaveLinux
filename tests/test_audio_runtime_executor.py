@@ -31,6 +31,24 @@ class FakeAdapter:
         yield self.engine
 
 
+class FakeVerification:
+    def __init__(self, ready=True, reasons=None):
+        self.ready = bool(ready)
+        self.reasons = list(reasons or [])
+
+    def to_dict(self):
+        return {
+            "ready": bool(self.ready),
+            "reasons": [
+                {
+                    "code": str(getattr(reason, "code", "") or ""),
+                    "detail": str(getattr(reason, "detail", "") or ""),
+                }
+                for reason in self.reasons
+            ],
+        }
+
+
 class FakeEngine:
     def __init__(self):
         self.output_mixes = {
@@ -61,6 +79,9 @@ class FakeEngine:
             "success": True,
             "message": "FX chain cleared",
         }
+        self.reprime_calls = []
+        self.reprime_result = True
+        self.verify_result = FakeVerification(True)
 
     def create_snapshot(self, force=False):
         return object()
@@ -105,6 +126,20 @@ class FakeEngine:
     def apply_channel_fx_transaction(self, node_name, capture_target, effects, params_map=None):
         self.last_fx = (node_name, capture_target, list(effects), dict(params_map))
         return dict(self.fx_apply_result)
+
+    def reprime_channel_fx_capture(self, node_name, settle_s=1.0):
+        self.reprime_calls.append((node_name, float(settle_s)))
+        return bool(self.reprime_result)
+
+    def verify_channel_fx_runtime(self, node_name, *, expected_default=False, snap=None,
+                                  fx_status=None, requested_effects=None):
+        self.verify_args = {
+            "node_name": node_name,
+            "expected_default": bool(expected_default),
+            "requested_effects": list(requested_effects or []),
+            "fx_status": dict(fx_status or {}),
+        }
+        return self.verify_result
 
     def clear_channel_fx_transaction(self, node_name, target_source=None, keep_proxy=False):
         self.cleared = True
@@ -257,6 +292,54 @@ class RuntimeExecutorTests(unittest.TestCase):
         executor._set_default_sink({"sink_name": "alsa_output.speakers"})
 
         self.assertEqual(engine.default_sink_calls, ["alsa_output.speakers"])
+
+    def test_reprime_channel_fx_emits_active_on_success(self):
+        engine = FakeEngine()
+        executor = RuntimeExecutor(FakeAdapter(engine), DummyDiagnostics())
+        desired = self._desired()
+        statuses = []
+
+        executor._reprime_channel_fx(
+            {
+                "node_name": "mic",
+                "generation": 2,
+                "settle_s": 1.0,
+            },
+            desired,
+            status_callback=statuses.append,
+        )
+
+        self.assertEqual(engine.reprime_calls, [("mic", 1.0)])
+        self.assertEqual(engine.verify_args["node_name"], "mic")
+        self.assertEqual(engine.verify_args["requested_effects"], ["rnnoise"])
+        self.assertEqual(statuses[-1].state, "active")
+        self.assertEqual(statuses[-1].message, "FX capture re-primed")
+
+    def test_reprime_channel_fx_emits_degraded_on_failed_verification(self):
+        engine = FakeEngine()
+        engine.verify_result = FakeVerification(
+            False,
+            reasons=[SimpleNamespace(code="fx_source_not_present", detail="The FX source is not visible.")],
+        )
+        executor = RuntimeExecutor(FakeAdapter(engine), DummyDiagnostics())
+        desired = self._desired()
+        statuses = []
+
+        executor.observe = lambda desired_state: ObservedState()
+        executor._reprime_channel_fx(
+            {
+                "node_name": "mic",
+                "generation": 2,
+                "settle_s": 1.0,
+            },
+            desired,
+            status_callback=statuses.append,
+        )
+
+        self.assertEqual(engine.reprime_calls, [("mic", 1.0)])
+        self.assertEqual(statuses[-1].state, "degraded")
+        self.assertIn("The FX source is not visible.", statuses[-1].message)
+        self.assertEqual(statuses[-1].diagnostics_path, "/tmp/runtime-failure.json")
 
     def test_set_mix_hardware_route_updates_default_sink_for_monitor(self):
         engine = FakeEngine()

@@ -67,6 +67,15 @@ class _FakeWindow(QObject):
             "include_summary": include_summary,
         }
 
+    def _stress_set_channel_fx(self, node_name, effects=None, params_map=None, persist=True, include_summary=False):
+        return {
+            "node_name": node_name,
+            "effects": list(effects or []),
+            "params_map": dict(params_map or {}),
+            "persist": persist,
+            "include_summary": include_summary,
+        }
+
     def _stress_open_settings_tab(self, tab_name):
         return {"active_tab": tab_name, "visible": True}
 
@@ -127,6 +136,31 @@ class StressControlServerTests(unittest.TestCase):
                 result,
                 {
                     "source_name": "alsa_input.test",
+                    "persist": False,
+                    "include_summary": False,
+                },
+            )
+
+    def test_dispatch_set_channel_fx_can_apply_non_persistent_effects(self):
+        window = _FakeWindow()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            server = StressControlServer(window, socket_path=os.path.join(temp_dir, "stress.sock"))
+            result = server._dispatch_command(
+                "set_channel_fx",
+                {
+                    "node_name": "alsa_input.test",
+                    "effects": ["rnnoise"],
+                    "params_map": {"rnnoise": {"VAD Threshold (%)": 75.0}},
+                    "persist": False,
+                    "include_summary": False,
+                },
+            )
+            self.assertEqual(
+                result,
+                {
+                    "node_name": "alsa_input.test",
+                    "effects": ["rnnoise"],
+                    "params_map": {"rnnoise": {"VAD Threshold (%)": 75.0}},
                     "persist": False,
                     "include_summary": False,
                 },

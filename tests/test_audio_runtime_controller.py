@@ -1,5 +1,7 @@
 import unittest
+import threading
 from types import SimpleNamespace
+from unittest import mock
 
 from audio_runtime.controller import AudioRuntimeController
 from audio_runtime.models import (
@@ -7,10 +9,48 @@ from audio_runtime.models import (
     ChannelSpec,
     DesiredState,
     OperationStatus,
+    ReprimeChannelFx,
     RecoverChannel,
     RuntimeViewState,
     SetCardProfile,
+    SetSelectedMic,
 )
+
+
+class _FakeTimerSignal:
+    def __init__(self):
+        self._callback = None
+
+    def connect(self, callback):
+        self._callback = callback
+
+
+class _FakeTimer:
+    def __init__(self, parent=None):
+        self.parent = parent
+        self.timeout = _FakeTimerSignal()
+        self._active = False
+        self.delay_ms = None
+        self.deleted = False
+
+    def setSingleShot(self, single_shot):
+        return None
+
+    def start(self, delay_ms):
+        self._active = True
+        self.delay_ms = int(delay_ms)
+
+    def stop(self):
+        self._active = False
+
+    def deleteLater(self):
+        self.deleted = True
+
+    def fire(self):
+        self._active = False
+        callback = self.timeout._callback
+        if callback is not None:
+            callback()
 
 
 class RuntimeControllerStateTests(unittest.TestCase):
@@ -21,11 +61,13 @@ class RuntimeControllerStateTests(unittest.TestCase):
             _fx_statuses={},
             _pending_operations={},
             _last_observed_channel_ids={},
+            state_lock=threading.RLock(),
         )
         controller._latest_view_state = RuntimeViewState()
         controller._latest_fx_status = {}
         controller._last_requested_fx = {}
         controller._fx_generations = {}
+        controller._fx_reprime_timers = {}
         controller._desired_selected_mic = None
         controller.view_state_changed = SimpleNamespace(emit=lambda *args, **kwargs: None)
         controller.fx_status_changed = SimpleNamespace(emit=lambda *args, **kwargs: None)
@@ -128,6 +170,26 @@ class RuntimeControllerStateTests(unittest.TestCase):
         self.assertEqual(intents[0].card_name, "alsa_card.pci-1")
         self.assertEqual(intents[0].profile_name, "pro-audio")
 
+    def test_fx_request_for_falls_back_to_desired_channel_fx_state(self):
+        controller = self._controller()
+        controller._worker.desired_state.channels["mic"] = ChannelSpec(
+            node_name="mic",
+            capture_target="alsa_input.synthetic",
+            fx=SimpleNamespace(
+                effects=["rnnoise"],
+                params_map={"rnnoise": {"VAD Threshold (%)": 75.0}},
+            ),
+        )
+
+        request = controller.fx_request_for("mic")
+
+        self.assertEqual(request["capture_target"], "alsa_input.synthetic")
+        self.assertEqual(request["effects"], ["rnnoise"])
+        self.assertEqual(
+            request["params_map"],
+            {"rnnoise": {"VAD Threshold (%)": 75.0}},
+        )
+
     def test_recover_channels_enqueues_one_intent_per_valid_name(self):
         controller = self._controller()
         intents = []
@@ -140,6 +202,62 @@ class RuntimeControllerStateTests(unittest.TestCase):
         self.assertIsInstance(intents[1], RecoverChannel)
         self.assertEqual(intents[0].node_name, "mic")
         self.assertEqual(intents[1].node_name, "voice")
+
+    def test_reprime_channel_fx_enqueues_reprime_intent(self):
+        controller = self._controller()
+        intents = []
+        controller.enqueue_intent = intents.append
+
+        controller.reprime_channel_fx("mic", generation=4, settle_s=1.25)
+
+        self.assertEqual(len(intents), 1)
+        self.assertIsInstance(intents[0], ReprimeChannelFx)
+        self.assertEqual(intents[0].node_name, "mic")
+        self.assertEqual(intents[0].generation, 4)
+        self.assertEqual(intents[0].settle_s, 1.25)
+
+    @mock.patch("audio_runtime.controller.QTimer", _FakeTimer)
+    def test_active_fx_status_does_not_blind_reprime_live_chain(self):
+        controller = self._controller()
+        intents = []
+        controller.enqueue_intent = intents.append
+        controller._worker.desired_state.selected_mic = "mic"
+        controller._worker.desired_state.channels["mic"] = ChannelSpec(
+            node_name="mic",
+            fx=SimpleNamespace(effects=["rnnoise"], generation=4),
+        )
+
+        controller._on_fx_status_ready(
+            OperationStatus(
+                node_name="mic",
+                state="active",
+                generation=4,
+                message="FX chain active",
+            )
+        )
+
+        self.assertNotIn("mic", controller._fx_reprime_timers)
+        self.assertEqual(intents, [])
+
+    @mock.patch("audio_runtime.controller.QTimer", _FakeTimer)
+    def test_set_selected_mic_cancels_old_post_active_reprime(self):
+        controller = self._controller()
+        intents = []
+        controller.enqueue_intent = intents.append
+        controller._desired_selected_mic = "mic"
+        controller._worker.desired_state.selected_mic = "mic"
+        controller._worker.desired_state.channels["mic"] = ChannelSpec(
+            node_name="mic",
+            fx=SimpleNamespace(effects=["rnnoise"], generation=4),
+        )
+        controller._schedule_post_active_fx_reprime("mic", generation=4)
+
+        controller.set_selected_mic("usb")
+
+        self.assertNotIn("mic", controller._fx_reprime_timers)
+        self.assertEqual(len(intents), 1)
+        self.assertIsInstance(intents[0], SetSelectedMic)
+        self.assertEqual(intents[0].node_name, "usb")
 
     def test_set_mix_hardware_route_sync_applies_route_immediately(self):
         calls = []

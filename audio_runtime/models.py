@@ -239,6 +239,13 @@ class SetSelectedMic:
 
 
 @dataclass
+class ReprimeChannelFx:
+    node_name: str
+    generation: int = 0
+    settle_s: float = 1.0
+
+
+@dataclass
 class RefreshNow:
     reason: str = ""
 

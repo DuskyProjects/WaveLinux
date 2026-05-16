@@ -11,6 +11,7 @@ from .models import (
     ClearChannelFx,
     EnsureSubmixRoute,
     FxSpec,
+    ReprimeChannelFx,
     RemoveNodeRouting,
     RecoverChannel,
     RefreshNow,
@@ -133,6 +134,8 @@ class RuntimePlanner:
         if isinstance(intent, SetSelectedMic):
             desired_state.selected_mic = intent.node_name
             return
+        if isinstance(intent, ReprimeChannelFx):
+            return
 
     def reconcile(self, desired_state, observed_state, intent):
         if isinstance(intent, SetChannelFx):
@@ -217,6 +220,20 @@ class RuntimePlanner:
             return [Action("set_card_profile", {
                 "card_name": intent.card_name,
                 "profile_name": intent.profile_name,
+            })]
+        if isinstance(intent, ReprimeChannelFx):
+            chan = desired_state.channels.get(intent.node_name)
+            fx = getattr(chan, "fx", None)
+            current_generation = int(getattr(fx, "generation", 0) or 0)
+            current_effects = list(getattr(fx, "effects", []) or [])
+            if desired_state.selected_mic != intent.node_name or not current_effects:
+                return []
+            if int(intent.generation or 0) and current_generation != int(intent.generation):
+                return []
+            return [Action("reprime_channel_fx", {
+                "node_name": intent.node_name,
+                "generation": current_generation,
+                "settle_s": float(intent.settle_s),
             })]
         if isinstance(intent, RecoverChannel):
             chan = desired_state.channels.get(intent.node_name)

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import nullcontext
 import queue
 import threading
 import time
 
-from PyQt6.QtCore import QObject, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 
 from .diagnostics import RuntimeDiagnostics
 from .executor import RuntimeExecutor
@@ -20,6 +21,7 @@ from .models import (
     FxSpec,
     MixSpec,
     OperationStatus,
+    ReprimeChannelFx,
     RemoveNodeRouting,
     RecoverChannel,
     RefreshNow,
@@ -131,6 +133,8 @@ class AudioRuntimeWorker(QObject):
             return ("card_profile", intent.card_name)
         if isinstance(intent, SetSelectedMic):
             return ("selected_mic",)
+        if isinstance(intent, ReprimeChannelFx):
+            return ("fx_reprime", intent.node_name)
         if isinstance(intent, RefreshNow):
             return ("refresh",)
         return None
@@ -203,6 +207,7 @@ class AudioRuntimeWorker(QObject):
         return isinstance(intent, (
             ClearChannelFx,
             RecoverChannel,
+            ReprimeChannelFx,
             RefreshNow,
             SetAppRoute,
             SetChannelFx,
@@ -213,6 +218,11 @@ class AudioRuntimeWorker(QObject):
 class AudioRuntimeController(QObject):
     """Main-thread facade for the serialized runtime worker."""
 
+    # Keep explicit reprime available for recovery, but do not blind-reprime a
+    # newly active chain. A/B/A mic-swap diagnostics showed the automatic
+    # post-active reprime can turn a proven-live RNNoise chain silent.
+    _POST_ACTIVE_FX_REPRIME_DELAY_MS = 7500
+    _POST_ACTIVE_FX_REPRIME_ENABLED = False
     view_state_changed = pyqtSignal(object)
     fx_status_changed = pyqtSignal(object)
     _SYNC_CONVERGENCE_HEALTH_CODES = frozenset({
@@ -257,6 +267,7 @@ class AudioRuntimeController(QObject):
         self._latest_fx_status = {}
         self._last_requested_fx = {}
         self._fx_generations = {}
+        self._fx_reprime_timers = {}
         self._desired_selected_mic = None
         self._thread = QThread(self)
         self._worker = AudioRuntimeWorker(adapter, diagnostics=self.diagnostics)
@@ -272,6 +283,33 @@ class AudioRuntimeController(QObject):
 
     def fx_status_for(self, node_name):
         return self._latest_fx_status.get(node_name, OperationStatus(node_name=node_name))
+
+    def fx_request_for(self, node_name):
+        node_name = str(node_name or "").strip()
+        wanted = self._last_requested_fx.get(node_name) or {}
+        if not wanted:
+            channel = getattr(self._worker.desired_state, "channels", {}).get(node_name)
+            if channel is not None:
+                fx = getattr(channel, "fx", None)
+                wanted = {
+                    "capture_target": str(getattr(channel, "capture_target", "") or "").strip(),
+                    "effects": list(getattr(fx, "effects", []) or []),
+                    "params_map": {
+                        key: dict(values)
+                        for key, values in (getattr(fx, "params_map", {}) or {}).items()
+                    },
+                }
+        return {
+            "capture_target": str(wanted.get("capture_target") or "").strip(),
+            "effects": list(wanted.get("effects") or []),
+            "params_map": {
+                key: dict(values)
+                for key, values in (wanted.get("params_map") or {}).items()
+            },
+        }
+
+    def fx_generation_for(self, node_name):
+        return int(self._fx_generations.get(str(node_name or "").strip(), 0) or 0)
 
     def enqueue_intent(self, intent):
         self._worker.enqueue(intent)
@@ -336,6 +374,16 @@ class AudioRuntimeController(QObject):
             if not node_name:
                 continue
             self.enqueue_intent(RecoverChannel(node_name=str(node_name)))
+
+    def reprime_channel_fx(self, node_name, *, generation=0, settle_s=1.0):
+        node_name = str(node_name or "").strip()
+        if not node_name:
+            return
+        self.enqueue_intent(ReprimeChannelFx(
+            node_name=node_name,
+            generation=int(generation or 0),
+            settle_s=float(settle_s),
+        ))
 
     def set_submix_state(self, node_id, mix_name, volume, mute, node_name=""):
         self.enqueue_intent(SetSubmixState(
@@ -469,6 +517,9 @@ class AudioRuntimeController(QObject):
     def set_selected_mic(self, node_name):
         if node_name == self._desired_selected_mic:
             return
+        old_node_name = self._desired_selected_mic
+        if old_node_name:
+            self._cancel_post_active_fx_reprime(old_node_name)
         self._desired_selected_mic = node_name
         self.enqueue_intent(SetSelectedMic(node_name=node_name))
 
@@ -634,6 +685,7 @@ class AudioRuntimeController(QObject):
         )
 
     def shutdown(self):
+        self._cancel_all_post_active_fx_reprime()
         self._worker.stop()
         self._thread.quit()
         self._thread.wait(3000)
@@ -645,9 +697,121 @@ class AudioRuntimeController(QObject):
     def _on_fx_status_ready(self, status):
         if status.node_name:
             self._latest_fx_status[status.node_name] = status
+            state = str(getattr(status, "state", "") or "").strip()
+            if state in {"building", "clearing", "cutover_pending", "degraded", "idle"}:
+                self._cancel_post_active_fx_reprime(status.node_name)
+            elif state == "active":
+                self._maybe_schedule_post_active_fx_reprime(status)
         self.fx_status_changed.emit(status)
 
+    def _maybe_schedule_post_active_fx_reprime(self, status):
+        node_name = str(getattr(status, "node_name", "") or "").strip()
+        if not node_name:
+            return
+        if not bool(self._POST_ACTIVE_FX_REPRIME_ENABLED):
+            self._cancel_post_active_fx_reprime(node_name)
+            return
+        message = str(getattr(status, "message", "") or "").strip()
+        if message != "FX chain active":
+            self._cancel_post_active_fx_reprime(node_name)
+            return
+        context = self._desired_fx_context(node_name)
+        if context["selected_mic"] != node_name or not context["requested_effects"]:
+            self._cancel_post_active_fx_reprime(node_name)
+            return
+        desired_generation = int(context["generation"] or 0)
+        status_generation = int(getattr(status, "generation", 0) or 0)
+        if desired_generation and status_generation and desired_generation != status_generation:
+            self._cancel_post_active_fx_reprime(node_name)
+            return
+        self._schedule_post_active_fx_reprime(
+            node_name,
+            generation=status_generation or desired_generation,
+            delay_ms=self._POST_ACTIVE_FX_REPRIME_DELAY_MS,
+            settle_s=1.0,
+        )
+
+    def _schedule_post_active_fx_reprime(self, node_name, *, generation=0, delay_ms=1000,
+                                         settle_s=1.0):
+        node_name = str(node_name or "").strip()
+        if not node_name:
+            return
+        self._cancel_post_active_fx_reprime(node_name)
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda name=node_name: self._run_post_active_fx_reprime(name))
+        self._fx_reprime_timers[node_name] = {
+            "timer": timer,
+            "generation": int(generation or 0),
+            "settle_s": float(settle_s),
+        }
+        timer.start(max(0, int(delay_ms)))
+
+    def _cancel_post_active_fx_reprime(self, node_name):
+        node_name = str(node_name or "").strip()
+        if not node_name:
+            return
+        entry = self._fx_reprime_timers.pop(node_name, None)
+        timer = (entry or {}).get("timer")
+        if timer is None:
+            return
+        try:
+            timer.stop()
+        except Exception:
+            pass
+        try:
+            timer.deleteLater()
+        except Exception:
+            pass
+
+    def _cancel_all_post_active_fx_reprime(self):
+        for node_name in list(self._fx_reprime_timers.keys()):
+            self._cancel_post_active_fx_reprime(node_name)
+
+    def _run_post_active_fx_reprime(self, node_name):
+        node_name = str(node_name or "").strip()
+        entry = self._fx_reprime_timers.pop(node_name, None)
+        if not node_name or entry is None:
+            return
+        timer = entry.get("timer")
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+            try:
+                timer.deleteLater()
+            except Exception:
+                pass
+        context = self._desired_fx_context(node_name)
+        if context["selected_mic"] != node_name or not context["requested_effects"]:
+            return
+        requested_generation = int(entry.get("generation", 0) or 0)
+        current_generation = int(context["generation"] or 0)
+        if requested_generation and current_generation and requested_generation != current_generation:
+            return
+        self.reprime_channel_fx(
+            node_name,
+            generation=current_generation or requested_generation,
+            settle_s=float(entry.get("settle_s", 1.0) or 1.0),
+        )
+
+    def _desired_fx_context(self, node_name):
+        node_name = str(node_name or "").strip()
+        state_lock = getattr(self._worker, "state_lock", None)
+        with (state_lock if state_lock is not None else nullcontext()):
+            desired = getattr(self._worker, "desired_state", None)
+            channels = getattr(desired, "channels", {}) if desired is not None else {}
+            channel = channels.get(node_name)
+            fx = getattr(channel, "fx", None)
+            return {
+                "selected_mic": str(getattr(desired, "selected_mic", "") or "").strip(),
+                "requested_effects": list(getattr(fx, "effects", []) or []),
+                "generation": int(getattr(fx, "generation", 0) or 0),
+            }
+
     def _drop_channel_state(self, node_name):
+        self._cancel_post_active_fx_reprime(node_name)
         self._worker.desired_state.channels.pop(node_name, None)
         if self._worker.desired_state.selected_mic == node_name:
             self._worker.desired_state.selected_mic = None
@@ -657,6 +821,7 @@ class AudioRuntimeController(QObject):
         self._latest_fx_status.pop(node_name, None)
         self._worker._fx_statuses.pop(node_name, None)
         self._worker._pending_operations.pop(f"fx:{node_name}", None)
+        self._worker._pending_operations.pop(f"fx_reprime:{node_name}", None)
         self._worker._last_observed_channel_ids.pop(node_name, None)
 
     def _rename_channel_state(self, old_node_name, new_node_name):
@@ -685,8 +850,13 @@ class AudioRuntimeController(QObject):
         pending = self._worker._pending_operations.pop(f"fx:{old_node_name}", None)
         if pending is not None:
             self._worker._pending_operations[f"fx:{new_node_name}"] = pending
+        reprime_pending = self._worker._pending_operations.pop(f"fx_reprime:{old_node_name}", None)
+        if reprime_pending is not None:
+            self._worker._pending_operations[f"fx_reprime:{new_node_name}"] = reprime_pending
+        self._cancel_post_active_fx_reprime(old_node_name)
 
     def _reset_runtime_state(self):
+        self._cancel_all_post_active_fx_reprime()
         schema_version = getattr(self._worker.desired_state, "schema_version", 1)
         self._worker.desired_state = DesiredState(schema_version=schema_version)
         self._worker._fx_statuses.clear()

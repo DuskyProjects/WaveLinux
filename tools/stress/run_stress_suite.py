@@ -23,6 +23,7 @@ from tools.stress.assertions import (
     assert_bluetooth_mic_not_selected,
     assert_default_source,
     assert_default_sink,
+    assert_fx_probe_flow,
     assert_headset_not_in_bad_profile,
     assert_mic_probe_flow,
     assert_monitor_probe_flow,
@@ -37,6 +38,7 @@ from tools.stress.assertions import (
 from tools.stress.audio_probe import (
     capture_source_audio,
     generate_probe_wav,
+    generate_speech_like_probe_wav,
     probe_route,
     spawn_probe_stream,
     stop_probe_stream,
@@ -53,6 +55,7 @@ from tools.stress.bluetooth_ops import (
     set_profile,
 )
 from tools.stress.control_client import StressControlClient, wait_for_socket
+from tools.stress.synthetic_inputs import SyntheticInputFixture
 from tools.stress.system_snapshot import (
     capture_system_snapshot,
     ensure_dir,
@@ -70,6 +73,7 @@ DEFAULT_LOOP_COUNTS = {
     "monitor_flips": 30,
     "bluetooth_reconnect": 10,
     "forced_profile": 5,
+    "effects_cycles": 10,
     "mic_swaps": 30,
     "pipewire_restart": 5,
     "app_route": 20,
@@ -85,12 +89,30 @@ PHASE_ORDER = (
     "bluetooth_reconnect",
     "forced_profile_abuse",
     "mic_swap",
+    "effects_cycle",
     "pipewire_restart",
     "app_route",
     "settings_churn",
     "module_isolation",
     "soak",
 )
+
+BLUETOOTH_REQUIRED_PHASES = frozenset(
+    {
+        "monitor_churn",
+        "bluetooth_reconnect",
+        "forced_profile_abuse",
+    }
+)
+
+DEFAULT_MIC_FX_EFFECTS = ("rnnoise",)
+DEFAULT_MIC_FX_PARAMS = {
+    "rnnoise": {
+        "VAD Threshold (%)": 75.0,
+        "VAD Grace Period (ms)": 200.0,
+        "Retroactive VAD Grace (ms)": 0.0,
+    }
+}
 
 
 def load_profile(path):
@@ -205,9 +227,12 @@ class StressRunner:
         self._app_log_handle = None
         self._client = None
         self._probe_streams = {}
+        self._synthetic_fixtures = {}
         self._bt_autoswitch_original = None
+        self._bluetooth_ready = False
         self._short_probe = generate_probe_wav(duration_s=6.0, amplitude=0.03)
         self._long_probe = generate_probe_wav(duration_s=120.0, amplitude=0.02, freq_hz=330.0)
+        self._fx_probe = generate_speech_like_probe_wav(duration_s=120.0)
 
     def log_event(self, kind, **payload):
         entry = {"at": time.time(), "kind": kind, **payload}
@@ -219,6 +244,17 @@ class StressRunner:
             str((self.profile.get("bluetooth") or {}).get("sink_name") or "").strip(),
             str(self.profile.get("fallback_speaker") or "").strip(),
         ]
+
+    def _bluetooth_required(self):
+        return any(name in BLUETOOTH_REQUIRED_PHASES for name in self.phase_names)
+
+    def _monitor_targets(self):
+        speaker = str(self.profile.get("fallback_speaker") or "").strip()
+        bt_sink = str((self.profile.get("bluetooth") or {}).get("sink_name") or "").strip()
+        targets = [speaker] if speaker else []
+        if self._bluetooth_ready and bt_sink and bt_sink not in targets:
+            targets.append(bt_sink)
+        return tuple(targets)
 
     def arm_safe_levels(self):
         for sink_name in self._safe_sink_names():
@@ -392,6 +428,18 @@ class StressRunner:
         run_text(["pactl", "set-default-source", source_name], timeout=5)
         self.restore_safe_levels()
 
+    def _preferred_fx_mic(self, summary=None):
+        summary = dict(summary or {})
+        candidates = [
+            str(summary.get("selected_mic") or "").strip(),
+            str((self.profile.get("mics") or {}).get("external") or "").strip(),
+            str((self.profile.get("mics") or {}).get("internal") or "").strip(),
+        ]
+        for candidate in candidates:
+            if candidate:
+                return candidate
+        return ""
+
     def launch_app(self):
         self.ensure_wave_stopped()
         self.ensure_defaults_physical()
@@ -481,19 +529,243 @@ class StressRunner:
         assert_monitor_probe_flow(captures)
         return captures
 
-    def _capture_selected_mic_probe(self, summary):
+    def _capture_selected_mic_probe(self, summary, *, duration_s=1.0, require_signal=False):
         fx_source = str(summary.get("selected_mic_fx_source") or summary.get("expected_default_source") or "").strip()
         ensure(fx_source, "mic.default_source_drift", "No selected mic FX/default source reported", observed=summary)
-        stats = capture_source_audio(fx_source, duration_s=1.0)
+        stats = capture_source_audio(fx_source, duration_s=float(duration_s))
         self.log_event("mic_probe", source=fx_source, stats=stats)
-        # A silent room does not reliably produce capture bytes on every
-        # source/profile combination. For the automated harness, treat the
-        # selected FX source being present and chosen as default as the hard
-        # assertion; sample bytes are logged for diagnostics but are not
-        # release-blocking without an injected physical input signal.
-        if int(stats.get("bytes", 0)) <= 0:
+        if require_signal:
+            assert_fx_probe_flow(stats)
+        elif int(stats.get("bytes", 0)) <= 0:
+            # A silent room does not reliably produce capture bytes on every
+            # source/profile combination. For non-deterministic phases, treat
+            # bytes and peaks as diagnostics only.
             self.log_event("mic_probe_no_bytes", source=fx_source, stats=stats)
         return stats
+
+    def _default_mic_fx_request(self):
+        return (
+            list(DEFAULT_MIC_FX_EFFECTS),
+            {
+                effect_id: dict(values)
+                for effect_id, values in DEFAULT_MIC_FX_PARAMS.items()
+            },
+        )
+
+    def _set_channel_fx(self, node_name, *, effects=None, params_map=None, include_summary=False):
+        effects = list(effects) if effects is not None else self._default_mic_fx_request()[0]
+        params_map = (
+            {
+                effect_id: dict(values)
+                for effect_id, values in (params_map or {}).items()
+            }
+            if params_map is not None
+            else self._default_mic_fx_request()[1]
+        )
+        response = self._client.request(
+            "set_channel_fx",
+            {
+                "node_name": node_name,
+                "effects": effects,
+                "params_map": params_map,
+                "persist": False,
+                "include_summary": include_summary,
+            },
+            timeout_s=20.0,
+        )
+        self.log_event(
+            "set_channel_fx",
+            node_name=node_name,
+            effects=effects,
+            fx_status=response.get("fx_status"),
+        )
+        return response
+
+    def _ensure_synthetic_fixture(self, key):
+        key = str(key or "").strip().lower() or "a"
+        fixture = self._synthetic_fixtures.get(key)
+        if fixture is None:
+            fixture = SyntheticInputFixture(f"{key}_{self.run_id.lower()}")
+            self._synthetic_fixtures[key] = fixture
+        fixture.provision()
+        self.log_event("synthetic_fixture_ready", key=key, fixture=fixture.to_dict())
+        return fixture
+
+    def _release_synthetic_fixtures(self):
+        for fixture in list(self._synthetic_fixtures.values()):
+            try:
+                self.log_event("synthetic_fixture_unload", fixture=fixture.to_dict())
+                fixture.unload()
+            except Exception as exc:
+                self.log_event("synthetic_fixture_unload_failed", error=repr(exc))
+        self._synthetic_fixtures.clear()
+
+    def _start_synthetic_input_signal(self, fixture, *, stream_key):
+        fixture = fixture.provision()
+        proc = self._probe_streams.get(stream_key)
+        if proc is not None and proc.poll() is None:
+            return
+        self._probe_streams[stream_key] = spawn_probe_stream(
+            self._fx_probe,
+            sink_name=fixture.sink_name,
+            app_name=f"StressFxInput{stream_key}",
+            stream_name=f"Stress FX Input {stream_key}",
+            media_role="communication",
+        )
+        time.sleep(0.35)
+
+    def _activate_fx_on_synthetic_fixture(
+        self,
+        key,
+        *,
+        stream_key,
+        effects=None,
+        params_map=None,
+        timeout_s=12.0,
+    ):
+        fixture = self._ensure_synthetic_fixture(key)
+        self._start_synthetic_input_signal(fixture, stream_key=stream_key)
+        self._client.request(
+            "set_selected_mic",
+            {
+                "source_name": fixture.source_name,
+                "include_summary": True,
+            },
+            timeout_s=20.0,
+        )
+        self._set_channel_fx(
+            fixture.source_name,
+            effects=effects,
+            params_map=params_map,
+            include_summary=True,
+        )
+        summary = self._wait_for_selected_mic_fx_ready(
+            fixture.source_name,
+            timeout_s=float(timeout_s),
+            require_signal=True,
+        )
+        return fixture, summary
+
+    def _wait_for_selected_mic_fx_signal(self, expected_mic=None, *, timeout_s=5.0, interval_s=0.1):
+        expected_mic = str(expected_mic or "").strip() or None
+        deadline = time.monotonic() + max(0.5, float(timeout_s))
+        consecutive = 0
+        last_summary = {}
+        last_stats = {}
+        while time.monotonic() < deadline:
+            summary = self._client.request("get_runtime_summary", timeout_s=10.0)
+            last_summary = dict(summary or {})
+            selected_mic = str(last_summary.get("selected_mic") or "").strip()
+            if expected_mic and selected_mic != expected_mic:
+                consecutive = 0
+                time.sleep(max(0.05, float(interval_s)))
+                continue
+            try:
+                last_stats = self._capture_selected_mic_probe(
+                    last_summary,
+                    duration_s=0.25,
+                    require_signal=True,
+                )
+                consecutive += 1
+                if consecutive >= 2:
+                    return last_summary
+            except StressAssertionFailure:
+                consecutive = 0
+            time.sleep(max(0.05, float(interval_s)))
+        raise StressAssertionFailure(
+            "fx.signal_silent",
+            "Selected mic FX output stayed silent during verification",
+            observed={"summary": last_summary, "stats": last_stats},
+        )
+
+    def _wait_for_selected_mic_fx_cleared(self, expected_mic=None, *, timeout_s=10.0, interval_s=0.2):
+        expected_mic = str(expected_mic or "").strip() or None
+        deadline = time.monotonic() + max(0.5, float(timeout_s))
+        last_summary = {}
+        while time.monotonic() < deadline:
+            summary = self._client.request("get_runtime_summary", timeout_s=10.0)
+            last_summary = dict(summary or {})
+            selected_mic = str(last_summary.get("selected_mic") or "").strip()
+            if expected_mic and selected_mic != expected_mic:
+                time.sleep(max(0.05, float(interval_s)))
+                continue
+            requested = dict(last_summary.get("selected_mic_fx_requested") or {})
+            effects = list(requested.get("effects") or [])
+            fx_source = str(last_summary.get("selected_mic_fx_source") or "").strip()
+            current_default = str(last_summary.get("active_default_source") or "").strip()
+            if not effects and not fx_source and (not expected_mic or current_default == expected_mic):
+                return last_summary
+            time.sleep(max(0.05, float(interval_s)))
+        raise StressAssertionFailure(
+            "fx.clear_timeout",
+            "Selected mic FX did not clear before timeout",
+            observed=last_summary,
+        )
+
+    def _wait_for_selected_mic_fx_ready(
+        self,
+        expected_mic=None,
+        *,
+        timeout_s=12.0,
+        interval_s=0.2,
+        require_signal=False,
+    ):
+        expected_mic = str(expected_mic or "").strip() or None
+        deadline = time.monotonic() + max(0.5, float(timeout_s))
+        last_summary = {}
+        consecutive_ready = 0
+        first_ready_at = 0.0
+        while time.monotonic() < deadline:
+            summary = self._client.request("get_runtime_summary", timeout_s=10.0)
+            last_summary = dict(summary or {})
+            selected_mic = str(last_summary.get("selected_mic") or "").strip()
+            if expected_mic and selected_mic != expected_mic:
+                consecutive_ready = 0
+                first_ready_at = 0.0
+                time.sleep(max(0.05, float(interval_s)))
+                continue
+            fx_source = str(last_summary.get("selected_mic_fx_source") or "").strip()
+            fx_status = dict(last_summary.get("selected_mic_fx_status") or {})
+            fx_state = str(fx_status.get("state") or "").strip()
+            fx_verification = dict(last_summary.get("selected_mic_fx_verification") or {})
+            fx_ready = bool(last_summary.get("selected_mic_fx_ready"))
+            if fx_state == "degraded":
+                raise StressAssertionFailure(
+                    "fx.activation_failed",
+                    "Selected mic FX degraded while waiting for activation",
+                    observed=last_summary,
+                )
+            if fx_source and fx_ready:
+                if not consecutive_ready:
+                    first_ready_at = time.monotonic()
+                consecutive_ready += 1
+                if consecutive_ready >= 3 and (time.monotonic() - first_ready_at) >= 0.5:
+                    if require_signal:
+                        signal_timeout_s = max(
+                            8.0,
+                            min(18.0, deadline - time.monotonic()),
+                        )
+                        return self._wait_for_selected_mic_fx_signal(
+                            expected_mic,
+                            timeout_s=signal_timeout_s,
+                            interval_s=0.1,
+                        )
+                    return last_summary
+            else:
+                consecutive_ready = 0
+                first_ready_at = 0.0
+            if fx_state in {"active", "idle"} and not fx_ready and fx_verification.get("reasons"):
+                self.log_event(
+                    "fx_not_ready",
+                    selected_mic=selected_mic,
+                    verification=fx_verification,
+                )
+            time.sleep(max(0.05, float(interval_s)))
+        raise StressAssertionFailure(
+            "fx.activation_timeout",
+            "Selected mic FX did not become ready before timeout",
+            observed=last_summary,
+        )
 
     def _start_direct_streams(self):
         for key, sink_name, role in (
@@ -571,6 +843,7 @@ class StressRunner:
         for proc in list(self._probe_streams.values()):
             stop_probe_stream(proc)
         self._probe_streams.clear()
+        self._release_synthetic_fixtures()
 
     def _parse_sink_inputs_for_app(self, sink_inputs_text, app_name):
         blocks = []
@@ -651,11 +924,16 @@ class StressRunner:
         self._lock_bluetooth_playback_policy()
         snapshot = self.capture_snapshot("preflight")
         assert_pipewire_stack_healthy(snapshot)
+        if not self._bluetooth_required():
+            self._bluetooth_ready = False
+            self.summary["artifacts"]["preflight"] = "preflight.json"
+            return
         self._ensure_a2dp()
         snapshot = self.capture_snapshot("preflight-post-a2dp")
         assert_headset_not_in_bad_profile(snapshot, self.profile)
         assert_bluetooth_mic_not_selected(snapshot, self.profile)
         assert_a2dp_active(snapshot, self.profile)
+        self._bluetooth_ready = True
         self.summary["artifacts"]["preflight"] = "preflight.json"
 
     def phase_cold_launch(self, attempt):
@@ -664,8 +942,9 @@ class StressRunner:
         checks.append({"name": "wait_for_ready", "status": "passed", "observed": summary})
         launch_snapshot = self.capture_snapshot(f"cold-launch-{attempt}-graph")
         assert_wave_graph_present(launch_snapshot)
-        assert_headset_not_in_bad_profile(launch_snapshot, self.profile)
-        assert_bluetooth_mic_not_selected(launch_snapshot, self.profile)
+        if self._bluetooth_ready:
+            assert_headset_not_in_bad_profile(launch_snapshot, self.profile)
+            assert_bluetooth_mic_not_selected(launch_snapshot, self.profile)
         expected_default_source = str(summary.get("expected_default_source") or "").strip()
         if expected_default_source:
             assert_default_source(launch_snapshot, expected_default_source)
@@ -684,6 +963,21 @@ class StressRunner:
     def phase_quit_loop(self, attempt):
         checks = []
         self.launch_app()
+        _, fx_summary = self._activate_fx_on_synthetic_fixture(
+            "quit",
+            stream_key=f"StressFxQuit{attempt}",
+        )
+        checks.append(
+            {
+                "name": "effects_live_before_quit",
+                "status": "passed",
+                "observed": self._capture_selected_mic_probe(
+                    fx_summary,
+                    duration_s=0.25,
+                    require_signal=True,
+                ),
+            }
+        )
         self.quit_app()
         snapshot = self.ensure_wave_stopped()
         assert_wave_graph_absent(snapshot)
@@ -695,6 +989,21 @@ class StressRunner:
     def phase_hard_kill(self, attempt):
         checks = []
         self.launch_app()
+        _, fx_summary = self._activate_fx_on_synthetic_fixture(
+            "hard_kill",
+            stream_key=f"StressFxHardKill{attempt}",
+        )
+        checks.append(
+            {
+                "name": "effects_live_before_kill",
+                "status": "passed",
+                "observed": self._capture_selected_mic_probe(
+                    fx_summary,
+                    duration_s=0.25,
+                    require_signal=True,
+                ),
+            }
+        )
         self.kill_app()
         orphan = self.capture_snapshot(f"hard-kill-{attempt}-orphan")
         checks.append({"name": "orphan_graph_snapshot", "status": "passed", "observed": orphan.get("wave_named_objects")})
@@ -775,9 +1084,23 @@ class StressRunner:
         self.launch_app()
         external = str((self.profile.get("mics") or {}).get("external") or "").strip()
         internal = str((self.profile.get("mics") or {}).get("internal") or "").strip()
-        sequence = [external, internal] * (self.loop_counts["mic_swaps"] // 2)
+        for source_name in (external, internal):
+            ensure(source_name, "mic.missing_profile_source", "Stress profile missing mic source", observed=self.profile.get("mics"))
+            self._set_channel_fx(source_name, include_summary=False)
+        self._client.request(
+            "set_selected_mic",
+            {
+                "source_name": external,
+                "include_summary": True,
+            },
+            timeout_s=20.0,
+        )
+        baseline = self._wait_for_selected_mic_fx_ready(external, timeout_s=12.0)
+        baseline_stats = self._capture_selected_mic_probe(baseline)
+        checks.append({"name": "mic_fx_baseline", "status": "passed", "observed": baseline_stats})
+        sequence = [internal if index % 2 == 0 else external for index in range(self.loop_counts["mic_swaps"])]
         for index, source_name in enumerate(sequence):
-            summary = self._client.request(
+            self._client.request(
                 "set_selected_mic",
                 {
                     "source_name": source_name,
@@ -785,20 +1108,124 @@ class StressRunner:
                 },
                 timeout_s=20.0,
             )
-            time.sleep(0.6)
+            summary = self._wait_for_selected_mic_fx_ready(source_name, timeout_s=12.0)
             ensure(summary.get("selected_mic") == source_name, "mic.default_source_drift", f"Selected mic did not switch to {source_name}", observed=summary)
             ensure(summary.get("expected_default_source"), "mic.swap_silent", "No expected default source reported after mic switch", observed=summary)
             mic_stats = self._capture_selected_mic_probe(summary)
             checks.append({"name": f"mic_swap_{index}", "status": "passed", "observed": mic_stats})
             snapshot = self.capture_snapshot(f"mic-swap-{attempt}-{index}")
-            assert_bluetooth_mic_not_selected(snapshot, self.profile)
+            if self._bluetooth_ready:
+                assert_bluetooth_mic_not_selected(snapshot, self.profile)
         self.quit_app()
+        return checks
+
+    def phase_effects_cycle(self, attempt):
+        checks = []
+        self.launch_app()
+        fixture_keys = ("a", "b")
+        for key in fixture_keys:
+            fixture = self._ensure_synthetic_fixture(key)
+            self._start_synthetic_input_signal(fixture, stream_key=f"StressFxCycle{key.upper()}")
+        for index in range(self.loop_counts["effects_cycles"]):
+            key = fixture_keys[index % len(fixture_keys)]
+            fixture = self._ensure_synthetic_fixture(key)
+            _, summary = self._activate_fx_on_synthetic_fixture(
+                key,
+                stream_key=f"StressFxCycle{key.upper()}",
+            )
+            checks.append(
+                {
+                    "name": f"effects_cycle_{index}_initial",
+                    "status": "passed",
+                    "observed": self._capture_selected_mic_probe(
+                        summary,
+                        duration_s=0.25,
+                        require_signal=True,
+                    ),
+                }
+            )
+            tuned_params = self._default_mic_fx_request()[1]
+            tuned_params["rnnoise"]["VAD Threshold (%)"] = 60.0 if index % 2 == 0 else 80.0
+            self._set_channel_fx(
+                fixture.source_name,
+                params_map=tuned_params,
+                include_summary=True,
+            )
+            summary = self._wait_for_selected_mic_fx_ready(
+                fixture.source_name,
+                timeout_s=12.0,
+                require_signal=True,
+            )
+            checks.append(
+                {
+                    "name": f"effects_cycle_{index}_retuned",
+                    "status": "passed",
+                    "observed": self._capture_selected_mic_probe(
+                        summary,
+                        duration_s=0.25,
+                        require_signal=True,
+                    ),
+                }
+            )
+            self._set_channel_fx(
+                fixture.source_name,
+                effects=[],
+                params_map={},
+                include_summary=True,
+            )
+            cleared = self._wait_for_selected_mic_fx_cleared(
+                fixture.source_name,
+                timeout_s=10.0,
+            )
+            checks.append(
+                {
+                    "name": f"effects_cycle_{index}_cleared",
+                    "status": "passed",
+                    "observed": {
+                        "selected_mic": cleared.get("selected_mic"),
+                        "active_default_source": cleared.get("active_default_source"),
+                    },
+                }
+            )
+            self._set_channel_fx(fixture.source_name, include_summary=True)
+            summary = self._wait_for_selected_mic_fx_ready(
+                fixture.source_name,
+                timeout_s=12.0,
+                require_signal=True,
+            )
+            checks.append(
+                {
+                    "name": f"effects_cycle_{index}_restored",
+                    "status": "passed",
+                    "observed": self._capture_selected_mic_probe(
+                        summary,
+                        duration_s=0.25,
+                        require_signal=True,
+                    ),
+                }
+            )
+        self.quit_app()
+        self._stop_all_probe_streams()
         return checks
 
     def phase_pipewire_restart(self, attempt):
         checks = []
         self.launch_app()
-        self._start_direct_streams()
+        _, pre_summary = self._activate_fx_on_synthetic_fixture(
+            "pipewire_restart",
+            stream_key=f"StressFxPipeWire{attempt}",
+        )
+        checks.append(
+            {
+                "name": "effects_live_before_pipewire_restart",
+                "status": "passed",
+                "observed": self._capture_selected_mic_probe(
+                    pre_summary,
+                    duration_s=0.25,
+                    require_signal=True,
+                ),
+            }
+        )
         self.restart_pipewire_stack()
         snapshot, timeline_name = self._wait_for_pipewire_restart_recovery(attempt)
         write_snapshot_artifacts(
@@ -807,17 +1234,34 @@ class StressRunner:
             snapshot,
         )
         assert_pipewire_stack_healthy(snapshot)
-        assert_headset_not_in_bad_profile(snapshot, self.profile)
+        if self._bluetooth_ready:
+            assert_headset_not_in_bad_profile(snapshot, self.profile)
         checks.append({
             "name": "pipewire_stack_healthy",
             "status": "passed",
             "observed": {"timeline": timeline_name},
         })
+        self._stop_all_probe_streams()
         self.ensure_wave_stopped()
         self.launch_app()
         summary = self._client.request("get_runtime_summary", timeout_s=10.0)
         ensure(summary.get("ready"), "pw.restart_recovery_failed", "WaveLinux did not recover after PipeWire restart", observed=summary)
         checks.append({"name": "wave_ready_after_restart", "status": "passed", "observed": summary})
+        _, recovered_summary = self._activate_fx_on_synthetic_fixture(
+            "pipewire_restart",
+            stream_key=f"StressFxPipeWire{attempt}",
+        )
+        checks.append(
+            {
+                "name": "effects_live_after_pipewire_restart",
+                "status": "passed",
+                "observed": self._capture_selected_mic_probe(
+                    recovered_summary,
+                    duration_s=0.25,
+                    require_signal=True,
+                ),
+            }
+        )
         self.quit_app()
         self._stop_all_probe_streams()
         return checks
@@ -837,10 +1281,9 @@ class StressRunner:
         for app_name, sink_name in route_targets.items():
             self._client.request("set_app_route", {"app_id": resolved[app_name], "sink_name": sink_name}, timeout_s=20.0)
         time.sleep(1.0)
-        speaker = str(self.profile.get("fallback_speaker") or "").strip()
-        bt_sink = str((self.profile.get("bluetooth") or {}).get("sink_name") or "").strip()
+        targets = self._monitor_targets()
         for index in range(self.loop_counts["app_route"]):
-            target = speaker if index % 2 == 0 else bt_sink
+            target = targets[index % len(targets)]
             self._client.request("set_monitor_output", {"sink_name": target}, timeout_s=20.0)
             if index % 4 == 3:
                 self._stop_all_probe_streams()
@@ -860,14 +1303,26 @@ class StressRunner:
 
     def phase_settings_churn(self, attempt):
         checks = []
-        self.launch_app()
+        summary = self.launch_app()
         self._start_direct_streams()
         tabs = ["Apps", "Health", "Advanced", "Updates"]
         timings = []
-        speaker = str(self.profile.get("fallback_speaker") or "").strip()
-        bt_sink = str((self.profile.get("bluetooth") or {}).get("sink_name") or "").strip()
-        internal = str((self.profile.get("mics") or {}).get("internal") or "").strip()
-        external = str((self.profile.get("mics") or {}).get("external") or "").strip()
+        targets = self._monitor_targets()
+        _, fx_summary = self._activate_fx_on_synthetic_fixture(
+            "settings_a",
+            stream_key="StressFxSettingsA",
+        )
+        checks.append(
+            {
+                "name": "settings_fx_baseline",
+                "status": "passed",
+                "observed": self._capture_selected_mic_probe(
+                    fx_summary,
+                    duration_s=0.25,
+                    require_signal=True,
+                ),
+            }
+        )
         for index in range(self.loop_counts["settings_tabs"]):
             tab_name = tabs[index % len(tabs)]
             started = time.monotonic()
@@ -876,8 +1331,13 @@ class StressRunner:
             timings.append(elapsed_ms)
             ensure(result.get("active_tab") == tab_name, "ui.tab_switch_slow", f"Settings tab did not switch to {tab_name}", observed=result)
             if index % 10 == 0:
-                self._client.request("set_monitor_output", {"sink_name": speaker if (index // 10) % 2 == 0 else bt_sink}, timeout_s=20.0)
-                self._client.request("set_selected_mic", {"source_name": internal if (index // 10) % 2 == 0 else external}, timeout_s=20.0)
+                target = targets[(index // 10) % len(targets)]
+                self._client.request("set_monitor_output", {"sink_name": target}, timeout_s=20.0)
+                fx_key = "settings_a" if (index // 10) % 2 == 0 else "settings_b"
+                _, summary = self._activate_fx_on_synthetic_fixture(
+                    fx_key,
+                    stream_key=f"StressFxSettings{fx_key[-1].upper()}",
+                )
             if elapsed_ms > 750.0:
                 raise StressAssertionFailure("ui.tab_switch_slow", f"Settings tab switch exceeded 750ms on {tab_name}", observed={"elapsed_ms": elapsed_ms, "tab": tab_name})
         hard_slow = [value for value in timings if value > 400.0]
@@ -897,6 +1357,16 @@ class StressRunner:
             or summary.get("active_default_sink")
             or self._preferred_sink()
         )
+        fixture, fx_summary = self._activate_fx_on_synthetic_fixture(
+            "module_isolation",
+            stream_key="StressFxIsolation",
+        )
+        mic_baseline = self._capture_selected_mic_probe(
+            fx_summary,
+            duration_s=0.25,
+            require_signal=True,
+        )
+        checks.append({"name": "effects_selected_mic_baseline", "status": "passed", "observed": mic_baseline})
         baseline = self._probe_monitor_path(
             hardware_sink,
             phase_id=f"module-isolation-baseline-{attempt}",
@@ -1050,6 +1520,17 @@ class StressRunner:
             channel_sink="wavelinux_browser",
         )
         checks.append({"name": "effects_restart", "status": "passed", "observed": effects_probe})
+        runtime_summary = self._wait_for_selected_mic_fx_ready(
+            fixture.source_name,
+            timeout_s=12.0,
+            require_signal=True,
+        )
+        effects_mic_probe = self._capture_selected_mic_probe(
+            runtime_summary,
+            duration_s=0.25,
+            require_signal=True,
+        )
+        checks.append({"name": "effects_restart_selected_mic", "status": "passed", "observed": effects_mic_probe})
 
         device_policy = self._client.request(
             "restart_module",
@@ -1108,6 +1589,7 @@ class StressRunner:
             ("bluetooth_reconnect", self.loop_counts["bluetooth_reconnect"], self.phase_bluetooth_reconnect),
             ("forced_profile_abuse", self.loop_counts["forced_profile"], self.phase_forced_profile_abuse),
             ("mic_swap", 1, self.phase_mic_swap),
+            ("effects_cycle", 1, self.phase_effects_cycle),
             ("pipewire_restart", self.loop_counts["pipewire_restart"], self.phase_pipewire_restart),
             ("app_route", 1, self.phase_app_route),
             ("settings_churn", 1, self.phase_settings_churn),

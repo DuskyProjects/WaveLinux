@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import engine.effects_pipeline as effects_pipeline
 import logging
 import time
 
@@ -32,6 +33,169 @@ def unload_submix_replacements(engine, replacements):
             engine._run(["pactl", "unload-module", str(module_id)])
 
 
+def _stored_proxy_info(info):
+    return {
+        "sink_name": info.get("proxy_sink_name"),
+        "sink_module_id": info.get("proxy_sink_module_id"),
+        "source_name": info.get("proxy_source_name") or info.get("source"),
+        "source_request_name": info.get("proxy_source_request_name"),
+        "source_module_id": info.get("proxy_source_module_id"),
+    }
+
+
+def _proxy_is_usable(engine, proxy):
+    sink_name = str(proxy.get("sink_name") or "").strip()
+    source_name = str(proxy.get("source_name") or "").strip()
+    if not sink_name or not source_name:
+        return False
+    sink_module_id = proxy.get("sink_module_id")
+    if sink_module_id is not None and not engine._module_is_alive(sink_module_id):
+        return False
+    source_module_id = proxy.get("source_module_id")
+    if source_module_id is not None and not engine._module_is_alive(source_module_id):
+        return False
+    resolve_source_name = getattr(engine, "resolve_source_name", None)
+    if callable(resolve_source_name):
+        requested = str(proxy.get("source_request_name") or source_name).strip()
+        resolved = (
+            resolve_source_name(requested)
+            or resolve_source_name(source_name)
+        )
+        if not resolved:
+            return False
+        proxy["source_name"] = resolved
+    return True
+
+
+def _prepare_proxy(engine, info, node_name):
+    proxy = _stored_proxy_info(info)
+    if _proxy_is_usable(engine, proxy):
+        return proxy
+    safe_key = str(info.get("safe_key") or engine._safe_channel_key(node_name) or "").strip()
+    if not safe_key:
+        return None
+    return engine._ensure_fx_proxy(safe_key)
+
+
+def _source_visible(engine, source_name, snap=None):
+    source_name = str(source_name or "").strip()
+    if not source_name:
+        return False
+    resolver = getattr(engine, "resolve_source_name", None)
+    if callable(resolver):
+        try:
+            if resolver(source_name, snap=snap):
+                return True
+        except TypeError:
+            if resolver(source_name):
+                return True
+    return False
+
+
+def _wait_sink_visible(engine, sink_name, *, attempts=20, delay=0.05):
+    sink_name = str(sink_name or "").strip()
+    if not sink_name:
+        return False
+    checker = getattr(engine, "_sink_visible", None)
+    if not callable(checker):
+        return True
+    for _ in range(max(1, int(attempts))):
+        try:
+            if checker(sink_name):
+                return True
+        except Exception:
+            pass
+        time.sleep(max(0.0, float(delay)))
+    return False
+
+
+def _fx_info_is_live(engine, info, snap=None):
+    for proc_key in info.get("procs", []):
+        proc = engine.rnnoise_processes.get(proc_key)
+        if proc is None or proc.poll() is not None:
+            return False
+
+    mode = str(info.get("mode") or "").strip()
+    if mode not in {"proxy", "proxy_passthrough"}:
+        return bool(info.get("source"))
+
+    for module_key in ("proxy_sink_module_id", "proxy_source_module_id"):
+        module_id = info.get(module_key)
+        if module_id is not None and not engine._module_is_alive(module_id):
+            return False
+
+    for loopback_id in info.get("loopbacks", []):
+        if loopback_id is not None and not engine._module_is_alive(loopback_id):
+            return False
+
+    if not _source_visible(engine, info.get("source"), snap=snap):
+        return False
+
+    if mode == "proxy" and not _source_visible(engine, info.get("active_chain_source"), snap=snap):
+        return False
+
+    return True
+
+
+def reprime_channel_fx_capture(engine, node_name, *, settle_s=1.0):
+    info = engine.channel_fx.get(str(node_name or "").strip()) or {}
+    if str(info.get("mode") or "").strip() != "proxy":
+        return False
+    capture_target = str(info.get("capture_target") or "").strip()
+    active_chain_sink = str(info.get("active_chain_sink") or "").strip()
+    loopbacks = list(info.get("loopbacks") or [])
+    modules_text = engine._run(["pactl", "list", "modules"]) or ""
+    upstream_loopback = ""
+    for module_id in loopbacks:
+        module_id = str(module_id or "").strip()
+        if not module_id:
+            continue
+        marker = f"Module #{module_id}"
+        start = modules_text.find(marker)
+        if start < 0:
+            continue
+        end = modules_text.find("Module #", start + len(marker))
+        section = modules_text[start:end if end >= 0 else None]
+        if f"source={capture_target}" not in section:
+            continue
+        if f"sink={active_chain_sink}" not in section:
+            continue
+        upstream_loopback = module_id
+        break
+    if not capture_target or not active_chain_sink or not upstream_loopback:
+        return False
+    loader = getattr(engine, "_load_loopback_module", None)
+    if callable(loader):
+        new_loopback = loader(
+            capture_target,
+            active_chain_sink,
+            channels=1,
+            channel_map="mono",
+            source_dont_move=True,
+            sink_dont_move=True,
+        )
+    else:
+        new_loopback = engine._wait_load_loopback(
+            capture_target,
+            active_chain_sink,
+            channels=1,
+            channel_map="mono",
+            source_dont_move=True,
+            sink_dont_move=True,
+        )
+    if new_loopback is None:
+        return False
+    time.sleep(max(0.0, float(settle_s)))
+    engine._run(["pactl", "unload-module", upstream_loopback])
+    info["loopbacks"] = [
+        new_loopback if str(module_id or "").strip() == upstream_loopback else str(module_id)
+        for module_id in loopbacks
+        if str(module_id or "").strip()
+    ]
+    engine.invalidate_snapshot()
+    return True
+
+
 def apply_channel_fx_transaction(engine, node_name, capture_target, effects, params_map=None):
     """Transactionally replace a channel FX chain without dropping audio."""
     if not node_name:
@@ -55,12 +219,15 @@ def apply_channel_fx_transaction(engine, node_name, capture_target, effects, par
             engine.channel_fx.pop(node_name, None)
         old_info = {}
 
-    reuse_proxy = bool(
-        old_info.get("mode") in {"proxy", "proxy_passthrough"}
-        and old_info.get("proxy_sink_name")
-        and old_info.get("proxy_source_name")
-    )
+    capture_target = str(capture_target or old_info.get("capture_target") or "").strip() or None
+    proxy = None
+
+    if old_info.get("mode") in {"proxy", "proxy_passthrough"}:
+        proxy = _prepare_proxy(engine, old_info, node_name)
+    reuse_proxy = proxy is not None
     effective_source = old_info.get("source") or capture_target
+    if not reuse_proxy and old_info.get("mode") in {"proxy", "proxy_passthrough"} and capture_target:
+        effective_source = capture_target
     if not effective_source:
         return fx_result(
             False,
@@ -70,12 +237,6 @@ def apply_channel_fx_transaction(engine, node_name, capture_target, effects, par
         )
 
     safe_key = engine._safe_channel_key(node_name)
-    proxy = {
-        "sink_name": old_info.get("proxy_sink_name"),
-        "sink_module_id": old_info.get("proxy_sink_module_id"),
-        "source_name": old_info.get("proxy_source_name") or old_info.get("source"),
-        "source_module_id": old_info.get("proxy_source_module_id"),
-    } if reuse_proxy else None
     stamp = int(time.time() * 1000)
     config_path, sink_name, source_name, used_effects = (
         engine._build_unified_chain_config(safe_key, ordered, params_map, stamp)
@@ -133,15 +294,9 @@ def apply_channel_fx_transaction(engine, node_name, capture_target, effects, par
             failure_stage = "candidate_source"
             raise RuntimeError("candidate source did not appear")
 
-        lb = engine._wait_load_loopback(
-            capture_target,
-            sink_name,
-            channels=1,
-            channel_map="mono",
-        )
-        if lb is None:
-            failure_stage = "upstream_loopback"
-            raise RuntimeError("candidate upstream loopback failed")
+        if not _wait_sink_visible(engine, sink_name):
+            failure_stage = "candidate_sink"
+            raise RuntimeError("candidate sink did not appear")
 
         if proxy is None:
             proxy = engine._ensure_fx_proxy(safe_key)
@@ -149,15 +304,36 @@ def apply_channel_fx_transaction(engine, node_name, capture_target, effects, par
                 failure_stage = "proxy_create"
                 raise RuntimeError("stable FX source could not be created")
 
+        if not _wait_sink_visible(engine, proxy["sink_name"]):
+            failure_stage = "proxy_sink"
+            raise RuntimeError("stable FX sink did not appear")
+
         proxy_feed = engine._wait_load_loopback(
             source_name,
             proxy["sink_name"],
             channels=1,
             channel_map="mono",
+            source_dont_move=True,
+            sink_dont_move=True,
         )
         if proxy_feed is None or not engine._module_is_alive(proxy_feed):
             failure_stage = "proxy_feed"
             raise RuntimeError("processed signal could not be attached to the stable FX source")
+
+        # Prime downstream demand before attaching the live mic/source input.
+        time.sleep(0.1)
+
+        lb = engine._wait_load_loopback(
+            capture_target,
+            sink_name,
+            channels=1,
+            channel_map="mono",
+            source_dont_move=True,
+            sink_dont_move=True,
+        )
+        if lb is None:
+            failure_stage = "upstream_loopback"
+            raise RuntimeError("candidate upstream loopback failed")
 
         if not reuse_proxy:
             for key, binding in binding_snapshot.items():
@@ -200,7 +376,7 @@ def apply_channel_fx_transaction(engine, node_name, capture_target, effects, par
                 failure_stage = "default_source"
                 raise RuntimeError("default source did not switch to the stable FX source")
 
-        engine.channel_fx[node_name] = {
+        candidate_info = {
             "mode": "proxy",
             "effects": list(used_effects),
             "params": {
@@ -208,7 +384,7 @@ def apply_channel_fx_transaction(engine, node_name, capture_target, effects, par
                 for fid in used_effects
             },
             "procs": [proc_key],
-            "loopbacks": [lb, proxy_feed],
+            "loopbacks": [proxy_feed, lb],
             "source": proxy["source_name"],
             "active_chain_source": source_name,
             "active_chain_sink": sink_name,
@@ -221,6 +397,27 @@ def apply_channel_fx_transaction(engine, node_name, capture_target, effects, par
             "proxy_source_request_name": proxy.get("source_request_name"),
             "proxy_source_module_id": proxy["source_module_id"],
         }
+        verification = effects_pipeline.verify_channel_fx_runtime(
+            engine,
+            node_name,
+            expected_default=mic_cutover,
+            info=candidate_info,
+            fx_status={
+                "state": "active",
+                "generation": 0,
+                "message": "FX chain active",
+                "error": "",
+            },
+            requested_effects=used_effects,
+        )
+        if not verification.ready:
+            failure_stage = "verification"
+            reason_text = "; ".join(
+                str(reason.detail or reason.code).strip()
+                for reason in verification.reasons
+            ).strip()
+            raise RuntimeError(reason_text or "FX runtime verification failed")
+        engine.channel_fx[node_name] = candidate_info
         if replacements:
             engine._commit_submix_replacements(
                 replacements,
@@ -278,12 +475,16 @@ def clear_channel_fx_transaction(engine, node_name, target_source=None, keep_pro
         return engine._clear_inline_channel_fx(node_name, info)
 
     if info.get("mode") in {"proxy", "proxy_passthrough"} and info.get("proxy_sink_name"):
-        proxy_source = info.get("proxy_source_name") or info.get("source")
-        proxy_sink = info.get("proxy_sink_name")
+        proxy = _prepare_proxy(engine, info, node_name)
+        proxy_source = (proxy or {}).get("source_name") or info.get("proxy_source_name") or info.get("source")
+        proxy_sink = (proxy or {}).get("sink_name") or info.get("proxy_sink_name")
         capture_target = info.get("capture_target") or ""
         dest_source = target_source or capture_target
         if not proxy_source or not proxy_sink or not dest_source:
+            engine._teardown_fx_plumbing(info)
+            engine._destroy_fx_proxy(info)
             engine.channel_fx.pop(node_name, None)
+            engine.invalidate_snapshot()
             return fx_result(
                 True,
                 kept_source=dest_source,
@@ -303,11 +504,13 @@ def clear_channel_fx_transaction(engine, node_name, target_source=None, keep_pro
         failure_stage = None
 
         try:
-            replacement_feed = engine._load_loopback_module(
+            replacement_feed = engine._wait_load_loopback(
                 dest_source,
                 proxy_sink,
                 channels=1,
                 channel_map="mono",
+                source_dont_move=True,
+                sink_dont_move=True,
             )
             if replacement_feed is None or not engine._module_is_alive(replacement_feed):
                 failure_stage = "proxy_feed"
@@ -542,9 +745,7 @@ def get_channel_fx_source(engine, node_name, snap=None):
         info["source"] = target["source_name"]
         info["capture_target"] = target["capture_target"]
         return info.get("source")
-    for pk in info.get("procs", []):
-        proc = engine.rnnoise_processes.get(pk)
-        if proc is None or proc.poll() is not None:
-            engine.clear_channel_fx(node_name)
-            return None
+    if not _fx_info_is_live(engine, info, snap=snap):
+        engine.clear_channel_fx(node_name)
+        return None
     return info.get("source")

@@ -79,6 +79,20 @@ def assert_mic_probe_flow(stats):
     )
 
 
+def assert_fx_probe_flow(stats, *, peak_min=16, rms_min=1.0):
+    ensure(
+        int((stats or {}).get("bytes", 0)) > 0
+        and int((stats or {}).get("peak", 0)) >= int(peak_min)
+        and float((stats or {}).get("rms", 0.0)) >= float(rms_min),
+        "fx.signal_silent",
+        (
+            "Expected active FX output signal but capture stayed below thresholds: "
+            f"bytes={stats.get('bytes')} peak={stats.get('peak')} rms={stats.get('rms')}"
+        ),
+        observed=stats,
+    )
+
+
 def assert_no_orphan_wavelinux_processes(snapshot):
     processes = list(snapshot.get("wave_processes") or [])
     ensure(not processes, "kill.orphan_process", "WaveLinux-related processes remain alive", observed=processes)

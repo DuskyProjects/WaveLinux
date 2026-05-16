@@ -192,6 +192,45 @@ class _FakeFxRuntime:
         return SimpleNamespace(state="idle", message="", generation=0)
 
 
+class _FakeEngineSession:
+    def __init__(self, engine):
+        self.engine = engine
+
+    def __enter__(self):
+        return self.engine
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeStressEngine:
+    def session(self):
+        return _FakeEngineSession(self)
+
+    def create_snapshot(self, force=True):
+        return SimpleNamespace(
+            nodes=[
+                SimpleNamespace(name="wavelinux_mix_monitor"),
+                SimpleNamespace(name="wavelinux_browser"),
+            ]
+        )
+
+    def get_default_sink(self):
+        return "alsa_output.speakers"
+
+    def get_default_source(self):
+        return "alsa_input.internal"
+
+    def get_live_mix_hardware_route(self, mix_name, snap=None):
+        return "alsa_output.speakers" if mix_name == "Monitor" else None
+
+    def stable_sink_inventory(self, snap=None):
+        return [{"name": "alsa_output.speakers", "display_name": "Speaker", "stable_id": "sink:1"}]
+
+    def stable_source_inventory(self, snap=None):
+        return [{"name": "alsa_input.internal", "display_name": "Mic", "stable_id": "source:1"}]
+
+
 class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -281,6 +320,48 @@ class WaveLinuxMainMixPersistenceTests(unittest.TestCase):
         )
 
         self.assertTrue(win._startup_audio_ready())
+
+    def test_startup_audio_ready_settled_requires_continuous_ready_window(self):
+        win = self._window()
+        win.selected_mic = "alsa_input.internal"
+        win.active_effects = {}
+        win._runtime_view_state = SimpleNamespace(
+            mic_inputs=[SimpleNamespace(name="alsa_input.internal")],
+            default_source="alsa_input.internal",
+            health={},
+        )
+
+        with mock.patch("controllers.runtime_view_controller.time.monotonic", side_effect=[10.0, 10.2, 10.7]):
+            self.assertFalse(win._startup_audio_ready_settled())
+            self.assertFalse(win._startup_audio_ready_settled())
+            self.assertTrue(win._startup_audio_ready_settled())
+
+    def test_stress_runtime_summary_waits_for_settled_startup_readiness(self):
+        win = self._window()
+        win.engine = _FakeStressEngine()
+        win._runtime_stopped = False
+        win._desired_mix_hw = {"Monitor": "alsa_output.speakers", "Stream": None}
+        win._runtime_degraded_channels = lambda: []
+        win._active_settings_tab_name = lambda: "Apps"
+        win._settings_dialog_visible = lambda: False
+        win._runtime_view_state = SimpleNamespace(
+            health={},
+            default_sink="alsa_output.speakers",
+            default_source="alsa_input.internal",
+            app_views=[],
+            mic_inputs=[],
+            virtual_channels=[],
+        )
+
+        with mock.patch("controllers.runtime_view_controller.time.monotonic", side_effect=[20.0, 20.6]):
+            first = win._stress_runtime_summary()
+            second = win._stress_runtime_summary()
+
+        self.assertTrue(first["startup_audio_ready"])
+        self.assertFalse(first["startup_audio_ready_settled"])
+        self.assertFalse(first["ready"])
+        self.assertTrue(second["startup_audio_ready_settled"])
+        self.assertTrue(second["ready"])
 
     def test_normalize_effect_request_keeps_rnnoise_for_internal_alsa_mics(self):
         win = self._window()

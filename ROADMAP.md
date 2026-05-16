@@ -19,6 +19,12 @@
 - More targeted diagnostics and recovery UX polish
 - Additional device-policy soak testing across broader hardware combinations
 
+## 4.0 Direction
+
+- Begin the Rust migration in WaveLinux 4.0
+- Migrate the audio engine/runtime core first while keeping the PyQt UI shell initially
+- Preserve the current modular seams so the Rust work can replace engine/runtime internals without redoing the UI architecture
+
 ## Not Planned
 
 - Native in-app VST hosting

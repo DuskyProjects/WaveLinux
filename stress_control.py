@@ -214,6 +214,14 @@ class StressControlServer(QObject):
                 persist=bool(args.get("persist", True)),
                 include_summary=bool(args.get("include_summary", False)),
             )
+        if command == "set_channel_fx":
+            return window._stress_set_channel_fx(
+                args.get("node_name"),
+                effects=list(args.get("effects") or []),
+                params_map=dict(args.get("params_map") or {}),
+                persist=bool(args.get("persist", True)),
+                include_summary=bool(args.get("include_summary", False)),
+            )
         if command == "set_app_route":
             app_id = str(args.get("app_id") or "").strip()
             sink_name = args.get("sink_name")
