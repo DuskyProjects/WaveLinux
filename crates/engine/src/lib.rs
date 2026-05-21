@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -57,15 +57,18 @@ impl From<serde_json::Error> for EngineError {
 pub struct EnginePaths {
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
+    pub autostart_dir: PathBuf,
 }
 
 impl EnginePaths {
     pub fn from_xdg() -> Result<Self, EngineError> {
         let dirs = ProjectDirs::from("io.github", "DuskyProjects", "WaveLinux")
             .ok_or(EngineError::ConfigPathUnavailable)?;
+        let base_dirs = BaseDirs::new().ok_or(EngineError::ConfigPathUnavailable)?;
         Ok(Self {
             config_dir: dirs.config_dir().to_path_buf(),
             data_dir: dirs.data_dir().to_path_buf(),
+            autostart_dir: base_dirs.config_dir().join("autostart"),
         })
     }
 
@@ -73,6 +76,7 @@ impl EnginePaths {
         Self {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
+            autostart_dir: root.join("autostart"),
         }
     }
 
@@ -82,6 +86,10 @@ impl EnginePaths {
 
     fn scenes_dir(&self) -> PathBuf {
         self.data_dir.join("scenes")
+    }
+
+    fn autostart_file(&self) -> PathBuf {
+        self.autostart_dir.join("wavelinux.desktop")
     }
 }
 
@@ -419,6 +427,7 @@ impl WaveLinuxEngine {
     }
 
     pub fn set_settings(&self, settings: MixerSettings) -> Result<MixerSettings, EngineError> {
+        self.apply_start_at_login(settings.start_at_login)?;
         self.update_config(|config| Ok(config.set_settings(settings)))?
     }
 
@@ -680,6 +689,17 @@ impl WaveLinuxEngine {
             .collect())
     }
 
+    fn apply_start_at_login(&self, enabled: bool) -> Result<(), EngineError> {
+        let autostart_file = self.paths.autostart_file();
+        if enabled {
+            fs::create_dir_all(&self.paths.autostart_dir)?;
+            fs::write(&autostart_file, render_autostart_desktop_entry())?;
+        } else if autostart_file.exists() {
+            fs::remove_file(autostart_file)?;
+        }
+        Ok(())
+    }
+
     fn update_config<T>(
         &self,
         update: impl FnOnce(&mut MixerConfig) -> Result<T, ModelError>,
@@ -821,6 +841,35 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), EngineError> {
     let data = serde_json::to_string_pretty(value)?;
     fs::write(path, data)?;
     Ok(())
+}
+
+fn render_autostart_desktop_entry() -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=WaveLinux\nComment=Linux creator audio mixer\nExec={}\nIcon=wavelinux\nTerminal=false\nCategories=Audio;AudioVideo;Mixer;\nStartupWMClass=WaveLinux\nX-GNOME-Autostart-enabled=true\n",
+        desktop_quote(&installed_binary_path())
+    )
+}
+
+fn installed_binary_path() -> PathBuf {
+    if let Some(bin_home) = std::env::var_os("XDG_BIN_HOME") {
+        return PathBuf::from(bin_home).join("wavelinux");
+    }
+    if let Some(base_dirs) = BaseDirs::new() {
+        return base_dirs.home_dir().join(".local/bin/wavelinux");
+    }
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("wavelinux"))
+}
+
+fn desktop_quote(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    if raw
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch == '"' || ch == '\\')
+    {
+        format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        raw.into_owned()
+    }
 }
 
 pub fn route_stream_to_configured_channel(
@@ -1054,6 +1103,23 @@ mod tests {
                 .settings
                 .lock_default_output
         );
+    }
+
+    #[test]
+    fn start_at_login_writes_autostart_entry() {
+        let engine = test_engine();
+        let mut settings = engine.get_state().unwrap().config.settings;
+        settings.start_at_login = true;
+        engine.set_settings(settings.clone()).unwrap();
+
+        let autostart_file = engine.paths.autostart_file();
+        let entry = fs::read_to_string(&autostart_file).unwrap();
+        assert!(entry.contains("X-GNOME-Autostart-enabled=true"));
+        assert!(entry.contains("Exec="));
+
+        settings.start_at_login = false;
+        engine.set_settings(settings).unwrap();
+        assert!(!autostart_file.exists());
     }
 
     #[test]
