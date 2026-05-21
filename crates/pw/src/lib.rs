@@ -337,6 +337,9 @@ pub fn plan_ensure_graph(config: &MixerConfig) -> PlannedGraph {
     for channel in &config.channels {
         managed_nodes.push(channel.virtual_sink_name.clone());
         commands.extend(plan_ensure_channel(channel));
+        if let Some(source) = &channel.source_device {
+            commands.extend(plan_route_input_to_channel(channel, source));
+        }
         for mix in &config.mixes {
             if channel.mix_buses.contains_key(&mix.id) {
                 commands.extend(plan_route_channel_to_mix(channel, mix));
@@ -440,6 +443,31 @@ pub fn plan_route_channel_to_mix(channel: &Channel, mix: &Mix) -> Vec<CommandSpe
             ),
         ],
         format!("route '{}' to '{}'", channel.name, mix.name),
+    )]
+}
+
+pub fn plan_route_input_to_channel(channel: &Channel, source_name: &str) -> Vec<CommandSpec> {
+    vec![CommandSpec::new(
+        CommandDomain::Route,
+        "pactl",
+        [
+            "load-module".into(),
+            "module-loopback".into(),
+            format!("source={source_name}"),
+            format!("sink={}", channel.virtual_sink_name),
+            "latency_msec=10".into(),
+            "channels=2".into(),
+            "channel_map=front-left,front-right".into(),
+            format!(
+                "source_output_properties=wavelinux.managed=1 wavelinux.role=input_to_channel wavelinux.channel_id={}",
+                channel.id
+            ),
+            format!(
+                "sink_input_properties=wavelinux.managed=1 wavelinux.role=input_to_channel wavelinux.channel_id={}",
+                channel.id
+            ),
+        ],
+        format!("route input {source_name} to '{}'", channel.name),
     )]
 }
 
@@ -1155,6 +1183,22 @@ mod tests {
         let spec = plan_move_app_stream("42", &channel);
         assert_eq!(spec.program, "pactl");
         assert_eq!(spec.args[2], "wavelinux_channel_discord");
+    }
+
+    #[test]
+    fn input_route_targets_channel_sink() {
+        let channel = Channel::new_fixed("mic", "Mic", ChannelKind::Microphone);
+        let spec = plan_route_input_to_channel(&channel, "alsa_input.usb_mic")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(spec.program, "pactl");
+        assert!(spec.args.contains(&"source=alsa_input.usb_mic".into()));
+        assert!(spec.args.contains(&"sink=wavelinux_channel_mic".into()));
+        assert!(spec
+            .args
+            .iter()
+            .any(|arg| arg.contains("wavelinux.role=input_to_channel")));
     }
 
     #[test]

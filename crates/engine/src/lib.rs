@@ -402,6 +402,22 @@ impl WaveLinuxEngine {
         self.update_config(|config| config.set_channel_linked(channel_id, linked))?
     }
 
+    pub fn set_channel_input(
+        &self,
+        channel_id: String,
+        source_device: Option<String>,
+    ) -> Result<Channel, EngineError> {
+        let channel =
+            self.update_config(|config| config.set_channel_input(channel_id, source_device))??;
+        let target_channel_id = channel.id.clone();
+        let _ = self.cleanup_modules(|module| {
+            module.role.as_deref() == Some("input_to_channel")
+                && module.channel_id.as_deref() == Some(target_channel_id.as_str())
+        });
+        let _ = self.repair_audio_graph();
+        Ok(channel)
+    }
+
     pub fn set_settings(&self, settings: MixerSettings) -> Result<MixerSettings, EngineError> {
         self.update_config(|config| Ok(config.set_settings(settings)))?
     }
@@ -1055,5 +1071,22 @@ mod tests {
             .mix_buses
             .values()
             .all(|bus| (bus.volume - 0.35).abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn channel_input_is_persisted() {
+        let engine = test_engine();
+        engine
+            .set_channel_input("mic".into(), Some("alsa_input.usb_mic".into()))
+            .unwrap();
+        let mic = engine
+            .get_state()
+            .unwrap()
+            .config
+            .channels
+            .into_iter()
+            .find(|channel| channel.id == "mic")
+            .unwrap();
+        assert_eq!(mic.source_device.as_deref(), Some("alsa_input.usb_mic"));
     }
 }

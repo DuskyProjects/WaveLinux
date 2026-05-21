@@ -58,6 +58,7 @@ export interface Channel {
   name: string;
   kind: ChannelKind;
   virtual_sink_name: string;
+  source_device?: string | null;
   linked: boolean;
   mix_buses: Record<string, MixBus>;
   app_matchers: AppMatcher[];

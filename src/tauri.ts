@@ -99,6 +99,7 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       name,
       kind: "application",
       virtual_sink_name: `wavelinux_channel_${id}`,
+      source_device: null,
       linked: false,
       mix_buses: Object.fromEntries(
         demoState.config.mixes.map((mix) => [mix.id, { volume: 1, muted: false }]),
@@ -120,6 +121,15 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
   if (command === "set_channel_linked") {
     const channel = findChannel(stringArg(args, "channelId"));
     if (channel) channel.linked = boolArg(args, "linked", channel.linked);
+    return channel ?? {};
+  }
+
+  if (command === "set_channel_input") {
+    const channel = findChannel(stringArg(args, "channelId"));
+    if (channel) {
+      const sourceDevice = stringArg(args, "sourceDevice");
+      channel.source_device = sourceDevice || null;
+    }
     return channel ?? {};
   }
 
@@ -519,6 +529,7 @@ export const demoState: AppStateSnapshot = {
         name,
         kind: index === 0 ? "microphone" : index === 5 ? "soundboard" : "application",
         virtual_sink_name: `wavelinux_channel_${id}`,
+        source_device: index === 0 ? "alsa_input.usb_mic" : null,
         linked: false,
         mix_buses: {
           monitor: { volume: index === 0 ? 0.82 : 0.76, muted: false },

@@ -101,6 +101,15 @@ fn set_channel_linked(
 }
 
 #[tauri::command]
+fn set_channel_input(
+    engine: State<'_, EngineState>,
+    channel_id: String,
+    source_device: Option<String>,
+) -> Result<Channel, String> {
+    tauri_result(engine.engine.set_channel_input(channel_id, source_device))
+}
+
+#[tauri::command]
 fn set_settings(
     engine: State<'_, EngineState>,
     settings: MixerSettings,
@@ -310,6 +319,7 @@ fn main() {
             rename_channel,
             delete_channel,
             set_channel_linked,
+            set_channel_input,
             set_settings,
             set_channel_volume,
             set_channel_mute,

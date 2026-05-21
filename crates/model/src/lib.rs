@@ -387,6 +387,16 @@ impl MixerConfig {
         Ok(channel.clone())
     }
 
+    pub fn set_channel_input(
+        &mut self,
+        channel_id: impl AsRef<str>,
+        source_device: Option<DeviceId>,
+    ) -> Result<Channel, ModelError> {
+        let channel = self.channel_mut(channel_id.as_ref())?;
+        channel.source_device = source_device.filter(|value| !value.trim().is_empty());
+        Ok(channel.clone())
+    }
+
     pub fn assign_app_to_channel(
         &mut self,
         channel_id: impl AsRef<str>,
@@ -554,6 +564,8 @@ pub struct Channel {
     pub name: String,
     pub kind: ChannelKind,
     pub virtual_sink_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_device: Option<DeviceId>,
     pub linked: bool,
     pub mix_buses: BTreeMap<MixId, MixBus>,
     pub app_matchers: Vec<AppMatcher>,
@@ -568,6 +580,7 @@ impl Channel {
             name: name.into(),
             kind,
             virtual_sink_name: format!("wavelinux_channel_{safe}"),
+            source_device: None,
             linked: false,
             mix_buses: BTreeMap::new(),
             app_matchers: Vec::new(),
@@ -1309,6 +1322,28 @@ mod tests {
             .mix_buses
             .values()
             .all(|bus| (bus.volume - 0.42).abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn channel_input_can_be_assigned_and_cleared() {
+        let mut config = MixerConfig::default();
+        config
+            .set_channel_input("mic", Some("alsa_input.usb_mic".into()))
+            .unwrap();
+        let mic = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "mic")
+            .unwrap();
+        assert_eq!(mic.source_device.as_deref(), Some("alsa_input.usb_mic"));
+
+        config.set_channel_input("mic", Some("".into())).unwrap();
+        let mic = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "mic")
+            .unwrap();
+        assert!(mic.source_device.is_none());
     }
 
     #[test]

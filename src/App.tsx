@@ -230,6 +230,7 @@ function MixerView({
   busy: boolean;
 }) {
   const outputs = state.graph.outputs.filter((output) => !output.is_virtual);
+  const inputs = state.graph.inputs.filter((input) => !input.is_virtual);
   const [menu, setMenu] = useState<{ x: number; y: number; channelId: string } | null>(null);
   const menuChannel = menu
     ? state.config.channels.find((channel) => channel.id === menu.channelId)
@@ -325,6 +326,7 @@ function MixerView({
                   <ChannelHeaderCell
                     appCount={state.graph.app_streams.filter((stream) => stream.routed_channel_id === channel.id).length}
                     channel={channel}
+                    inputs={inputs}
                     onFocus={() => setSelectedChannelId(channel.id)}
                     onOpenMenu={(event) => {
                       event.preventDefault();
@@ -495,24 +497,32 @@ function MixHeaderCell({
 function ChannelHeaderCell({
   channel,
   appCount,
+  inputs,
   onFocus,
   onOpenMenu,
   run,
 }: {
   channel: Channel;
   appCount: number;
+  inputs: AppStateSnapshot["graph"]["inputs"];
   onFocus: () => void;
   onOpenMenu: (event: ReactMouseEvent<HTMLElement>) => void;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
   const Icon = channel.kind === "microphone" ? Mic : channel.kind === "soundboard" ? Music2 : Headphones;
+  const selectedInput =
+    channel.source_device === "@DEFAULT_SOURCE@"
+      ? "Default input"
+      : inputs.find((input) => input.id === channel.source_device)?.description;
   return (
     <div className="matrix-cell channel-header-cell" onClick={onFocus} onContextMenu={onOpenMenu}>
       <div className="channel-header-main">
         <Icon size={17} />
         <div>
           <strong title={channel.name}>{channel.name}</strong>
-          <span>{appCount} apps · {channel.effects.length} FX</span>
+          <span title={selectedInput ?? "No physical input"}>
+            {appCount} apps · {channel.effects.length} FX · {selectedInput ?? "No input"}
+          </span>
         </div>
       </div>
       <button
@@ -530,6 +540,31 @@ function ChannelHeaderCell({
       >
         {channel.linked ? <Link2 size={14} /> : <Unlink size={14} />}
       </button>
+      <select
+        className="channel-input-select"
+        onChange={(event) => {
+          event.stopPropagation();
+          void run(
+            "set_channel_input",
+            {
+              channelId: channel.id,
+              sourceDevice: event.currentTarget.value || null,
+            },
+            "Input route updated",
+          );
+        }}
+        onClick={(event) => event.stopPropagation()}
+        title="Physical input source"
+        value={channel.source_device ?? ""}
+      >
+        <option value="">No physical input</option>
+        <option value="@DEFAULT_SOURCE@">Default input</option>
+        {inputs.map((input) => (
+          <option key={input.id} value={input.id}>
+            {input.description}
+          </option>
+        ))}
+      </select>
     </div>
   );
 }
