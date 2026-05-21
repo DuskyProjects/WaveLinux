@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 pub const CONFIG_VERSION: u32 = 1;
 pub const MAX_MIXES: usize = 5;
-pub const MAX_CHANNELS: usize = 8;
+pub const MAX_SOFTWARE_CHANNELS: usize = 8;
+pub const MAX_HARDWARE_INPUTS: usize = 4;
+pub const MAX_CHANNELS: usize = MAX_SOFTWARE_CHANNELS + MAX_HARDWARE_INPUTS;
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const BIT_DEPTH: u16 = 24;
 pub const CHANNEL_LAYOUT: &str = "stereo";
@@ -22,7 +24,9 @@ pub type EffectInstanceId = String;
 pub enum ModelError {
     #[error("mix limit reached ({MAX_MIXES})")]
     MixLimitReached,
-    #[error("channel limit reached ({MAX_CHANNELS})")]
+    #[error(
+        "channel limit reached ({MAX_SOFTWARE_CHANNELS} software + {MAX_HARDWARE_INPUTS} hardware)"
+    )]
     ChannelLimitReached,
     #[error("mix not found: {0}")]
     MixNotFound(String),
@@ -146,7 +150,10 @@ impl MixerConfig {
         if self.mixes.len() > MAX_MIXES {
             return Err(ModelError::MixLimitReached);
         }
-        if self.channels.len() > MAX_CHANNELS {
+        if self.channels.len() > MAX_CHANNELS
+            || self.software_channel_count() > MAX_SOFTWARE_CHANNELS
+            || self.hardware_input_count() > MAX_HARDWARE_INPUTS
+        {
             return Err(ModelError::ChannelLimitReached);
         }
         ensure_unique_names(self.mixes.iter().map(|mix| mix.name.as_str()), "mix")?;
@@ -244,7 +251,11 @@ impl MixerConfig {
         name: impl AsRef<str>,
         kind: ChannelKind,
     ) -> Result<Channel, ModelError> {
-        if self.channels.len() >= MAX_CHANNELS {
+        if self.channels.len() >= MAX_CHANNELS
+            || (kind.uses_hardware_slot() && self.hardware_input_count() >= MAX_HARDWARE_INPUTS)
+            || (!kind.uses_hardware_slot()
+                && self.software_channel_count() >= MAX_SOFTWARE_CHANNELS)
+        {
             return Err(ModelError::ChannelLimitReached);
         }
         let name = clean_name(name)?;
@@ -490,6 +501,20 @@ impl MixerConfig {
         }
     }
 
+    pub fn software_channel_count(&self) -> usize {
+        self.channels
+            .iter()
+            .filter(|channel| !channel.kind.uses_hardware_slot())
+            .count()
+    }
+
+    pub fn hardware_input_count(&self) -> usize {
+        self.channels
+            .iter()
+            .filter(|channel| channel.kind.uses_hardware_slot())
+            .count()
+    }
+
     fn mix_name_exists(&self, name: &str) -> bool {
         self.mixes
             .iter()
@@ -556,6 +581,12 @@ pub enum ChannelKind {
     Soundboard,
     System,
     Generic,
+}
+
+impl ChannelKind {
+    pub fn uses_hardware_slot(&self) -> bool {
+        matches!(self, Self::Microphone | Self::Generic)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1274,6 +1305,8 @@ mod tests {
         assert_eq!(config.audio.sample_rate_hz, SAMPLE_RATE_HZ);
         assert!(config.mixes.len() <= MAX_MIXES);
         assert!(config.channels.len() <= MAX_CHANNELS);
+        assert!(config.software_channel_count() <= MAX_SOFTWARE_CHANNELS);
+        assert!(config.hardware_input_count() <= MAX_HARDWARE_INPUTS);
         config.validate().unwrap();
     }
 
@@ -1294,6 +1327,42 @@ mod tests {
         for channel in &config.channels {
             assert!(channel.mix_buses.contains_key(&mix.id));
         }
+    }
+
+    #[test]
+    fn channel_limits_are_enforced_by_wave_link_3_kind() {
+        let mut config = MixerConfig::default();
+
+        config
+            .create_channel("Podcast", ChannelKind::Application)
+            .unwrap();
+        config
+            .create_channel("Alerts", ChannelKind::Soundboard)
+            .unwrap();
+        config
+            .create_channel("System", ChannelKind::System)
+            .unwrap();
+        let err = config
+            .create_channel("Ninth Software Channel", ChannelKind::Application)
+            .unwrap_err();
+        assert_eq!(err, ModelError::ChannelLimitReached);
+
+        config
+            .create_channel("Mic 2", ChannelKind::Microphone)
+            .unwrap();
+        config
+            .create_channel("Capture Card", ChannelKind::Generic)
+            .unwrap();
+        config
+            .create_channel("Interface", ChannelKind::Microphone)
+            .unwrap();
+        assert_eq!(config.hardware_input_count(), MAX_HARDWARE_INPUTS);
+
+        let err = config
+            .create_channel("Fifth Input", ChannelKind::Microphone)
+            .unwrap_err();
+        assert_eq!(err, ModelError::ChannelLimitReached);
+        assert_eq!(config.channels.len(), MAX_CHANNELS);
     }
 
     #[test]

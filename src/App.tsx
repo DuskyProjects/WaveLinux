@@ -60,6 +60,9 @@ const views: Array<{ id: View; label: string; icon: typeof SlidersHorizontal }> 
   { id: "settings", label: "Settings", icon: Settings },
 ];
 
+const MAX_SOFTWARE_CHANNELS = 8;
+const MAX_HARDWARE_INPUTS = 4;
+
 export default function App() {
   const [state, setState] = useState<AppStateSnapshot | null>(null);
   const [activeView, setActiveView] = useState<View>("mixer");
@@ -231,6 +234,8 @@ function MixerView({
 }) {
   const outputs = state.graph.outputs.filter((output) => !output.is_virtual);
   const inputs = state.graph.inputs.filter((input) => !input.is_virtual);
+  const softwareChannelCount = state.config.channels.filter((channel) => !isHardwareChannel(channel)).length;
+  const hardwareInputCount = state.config.channels.filter(isHardwareChannel).length;
   const [menu, setMenu] = useState<{ x: number; y: number; channelId: string } | null>(null);
   const menuChannel = menu
     ? state.config.channels.find((channel) => channel.id === menu.channelId)
@@ -291,18 +296,34 @@ function MixerView({
               <h2>Mix Matrix</h2>
               <span>Inputs down the side, independent mixes across the top</span>
             </div>
-            <button
-              className="secondary-button"
-              disabled={state.config.channels.length >= 8 || busy}
-              onClick={() => {
-                const name = window.prompt("Channel name", "Podcast");
-                if (name) void run("create_channel", { name, kind: "application" satisfies ChannelKind }, "Channel created");
-              }}
-              type="button"
-            >
-              <CirclePlus size={16} />
-              Channel
-            </button>
+            <div className="panel-actions">
+              <button
+                className="secondary-button"
+                disabled={hardwareInputCount >= MAX_HARDWARE_INPUTS || busy}
+                onClick={() => {
+                  const name = window.prompt("Input name", "Mic 2");
+                  if (name) void run("create_channel", { name, kind: "microphone" satisfies ChannelKind }, "Input added");
+                }}
+                type="button"
+                title={`${hardwareInputCount}/${MAX_HARDWARE_INPUTS} hardware inputs`}
+              >
+                <Mic size={16} />
+                Input
+              </button>
+              <button
+                className="secondary-button"
+                disabled={softwareChannelCount >= MAX_SOFTWARE_CHANNELS || busy}
+                onClick={() => {
+                  const name = window.prompt("Channel name", "Podcast");
+                  if (name) void run("create_channel", { name, kind: "application" satisfies ChannelKind }, "Channel created");
+                }}
+                type="button"
+                title={`${softwareChannelCount}/${MAX_SOFTWARE_CHANNELS} software channels`}
+              >
+                <CirclePlus size={16} />
+                App
+              </button>
+            </div>
           </div>
 
           <div className="matrix-scroller">
@@ -1665,6 +1686,10 @@ function matcherForStream(stream: AppStream) {
 
 function availableEffects(state: AppStateSnapshot): number {
   return state.graph.effect_availability.filter((item) => item.available).length;
+}
+
+function isHardwareChannel(channel: Pick<Channel, "kind">): boolean {
+  return channel.kind === "microphone" || channel.kind === "generic";
 }
 
 function pseudoLevel(seed: string, index: number): number {
