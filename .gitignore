@@ -1,0 +1,11 @@
+/target/
+/dist/
+/node_modules/
+/.vite/
+/.idea/
+/.vscode/
+*.log
+*.AppImage
+*.deb
+*.rpm
+

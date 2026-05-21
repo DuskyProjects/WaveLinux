@@ -1,0 +1,19 @@
+[package]
+name = "wavelinux-app"
+version = "4.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = ["image-png", "tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-opener = "2"
+wavelinux-engine = { path = "../engine" }
+wavelinux-model = { path = "../model" }

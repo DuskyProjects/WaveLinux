@@ -1,0 +1,33 @@
+{
+  "name": "wavelinux",
+  "version": "4.0.0",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "yarn desktop:dev",
+    "build": "yarn desktop:build && yarn install:local",
+    "desktop:dev": "cd crates/app && ../../node_modules/.bin/tauri dev",
+    "desktop:build": "cd crates/app && NO_STRIP=1 ../../node_modules/.bin/tauri build",
+    "install:local": "bash scripts/install-local.sh",
+    "tauri:dev": "yarn desktop:dev",
+    "tauri:build": "yarn desktop:build",
+    "web:dev": "vite --port 1420",
+    "web:build": "tsc && vite build",
+    "web:preview": "vite preview --port 1420"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^7.0.0"
+  }
+}
