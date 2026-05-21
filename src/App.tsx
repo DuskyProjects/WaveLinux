@@ -233,7 +233,7 @@ function MixerView({
   busy: boolean;
 }) {
   const outputs = state.graph.outputs.filter((output) => !output.is_virtual);
-  const inputs = state.graph.inputs.filter((input) => !input.is_virtual);
+  const inputs = state.graph.inputs.filter((input) => !isWaveLinuxManagedDevice(input));
   const softwareChannelCount = state.config.channels.filter((channel) => !isHardwareChannel(channel)).length;
   const hardwareInputCount = state.config.channels.filter(isHardwareChannel).length;
   const [menu, setMenu] = useState<{ x: number; y: number; channelId: string } | null>(null);
@@ -301,13 +301,13 @@ function MixerView({
                 className="secondary-button"
                 disabled={hardwareInputCount >= MAX_HARDWARE_INPUTS || busy}
                 onClick={() => {
-                  const name = window.prompt("Input name", "Mic 2");
-                  if (name) void run("create_channel", { name, kind: "microphone" satisfies ChannelKind }, "Input added");
+                  const name = window.prompt("Input name", "Hardware Input");
+                  if (name) void run("create_channel", { name, kind: "generic" satisfies ChannelKind }, "Input added");
                 }}
                 type="button"
-                title={`${hardwareInputCount}/${MAX_HARDWARE_INPUTS} hardware inputs`}
+                title={`${hardwareInputCount}/${MAX_HARDWARE_INPUTS} hardware sources`}
               >
-                <Mic size={16} />
+                <Cable size={16} />
                 Input
               </button>
               <button
@@ -530,7 +530,7 @@ function ChannelHeaderCell({
   onOpenMenu: (event: ReactMouseEvent<HTMLElement>) => void;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
-  const Icon = channel.kind === "microphone" ? Mic : channel.kind === "soundboard" ? Music2 : Headphones;
+  const Icon = channelIcon(channel.kind);
   const selectedInput =
     channel.source_device === "@DEFAULT_SOURCE@"
       ? "Default input"
@@ -541,7 +541,7 @@ function ChannelHeaderCell({
         <Icon size={17} />
         <div>
           <strong title={channel.name}>{channel.name}</strong>
-          <span title={selectedInput ?? "No physical input"}>
+          <span title={selectedInput ?? "No audio source"}>
             {appCount} apps · {channel.effects.length} FX · {selectedInput ?? "No input"}
           </span>
         </div>
@@ -575,10 +575,10 @@ function ChannelHeaderCell({
           );
         }}
         onClick={(event) => event.stopPropagation()}
-        title="Physical input source"
+        title="Audio source"
         value={channel.source_device ?? ""}
       >
-        <option value="">No physical input</option>
+        <option value="">No audio source</option>
         <option value="@DEFAULT_SOURCE@">Default input</option>
         {inputs.map((input) => (
           <option key={input.id} value={input.id}>
@@ -758,7 +758,7 @@ function ChannelStrip({
   onOpenMenu: (event: ReactMouseEvent<HTMLElement>) => void;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
-  const Icon = channel.kind === "microphone" ? Mic : channel.kind === "soundboard" ? Music2 : Headphones;
+  const Icon = channelIcon(channel.kind);
   return (
     <article className="channel-strip" onClick={onFocus} onContextMenu={onOpenMenu}>
       <div className="strip-title">
@@ -1742,6 +1742,23 @@ function availableEffects(state: AppStateSnapshot): number {
 
 function isHardwareChannel(channel: Pick<Channel, "kind">): boolean {
   return channel.kind === "microphone" || channel.kind === "generic";
+}
+
+function isWaveLinuxManagedDevice(
+  device: Pick<AppStateSnapshot["graph"]["inputs"][number], "id" | "name" | "is_virtual">,
+): boolean {
+  return (
+    device.is_virtual &&
+    (device.id.startsWith("wavelinux_") || device.name.startsWith("wavelinux_"))
+  );
+}
+
+function channelIcon(kind: ChannelKind): typeof Headphones {
+  if (kind === "microphone") return Mic;
+  if (kind === "soundboard") return Music2;
+  if (kind === "generic") return Cable;
+  if (kind === "system") return MonitorSpeaker;
+  return Headphones;
 }
 
 function pseudoLevel(seed: string, index: number): number {

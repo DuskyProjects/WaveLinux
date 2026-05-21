@@ -4,19 +4,23 @@ WaveLinux 4.0 is a new Linux-first, open-source creator audio mixer built with
 Rust, Tauri, React, and PipeWire. It carries the WaveLinux name, but the app,
 architecture, and product direction start fresh.
 
-The v1 target is software parity for generic microphones and desktop audio:
+The v1 target is software parity for generic audio hardware and desktop audio:
 
 - Up to 5 virtual mixes
-- Up to 8 software/non-Wave channels
+- Up to 8 software channels plus 4 hardware input channels
+- Hardware input routing for any PipeWire capture source: USB interfaces,
+  headset microphones, capture cards, line inputs, Bluetooth sources, monitor
+  sources, and other non-WaveLinux audio sources
 - Unlimited app streams grouped into channels
 - Per-channel/per-mix volume and mute
 - Virtual mix sources for OBS, Discord, Teams, games, and browsers
 - Open DSP chains through PipeWire filter-chain/LADSPA/LV2 replacements
 - Scenes, diagnostics, startup restore, and packaged Linux desktop builds
 
-Hardware-specific Elgato features such as Clipguard, Wave device gain control,
-Wave FX Processor, Stream Deck integration, and Marketplace effects are outside
-the v1 scope.
+Vendor-specific device features such as proprietary gain control, hardware clip
+protection, Stream Deck integration, and marketplace effects are outside the v1
+scope. WaveLinux should work with standard Linux audio devices instead of
+special-casing one hardware family.
 
 ## Desktop Development
 

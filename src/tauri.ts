@@ -550,14 +550,14 @@ export const demoState: AppStateSnapshot = {
         muted: false,
       },
     ],
-    channels: ["Mic", "Game", "Chat", "Music", "Browser", "SFX"].map((name, index) => {
+    channels: ["Hardware In", "Game", "Chat", "Music", "Browser", "SFX"].map((name, index) => {
       const id = slug(name);
       return {
         id,
         name,
-        kind: index === 0 ? "microphone" : index === 5 ? "soundboard" : "application",
+        kind: index === 0 ? "generic" : index === 5 ? "soundboard" : "application",
         virtual_sink_name: `wavelinux_channel_${id}`,
-        source_device: index === 0 ? "alsa_input.usb_mic" : null,
+        source_device: index === 0 ? "alsa_input.usb_interface" : null,
         linked: false,
         mix_buses: {
           monitor: { volume: index === 0 ? 0.82 : 0.76, muted: false },
@@ -578,7 +578,10 @@ export const demoState: AppStateSnapshot = {
   },
   graph: {
     inputs: [
-      { id: "alsa_input.usb_mic", name: "alsa_input.usb_mic", description: "USB Microphone", is_default: true, is_virtual: false },
+      { id: "alsa_input.usb_interface", name: "alsa_input.usb_interface", description: "USB Interface Line In", is_default: true, is_virtual: false },
+      { id: "alsa_input.capture_card", name: "alsa_input.capture_card", description: "HDMI Capture Card Audio", is_default: false, is_virtual: false },
+      { id: "bluez_input.headset", name: "bluez_input.headset", description: "Bluetooth Headset Mic", is_default: false, is_virtual: false },
+      { id: "alsa_output.usb.monitor", name: "alsa_output.usb.monitor", description: "USB Headphones Monitor", is_default: false, is_virtual: false },
     ],
     outputs: [
       { id: "alsa_output.usb", name: "alsa_output.usb", description: "USB Headphones", is_default: true, is_virtual: false },
