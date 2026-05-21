@@ -1018,7 +1018,7 @@ input[type="range"] {
 .diagnostic-row,
 .toggle-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 190px 42px;
+  grid-template-columns: minmax(0, 1fr) 170px 150px 42px;
   gap: 10px;
   align-items: center;
   min-height: 54px;
@@ -1030,6 +1030,26 @@ input[type="range"] {
 
 .rule-row {
   grid-template-columns: minmax(0, 1fr) auto 28px;
+}
+
+.route-volume-control {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: #9aa7b3;
+}
+
+.route-volume-control strong {
+  color: #dce8ee;
+  font-size: 12px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.route-volume-control input {
+  min-width: 0;
 }
 
 .route-row strong,
@@ -1273,6 +1293,14 @@ button:disabled {
 
   .master-panel {
     min-height: 430px;
+  }
+
+  .route-row {
+    grid-template-columns: minmax(0, 1fr) 170px 42px;
+  }
+
+  .route-volume-control {
+    grid-column: 1 / -1;
   }
 }
 

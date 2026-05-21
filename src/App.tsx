@@ -1054,6 +1054,19 @@ function StreamRouteRow({
   stream: AppStream;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
+  const [draftVolume, setDraftVolume] = useState(Math.round(stream.volume * 100));
+
+  useEffect(() => {
+    setDraftVolume(Math.round(stream.volume * 100));
+  }, [stream.volume]);
+
+  const commitVolume = useCallback(() => {
+    void run("set_app_stream_volume", {
+      streamId: stream.id,
+      volume: draftVolume / 100,
+    });
+  }, [draftVolume, run, stream.id]);
+
   const routeStream = async (channelId: string) => {
     if (!channelId) {
       const matcher = matcherForStream(stream);
@@ -1092,10 +1105,26 @@ function StreamRouteRow({
         <option value="">Unassigned</option>
         {state.config.channels.map((channel) => (
           <option key={channel.id} value={channel.id}>
-            {channel.name}
+          {channel.name}
           </option>
         ))}
       </select>
+      <label className="route-volume-control" title="App stream volume">
+        <Volume2 size={14} />
+        <input
+          aria-label={`${stream.display_name} volume`}
+          max={100}
+          min={0}
+          onChange={(event) => setDraftVolume(Number(event.currentTarget.value))}
+          onKeyUp={commitVolume}
+          onMouseUp={commitVolume}
+          onPointerUp={commitVolume}
+          onTouchEnd={commitVolume}
+          type="range"
+          value={draftVolume}
+        />
+        <strong>{draftVolume}</strong>
+      </label>
       <button
         className={stream.muted ? "icon-button danger active" : "icon-button"}
         onClick={() => run("set_app_stream_mute", { streamId: stream.id, muted: !stream.muted })}
