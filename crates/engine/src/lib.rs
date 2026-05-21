@@ -16,11 +16,11 @@ use wavelinux_model::{
     MixerSettings, ModelError, RuntimeGraph, Scene,
 };
 use wavelinux_pw::{
-    plan_ensure_graph, plan_move_app_stream, plan_route_mix_to_output, plan_set_channel_bus_mute,
-    plan_set_channel_bus_volume, plan_set_mix_mute as plan_pw_set_mix_mute,
-    plan_set_mix_volume as plan_pw_set_mix_volume, plan_set_stream_mute, plan_set_stream_volume,
-    plan_unload_modules, CommandOutput, CommandSpec, ManagedModule, PlannedGraph, PwClient,
-    PwError,
+    plan_ensure_graph, plan_move_app_stream, plan_move_app_stream_to_default,
+    plan_route_mix_to_output, plan_set_channel_bus_mute, plan_set_channel_bus_volume,
+    plan_set_mix_mute as plan_pw_set_mix_mute, plan_set_mix_volume as plan_pw_set_mix_volume,
+    plan_set_stream_mute, plan_set_stream_volume, plan_unload_modules, CommandOutput, CommandSpec,
+    ManagedModule, PlannedGraph, PwClient, PwError,
 };
 
 #[derive(Debug, Error)]
@@ -488,6 +488,10 @@ impl WaveLinuxEngine {
         self.update_config(|config| config.assign_app_to_channel(channel_id, matcher))?
     }
 
+    pub fn remove_app_route(&self, matcher: AppMatcher) -> Result<Option<AppRoute>, EngineError> {
+        self.update_config(|config| Ok(config.remove_app_route(matcher)))?
+    }
+
     pub fn move_app_stream(
         &self,
         stream_id: String,
@@ -502,6 +506,15 @@ impl WaveLinuxEngine {
             .ok_or_else(|| ModelError::ChannelNotFound(channel_id.clone()))?;
         Ok(command_execution(
             self.pw.execute(plan_move_app_stream(&stream_id, &channel)),
+        ))
+    }
+
+    pub fn move_app_stream_to_default(
+        &self,
+        stream_id: String,
+    ) -> Result<CommandExecution, EngineError> {
+        Ok(command_execution(
+            self.pw.execute(plan_move_app_stream_to_default(&stream_id)),
         ))
     }
 
@@ -1004,6 +1017,20 @@ mod tests {
         };
         let channel = route_stream_to_configured_channel(&config, &stream).unwrap();
         assert_eq!(channel.id, "chat");
+    }
+
+    #[test]
+    fn app_route_can_be_removed() {
+        let engine = test_engine();
+        let matcher = AppMatcher::from_app_id("spotify");
+        engine
+            .assign_app_to_channel("music".into(), matcher.clone())
+            .unwrap();
+
+        let removed = engine.remove_app_route(matcher.clone()).unwrap().unwrap();
+        assert_eq!(removed.channel_id, "music");
+        assert!(engine.remove_app_route(matcher).unwrap().is_none());
+        assert!(engine.get_state().unwrap().config.app_routes.is_empty());
     }
 
     #[test]

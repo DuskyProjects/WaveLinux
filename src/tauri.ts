@@ -1,5 +1,6 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
+  AppMatcher,
   AppStateSnapshot,
   Channel,
   EffectCatalog,
@@ -97,7 +98,13 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     const channel: Channel = {
       id,
       name,
-      kind: "application",
+      kind:
+        args?.kind === "microphone" ||
+        args?.kind === "soundboard" ||
+        args?.kind === "system" ||
+        args?.kind === "generic"
+          ? args.kind
+          : "application",
       virtual_sink_name: `wavelinux_channel_${id}`,
       source_device: null,
       linked: false,
@@ -199,6 +206,13 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return {};
   }
 
+  if (command === "move_app_stream_to_default") {
+    const streamId = stringArg(args, "streamId");
+    const stream = demoState.graph.app_streams.find((item) => item.id === streamId);
+    if (stream) stream.routed_channel_id = null;
+    return {};
+  }
+
   if (command === "assign_app_to_channel") {
     const channelId = stringArg(args, "channelId");
     const matcher = args?.matcher;
@@ -212,6 +226,20 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       });
     }
     return demoState.config.app_routes.at(-1) ?? {};
+  }
+
+  if (command === "remove_app_route") {
+    const matcher = args?.matcher;
+    if (matcher && typeof matcher === "object") {
+      const before = demoState.config.app_routes.length;
+      demoState.config.app_routes = demoState.config.app_routes.filter(
+        (route) => JSON.stringify(route.matcher) !== JSON.stringify(matcher),
+      );
+      if (before !== demoState.config.app_routes.length) {
+        return { matcher: matcher as AppMatcher, channel_id: "" };
+      }
+    }
+    return null;
   }
 
   if (command === "set_app_stream_volume") {

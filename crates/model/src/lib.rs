@@ -425,6 +425,14 @@ impl MixerConfig {
         Ok(route)
     }
 
+    pub fn remove_app_route(&mut self, matcher: AppMatcher) -> Option<AppRoute> {
+        let index = self
+            .app_routes
+            .iter()
+            .position(|route| route.matcher == matcher)?;
+        Some(self.app_routes.remove(index))
+    }
+
     pub fn set_effect_chain(
         &mut self,
         channel_id: impl AsRef<str>,
@@ -1480,5 +1488,19 @@ mod tests {
         let removed = config.delete_channel("chat").unwrap();
         assert_eq!(removed.id, "chat");
         assert!(config.app_routes.is_empty());
+    }
+
+    #[test]
+    fn app_routes_can_be_removed_by_matcher() {
+        let mut config = MixerConfig::default();
+        let matcher = AppMatcher::from_app_id("spotify");
+        config
+            .assign_app_to_channel("music", matcher.clone())
+            .unwrap();
+
+        let removed = config.remove_app_route(matcher.clone()).unwrap();
+        assert_eq!(removed.channel_id, "music");
+        assert!(config.app_routes.is_empty());
+        assert_eq!(config.remove_app_route(matcher), None);
     }
 }

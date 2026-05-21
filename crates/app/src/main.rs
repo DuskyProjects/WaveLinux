@@ -147,12 +147,28 @@ fn assign_app_to_channel(
 }
 
 #[tauri::command]
+fn remove_app_route(
+    engine: State<'_, EngineState>,
+    matcher: AppMatcher,
+) -> Result<Option<AppRoute>, String> {
+    tauri_result(engine.engine.remove_app_route(matcher))
+}
+
+#[tauri::command]
 fn move_app_stream(
     engine: State<'_, EngineState>,
     stream_id: String,
     channel_id: String,
 ) -> Result<wavelinux_engine::CommandExecution, String> {
     tauri_result(engine.engine.move_app_stream(stream_id, channel_id))
+}
+
+#[tauri::command]
+fn move_app_stream_to_default(
+    engine: State<'_, EngineState>,
+    stream_id: String,
+) -> Result<wavelinux_engine::CommandExecution, String> {
+    tauri_result(engine.engine.move_app_stream_to_default(stream_id))
 }
 
 #[tauri::command]
@@ -324,7 +340,9 @@ fn main() {
             set_channel_volume,
             set_channel_mute,
             assign_app_to_channel,
+            remove_app_route,
             move_app_stream,
+            move_app_stream_to_default,
             set_app_stream_volume,
             set_app_stream_mute,
             set_effect_chain,

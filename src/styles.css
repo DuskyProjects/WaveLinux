@@ -1029,11 +1029,13 @@ input[type="range"] {
 }
 
 .rule-row {
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto 28px;
 }
 
 .route-row strong,
 .route-row span,
+.rule-row strong,
+.rule-row span,
 .diagnostic-row strong,
 .diagnostic-row span {
   display: block;

@@ -509,6 +509,19 @@ pub fn plan_move_app_stream(stream_id: &str, channel: &Channel) -> CommandSpec {
     )
 }
 
+pub fn plan_move_app_stream_to_default(stream_id: &str) -> CommandSpec {
+    CommandSpec::new(
+        CommandDomain::Route,
+        "pactl",
+        [
+            String::from("move-sink-input"),
+            stream_id.to_owned(),
+            String::from("@DEFAULT_SINK@"),
+        ],
+        format!("move app stream {stream_id} to the default output"),
+    )
+}
+
 pub fn plan_set_stream_volume(stream_id: &str, volume: f32) -> CommandSpec {
     let percent = (volume.clamp(0.0, 1.0) * 100.0).round() as u8;
     CommandSpec::new(
@@ -1183,6 +1196,14 @@ mod tests {
         let spec = plan_move_app_stream("42", &channel);
         assert_eq!(spec.program, "pactl");
         assert_eq!(spec.args[2], "wavelinux_channel_discord");
+    }
+
+    #[test]
+    fn move_stream_to_default_targets_default_sink() {
+        let spec = plan_move_app_stream_to_default("42");
+        assert_eq!(spec.program, "pactl");
+        assert_eq!(spec.args[0], "move-sink-input");
+        assert_eq!(spec.args[2], "@DEFAULT_SINK@");
     }
 
     #[test]

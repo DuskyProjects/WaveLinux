@@ -1021,6 +1021,20 @@ function RoutingView({
               <div className="rule-row" key={`${route.channel_id}-${index}`}>
                 <span>{route.matcher.app_id ?? route.matcher.process_name ?? route.matcher.binary ?? "Any"}</span>
                 <strong>{channel?.name ?? route.channel_id}</strong>
+                <button
+                  className="mini-icon-button danger"
+                  onClick={() =>
+                    run(
+                      "remove_app_route",
+                      { matcher: route.matcher },
+                      "Routing rule removed",
+                    )
+                  }
+                  title="Remove saved routing rule"
+                  type="button"
+                >
+                  <Trash2 size={14} />
+                </button>
               </div>
             );
           })}
@@ -1041,7 +1055,16 @@ function StreamRouteRow({
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
   const routeStream = async (channelId: string) => {
-    if (!channelId) return;
+    if (!channelId) {
+      const matcher = matcherForStream(stream);
+      await run("remove_app_route", { matcher });
+      await run(
+        "move_app_stream_to_default",
+        { streamId: stream.id },
+        "Route cleared",
+      );
+      return;
+    }
     await run("move_app_stream", {
       streamId: stream.id,
       channelId,
