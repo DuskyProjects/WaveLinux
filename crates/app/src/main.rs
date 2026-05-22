@@ -10,8 +10,8 @@ use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use wavelinux_engine::{EngineError, GraphDebugReport, SoundCheckReport, WaveLinuxEngine};
 use wavelinux_model::{
     AppMatcher, AppRoute, AppStateSnapshot, AppVolumePreset, Channel, ChannelInputMode,
-    ChannelKind, ConfigBackup, EffectInstance, KnownApp, Mix, MixBus, MixerConfig, MixerSettings,
-    Scene, SetupTemplate,
+    ChannelKind, ConfigBackup, EffectInstance, KnownApp, LevelMeter, Mix, MixBus, MixerConfig,
+    MixerSettings, Scene, SetupTemplate,
 };
 
 struct EngineState {
@@ -26,6 +26,11 @@ fn get_state(engine: State<'_, EngineState>) -> Result<AppStateSnapshot, String>
 #[tauri::command]
 fn observe_state(engine: State<'_, EngineState>) -> Result<AppStateSnapshot, String> {
     tauri_result(engine.engine.observe_state())
+}
+
+#[tauri::command]
+fn observe_meters(engine: State<'_, EngineState>) -> Result<Vec<LevelMeter>, String> {
+    tauri_result(engine.engine.observe_meters())
 }
 
 #[tauri::command]
@@ -509,6 +514,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             observe_state,
+            observe_meters,
             create_mix,
             rename_mix,
             move_mix,
@@ -590,4 +596,5 @@ fn main() {
 
     engine.stop_background();
     let _ = background.join();
+    let _ = engine.cleanup_audio_graph();
 }

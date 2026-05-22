@@ -4615,6 +4615,7 @@ name = "wavelinux-engine"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "pipewire",
  "serde",
  "serde_json",
  "tempfile",

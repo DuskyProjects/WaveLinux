@@ -475,6 +475,11 @@ button {
   background: #151a20;
 }
 
+.channel-strip.hardware {
+  grid-template-rows: 34px 34px minmax(0, 1fr);
+  flex-basis: 158px;
+}
+
 .channel-strip:hover {
   border-color: #3a4651;
 }
@@ -494,6 +499,18 @@ button {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.strip-device-select {
+  width: 100%;
+  font-size: 12px;
+}
+
+.strip-device-select .app-select-button {
+  min-height: 30px;
+  padding: 0 7px;
+  border-radius: 7px;
+  font-size: 12px;
 }
 
 .strip-buses {
@@ -592,7 +609,6 @@ button {
   bottom: 0;
   background: linear-gradient(180deg, #efcf5a 0%, #74d98d 42%, #48bdd0 100%);
   opacity: 0.86;
-  transition: height 90ms linear;
 }
 
 .vu-cap {
@@ -602,7 +618,6 @@ button {
   height: 2px;
   border-radius: 999px;
   background: rgba(221, 248, 252, 0.9);
-  transition: bottom 90ms linear;
 }
 
 .vu-thumb {
@@ -721,10 +736,11 @@ button {
 
 .master-panel {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  grid-template-rows: auto minmax(260px, 1fr) auto auto;
   min-height: 0;
   padding: 16px;
   align-self: stretch;
+  overflow: hidden;
 }
 
 .panel {
@@ -750,17 +766,109 @@ button {
 }
 
 select,
+.app-select,
 input[type="range"] {
   width: 100%;
 }
 
-select {
+.app-select {
+  min-width: 0;
+}
+
+select,
+.app-select-button {
   min-height: 38px;
   padding: 0 10px;
   border: 1px solid #2c3540;
   border-radius: 8px;
   background: #0f141a;
   color: #eff2f4;
+}
+
+.app-select-button {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+}
+
+.app-select-button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-select-button svg {
+  color: #9aa7b3;
+}
+
+.app-select-button:disabled {
+  color: #66727d;
+  cursor: not-allowed;
+}
+
+.app-select-menu {
+  position: fixed;
+  z-index: 90;
+  display: grid;
+  gap: 2px;
+  padding: 5px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid #34414c;
+  border-radius: 8px;
+  background: #111820;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+  animation: app-select-open 82ms ease-out;
+}
+
+.app-select-option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #eff2f4;
+  text-align: left;
+}
+
+.app-select-option span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-select-option:hover,
+.app-select-option.active {
+  background: #1b2730;
+}
+
+.app-select-option.selected {
+  color: #72dce9;
+}
+
+.app-select-option:disabled {
+  color: #66727d;
+  cursor: not-allowed;
+}
+
+@keyframes app-select-open {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 input[type="range"] {
@@ -923,6 +1031,13 @@ input[type="range"] {
   margin-top: 0;
 }
 
+.effect-sync-status {
+  margin: 0 0 10px;
+  color: #68e9ff;
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .command-report-header strong,
 .command-report-header span {
   display: block;
@@ -1040,9 +1155,9 @@ input[type="range"] {
 }
 
 .rule-editor input,
-.rule-editor select,
-.rule-row select,
-.route-row select {
+.rule-editor .app-select,
+.rule-row .app-select,
+.route-row .app-select {
   min-width: 0;
 }
 
@@ -1192,7 +1307,7 @@ input[type="range"] {
   grid-column: 1 / 3;
 }
 
-.rule-row > select {
+.rule-row > .app-select {
   grid-column: 1 / 2;
 }
 
@@ -1740,14 +1855,15 @@ button:disabled {
   }
 
   .master-panel {
-    display: block;
+    display: grid;
+    grid-template-rows: auto minmax(220px, 1fr) auto auto;
     overflow: hidden;
   }
 
   .master-bus-grid {
     gap: 8px;
-    height: 124px;
-    min-height: 124px;
+    height: 100%;
+    min-height: 220px;
     margin-bottom: 8px;
   }
 
@@ -1757,7 +1873,7 @@ button:disabled {
   }
 
   .master-bus-control {
-    grid-template-rows: 22px minmax(44px, 1fr) 28px 16px;
+    grid-template-rows: 22px minmax(150px, 1fr) 28px 16px;
     gap: 4px;
   }
 

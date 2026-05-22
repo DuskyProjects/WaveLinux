@@ -24,6 +24,9 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
   if (command === "get_state" || command === "observe_state") {
     return cloneDemoState() as T;
   }
+  if (command === "observe_meters") {
+    return structuredClone(demoState.graph.meters) as T;
+  }
 
   console.info(`[demo] ${command}`, args ?? {});
   return demoMutation(command, args) as T;
@@ -203,7 +206,15 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       input_mode: "stereo",
       linked: false,
       mix_buses: Object.fromEntries(
-        demoState.config.mixes.map((mix) => [mix.id, { volume: 1, muted: false }]),
+        demoState.config.mixes.map((mix) => [
+          mix.id,
+          {
+            volume: 1,
+            muted:
+              mix.id === "monitor" &&
+              (args?.kind === "generic" || args?.kind === "microphone"),
+          },
+        ]),
       ),
       app_matchers: [],
       effects: [],
@@ -1061,7 +1072,10 @@ function applyDemoSetupTemplate(templateId: string) {
       input_mode: "stereo",
       linked: false,
       mix_buses: Object.fromEntries(
-        demoState.config.mixes.map((mix) => [mix.id, { volume: 0.8, muted: false }]),
+        demoState.config.mixes.map((mix) => [
+          mix.id,
+          { volume: mix.id === "monitor" && index === 0 ? 1 : 0.8, muted: mix.id === "monitor" && index === 0 },
+        ]),
       ),
       app_matchers: [],
       effects,
@@ -1155,7 +1169,7 @@ export const demoState: AppStateSnapshot = {
         input_mode: "stereo",
         linked: false,
         mix_buses: {
-          monitor: { volume: index === 0 ? 0.82 : 0.76, muted: false },
+          monitor: { volume: index === 0 ? 1 : 0.76, muted: index === 0 },
           stream: { volume: index === 2 ? 0.52 : 0.84, muted: false },
           discord_mix: { volume: index === 1 ? 0.2 : 0.75, muted: index === 3 },
         },

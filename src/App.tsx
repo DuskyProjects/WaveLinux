@@ -89,6 +89,10 @@ function initialView(): View {
 
 const MAX_SOFTWARE_CHANNELS = 8;
 const MAX_HARDWARE_INPUTS = 4;
+const AUTO_MONITOR_OUTPUT_VALUE = "__auto_monitor_output__";
+const UI_METER_ATTACK_SECONDS = 0.018;
+const UI_METER_RELEASE_SECONDS = 0.34;
+const UI_METER_FLOOR = 0.003;
 const matcherKinds = ["app_id", "process_name", "binary", "window_class", "media_name"] as const;
 type MatcherKind = (typeof matcherKinds)[number];
 
@@ -99,13 +103,18 @@ type AudioActionReport = {
   finishedAt: number;
 };
 
-type HeldMeterMap = Record<string, { level: number; seenAt: number }>;
 type OfflineRoutingEntry = {
   matcher: AppMatcher;
   displayName: string;
   meta: string;
   channel_id?: string;
   volumePreset?: AppVolumePreset;
+};
+
+type SelectOption = {
+  value: string;
+  label: string;
+  disabled?: boolean;
 };
 
 export default function App() {
@@ -169,13 +178,14 @@ export default function App() {
 
   useEffect(() => {
     refresh().catch((error) => setToast(String(error)));
+    const intervalMs = state?.engine.audio_graph_running ? 750 : 1000;
     const timer = window.setInterval(() => {
       invoke<AppStateSnapshot>("observe_state")
         .then(setState)
         .catch(() => undefined);
-    }, 1000);
+    }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [refresh, state?.engine.audio_graph_running]);
 
   useEffect(() => {
     if (!toast) return;
@@ -232,13 +242,6 @@ export default function App() {
         <header className="topbar">
           <div>
             <h1>{viewTitle(activeView)}</h1>
-            <p>
-              {state
-                ? `${state.config.mixes.length} mixes · ${state.config.channels.length} channels${
-                    state.config.settings.restore_audio_graph_on_launch ? " · startup restore on" : ""
-                  }`
-                : "Loading"}
-            </p>
           </div>
           <div className="top-actions">
             <button className="icon-button" onClick={() => refresh()} title="Refresh" type="button">
@@ -329,6 +332,10 @@ function MixerView({
   const outputs = state.graph.outputs.filter((output) => !output.is_virtual);
   const softwareChannelCount = state.config.channels.filter((channel) => !isHardwareChannel(channel)).length;
   const hardwareInputCount = state.config.channels.filter(isHardwareChannel).length;
+  const microphoneInputs = useMemo(
+    () => sortedMicrophoneInputs(state.graph.inputs),
+    [state.graph.inputs],
+  );
   const [menu, setMenu] = useState<{ x: number; y: number; channelId: string } | null>(null);
   const menuChannel = menu
     ? state.config.channels.find((channel) => channel.id === menu.channelId)
@@ -336,15 +343,15 @@ function MixerView({
   const menuChannelIndex = menu
     ? state.config.channels.findIndex((channel) => channel.id === menu.channelId)
     : -1;
-  const [heldMeters, setHeldMeters] = useState<HeldMeterMap>({});
   const primaryMixes = primaryBusMixes(state.config.mixes);
   const selectedMix =
     state.config.mixes.find((mix) => mix.id === activeMixId) ??
     state.config.mixes[0];
+  const [liveMeters, setLiveMeters] = useState<LevelMeter[]>(state.graph.meters);
   const metersUnavailable =
     state.engine.audio_graph_running &&
     !state.engine.dry_run &&
-    state.graph.meters.length === 0;
+    liveMeters.length === 0;
 
   useEffect(() => {
     if (!menu) return;
@@ -361,31 +368,37 @@ function MixerView({
   }, [menu]);
 
   useEffect(() => {
-    const now = Date.now();
-    const activeIds = new Set(state.graph.meters.map((meter) => meter.node_id));
-    setHeldMeters((previous) => {
-      const next: HeldMeterMap = {};
-      for (const [nodeId, held] of Object.entries(previous)) {
-        if (activeIds.has(nodeId) || now - held.seenAt < 2500) {
-          next[nodeId] = held;
-        }
-      }
-      for (const meter of state.graph.meters) {
-        const level = levelFromMeter(meter);
-        const previousLevel = next[meter.node_id]?.level ?? 0;
-        next[meter.node_id] = {
-          level: Math.max(level, previousLevel * 0.6),
-          seenAt: now,
-        };
-      }
-      return next;
-    });
+    setLiveMeters(state.graph.meters);
   }, [state.graph.meters]);
 
-  const meterLevels = useMemo(
-    () => meterLevelMap(state, heldMeters),
-    [heldMeters, state.engine.audio_graph_running, state.graph.meters],
-  );
+  useEffect(() => {
+    if (!state.engine.audio_graph_running) {
+      setLiveMeters([]);
+      return;
+    }
+
+    let stopped = false;
+    let timer = 0;
+    const tick = () => {
+      invoke<LevelMeter[]>("observe_meters")
+        .then((meters) => {
+          if (!stopped) setLiveMeters(meters);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (!stopped) timer = window.setTimeout(tick, 16);
+        });
+    };
+
+    timer = window.setTimeout(tick, 0);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [state.engine.audio_graph_running]);
+
+  const rawMeterLevels = useMemo(() => meterLevelMap(liveMeters), [liveMeters]);
+  const meterLevels = useSmoothMeterLevels(rawMeterLevels, state.engine.audio_graph_running);
   const levelFor = useCallback((nodeId: string) => meterLevels[nodeId] ?? 0, [meterLevels]);
 
   return (
@@ -426,17 +439,10 @@ function MixerView({
           <div className="source-toolbar">
             <div>
               <h2>Sources</h2>
-              <span>
-                {metersUnavailable
-                  ? "Meters unavailable: no live meter data"
-                  : selectedMix
-                    ? `${selectedMix.name} mix selected`
-                    : "Monitor and Stream"}
-              </span>
             </div>
             <div className="panel-actions">
               {metersUnavailable && (
-                <span className="meter-warning" title="No live pw-record meter samples are available yet">
+                <span className="meter-warning" title="No live PipeWire meter samples are available yet">
                   <Gauge size={14} />
                   Meters unavailable
                 </span>
@@ -472,13 +478,13 @@ function MixerView({
 
           <div className="channel-rail">
             {state.config.channels.map((channel) => {
-              const sourceLevel = levelFor(channel.id);
               return (
                 <ChannelStrip
                   channel={channel}
                   key={channel.id}
-                  level={sourceLevel}
+                  levelFor={levelFor}
                   mixes={primaryMixes}
+                  microphoneInputs={microphoneInputs}
                   onFocus={() => setSelectedChannelId(channel.id)}
                   onOpenMenu={(event) => {
                     event.preventDefault();
@@ -512,7 +518,6 @@ function MixerView({
           <div className="master-mix-title">
             <div>
               <strong>{selectedMix ? `${selectedMix.name} Mix` : "Mix"}</strong>
-              <span>{selectedMix?.virtual_source_name ?? "No virtual source"}</span>
             </div>
             <Radio size={18} />
           </div>
@@ -523,45 +528,60 @@ function MixerView({
                 key={mix.id}
                 mix={mix}
                 run={run}
-                vuLevel={mix.muted ? 0 : levelFor(mix.id) * mix.volume}
+                vuLevel={levelFor(mix.id)}
               />
             ))}
           </div>
 
           {selectedMix && (
-              <>
-                <label className="field-label" htmlFor="active-mix-monitor-output">
-                  Monitor output
-                </label>
-                <select
+            <>
+              <label className="field-label" htmlFor="active-mix-monitor-output">
+                Monitor output
+              </label>
+              <AppSelect
+                ariaLabel="Monitor output"
                 id="active-mix-monitor-output"
-                onChange={(event) =>
+                onChange={(value) => {
+                  if (selectedMix.id === "monitor" && value === AUTO_MONITOR_OUTPUT_VALUE) {
+                    void run(
+                      "set_settings",
+                      {
+                        settings: {
+                          ...state.config.settings,
+                          monitor_follows_default_output: true,
+                        },
+                      },
+                      "Auto monitor output enabled",
+                    ).catch(() => undefined);
+                    return;
+                  }
                   void run("set_mix_monitor_output", {
                     mixId: selectedMix.id,
-                    output: event.currentTarget.value || null,
-                  }).catch(() => undefined)
-                  }
-                  value={selectedMix.monitor_output ?? ""}
-                >
-                  <option value="">
-                    {state.config.settings.monitor_follows_default_output
-                      ? "Follow system default output"
-                      : "No monitor route"}
-                  </option>
-                {outputs.map((output) => (
-                  <option key={output.id} value={output.id}>
-                    {output.description}
-                  </option>
-                ))}
-              </select>
+                    output: value || null,
+                  }).catch(() => undefined);
+                }}
+                options={[
+                  ...(selectedMix.id === "monitor"
+                    ? [{
+                        value: AUTO_MONITOR_OUTPUT_VALUE,
+                        label: "Auto: Bluetooth, USB, jack, speakers",
+                      }]
+                    : []),
+                  { value: "", label: "No monitor route" },
+                  ...outputs.map((output) => ({
+                    value: output.id,
+                    label: output.description,
+                  })),
+                ]}
+                value={
+                  selectedMix.id === "monitor" && state.config.settings.monitor_follows_default_output
+                    ? AUTO_MONITOR_OUTPUT_VALUE
+                    : selectedMix.monitor_output ?? ""
+                }
+              />
             </>
           )}
 
-          <div className="master-stats">
-            <Stat icon={MonitorSpeaker} label="Outputs" value={outputs.length.toString()} />
-            <Stat icon={Cable} label="Apps" value={state.graph.app_streams.length.toString()} />
-            <Stat icon={Gauge} label="Meters" value={metersUnavailable ? "Unavailable" : state.graph.meters.length.toString()} />
-          </div>
         </div>
       </div>
       {menu && menuChannel && (
@@ -583,25 +603,70 @@ function MixerView({
 function ChannelStrip({
   channel,
   mixes,
-  level,
+  microphoneInputs,
+  levelFor,
   onFocus,
   onOpenMenu,
   run,
 }: {
   channel: Channel;
   mixes: Mix[];
-  level: number;
+  microphoneInputs: AppStateSnapshot["graph"]["inputs"];
+  levelFor: (nodeId: string) => number;
   onFocus: () => void;
   onOpenMenu: (event: ReactMouseEvent<HTMLElement>) => void;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
   const Icon = channelIcon(channel.kind);
+  const isHardware = isHardwareChannel(channel);
+  const selectedInputMissing =
+    isHardware &&
+    channel.source_device &&
+    !microphoneInputs.some((input) => input.id === channel.source_device);
+
   return (
-    <article className="channel-strip" onClick={onFocus} onContextMenu={onOpenMenu}>
+    <article
+      className={isHardware ? "channel-strip hardware" : "channel-strip"}
+      onClick={onFocus}
+      onContextMenu={onOpenMenu}
+    >
       <div className="strip-title">
         <Icon size={17} />
         <span>{channel.name}</span>
       </div>
+      {isHardware && (
+        <AppSelect
+          className="strip-device-select"
+          ariaLabel={`${channel.name} microphone`}
+          onChange={(nextValue) => {
+            const value = nextValue || null;
+            void run(
+              "set_hardware_input_device",
+              {
+                channelId: channel.id,
+                channel_id: channel.id,
+                sourceDevice: value,
+                source_device: value,
+              },
+              "Microphone updated",
+            ).catch(() => undefined);
+          }}
+          options={[
+            { value: "", label: "Auto mic" },
+            ...(selectedInputMissing
+              ? [{
+                  value: channel.source_device ?? "",
+                  label: channel.source_device ?? "",
+                }]
+              : []),
+            ...microphoneInputs.map((input) => ({
+              value: input.id,
+              label: input.description,
+            })),
+          ]}
+          value={channel.source_device ?? ""}
+        />
+      )}
       <div className="strip-buses">
         {mixes.map((mix) => (
           <ChannelBusControl
@@ -610,7 +675,7 @@ function ChannelStrip({
             key={mix.id}
             mix={mix}
             run={run}
-            vuLevel={(channel.mix_buses[mix.id]?.muted ?? false) ? 0 : level * (channel.mix_buses[mix.id]?.volume ?? 1)}
+            vuLevel={levelFor(channelBusMeterId(channel.id, mix.id))}
           />
         ))}
       </div>
@@ -718,6 +783,196 @@ function ChannelContextMenu({
       </button>
     </div>
   );
+}
+
+function AppSelect({
+  ariaLabel,
+  className = "",
+  disabled = false,
+  id,
+  onChange,
+  options,
+  value,
+}: {
+  ariaLabel: string;
+  className?: string;
+  disabled?: boolean;
+  id?: string;
+  onChange: (value: string) => void;
+  options: SelectOption[];
+  value: string;
+}) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [position, setPosition] = useState({ left: 0, top: 0, width: 180, maxHeight: 260 });
+  const selectedIndex = options.findIndex((option) => option.value === value);
+  const selectedOption = selectedIndex >= 0 ? options[selectedIndex] : options[0];
+
+  const positionMenu = useCallback(() => {
+    const button = buttonRef.current;
+    if (!button) return;
+    const rect = button.getBoundingClientRect();
+    const gap = 6;
+    const maxHeight = Math.min(260, Math.max(120, window.innerHeight - 24));
+    const spaceBelow = window.innerHeight - rect.bottom - gap - 12;
+    const spaceAbove = rect.top - gap - 12;
+    const opensUp = spaceBelow < 160 && spaceAbove > spaceBelow;
+    const height = Math.min(maxHeight, Math.max(120, opensUp ? spaceAbove : spaceBelow));
+    setPosition({
+      left: Math.max(12, Math.min(rect.left, window.innerWidth - rect.width - 12)),
+      top: opensUp ? Math.max(12, rect.top - gap - height) : Math.min(window.innerHeight - 12 - height, rect.bottom + gap),
+      width: rect.width,
+      maxHeight: height,
+    });
+  }, []);
+
+  const openMenu = useCallback(() => {
+    if (disabled || options.length === 0) return;
+    setActiveIndex(selectedIndex >= 0 ? selectedIndex : firstEnabledOptionIndex(options));
+    positionMenu();
+    setOpen(true);
+  }, [disabled, options, positionMenu, selectedIndex]);
+
+  const closeMenu = useCallback(() => setOpen(false), []);
+
+  useEffect(() => {
+    if (!open) return;
+    positionMenu();
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (
+        target &&
+        (rootRef.current?.contains(target) || menuRef.current?.contains(target))
+      ) {
+        return;
+      }
+      closeMenu();
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeMenu();
+    };
+    const onScroll = (event: Event) => {
+      const target = event.target as Node | null;
+      if (target && menuRef.current?.contains(target)) return;
+      closeMenu();
+    };
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("resize", positionMenu);
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("resize", positionMenu);
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [closeMenu, open, positionMenu]);
+
+  const choose = useCallback((option: SelectOption) => {
+    if (option.disabled) return;
+    closeMenu();
+    if (option.value !== value) {
+      onChange(option.value);
+    }
+    buttonRef.current?.focus({ preventScroll: true });
+  }, [closeMenu, onChange, value]);
+
+  const moveActive = (direction: 1 | -1) => {
+    setActiveIndex((current) => nextEnabledOptionIndex(options, current, direction));
+  };
+
+  return (
+    <div
+      className={["app-select", className].filter(Boolean).join(" ")}
+      onClick={(event) => event.stopPropagation()}
+      onPointerDown={(event) => event.stopPropagation()}
+      ref={rootRef}
+    >
+      <button
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        aria-label={ariaLabel}
+        className="app-select-button"
+        disabled={disabled}
+        id={id}
+        ref={buttonRef}
+        onClick={() => (open ? closeMenu() : openMenu())}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown") {
+            event.preventDefault();
+            if (!open) openMenu();
+            else moveActive(1);
+          } else if (event.key === "ArrowUp") {
+            event.preventDefault();
+            if (!open) openMenu();
+            else moveActive(-1);
+          } else if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            if (open && options[activeIndex]) {
+              choose(options[activeIndex]);
+            } else {
+              openMenu();
+            }
+          }
+        }}
+        type="button"
+      >
+        <span>{selectedOption?.label ?? "Select"}</span>
+        <ArrowDown size={15} />
+      </button>
+      {open && (
+        <div
+          className="app-select-menu"
+          ref={menuRef}
+          role="listbox"
+          style={{
+            left: position.left,
+            maxHeight: position.maxHeight,
+            top: position.top,
+            width: position.width,
+          }}
+        >
+          {options.map((option, index) => (
+            <button
+              aria-selected={option.value === value}
+              className={[
+                "app-select-option",
+                option.value === value ? "selected" : "",
+                index === activeIndex ? "active" : "",
+              ].filter(Boolean).join(" ")}
+              disabled={option.disabled}
+              key={`${option.value}-${index}`}
+              onClick={() => choose(option)}
+              onMouseEnter={() => setActiveIndex(index)}
+              role="option"
+              type="button"
+            >
+              <span>{option.label}</span>
+              {option.value === value && <Check size={14} />}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function firstEnabledOptionIndex(options: SelectOption[]) {
+  const index = options.findIndex((option) => !option.disabled);
+  return index >= 0 ? index : 0;
+}
+
+function nextEnabledOptionIndex(options: SelectOption[], current: number, direction: 1 | -1) {
+  if (options.length === 0) return 0;
+  let next = current;
+  for (let attempt = 0; attempt < options.length; attempt += 1) {
+    next = (next + direction + options.length) % options.length;
+    if (!options[next]?.disabled) return next;
+  }
+  return current;
 }
 
 function ChannelBusControl({
@@ -863,7 +1118,9 @@ function VuSlider({
   vuLevel: number;
 }) {
   const draggingPointerId = useRef<number | null>(null);
+  const trackRef = useRef<HTMLDivElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const visibleVuLevel = vuLevel >= 0.001 ? vuLevel : 0;
   const className = [
     "vu-slider",
     master ? "master" : "",
@@ -874,7 +1131,7 @@ function VuSlider({
     .join(" ");
 
   const valueFromPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect();
+    const rect = trackRef.current?.getBoundingClientRect() ?? event.currentTarget.getBoundingClientRect();
     if (rect.height <= 0) return value;
     const ratio = 1 - (event.clientY - rect.top) / rect.height;
     return sliderPercent(ratio * 100);
@@ -965,9 +1222,13 @@ function VuSlider({
       role="slider"
       tabIndex={0}
     >
-      <div className="vu-track">
-        <div className="vu-fill" style={{ height: trackSize(vuLevel) }} />
-        <div className="vu-cap" style={{ bottom: trackPosition(vuLevel) }} />
+      <div className="vu-track" ref={trackRef}>
+        {visibleVuLevel > 0 && (
+          <>
+            <div className="vu-fill" style={{ height: trackSize(visibleVuLevel) }} />
+            <div className="vu-cap" style={{ bottom: trackPosition(visibleVuLevel) }} />
+          </>
+        )}
       </div>
       <div className="vu-thumb" style={{ bottom: thumbPosition(value) }} />
     </div>
@@ -1023,17 +1284,15 @@ function RoutingView({
           <GitBranch size={18} />
         </div>
         <div className="rule-editor">
-          <select
-            aria-label="Rule matcher type"
-            onChange={(event) => setMatcherKind(event.currentTarget.value as MatcherKind)}
+          <AppSelect
+            ariaLabel="Rule matcher type"
+            onChange={(value) => setMatcherKind(value as MatcherKind)}
+            options={matcherKinds.map((kind) => ({
+              value: kind,
+              label: matcherKindLabel(kind),
+            }))}
             value={matcherKind}
-          >
-            {matcherKinds.map((kind) => (
-              <option key={kind} value={kind}>
-                {matcherKindLabel(kind)}
-              </option>
-            ))}
-          </select>
+          />
           <input
             aria-label="Rule matcher value"
             onChange={(event) => setMatcherValue(event.currentTarget.value)}
@@ -1044,17 +1303,15 @@ function RoutingView({
             type="text"
             value={matcherValue}
           />
-          <select
-            aria-label="Rule channel"
-            onChange={(event) => setTargetChannelId(event.currentTarget.value)}
+          <AppSelect
+            ariaLabel="Rule channel"
+            onChange={setTargetChannelId}
+            options={state.config.channels.map((channel) => ({
+              value: channel.id,
+              label: channel.name,
+            }))}
             value={targetChannelId}
-          >
-            {state.config.channels.map((channel) => (
-              <option key={channel.id} value={channel.id}>
-                {channel.name}
-              </option>
-            ))}
-          </select>
+          />
           <button
             className="secondary-button"
             disabled={!matcherValue.trim() || !targetChannelId}
@@ -1074,10 +1331,9 @@ function RoutingView({
                   <strong>{entry.displayName}</strong>
                   <span>{entry.meta}</span>
                 </div>
-                <select
-                  aria-label={`Route ${entry.displayName} to channel`}
-                  onChange={(event) => {
-                    const channelId = event.currentTarget.value;
+                <AppSelect
+                  ariaLabel={`Route ${entry.displayName} to channel`}
+                  onChange={(channelId) => {
                     if (channelId) {
                       void run(
                         "assign_app_to_channel",
@@ -1088,15 +1344,15 @@ function RoutingView({
                       void run("remove_app_route", { matcher: entry.matcher }, "Routing rule removed");
                     }
                   }}
+                  options={[
+                    { value: "", label: "Unassigned" },
+                    ...state.config.channels.map((item) => ({
+                      value: item.id,
+                      label: item.name,
+                    })),
+                  ]}
                   value={channel?.id ?? ""}
-                >
-                  <option value="">Unassigned</option>
-                  {state.config.channels.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.name}
-                    </option>
-                  ))}
-                </select>
+                />
                 <OfflineVolumeControl
                   label={entry.displayName}
                   matcher={entry.matcher}
@@ -1253,17 +1509,18 @@ function StreamRouteRow({
         <strong>{stream.display_name}</strong>
         <span>{stream.media_name ?? stream.process_name ?? stream.id}</span>
       </div>
-      <select
+      <AppSelect
+        ariaLabel={`Route ${stream.display_name} to channel`}
+        onChange={(value) => void routeStream(value)}
+        options={[
+          { value: "", label: "Unassigned" },
+          ...state.config.channels.map((channel) => ({
+            value: channel.id,
+            label: channel.name,
+          })),
+        ]}
         value={stream.routed_channel_id ?? ""}
-        onChange={(event) => void routeStream(event.currentTarget.value)}
-      >
-        <option value="">Unassigned</option>
-        {state.config.channels.map((channel) => (
-          <option key={channel.id} value={channel.id}>
-            {channel.name}
-          </option>
-        ))}
-      </select>
+      />
       <label className="route-volume-control" title="App stream volume">
         <Volume2 size={14} />
         <input
@@ -1388,12 +1645,82 @@ function EffectsView({
   setSelectedChannelId: (channelId: string) => void;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
-  const selectedEffects = selectedChannel?.effects ?? [];
-  const microphoneInputs = state.graph.inputs.filter(isMicrophoneSource);
+  const microphoneInputs = useMemo(
+    () => sortedMicrophoneInputs(state.graph.inputs),
+    [state.graph.inputs],
+  );
   const [effectClipboard, setEffectClipboard] = useState<EffectInstance | null>(null);
+  const [draftEffectsByChannel, setDraftEffectsByChannel] = useState<Record<string, EffectInstance[]>>({});
+  const [pendingEffectWrites, setPendingEffectWrites] = useState<Record<string, number>>({});
+  const [effectError, setEffectError] = useState<string | null>(null);
+  const effectWriteGeneration = useRef<Record<string, number>>({});
+  const selectedEffects = selectedChannel
+    ? draftEffectsByChannel[selectedChannel.id] ?? selectedChannel.effects
+    : [];
+
+  useEffect(() => {
+    setDraftEffectsByChannel((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const channel of state.config.channels) {
+        const draft = next[channel.id];
+        if (draft && effectChainsEqual(draft, channel.effects)) {
+          delete next[channel.id];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [state.config.channels]);
+
   const updateEffects = (effects: EffectInstance[], message?: string) => {
     if (!selectedChannel) return;
-    void run("set_effect_chain", { channelId: selectedChannel.id, effects }, message);
+    const channelId = selectedChannel.id;
+    const optimisticEffects = structuredClone(effects);
+    const writeGeneration = (effectWriteGeneration.current[channelId] ?? 0) + 1;
+    effectWriteGeneration.current[channelId] = writeGeneration;
+    setEffectError(null);
+    setDraftEffectsByChannel((current) => ({
+      ...current,
+      [channelId]: optimisticEffects,
+    }));
+    setPendingEffectWrites((current) => ({
+      ...current,
+      [channelId]: (current[channelId] ?? 0) + 1,
+    }));
+    void invoke<Channel>("set_effect_chain", { channelId, effects: optimisticEffects })
+      .then((channel) => {
+        if (effectWriteGeneration.current[channelId] !== writeGeneration) return;
+        setDraftEffectsByChannel((current) => ({
+          ...current,
+          [channelId]: channel.effects,
+        }));
+        if (message) {
+          // Keep this local to EffectsView so effect edits never wait on a full state refresh.
+          setEffectError(null);
+        }
+      })
+      .catch((error) => {
+        if (effectWriteGeneration.current[channelId] !== writeGeneration) return;
+        setEffectError(String(error));
+        setDraftEffectsByChannel((current) => {
+          const next = { ...current };
+          delete next[channelId];
+          return next;
+        });
+      })
+      .finally(() => {
+        setPendingEffectWrites((current) => {
+          const count = Math.max(0, (current[channelId] ?? 1) - 1);
+          const next = { ...current };
+          if (count === 0) {
+            delete next[channelId];
+          } else {
+            next[channelId] = count;
+          }
+          return next;
+        });
+      });
   };
   const addEffect = (effect: EffectDefinition) => {
     if (!selectedChannel) return;
@@ -1413,10 +1740,26 @@ function EffectsView({
         ? { ...effect, params: { ...effect.params, ...values } }
         : effect,
     );
-    void run(
-      "set_effect_chain",
-      { channelId: selectedChannel.id, effects },
-      "Preset applied",
+    updateEffects(effects, "Preset applied");
+  };
+  const updateEffectParam = (instanceId: string, paramId: string, value: number) => {
+    if (!selectedChannel) return;
+    updateEffects(
+      selectedEffects.map((effect) =>
+        effect.instance_id === instanceId
+          ? { ...effect, params: { ...effect.params, [paramId]: value } }
+          : effect,
+      ),
+      "Effect updated",
+    );
+  };
+  const toggleEffectBypass = (instanceId: string, bypassed: boolean) => {
+    if (!selectedChannel) return;
+    updateEffects(
+      selectedEffects.map((effect) =>
+        effect.instance_id === instanceId ? { ...effect, bypassed } : effect,
+      ),
+      bypassed ? "Effect bypassed" : "Effect enabled",
     );
   };
   const moveEffect = (index: number, direction: -1 | 1) => {
@@ -1483,7 +1826,7 @@ function EffectsView({
               <small>
                 {isHardwareChannel(channel)
                   ? channelInputLabel(channel, microphoneInputs)
-                  : `${channel.effects.length} FX`}
+                  : `${(draftEffectsByChannel[channel.id] ?? channel.effects).length} FX`}
               </small>
             </button>
           ))}
@@ -1517,60 +1860,66 @@ function EffectsView({
             </button>
           </div>
         </div>
+        {(pendingEffectWrites[selectedChannel?.id ?? ""] ?? 0) > 0 && (
+          <div className="effect-sync-status">Syncing effect chain...</div>
+        )}
+        {effectError && (
+          <div className="effect-warning">
+            <CircleAlert size={15} />
+            <span>{effectError}</span>
+          </div>
+        )}
         {selectedChannel && isHardwareChannel(selectedChannel) && (
           <div className="hardware-source-card">
             <label className="field-label" htmlFor="effects-microphone-source">
               Microphone
             </label>
-            <select
+            <AppSelect
+              ariaLabel="Microphone"
               id="effects-microphone-source"
-              onChange={(event) =>
+              onChange={(value) =>
                 void run(
                   "set_channel_input",
                   {
                     channelId: selectedChannel.id,
-                    sourceDevice: event.currentTarget.value || null,
-                    source_device: event.currentTarget.value || null,
+                    sourceDevice: value || null,
+                    source_device: value || null,
                   },
                   "Microphone updated",
                 ).catch(() => undefined)
               }
+              options={[
+                { value: "", label: "Auto hardware input" },
+                ...microphoneInputs.map((input) => ({
+                  value: input.id,
+                  label: input.description,
+                })),
+              ]}
               value={selectedChannel.source_device ?? ""}
-            >
-              <option value="">Default mic</option>
-              {selectedChannel.source_device === "@DEFAULT_SOURCE@" && (
-                <option value="@DEFAULT_SOURCE@">Default mic</option>
-              )}
-              {microphoneInputs.map((input) => (
-                <option key={input.id} value={input.id}>
-                  {input.description}
-                </option>
-              ))}
-            </select>
+            />
             <label className="field-label" htmlFor="effects-input-mode">
               Input mode
             </label>
-            <select
+            <AppSelect
+              ariaLabel="Input mode"
               id="effects-input-mode"
-              onChange={(event) =>
+              onChange={(value) =>
                 void run(
                   "set_channel_input_mode",
                   {
                     channelId: selectedChannel.id,
-                    inputMode: event.currentTarget.value,
-                    input_mode: event.currentTarget.value,
+                    inputMode: value,
+                    input_mode: value,
                   },
                   "Input mode updated",
                 ).catch(() => undefined)
               }
+              options={inputModeOptions.map((mode) => ({
+                value: mode.id,
+                label: mode.label,
+              }))}
               value={selectedChannel.input_mode}
-            >
-              {inputModeOptions.map((mode) => (
-                <option key={mode.id} value={mode.id}>
-                  {mode.label}
-                </option>
-              ))}
-            </select>
+            />
           </div>
         )}
         <div className="effect-chain">
@@ -1579,7 +1928,6 @@ function EffectsView({
             return (
               <EffectBlock
                 availability={state.graph.effect_availability.find((item) => item.effect_id === effect.effect_id)}
-                channelId={selectedChannel?.id ?? ""}
                 definition={definition}
                 effect={effect}
                 index={index}
@@ -1589,7 +1937,8 @@ function EffectsView({
                 onMove={moveEffect}
                 onRename={renameEffect}
                 onApplyPreset={applyPreset}
-                run={run}
+                onToggleBypass={toggleEffectBypass}
+                onUpdateParam={updateEffectParam}
                 total={selectedEffects.length}
               />
             );
@@ -1628,7 +1977,6 @@ function EffectsView({
 
 function EffectBlock({
   availability,
-  channelId,
   effect,
   definition,
   index,
@@ -1638,10 +1986,10 @@ function EffectBlock({
   onDelete,
   onMove,
   onRename,
-  run,
+  onToggleBypass,
+  onUpdateParam,
 }: {
   availability?: EffectAvailability;
-  channelId: string;
   effect: EffectInstance;
   definition?: EffectDefinition;
   index: number;
@@ -1651,7 +1999,8 @@ function EffectBlock({
   onDelete: (instanceId: string) => void;
   onMove: (index: number, direction: -1 | 1) => void;
   onRename: (instanceId: string) => void;
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  onToggleBypass: (instanceId: string, bypassed: boolean) => void;
+  onUpdateParam: (instanceId: string, paramId: string, value: number) => void;
 }) {
   return (
     <article className={effect.bypassed ? "effect-block bypassed" : "effect-block"}>
@@ -1700,13 +2049,7 @@ function EffectBlock({
           </button>
           <button
             className={effect.bypassed ? "mini-icon-button active" : "mini-icon-button"}
-            onClick={() =>
-              void run("bypass_effect", {
-                channelId,
-                instanceId: effect.instance_id,
-                bypassed: !effect.bypassed,
-              }).catch(() => undefined)
-            }
+            onClick={() => onToggleBypass(effect.instance_id, !effect.bypassed)}
             type="button"
             title="Bypass effect"
           >
@@ -1750,14 +2093,7 @@ function EffectBlock({
           min={param.min}
           unit={param.unit}
           value={effect.params[param.id] ?? param.default}
-          onChange={(value) =>
-            void run("set_effect_param", {
-              channelId,
-              instanceId: effect.instance_id,
-              paramId: param.id,
-              value,
-            }).catch(() => undefined)
-          }
+          onChange={(value) => onUpdateParam(effect.instance_id, param.id, value)}
         />
       ))}
     </article>
@@ -1833,6 +2169,9 @@ function ScenesView({
     link.click();
     URL.revokeObjectURL(url);
   };
+  const runSceneAction = (action: () => Promise<void>) => {
+    void action().catch(() => undefined);
+  };
 
   return (
     <section className="panel single-panel">
@@ -1860,7 +2199,7 @@ function ScenesView({
           </button>
           <button
             className="secondary-button"
-            onClick={() => void exportBackup()}
+            onClick={() => runSceneAction(exportBackup)}
             type="button"
             title="Export the full mixer setup and saved scene library"
           >
@@ -1869,12 +2208,14 @@ function ScenesView({
           </button>
           <button
             className="primary-button"
-            onClick={async () => {
-              const name = window.prompt("Scene name", "Streaming");
-              if (!name) return;
-              await run("save_scene", { name }, "Scene saved");
-              await refreshScenes();
-            }}
+            onClick={() =>
+              runSceneAction(async () => {
+                const name = window.prompt("Scene name", "Streaming");
+                if (!name) return;
+                await run("save_scene", { name }, "Scene saved");
+                await refreshScenes();
+              })
+            }
             type="button"
           >
             <Save size={16} />
@@ -1904,11 +2245,13 @@ function ScenesView({
               </ul>
               <button
                 className="secondary-button"
-                onClick={async () => {
-                  if (!window.confirm(`Replace the current mixer layout with "${template.name}"?`)) return;
-                  await run("apply_setup_template", { templateId: template.id, template_id: template.id }, "Template applied");
-                  await refreshScenes();
-                }}
+                onClick={() =>
+                  runSceneAction(async () => {
+                    if (!window.confirm(`Replace the current mixer layout with "${template.name}"?`)) return;
+                    await run("apply_setup_template", { templateId: template.id, template_id: template.id }, "Template applied");
+                    await refreshScenes();
+                  })
+                }
                 type="button"
               >
                 <WandSparkles size={16} />
@@ -1924,10 +2267,12 @@ function ScenesView({
           <article className="scene-tile" key={scene.id}>
             <button
               className="scene-load-button"
-              onClick={async () => {
-                await run("load_scene", sceneIdArgs(scene.id), "Scene loaded");
-                await refreshScenes();
-              }}
+              onClick={() =>
+                runSceneAction(async () => {
+                  await run("load_scene", sceneIdArgs(scene.id), "Scene loaded");
+                  await refreshScenes();
+                })
+              }
               type="button"
             >
               <strong>{scene.name}</strong>
@@ -1944,11 +2289,13 @@ function ScenesView({
               </button>
               <button
                 className="mini-icon-button danger"
-                onClick={async () => {
-                  if (!window.confirm(`Delete scene "${scene.name}"?`)) return;
-                  await run("delete_scene", sceneIdArgs(scene.id), "Scene deleted");
-                  await refreshScenes();
-                }}
+                onClick={() =>
+                  runSceneAction(async () => {
+                    if (!window.confirm(`Delete scene "${scene.name}"?`)) return;
+                    await run("delete_scene", sceneIdArgs(scene.id), "Scene deleted");
+                    await refreshScenes();
+                  })
+                }
                 title="Delete scene"
                 type="button"
               >
@@ -1987,7 +2334,11 @@ function DiagnosticsView({
           <div className="panel-actions">
             <button
               className="secondary-button"
-              onClick={async () => setReport(await run<SoundCheckReport>("run_sound_check"))}
+              onClick={() =>
+                void run<SoundCheckReport>("run_sound_check")
+                  .then(setReport)
+                  .catch(() => undefined)
+              }
               type="button"
             >
               <Activity size={16} />
@@ -1995,7 +2346,11 @@ function DiagnosticsView({
             </button>
             <button
               className="secondary-button"
-              onClick={async () => setGraphReport(await run<GraphDebugReport>("get_graph_debug_report"))}
+              onClick={() =>
+                void run<GraphDebugReport>("get_graph_debug_report")
+                  .then(setGraphReport)
+                  .catch(() => undefined)
+              }
               type="button"
               title="Inspect WaveLinux-managed PipeWire modules, routes, and planned commands"
             >
@@ -2272,7 +2627,7 @@ function SettingsView({
           value={state.config.settings.restore_audio_graph_on_launch}
         />
         <Toggle
-          label="Monitor follows default output"
+          label="Auto monitor output"
           onChange={(value) =>
             updateSettings({ ...state.config.settings, monitor_follows_default_output: value })
           }
@@ -2431,12 +2786,13 @@ function compactMixLabel(mix: Mix): string {
 }
 
 function matcherForStream(stream: AppStream): AppMatcher {
+  const keepMediaName = shouldKeepStreamMediaName(stream);
   const matcher = {
     app_id: stream.app_id ?? null,
     binary: stream.binary ?? stream.process_name ?? null,
     process_name: stream.process_name ?? null,
     window_class: stream.window_class ?? null,
-    media_name: stream.media_name ?? null,
+    media_name: keepMediaName ? (stream.media_name ?? null) : null,
   };
   if (!matcherIsEmpty(matcher)) return matcher;
 
@@ -2448,14 +2804,37 @@ function matcherForStream(stream: AppStream): AppMatcher {
   };
 }
 
+function shouldKeepStreamMediaName(stream: AppStream): boolean {
+  const mediaName = stream.media_name?.trim();
+  if (!mediaName || isGenericMediaName(mediaName)) return false;
+
+  const identityValues = [
+    stream.app_id,
+    stream.binary,
+    stream.process_name,
+    stream.window_class,
+  ]
+    .map((value) => value?.trim().toLowerCase())
+    .filter((value): value is string => Boolean(value));
+
+  if (identityValues.length === 0) return true;
+
+  const wrapperNeedles = ["ferdium", "electron", "chromium", "chrome", "brave", "vivaldi", "webapp", "web-app"];
+  return identityValues.some((value) => wrapperNeedles.some((needle) => value.includes(needle)));
+}
+
+function isGenericMediaName(value: string): boolean {
+  return ["audio-src", "audio src", "audio", "playback", "output", "input"].includes(value.trim().toLowerCase());
+}
+
 function matcherIsEmpty(matcher: AppMatcher): boolean {
   return matcherKinds.every((kind) => !matcher[kind]?.trim());
 }
 
 function fallbackMatcherValueForStream(stream: AppStream): string {
   const candidates = [
-    stream.media_name,
     stream.display_name && !/^Stream\s+\d+$/i.test(stream.display_name) ? stream.display_name : null,
+    stream.media_name && !isGenericMediaName(stream.media_name) ? stream.media_name : null,
     stream.id ? `stream-${stream.id}` : null,
   ];
   const value = candidates
@@ -2607,10 +2986,6 @@ function slugForFile(value: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-function availableEffects(state: AppStateSnapshot): number {
-  return state.graph.effect_availability.filter((item) => item.available).length;
-}
-
 function isHardwareChannel(channel: Pick<Channel, "kind">): boolean {
   return channel.kind === "microphone" || channel.kind === "generic";
 }
@@ -2639,12 +3014,55 @@ function isMicrophoneSource(device: AppStateSnapshot["graph"]["inputs"][number])
   );
 }
 
+function sortedMicrophoneInputs(
+  inputs: AppStateSnapshot["graph"]["inputs"],
+): AppStateSnapshot["graph"]["inputs"] {
+  return inputs
+    .filter(isMicrophoneSource)
+    .slice()
+    .sort((left, right) => {
+      const priority = microphoneInputPriority(right) - microphoneInputPriority(left);
+      if (priority !== 0) return priority;
+      if (left.is_default !== right.is_default) return left.is_default ? -1 : 1;
+      return left.description.localeCompare(right.description);
+    });
+}
+
+function microphoneInputPriority(device: AppStateSnapshot["graph"]["inputs"][number]): number {
+  const text = `${device.id} ${device.name} ${device.description}`.toLowerCase();
+  if (text.includes("usb")) return 60;
+  if (text.includes("bluez") || text.includes("bluetooth")) return 30;
+  if (
+    text.includes("jack") ||
+    text.includes("headset") ||
+    text.includes("headphone") ||
+    text.includes("linein") ||
+    text.includes("line-in") ||
+    text.includes("front mic") ||
+    text.includes("rear mic")
+  ) {
+    return 50;
+  }
+  if (
+    text.includes("built-in") ||
+    text.includes("built in") ||
+    text.includes("internal") ||
+    text.includes("digital microphone") ||
+    text.includes("dmic") ||
+    text.includes("hda") ||
+    text.includes("pci")
+  ) {
+    return 40;
+  }
+  if (text.includes("mic") || text.includes("microphone") || text.includes("analog")) return 35;
+  return 1;
+}
+
 function channelInputLabel(
   channel: Pick<Channel, "source_device">,
   inputs: AppStateSnapshot["graph"]["inputs"],
 ): string {
-  if (channel.source_device === "@DEFAULT_SOURCE@") return "Default mic";
-  if (!channel.source_device) return "Default mic";
+  if (!channel.source_device) return "Auto input";
   return (
     inputs.find((input) => input.id === channel.source_device)?.description ??
     channel.source_device
@@ -2661,28 +3079,84 @@ function channelIcon(kind: ChannelKind): typeof Headphones {
 
 function levelFromMeter(meter: LevelMeter): number {
   const peak = Math.max(meter.peak_left, meter.peak_right);
-  return Math.max(0, Math.min(1, Math.sqrt(Math.max(0, peak))));
+  if (peak < 0.01) return 0;
+  return Math.max(0, Math.min(1, peak));
 }
 
-function meterLevelMap(
-  state: AppStateSnapshot,
-  heldMeters?: HeldMeterMap,
-): Record<string, number> {
+function meterLevelMap(meters: LevelMeter[]): Record<string, number> {
   const levels: Record<string, number> = {};
-  for (const meter of state.graph.meters) {
+  for (const meter of meters) {
     levels[meter.node_id] = levelFromMeter(meter);
   }
-  if (!state.engine.audio_graph_running || !heldMeters) return levels;
-
-  const now = Date.now();
-  for (const [nodeId, held] of Object.entries(heldMeters)) {
-    if (nodeId in levels) continue;
-    const ageSeconds = Math.max(0, (now - held.seenAt) / 1000);
-    if (ageSeconds < 2.5) {
-      levels[nodeId] = Math.max(0, Math.min(1, held.level * Math.exp(-ageSeconds * 1.6)));
-    }
-  }
   return levels;
+}
+
+function useSmoothMeterLevels(rawLevels: Record<string, number>, graphRunning: boolean): Record<string, number> {
+  const rawRef = useRef(rawLevels);
+  const smoothRef = useRef<Record<string, number>>({});
+  const displayRef = useRef<Record<string, number>>({});
+  const [displayLevels, setDisplayLevels] = useState<Record<string, number>>({});
+
+  useEffect(() => {
+    rawRef.current = rawLevels;
+  }, [rawLevels]);
+
+  useEffect(() => {
+    let frame = 0;
+    let lastTick = performance.now();
+
+    const tick = (now: number) => {
+      const elapsedSeconds = Math.min(0.25, Math.max(0.001, (now - lastTick) / 1000));
+      lastTick = now;
+      const raw = graphRunning ? rawRef.current : {};
+      const smooth = smoothRef.current;
+      const nextDisplay: Record<string, number> = {};
+      const keys = new Set([...Object.keys(smooth), ...Object.keys(raw)]);
+
+      for (const key of keys) {
+        const incoming = raw[key] ?? 0;
+        const current = smooth[key] ?? 0;
+        const timeConstant = incoming > current ? UI_METER_ATTACK_SECONDS : UI_METER_RELEASE_SECONDS;
+        const blend = 1 - Math.exp(-elapsedSeconds / timeConstant);
+        const nextLevel = current + (incoming - current) * blend;
+
+        if (nextLevel < UI_METER_FLOOR && incoming < UI_METER_FLOOR) {
+          delete smooth[key];
+          continue;
+        }
+
+        const clamped = Math.max(0, Math.min(1, nextLevel));
+        smooth[key] = clamped;
+        nextDisplay[key] = clamped;
+      }
+
+      if (!meterLevelMapsEqual(displayRef.current, nextDisplay)) {
+        displayRef.current = nextDisplay;
+        setDisplayLevels(nextDisplay);
+      }
+      frame = window.requestAnimationFrame(tick);
+    };
+
+    frame = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(frame);
+  }, [graphRunning]);
+
+  return displayLevels;
+}
+
+function meterLevelMapsEqual(left: Record<string, number>, right: Record<string, number>): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) return false;
+  return leftKeys.every((key) => Math.abs((left[key] ?? 0) - (right[key] ?? 0)) < 0.001);
+}
+
+function channelBusMeterId(channelId: string, mixId: string): string {
+  return `channel:${channelId}:mix:${mixId}`;
+}
+
+function effectChainsEqual(left: EffectInstance[], right: EffectInstance[]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function audioActionToast(title: string, commands: CommandExecution[], plannedCount?: number): string {

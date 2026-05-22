@@ -20,5 +20,7 @@ jobs:
         with:
           node-version: 22
           cache: yarn
+      - run: corepack enable
+      - run: corepack prepare yarn@1.22.22 --activate
       - run: yarn install --frozen-lockfile
-      - run: yarn build
+      - run: yarn web:build

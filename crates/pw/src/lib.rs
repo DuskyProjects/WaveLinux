@@ -12,6 +12,8 @@ use wavelinux_model::{
     SAMPLE_RATE_HZ,
 };
 
+pub const METERS_ENV: &str = "WAVELINUX_ENABLE_METERS";
+pub const METERS_DISABLE_ENV: &str = "WAVELINUX_DISABLE_METERS";
 pub const PW_RECORD_METERS_ENV: &str = "WAVELINUX_ENABLE_PW_RECORD_METERS";
 pub const PW_RECORD_METERS_DISABLE_ENV: &str = "WAVELINUX_DISABLE_PW_RECORD_METERS";
 
@@ -80,10 +82,12 @@ pub struct CommandOutput {
     pub skipped: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MeterTarget {
     pub node_id: String,
     pub source_name: String,
+    pub gain: f32,
+    pub muted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -306,9 +310,17 @@ impl PwClient {
         Ok(parse_devices_json(&json, "Source"))
     }
 
+    pub fn list_inputs(&self) -> Result<Vec<DeviceInfo>, PwError> {
+        self.list_sources()
+    }
+
     fn list_sinks(&self) -> Result<Vec<DeviceInfo>, PwError> {
         let json = self.pactl_json(["list", "sinks"])?;
         Ok(parse_devices_json(&json, "Sink"))
+    }
+
+    pub fn list_outputs(&self) -> Result<Vec<DeviceInfo>, PwError> {
+        self.list_sinks()
     }
 
     fn list_sink_inputs_with_routes(
@@ -413,33 +425,76 @@ pub fn meter_targets_for_config(
             targets.push(MeterTarget {
                 node_id: mix.id.clone(),
                 source_name,
+                gain: mix.volume,
+                muted: mix.muted,
             });
         }
     }
     for channel in &config.channels {
-        let source_name = format!("{}.monitor", channel.virtual_sink_name);
+        let Some(source_name) = channel_meter_source_name(channel, available_sources) else {
+            continue;
+        };
         if available_sources.contains(&source_name) {
             targets.push(MeterTarget {
                 node_id: channel.id.clone(),
-                source_name,
+                source_name: source_name.clone(),
+                gain: 1.0,
+                muted: false,
             });
+            for (mix_id, bus) in &channel.mix_buses {
+                targets.push(MeterTarget {
+                    node_id: channel_bus_meter_id(&channel.id, mix_id),
+                    source_name: source_name.clone(),
+                    gain: bus.volume,
+                    muted: bus.muted,
+                });
+            }
         }
     }
     targets
 }
 
+fn channel_meter_source_name(
+    channel: &Channel,
+    available_sources: &BTreeSet<String>,
+) -> Option<String> {
+    let preferred = channel_mix_source_name(channel);
+    if available_sources.contains(&preferred) {
+        return Some(preferred);
+    }
+
+    if channel_has_active_effects(channel) {
+        let raw_monitor = format!("{}.monitor", channel.virtual_sink_name);
+        if available_sources.contains(&raw_monitor) {
+            return Some(raw_monitor);
+        }
+    }
+
+    None
+}
+
+pub fn channel_bus_meter_id(channel_id: &str, mix_id: &str) -> String {
+    format!("channel:{channel_id}:mix:{mix_id}")
+}
+
 pub fn meter_sampling_enabled() -> bool {
     meter_sampling_enabled_from_env(
-        std::env::var(PW_RECORD_METERS_ENV).ok().as_deref(),
-        std::env::var(PW_RECORD_METERS_DISABLE_ENV).ok().as_deref(),
-        command_exists("pw-record"),
+        std::env::var(METERS_ENV)
+            .ok()
+            .or_else(|| std::env::var(PW_RECORD_METERS_ENV).ok())
+            .as_deref(),
+        std::env::var(METERS_DISABLE_ENV)
+            .ok()
+            .or_else(|| std::env::var(PW_RECORD_METERS_DISABLE_ENV).ok())
+            .as_deref(),
+        command_exists("pipewire"),
     )
 }
 
 fn meter_sampling_enabled_from_env(
     enable_value: Option<&str>,
     disable_value: Option<&str>,
-    pw_record_available: bool,
+    meter_backend_available: bool,
 ) -> bool {
     if env_truthy(disable_value) {
         return false;
@@ -447,7 +502,7 @@ fn meter_sampling_enabled_from_env(
     if env_falsey(enable_value) {
         return false;
     }
-    pw_record_available
+    meter_backend_available
 }
 
 fn env_truthy(value: Option<&str>) -> bool {
@@ -807,6 +862,33 @@ pub fn plan_set_channel_bus_source_output_mute(source_output_id: &str, muted: bo
     )
 }
 
+pub fn plan_set_managed_sink_volume(sink_name: &str, volume: f32) -> CommandSpec {
+    let percent = (volume.clamp(0.0, 1.0) * 100.0).round() as u8;
+    CommandSpec::new(
+        CommandDomain::Level,
+        "pactl",
+        [
+            "set-sink-volume".into(),
+            sink_name.into(),
+            format!("{percent}%"),
+        ],
+        format!("set managed sink {sink_name} volume"),
+    )
+}
+
+pub fn plan_set_managed_sink_mute(sink_name: &str, muted: bool) -> CommandSpec {
+    CommandSpec::new(
+        CommandDomain::Level,
+        "pactl",
+        [
+            "set-sink-mute".into(),
+            sink_name.into(),
+            (if muted { "1" } else { "0" }).to_string(),
+        ],
+        format!("set managed sink {sink_name} mute"),
+    )
+}
+
 pub fn plan_set_mix_volume(mix: &Mix, volume: f32) -> CommandSpec {
     let percent = (volume.clamp(0.0, 1.0) * 100.0).round() as u8;
     CommandSpec::new(
@@ -966,11 +1048,9 @@ pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String
     rendered.push_str(&escape_pw(&input_name));
     rendered.push_str("\"\n");
     rendered.push_str("        target.object = \"");
-    rendered.push_str(&escape_pw(&format!(
-        "{}.monitor",
-        channel.virtual_sink_name
-    )));
+    rendered.push_str(&escape_pw(&channel.virtual_sink_name));
     rendered.push_str("\"\n");
+    rendered.push_str("        stream.capture.sink = true\n");
     rendered.push_str("        node.passive = true\n");
     rendered.push_str("        wavelinux.managed = \"1\"\n");
     rendered.push_str("        wavelinux.role = \"effect_input\"\n");
@@ -1453,7 +1533,7 @@ fn parse_managed_modules_short(modules_text: &str) -> Vec<ManagedModule> {
 
 fn managed_module_from_module_line(
     module_id: &str,
-    module_name: &str,
+    _module_name: &str,
     argument: &str,
 ) -> Option<ManagedModule> {
     if module_id.is_empty() {
@@ -1467,8 +1547,9 @@ fn managed_module_from_module_line(
     let channel_id =
         property_value_from_arg(argument, "wavelinux.channel_id=").map(ToOwned::to_owned);
     let mix_id = property_value_from_arg(argument, "wavelinux.mix_id=").map(ToOwned::to_owned);
-    let managed = looks_like_wavelinux_node(module_name)
-        || looks_like_wavelinux_node(argument)
+    let managed_flag = argument_has_wavelinux_managed_flag(argument);
+    let managed = node_name.as_deref().is_some_and(looks_like_wavelinux_node)
+        || managed_flag
         || role.is_some()
         || channel_id.is_some()
         || mix_id.is_some();
@@ -1529,13 +1610,14 @@ fn managed_module_from_parts(
     let role = property_string(properties, "wavelinux.role");
     let channel_id = property_string(properties, "wavelinux.channel_id");
     let mix_id = property_string(properties, "wavelinux.mix_id");
+    let argument_node_name = argument.and_then(wavelinux_node_name_from_module_argument);
     let node_name = node_name
         .filter(|value| !value.is_empty())
-        .or_else(|| property_string(properties, "node.name"));
+        .or_else(|| property_string(properties, "node.name"))
+        .or(argument_node_name);
     let managed = property_string(properties, "wavelinux.managed").as_deref() == Some("1")
         || role.is_some()
-        || node_name.as_deref().is_some_and(looks_like_wavelinux_node)
-        || argument.is_some_and(looks_like_wavelinux_node);
+        || node_name.as_deref().is_some_and(looks_like_wavelinux_node);
 
     if !managed {
         return None;
@@ -1618,7 +1700,18 @@ fn hydrate_sink_input_routes_from_modules(
 }
 
 fn looks_like_wavelinux_node(value: &str) -> bool {
-    value.to_ascii_lowercase().contains("wavelinux")
+    let value = value
+        .trim()
+        .trim_matches('"')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    value == "wavelinux"
+        || value.starts_with("wavelinux_")
+        || value.starts_with("wavelinux-")
+        || value.starts_with("wavelinux.")
+        || value.starts_with("output.wavelinux.fx.")
 }
 
 #[derive(Debug, Clone)]
@@ -2022,6 +2115,22 @@ fn property_value_from_arg<'a>(properties: &'a str, key: &str) -> Option<&'a str
         .filter(|value| !value.is_empty())
 }
 
+fn argument_has_wavelinux_managed_flag(argument: &str) -> bool {
+    argument.split_whitespace().any(|part| {
+        property_value_from_arg(part, "wavelinux.managed=") == Some("1")
+            || part
+                .strip_prefix("sink_input_properties=")
+                .is_some_and(|properties| {
+                    property_value_from_arg(properties, "wavelinux.managed=") == Some("1")
+                })
+            || part
+                .strip_prefix("source_output_properties=")
+                .is_some_and(|properties| {
+                    property_value_from_arg(properties, "wavelinux.managed=") == Some("1")
+                })
+    })
+}
+
 fn wavelinux_display_name(value: &str) -> String {
     let mut slug = String::new();
     for ch in value.chars() {
@@ -2164,7 +2273,7 @@ mod tests {
     }
 
     #[test]
-    fn pw_record_meters_default_on_when_available() {
+    fn meters_default_on_when_available() {
         assert!(meter_sampling_enabled_from_env(None, None, true));
         assert!(!meter_sampling_enabled_from_env(None, None, false));
         assert!(!meter_sampling_enabled_from_env(Some("0"), None, true));
@@ -2175,11 +2284,14 @@ mod tests {
 
     #[test]
     fn meter_targets_follow_available_wavelinux_sources() {
-        let config = MixerConfig::default();
+        let mut config = MixerConfig::default();
+        config.set_channel_volume("game", "stream", 0.42).unwrap();
+        config.set_channel_mute("chat", "monitor", true).unwrap();
         let available_sources = BTreeSet::from([
             "wavelinux_mix_monitor.monitor".to_string(),
             "wavelinux_mix_stream.monitor".to_string(),
             "wavelinux_channel_game.monitor".to_string(),
+            "wavelinux_channel_chat.monitor".to_string(),
             "alsa_input.real".to_string(),
         ]);
 
@@ -2191,9 +2303,41 @@ mod tests {
             && target.source_name == "wavelinux_mix_stream.monitor"));
         assert!(targets.iter().any(|target| target.node_id == "game"
             && target.source_name == "wavelinux_channel_game.monitor"));
+        assert!(targets.iter().any(|target| target.node_id
+            == channel_bus_meter_id("game", "stream")
+            && target.source_name == "wavelinux_channel_game.monitor"
+            && (target.gain - 0.42).abs() < f32::EPSILON
+            && !target.muted));
+        assert!(targets.iter().any(|target| target.node_id
+            == channel_bus_meter_id("chat", "monitor")
+            && target.source_name == "wavelinux_channel_chat.monitor"
+            && target.muted));
         assert!(!targets
             .iter()
             .any(|target| target.source_name == "alsa_input.real"));
+    }
+
+    #[test]
+    fn meter_targets_fall_back_to_raw_channel_monitor_when_fx_source_is_missing() {
+        let mut config = MixerConfig::default();
+        let hardware = config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        hardware.effects = vec![EffectInstance::new("limiter")];
+        let available_sources = BTreeSet::from(["wavelinux_channel_hardware_in.monitor".into()]);
+
+        let targets = meter_targets_for_config(&config, &available_sources);
+
+        assert!(targets.iter().any(|target| {
+            target.node_id == "hardware_in"
+                && target.source_name == "wavelinux_channel_hardware_in.monitor"
+        }));
+        assert!(targets.iter().any(|target| {
+            target.node_id == channel_bus_meter_id("hardware_in", "stream")
+                && target.source_name == "wavelinux_channel_hardware_in.monitor"
+        }));
     }
 
     #[test]
@@ -2558,6 +2702,21 @@ mod tests {
     }
 
     #[test]
+    fn managed_sink_level_commands_target_named_sink() {
+        let volume = plan_set_managed_sink_volume("wavelinux_channel_music", 1.0);
+        assert_eq!(
+            volume.args,
+            vec!["set-sink-volume", "wavelinux_channel_music", "100%"]
+        );
+
+        let mute = plan_set_managed_sink_mute("wavelinux_channel_music", false);
+        assert_eq!(
+            mute.args,
+            vec!["set-sink-mute", "wavelinux_channel_music", "0"]
+        );
+    }
+
+    #[test]
     fn parses_managed_source_output_routes() {
         let json = r#"
         [
@@ -2630,7 +2789,8 @@ mod tests {
         assert!(rendered.contains("libpipewire-module-protocol-native"));
         assert!(rendered.contains("active"));
         assert!(!rendered.contains("bypassed"));
-        assert!(rendered.contains("target.object = \"wavelinux_channel_hardware_in.monitor\""));
+        assert!(rendered.contains("target.object = \"wavelinux_channel_hardware_in\""));
+        assert!(rendered.contains("stream.capture.sink = true"));
         assert!(rendered.contains("node.name = \"wavelinux_fx_hardware_in_source\""));
     }
 
@@ -2754,6 +2914,20 @@ mod tests {
         assert_eq!(commands.len(), 5);
         assert_eq!(commands[0].args[0], "unload-module");
         assert_eq!(commands[0].args[1], "102");
+    }
+
+    #[test]
+    fn managed_module_detection_ignores_unowned_wavelinux_mentions() {
+        let listed_modules = "\
+300\tmodule-loopback\tsource=alsa_input.real sink=alsa_output.real node.description=not-a-wavelinux-node\t\n\
+301\tmodule-loopback\tsource=alsa_input.real sink=wavelinux_channel_music\t\n\
+302\tmodule-loopback\tsource=alsa_input.real sink=alsa_output.real sink_input_properties=wavelinux.managed=1\t\n";
+
+        let modules = parse_managed_modules_json(listed_modules, "[]", "[]", "[]", "[]");
+
+        assert!(!modules.iter().any(|module| module.module_id == "300"));
+        assert!(modules.iter().any(|module| module.module_id == "301"));
+        assert!(modules.iter().any(|module| module.module_id == "302"));
     }
 
     #[test]

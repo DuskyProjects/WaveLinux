@@ -22,6 +22,8 @@ fi
 install -d "$BIN_DIR" "$SUPPORT_DIR" "$APP_DIR" "$ICON_BASE/32x32/apps" "$ICON_BASE/128x128/apps" "$ICON_BASE/256x256/apps" "$ICON_BASE/512x512/apps" "$ICON_BASE/scalable/apps"
 install -m 0755 "$APPIMAGE" "$INSTALLED_APPIMAGE"
 install -m 0755 "$ROOT_DIR/scripts/wavelinux-launcher.sh" "$LAUNCHER"
+install -m 0755 "$ROOT_DIR/scripts/install-alsa-aliases.sh" "$SUPPORT_DIR/install-alsa-aliases.sh"
+install -m 0755 "$ROOT_DIR/scripts/remove-alsa-aliases.sh" "$SUPPORT_DIR/remove-alsa-aliases.sh"
 install -m 0644 "$ROOT_DIR/scripts/sanitize-runtime-env.sh" "$INSTALLED_SANITIZER"
 install -m 0644 "$ROOT_DIR/crates/app/icons/32x32.png" "$ICON_BASE/32x32/apps/wavelinux.png"
 install -m 0644 "$ROOT_DIR/crates/app/icons/128x128.png" "$ICON_BASE/128x128/apps/wavelinux.png"
@@ -53,6 +55,14 @@ fi
 
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
   gtk-update-icon-cache -q "$ICON_BASE" >/dev/null 2>&1 || true
+fi
+
+if [[ "${WAVELINUX_INSTALL_ALSA_ALIASES:-0}" == "1" ]]; then
+  "$ROOT_DIR/scripts/install-alsa-aliases.sh" || {
+    echo "Warning: failed to install WaveLinux ALSA aliases" >&2
+  }
+else
+  echo "Skipped ALSA aliases. Run yarn install:alsa-aliases if an ALSA-only app needs WaveLinux devices."
 fi
 
 echo "Installed WaveLinux AppImage to $INSTALLED_APPIMAGE"

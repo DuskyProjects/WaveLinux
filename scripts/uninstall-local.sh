@@ -6,6 +6,7 @@ SUPPORT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wavelinux"
 APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 ICON_BASE="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 paths=(
   "$BIN_DIR/wavelinux"
@@ -34,6 +35,12 @@ done
 if [[ -d "$SUPPORT_DIR" ]]; then
   rm -rf "$SUPPORT_DIR"
   echo "Removed $SUPPORT_DIR"
+fi
+
+if [[ -x "$ROOT_DIR/scripts/remove-alsa-aliases.sh" ]]; then
+  "$ROOT_DIR/scripts/remove-alsa-aliases.sh" || {
+    echo "Warning: failed to remove WaveLinux ALSA aliases" >&2
+  }
 fi
 
 if command -v update-desktop-database >/dev/null 2>&1; then

@@ -57,10 +57,9 @@ The app starts with its managed PipeWire graph stopped unless
 to create the virtual mixes and channel sinks, then **Stop** or **Cleanup** to
 remove WaveLinux-managed nodes.
 
-Closing the main window quits WaveLinux and unloads its managed PipeWire graph
-by default. Enable **Keep running in tray** in Settings when you want the window
-close button to hide the UI and leave virtual mixes running for OBS, Discord,
-and other apps.
+Closing the main window hides WaveLinux to the tray so audio keeps running for
+OBS, Discord, and other apps. Use **Quit** from the tray menu when you want to
+fully exit and unload WaveLinux-managed PipeWire nodes.
 
 Set `WAVELINUX_DRY_RUN=1` to inspect planned PipeWire commands without
 creating or moving audio nodes.
@@ -73,21 +72,32 @@ yarn web:dev
 
 ## Packaging
 
-Tauri is configured for AppImage, deb, and rpm bundles:
+Build the browser UI bundle used by CI:
 
 ```bash
 yarn build
 ```
 
+Build the desktop bundles:
+
+```bash
+yarn desktop:build
+```
+
 The build script sets `NO_STRIP=1` for linuxdeploy so AppImage bundling works
-on modern distributions whose system libraries use newer ELF sections. It also
-installs the freshly built AppImage into `~/.local/bin/wavelinux` and refreshes
-the local desktop entry/icons.
+on modern distributions whose system libraries use newer ELF sections.
 
 Install the current build without rebuilding:
 
 ```bash
 yarn install:local
+```
+
+Install optional ALSA aliases for ALSA-only apps that cannot see PulseAudio or
+PipeWire devices directly:
+
+```bash
+yarn install:alsa-aliases
 ```
 
 Generate or rotate the local Tauri release signing key:
