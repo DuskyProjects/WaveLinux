@@ -52,6 +52,16 @@ Run the desktop app:
 yarn dev
 ```
 
+The app starts with its managed PipeWire graph stopped unless
+**Restore audio graph on launch** is enabled. Use **Start Audio** in the top bar
+to create the virtual mixes and channel sinks, then **Stop** or **Cleanup** to
+remove WaveLinux-managed nodes.
+
+Closing the main window quits WaveLinux and unloads its managed PipeWire graph
+by default. Enable **Keep running in tray** in Settings when you want the window
+close button to hide the UI and leave virtual mixes running for OBS, Discord,
+and other apps.
+
 Set `WAVELINUX_DRY_RUN=1` to inspect planned PipeWire commands without
 creating or moving audio nodes.
 
@@ -78,6 +88,21 @@ Install the current build without rebuilding:
 
 ```bash
 yarn install:local
+```
+
+Generate or rotate the local Tauri release signing key:
+
+```bash
+yarn release:key
+yarn release:key --force
+```
+
+The private key and password stay outside the repo under
+`~/.config/wavelinux/`. Keep the private key, password file, and CI secrets in
+sync when rotating release keys. To sign built artifacts:
+
+```bash
+yarn release:sign
 ```
 
 Flatpak packaging is intentionally deferred because virtual audio device

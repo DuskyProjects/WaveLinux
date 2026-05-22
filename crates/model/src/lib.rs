@@ -5,7 +5,8 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 4;
+pub const BACKUP_VERSION: u32 = 1;
 pub const MAX_MIXES: usize = 5;
 pub const MAX_SOFTWARE_CHANNELS: usize = 8;
 pub const MAX_HARDWARE_INPUTS: usize = 4;
@@ -40,34 +41,40 @@ pub enum ModelError {
     DuplicateChannelName(String),
     #[error("invalid name")]
     InvalidName,
+    #[error("invalid app matcher")]
+    InvalidMatcher,
     #[error("cannot delete the last mix")]
     CannotDeleteLastMix,
     #[error("cannot delete the last channel")]
     CannotDeleteLastChannel,
+    #[error("setup template not found: {0}")]
+    TemplateNotFound(String),
     #[error("invalid volume: {0}")]
     InvalidVolume(String),
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeMode {
+    #[default]
     System,
     Dark,
     Light,
 }
 
-impl Default for ThemeMode {
-    fn default() -> Self {
-        Self::System
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct MixerSettings {
     pub theme: ThemeMode,
     pub start_at_login: bool,
+    #[serde(default)]
+    pub keep_running_in_tray: bool,
+    #[serde(default)]
+    pub restore_audio_graph_on_launch: bool,
+    #[serde(default = "default_true")]
+    pub monitor_follows_default_output: bool,
     pub lock_default_input: bool,
     pub lock_default_output: bool,
     pub auto_check_updates: bool,
@@ -80,6 +87,9 @@ impl Default for MixerSettings {
         Self {
             theme: ThemeMode::System,
             start_at_login: false,
+            keep_running_in_tray: true,
+            restore_audio_graph_on_launch: false,
+            monitor_follows_default_output: true,
             lock_default_input: false,
             lock_default_output: false,
             auto_check_updates: true,
@@ -97,11 +107,17 @@ pub enum ReleaseChannel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct MixerConfig {
     pub version: u32,
     pub mixes: Vec<Mix>,
     pub channels: Vec<Channel>,
     pub app_routes: Vec<AppRoute>,
+    pub app_volume_presets: Vec<AppVolumePreset>,
+    pub app_history: Vec<KnownApp>,
+    pub app_identity_overrides: Vec<AppIdentityOverride>,
+    pub app_label_overrides: Vec<AppLabelOverride>,
+    pub device_policy: DevicePolicy,
     pub settings: MixerSettings,
     pub audio: AudioSpec,
 }
@@ -114,7 +130,8 @@ impl Default for MixerConfig {
         ];
 
         let mut channels = vec![
-            Channel::new_fixed("mic", "Mic", ChannelKind::Microphone),
+            Channel::new_fixed("hardware_in", "Hardware In", ChannelKind::Generic),
+            Channel::new_fixed("system", "System", ChannelKind::System),
             Channel::new_fixed("game", "Game", ChannelKind::Application),
             Channel::new_fixed("chat", "Chat", ChannelKind::Application),
             Channel::new_fixed("music", "Music", ChannelKind::Application),
@@ -131,6 +148,11 @@ impl Default for MixerConfig {
             mixes,
             channels,
             app_routes: Vec::new(),
+            app_volume_presets: Vec::new(),
+            app_history: Vec::new(),
+            app_identity_overrides: Vec::new(),
+            app_label_overrides: Vec::new(),
+            device_policy: DevicePolicy::default(),
             settings: MixerSettings::default(),
             audio: AudioSpec::default(),
         }
@@ -171,22 +193,232 @@ impl MixerConfig {
                 }
             }
         }
+        for route in &self.app_routes {
+            self.ensure_channel_exists(&route.channel_id)?;
+            if route.matcher.is_empty() {
+                return Err(ModelError::InvalidMatcher);
+            }
+        }
+        for preset in &self.app_volume_presets {
+            if preset.matcher.is_empty() {
+                return Err(ModelError::InvalidMatcher);
+            }
+            valid_unit(preset.volume)?;
+        }
+        for app in &self.app_history {
+            if app.matcher.is_empty() {
+                return Err(ModelError::InvalidMatcher);
+            }
+        }
+        for override_rule in &self.app_identity_overrides {
+            if override_rule.source.is_empty() || override_rule.target.is_empty() {
+                return Err(ModelError::InvalidMatcher);
+            }
+        }
+        for label in &self.app_label_overrides {
+            if label.matcher.is_empty() {
+                return Err(ModelError::InvalidMatcher);
+            }
+            if label.label.trim().is_empty() {
+                return Err(ModelError::InvalidName);
+            }
+        }
+        let catalog = EffectCatalog::default();
+        for channel in &self.channels {
+            validate_effect_chain(&channel.effects, &catalog)?;
+        }
         Ok(())
     }
 
     pub fn normalized(mut self) -> Result<Self, ModelError> {
+        let previous_version = self.version;
         self.version = CONFIG_VERSION;
+        if previous_version < 4 {
+            self.settings.lock_default_output = false;
+        }
+        self.settings.keep_running_in_tray = true;
+        self.migrate_legacy_mic_channel();
+        self.ensure_system_channel();
         for mix in &mut self.mixes {
+            mix.ensure_virtual_node_names();
             mix.volume = clamp_unit(mix.volume);
         }
         for channel in &mut self.channels {
+            channel.ensure_virtual_node_name();
             channel.ensure_mix_buses(&self.mixes);
             for bus in channel.mix_buses.values_mut() {
                 bus.volume = clamp_unit(bus.volume);
             }
         }
+        let catalog = EffectCatalog::default();
+        for channel in &mut self.channels {
+            channel.effects =
+                normalize_effect_chain(std::mem::take(&mut channel.effects), &catalog, true)?;
+        }
+        self.normalize_app_identity();
+        self.normalize_device_policy();
+        self.normalize_app_routes();
+        self.normalize_app_volume_presets();
+        self.normalize_app_history();
         self.validate()?;
         Ok(self)
+    }
+
+    fn normalize_app_routes(&mut self) {
+        let valid_channels = self
+            .channels
+            .iter()
+            .map(|channel| channel.id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut seen = BTreeSet::new();
+        self.app_routes = self
+            .app_routes
+            .drain(..)
+            .filter_map(|mut route| {
+                if !valid_channels.contains(&route.channel_id) {
+                    return None;
+                }
+                route.matcher = route.matcher.normalized()?;
+                let key = app_matcher_key(&route.matcher);
+                seen.insert(key).then_some(route)
+            })
+            .collect();
+    }
+
+    fn normalize_app_history(&mut self) {
+        let mut seen = BTreeSet::new();
+        self.app_history = self
+            .app_history
+            .drain(..)
+            .filter_map(|mut app| {
+                app.matcher = app.matcher.normalized()?;
+                app.display_name = clean_app_display_name(&app.display_name)
+                    .unwrap_or_else(|| matcher_display_name(&app.matcher));
+                app.media_name = clean_optional_label(app.media_name);
+                let key = app_matcher_key(&app.matcher);
+                seen.insert(key).then_some(app)
+            })
+            .collect();
+        self.app_history.sort_by(|left, right| {
+            right
+                .last_seen_unix
+                .cmp(&left.last_seen_unix)
+                .then_with(|| left.display_name.cmp(&right.display_name))
+        });
+    }
+
+    fn normalize_app_identity(&mut self) {
+        let mut seen_overrides = BTreeSet::new();
+        self.app_identity_overrides = self
+            .app_identity_overrides
+            .drain(..)
+            .filter_map(|override_rule| {
+                let source = override_rule.source.normalized()?;
+                let target = override_rule.target.normalized()?;
+                if source == target {
+                    return None;
+                }
+                let key = app_matcher_key(&source);
+                seen_overrides
+                    .insert(key)
+                    .then_some(AppIdentityOverride { source, target })
+            })
+            .collect();
+
+        let mut seen_labels = BTreeSet::new();
+        self.app_label_overrides = self
+            .app_label_overrides
+            .drain(..)
+            .filter_map(|label| {
+                let matcher = label.matcher.normalized()?;
+                let label = clean_app_display_name(&label.label)?;
+                let key = app_matcher_key(&matcher);
+                seen_labels
+                    .insert(key)
+                    .then_some(AppLabelOverride { matcher, label })
+            })
+            .collect();
+    }
+
+    fn normalize_device_policy(&mut self) {
+        self.device_policy.preferred_input =
+            clean_optional_matcher(self.device_policy.preferred_input.take());
+        self.device_policy.preferred_output =
+            clean_optional_matcher(self.device_policy.preferred_output.take());
+        self.device_policy.restorable_input =
+            clean_optional_matcher(self.device_policy.restorable_input.take());
+        self.device_policy.restorable_output =
+            clean_optional_matcher(self.device_policy.restorable_output.take());
+    }
+
+    fn normalize_app_volume_presets(&mut self) {
+        let mut seen = BTreeSet::new();
+        self.app_volume_presets = self
+            .app_volume_presets
+            .drain(..)
+            .filter_map(|mut preset| {
+                preset.matcher = preset.matcher.normalized()?;
+                preset.volume = clamp_unit(preset.volume);
+                let key = app_matcher_key(&preset.matcher);
+                seen.insert(key).then_some(preset)
+            })
+            .collect();
+    }
+
+    fn migrate_legacy_mic_channel(&mut self) {
+        if self
+            .channels
+            .iter()
+            .any(|channel| channel.id == "hardware_in")
+        {
+            return;
+        }
+
+        let Some(channel) = self.channels.iter_mut().find(|channel| {
+            channel.id == "mic"
+                || (channel.kind == ChannelKind::Microphone
+                    && channel.name.eq_ignore_ascii_case("mic"))
+                || (channel.kind == ChannelKind::Microphone
+                    && channel.name.eq_ignore_ascii_case("microphone"))
+        }) else {
+            return;
+        };
+
+        let old_id = channel.id.clone();
+        channel.id = "hardware_in".into();
+        channel.name = "Hardware In".into();
+        channel.kind = ChannelKind::Generic;
+        channel.virtual_sink_name = "wavelinux_channel_hardware_in".into();
+
+        for route in &mut self.app_routes {
+            if route.channel_id == old_id {
+                route.channel_id = channel.id.clone();
+            }
+        }
+    }
+
+    fn ensure_system_channel(&mut self) {
+        if self
+            .channels
+            .iter()
+            .any(|channel| channel.kind == ChannelKind::System || channel.id == "system")
+        {
+            return;
+        }
+        if self.software_channel_count() >= MAX_SOFTWARE_CHANNELS
+            || self.channels.len() >= MAX_CHANNELS
+        {
+            return;
+        }
+
+        let mut system = Channel::new_fixed("system", "System", ChannelKind::System);
+        system.ensure_mix_buses(&self.mixes);
+        let insert_at = self
+            .channels
+            .iter()
+            .position(|channel| !channel.kind.uses_hardware_slot())
+            .unwrap_or(self.channels.len());
+        self.channels.insert(insert_at, system);
     }
 
     pub fn create_mix(&mut self, name: impl AsRef<str>) -> Result<Mix, ModelError> {
@@ -227,6 +459,22 @@ impl MixerConfig {
             .ok_or_else(|| ModelError::MixNotFound(mix_id.into()))?;
         mix.name = name;
         Ok(mix.clone())
+    }
+
+    pub fn move_mix(&mut self, mix_id: impl AsRef<str>, direction: i32) -> Result<Mix, ModelError> {
+        let mix_id = mix_id.as_ref();
+        let index = self
+            .mixes
+            .iter()
+            .position(|mix| mix.id == mix_id)
+            .ok_or_else(|| ModelError::MixNotFound(mix_id.into()))?;
+        let target = offset_index(index, direction, self.mixes.len());
+        if target == index {
+            return Ok(self.mixes[index].clone());
+        }
+        let mix = self.mixes.remove(index);
+        self.mixes.insert(target, mix.clone());
+        Ok(mix)
     }
 
     pub fn delete_mix(&mut self, mix_id: impl AsRef<str>) -> Result<Mix, ModelError> {
@@ -291,6 +539,26 @@ impl MixerConfig {
         Ok(channel.clone())
     }
 
+    pub fn move_channel(
+        &mut self,
+        channel_id: impl AsRef<str>,
+        direction: i32,
+    ) -> Result<Channel, ModelError> {
+        let channel_id = channel_id.as_ref();
+        let index = self
+            .channels
+            .iter()
+            .position(|channel| channel.id == channel_id)
+            .ok_or_else(|| ModelError::ChannelNotFound(channel_id.into()))?;
+        let target = offset_index(index, direction, self.channels.len());
+        if target == index {
+            return Ok(self.channels[index].clone());
+        }
+        let channel = self.channels.remove(index);
+        self.channels.insert(target, channel.clone());
+        Ok(channel)
+    }
+
     pub fn delete_channel(&mut self, channel_id: impl AsRef<str>) -> Result<Channel, ModelError> {
         if self.channels.len() <= 1 {
             return Err(ModelError::CannotDeleteLastChannel);
@@ -309,7 +577,24 @@ impl MixerConfig {
 
     pub fn set_settings(&mut self, settings: MixerSettings) -> MixerSettings {
         self.settings = settings;
+        self.settings.keep_running_in_tray = true;
         self.settings.clone()
+    }
+
+    pub fn set_channel_input_mode(
+        &mut self,
+        channel_id: impl AsRef<str>,
+        input_mode: ChannelInputMode,
+    ) -> Result<Channel, ModelError> {
+        let channel = self.channel_mut(channel_id.as_ref())?;
+        if !channel.kind.uses_hardware_slot() {
+            return Err(ModelError::InvalidConfig(format!(
+                "{} is not a hardware input channel",
+                channel.name
+            )));
+        }
+        channel.input_mode = input_mode;
+        Ok(channel.clone())
     }
 
     pub fn set_mix_volume(
@@ -337,9 +622,16 @@ impl MixerConfig {
         mix_id: impl AsRef<str>,
         output: Option<DeviceId>,
     ) -> Result<Mix, ModelError> {
-        let mix = self.mix_mut(mix_id.as_ref())?;
-        mix.monitor_output = output.filter(|value| !value.trim().is_empty());
-        Ok(mix.clone())
+        let output = clean_optional_matcher(output);
+        let mix = {
+            let mix = self.mix_mut(mix_id.as_ref())?;
+            mix.monitor_output = output.clone();
+            mix.clone()
+        };
+        if mix.id == "monitor" {
+            self.device_policy.preferred_output = output;
+        }
+        Ok(mix)
     }
 
     pub fn set_channel_volume(
@@ -403,9 +695,16 @@ impl MixerConfig {
         channel_id: impl AsRef<str>,
         source_device: Option<DeviceId>,
     ) -> Result<Channel, ModelError> {
-        let channel = self.channel_mut(channel_id.as_ref())?;
-        channel.source_device = source_device.filter(|value| !value.trim().is_empty());
-        Ok(channel.clone())
+        let source_device = clean_optional_matcher(source_device);
+        let channel = {
+            let channel = self.channel_mut(channel_id.as_ref())?;
+            channel.source_device = source_device.clone();
+            channel.clone()
+        };
+        if channel.kind.uses_hardware_slot() {
+            self.device_policy.preferred_input = source_device;
+        }
+        Ok(channel)
     }
 
     pub fn assign_app_to_channel(
@@ -415,6 +714,8 @@ impl MixerConfig {
     ) -> Result<AppRoute, ModelError> {
         let channel_id = channel_id.as_ref();
         self.ensure_channel_exists(channel_id)?;
+        let matcher = matcher.normalized().ok_or(ModelError::InvalidMatcher)?;
+        let matcher = self.resolve_app_matcher(&matcher);
         let route = AppRoute {
             matcher,
             channel_id: channel_id.into(),
@@ -426,11 +727,301 @@ impl MixerConfig {
     }
 
     pub fn remove_app_route(&mut self, matcher: AppMatcher) -> Option<AppRoute> {
-        let index = self
-            .app_routes
-            .iter()
-            .position(|route| route.matcher == matcher)?;
+        let matcher = matcher.normalized()?;
+        let resolved = self.resolve_app_matcher(&matcher);
+        let index = self.app_routes.iter().position(|route| {
+            app_matchers_overlap(&route.matcher, &matcher)
+                || app_matchers_overlap(&route.matcher, &resolved)
+        })?;
         Some(self.app_routes.remove(index))
+    }
+
+    pub fn set_app_volume_preset(
+        &mut self,
+        matcher: AppMatcher,
+        volume: f32,
+    ) -> Result<AppVolumePreset, ModelError> {
+        let matcher = matcher.normalized().ok_or(ModelError::InvalidMatcher)?;
+        let matcher = self.resolve_app_matcher(&matcher);
+        let preset = AppVolumePreset {
+            matcher,
+            volume: valid_unit(volume)?,
+        };
+        self.app_volume_presets
+            .retain(|existing| existing.matcher != preset.matcher);
+        self.app_volume_presets.push(preset.clone());
+        Ok(preset)
+    }
+
+    pub fn remove_app_volume_preset(&mut self, matcher: AppMatcher) -> Option<AppVolumePreset> {
+        let matcher = matcher.normalized()?;
+        let resolved = self.resolve_app_matcher(&matcher);
+        let index = self.app_volume_presets.iter().position(|preset| {
+            app_matchers_overlap(&preset.matcher, &matcher)
+                || app_matchers_overlap(&preset.matcher, &resolved)
+        })?;
+        Some(self.app_volume_presets.remove(index))
+    }
+
+    pub fn remember_app_stream(
+        &mut self,
+        stream: &AppStream,
+        seen_unix: i64,
+    ) -> Result<Option<KnownApp>, ModelError> {
+        let Some(raw_matcher) = AppMatcher::from_stream(stream) else {
+            return Ok(None);
+        };
+        let matcher = self.resolve_app_matcher(&raw_matcher);
+        let display_name = self
+            .label_for_matcher(&matcher)
+            .or_else(|| clean_app_display_name(&stream.display_name))
+            .unwrap_or_else(|| matcher_display_name(&matcher));
+        let media_name = clean_optional_label(stream.media_name.clone());
+        let Some(existing) = self
+            .app_history
+            .iter_mut()
+            .find(|app| app.matcher == matcher)
+        else {
+            let app = KnownApp {
+                matcher,
+                display_name,
+                media_name,
+                last_seen_unix: seen_unix,
+                forgotten: false,
+            };
+            self.app_history.push(app.clone());
+            self.normalize_app_history();
+            return Ok(Some(app));
+        };
+
+        let mut changed = false;
+        if existing.display_name != display_name {
+            existing.display_name = display_name;
+            changed = true;
+        }
+        if existing.media_name != media_name {
+            existing.media_name = media_name;
+            changed = true;
+        }
+        if seen_unix.saturating_sub(existing.last_seen_unix) >= 60 {
+            existing.last_seen_unix = seen_unix;
+            changed = true;
+        }
+        if changed {
+            let app = existing.clone();
+            self.normalize_app_history();
+            Ok(Some(app))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn forget_app(&mut self, matcher: AppMatcher) -> Option<KnownApp> {
+        let matcher = matcher.normalized()?;
+        let resolved = self.resolve_app_matcher(&matcher);
+        self.app_routes.retain(|route| {
+            !app_matchers_overlap(&route.matcher, &matcher)
+                && !app_matchers_overlap(&route.matcher, &resolved)
+        });
+        self.app_volume_presets.retain(|preset| {
+            !app_matchers_overlap(&preset.matcher, &matcher)
+                && !app_matchers_overlap(&preset.matcher, &resolved)
+        });
+        let app = self.app_history.iter_mut().find(|app| {
+            app_matchers_overlap(&app.matcher, &matcher)
+                || app_matchers_overlap(&app.matcher, &resolved)
+        })?;
+        app.forgotten = true;
+        Some(app.clone())
+    }
+
+    pub fn restore_app(&mut self, matcher: AppMatcher) -> Option<KnownApp> {
+        let matcher = matcher.normalized()?;
+        let resolved = self.resolve_app_matcher(&matcher);
+        let app = self.app_history.iter_mut().find(|app| {
+            app_matchers_overlap(&app.matcher, &matcher)
+                || app_matchers_overlap(&app.matcher, &resolved)
+        })?;
+        app.forgotten = false;
+        Some(app.clone())
+    }
+
+    pub fn pin_app_identity(
+        &mut self,
+        matcher: AppMatcher,
+        label: impl AsRef<str>,
+    ) -> Result<KnownApp, ModelError> {
+        let matcher = matcher.normalized().ok_or(ModelError::InvalidMatcher)?;
+        let matcher = self.resolve_app_matcher(&matcher);
+        let label = clean_app_display_name(label.as_ref()).ok_or(ModelError::InvalidName)?;
+        self.app_label_overrides
+            .retain(|existing| existing.matcher != matcher);
+        self.app_label_overrides.push(AppLabelOverride {
+            matcher: matcher.clone(),
+            label: label.clone(),
+        });
+
+        let app = self.upsert_known_app(matcher, label, None, 0, false);
+        self.normalize_app_identity();
+        Ok(app)
+    }
+
+    pub fn merge_app_identity(
+        &mut self,
+        source: AppMatcher,
+        target: AppMatcher,
+    ) -> Result<KnownApp, ModelError> {
+        let source = source.normalized().ok_or(ModelError::InvalidMatcher)?;
+        let target = target.normalized().ok_or(ModelError::InvalidMatcher)?;
+        if app_matchers_overlap(&source, &target) {
+            return Err(ModelError::InvalidMatcher);
+        }
+        let target = self.resolve_app_matcher(&target);
+        let label = self
+            .label_for_matcher(&target)
+            .or_else(|| {
+                self.app_history
+                    .iter()
+                    .find(|app| app_matchers_overlap(&app.matcher, &target))
+                    .map(|app| app.display_name.clone())
+            })
+            .unwrap_or_else(|| matcher_display_name(&target));
+
+        self.app_identity_overrides
+            .retain(|existing| !app_matchers_overlap(&existing.source, &source));
+        self.app_identity_overrides.push(AppIdentityOverride {
+            source: source.clone(),
+            target: target.clone(),
+        });
+
+        for route in &mut self.app_routes {
+            if app_matchers_overlap(&route.matcher, &source) {
+                route.matcher = target.clone();
+            }
+        }
+        for preset in &mut self.app_volume_presets {
+            if app_matchers_overlap(&preset.matcher, &source) {
+                preset.matcher = target.clone();
+            }
+        }
+        for app in &mut self.app_history {
+            if app_matchers_overlap(&app.matcher, &source) {
+                app.forgotten = true;
+            }
+        }
+
+        let app = self.upsert_known_app(target, label, None, 0, false);
+        self.normalize_app_identity();
+        self.normalize_app_routes();
+        self.normalize_app_volume_presets();
+        self.normalize_app_history();
+        Ok(app)
+    }
+
+    pub fn reset_app_identity(&mut self, matcher: AppMatcher) -> Option<KnownApp> {
+        let matcher = matcher.normalized()?;
+        self.app_identity_overrides.retain(|override_rule| {
+            !app_matchers_overlap(&override_rule.source, &matcher)
+                && !app_matchers_overlap(&override_rule.target, &matcher)
+        });
+        self.app_label_overrides
+            .retain(|label| !app_matchers_overlap(&label.matcher, &matcher));
+
+        let app = self
+            .app_history
+            .iter_mut()
+            .find(|app| app_matchers_overlap(&app.matcher, &matcher))?;
+        app.display_name = matcher_display_name(&app.matcher);
+        app.forgotten = false;
+        Some(app.clone())
+    }
+
+    pub fn set_preferred_output(&mut self, output: Option<DeviceId>) {
+        self.device_policy.preferred_output = clean_optional_matcher(output);
+    }
+
+    pub fn set_restorable_input(&mut self, input: Option<DeviceId>) {
+        self.device_policy.restorable_input = clean_optional_matcher(input);
+    }
+
+    pub fn set_restorable_output(&mut self, output: Option<DeviceId>) {
+        self.device_policy.restorable_output = clean_optional_matcher(output);
+    }
+
+    pub fn set_input_fallback_active(&mut self, active: bool) {
+        self.device_policy.active_input_fallback = active;
+    }
+
+    pub fn set_output_fallback_active(&mut self, active: bool) {
+        self.device_policy.active_output_fallback = active;
+    }
+
+    pub fn resolve_app_matcher(&self, matcher: &AppMatcher) -> AppMatcher {
+        self.app_identity_overrides
+            .iter()
+            .filter(|override_rule| app_matchers_overlap(&override_rule.source, matcher))
+            .max_by_key(|override_rule| app_matcher_specificity(&override_rule.source))
+            .map(|override_rule| override_rule.target.clone())
+            .unwrap_or_else(|| matcher.clone())
+    }
+
+    pub fn label_for_matcher(&self, matcher: &AppMatcher) -> Option<String> {
+        self.app_label_overrides
+            .iter()
+            .filter(|label| app_matchers_overlap(&label.matcher, matcher))
+            .max_by_key(|label| app_matcher_specificity(&label.matcher))
+            .map(|label| label.label.clone())
+    }
+
+    fn upsert_known_app(
+        &mut self,
+        matcher: AppMatcher,
+        display_name: String,
+        media_name: Option<String>,
+        seen_unix: i64,
+        forgotten: bool,
+    ) -> KnownApp {
+        if let Some(app) = self
+            .app_history
+            .iter_mut()
+            .find(|app| app_matchers_overlap(&app.matcher, &matcher))
+        {
+            app.display_name = display_name;
+            if media_name.is_some() {
+                app.media_name = media_name;
+            }
+            if seen_unix > 0 {
+                app.last_seen_unix = seen_unix;
+            }
+            app.forgotten = forgotten;
+            return app.clone();
+        }
+
+        let app = KnownApp {
+            matcher,
+            display_name,
+            media_name,
+            last_seen_unix: seen_unix,
+            forgotten,
+        };
+        self.app_history.push(app.clone());
+        app
+    }
+
+    pub fn apply_setup_template(
+        &mut self,
+        template_id: impl AsRef<str>,
+    ) -> Result<SetupTemplate, ModelError> {
+        let template_id = template_id.as_ref();
+        let template = setup_templates()
+            .into_iter()
+            .find(|template| template.id == template_id)
+            .ok_or_else(|| ModelError::TemplateNotFound(template_id.into()))?;
+        let mut next = config_for_setup_template(&template)?;
+        next.settings = self.settings.clone();
+        next.audio = self.audio.clone();
+        *self = next.normalized()?;
+        Ok(template)
     }
 
     pub fn set_effect_chain(
@@ -438,6 +1029,8 @@ impl MixerConfig {
         channel_id: impl AsRef<str>,
         effects: Vec<EffectInstance>,
     ) -> Result<Channel, ModelError> {
+        let catalog = EffectCatalog::default();
+        let effects = normalize_effect_chain(effects, &catalog, false)?;
         let channel = self.channel_mut(channel_id.as_ref())?;
         channel.effects = effects;
         Ok(channel.clone())
@@ -458,7 +1051,12 @@ impl MixerConfig {
             .iter_mut()
             .find(|effect| effect.instance_id == instance_id)
             .ok_or_else(|| ModelError::EffectNotFound(instance_id.into()))?;
-        effect.params.insert(param_id.into(), value);
+        let catalog = EffectCatalog::default();
+        let definition = effect_definition(&catalog, &effect.effect_id)?;
+        let param = effect_param_definition(definition, param_id)?;
+        effect
+            .params
+            .insert(param_id.into(), clamp_param_value(value, param));
         Ok(channel.clone())
     }
 
@@ -537,6 +1135,7 @@ impl MixerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct AudioSpec {
     pub sample_rate_hz: u32,
     pub bit_depth: u16,
@@ -559,10 +1158,15 @@ impl Default for AudioSpec {
 pub struct Mix {
     pub id: MixId,
     pub name: String,
+    #[serde(default)]
     pub virtual_sink_name: String,
+    #[serde(default)]
     pub virtual_source_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor_output: Option<DeviceId>,
+    #[serde(default = "default_unit_volume")]
     pub volume: f32,
+    #[serde(default)]
     pub muted: bool,
 }
 
@@ -579,6 +1183,16 @@ impl Mix {
             muted: false,
         }
     }
+
+    fn ensure_virtual_node_names(&mut self) {
+        let safe = safe_node_id(&self.id);
+        if self.virtual_sink_name.trim().is_empty() {
+            self.virtual_sink_name = format!("wavelinux_mix_{safe}");
+        }
+        if self.virtual_source_name.trim().is_empty() {
+            self.virtual_source_name = format!("wavelinux_mix_{safe}_source");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -589,6 +1203,56 @@ pub enum ChannelKind {
     Soundboard,
     System,
     Generic,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelInputMode {
+    #[default]
+    Stereo,
+    MonoLeft,
+    MonoRight,
+    SumMono,
+    SwapLr,
+}
+
+impl ChannelInputMode {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Stereo => "stereo",
+            Self::MonoLeft => "mono_left",
+            Self::MonoRight => "mono_right",
+            Self::SumMono => "sum_mono",
+            Self::SwapLr => "swap_lr",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo",
+            Self::MonoLeft => "Mono left to stereo",
+            Self::MonoRight => "Mono right to stereo",
+            Self::SumMono => "Sum to mono",
+            Self::SwapLr => "Swap left/right",
+        }
+    }
+
+    pub fn channel_map(self) -> &'static str {
+        match self {
+            Self::Stereo => "front-left,front-right",
+            Self::MonoLeft => "front-left,front-left",
+            Self::MonoRight => "front-right,front-right",
+            Self::SumMono => "mono",
+            Self::SwapLr => "front-right,front-left",
+        }
+    }
+
+    pub fn channels(self) -> u8 {
+        match self {
+            Self::SumMono => 1,
+            Self::Stereo | Self::MonoLeft | Self::MonoRight | Self::SwapLr => 2,
+        }
+    }
 }
 
 impl ChannelKind {
@@ -602,12 +1266,19 @@ pub struct Channel {
     pub id: ChannelId,
     pub name: String,
     pub kind: ChannelKind,
+    #[serde(default)]
     pub virtual_sink_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_device: Option<DeviceId>,
+    #[serde(default)]
+    pub input_mode: ChannelInputMode,
+    #[serde(default)]
     pub linked: bool,
+    #[serde(default)]
     pub mix_buses: BTreeMap<MixId, MixBus>,
+    #[serde(default)]
     pub app_matchers: Vec<AppMatcher>,
+    #[serde(default)]
     pub effects: Vec<EffectInstance>,
 }
 
@@ -620,6 +1291,7 @@ impl Channel {
             kind,
             virtual_sink_name: format!("wavelinux_channel_{safe}"),
             source_device: None,
+            input_mode: ChannelInputMode::Stereo,
             linked: false,
             mix_buses: BTreeMap::new(),
             app_matchers: Vec::new(),
@@ -631,16 +1303,22 @@ impl Channel {
         let valid: BTreeSet<_> = mixes.iter().map(|mix| mix.id.clone()).collect();
         self.mix_buses.retain(|mix_id, _| valid.contains(mix_id));
         for mix in mixes {
-            self.mix_buses
-                .entry(mix.id.clone())
-                .or_insert_with(MixBus::default);
+            self.mix_buses.entry(mix.id.clone()).or_default();
+        }
+    }
+
+    fn ensure_virtual_node_name(&mut self) {
+        if self.virtual_sink_name.trim().is_empty() {
+            self.virtual_sink_name = format!("wavelinux_channel_{}", safe_node_id(&self.id));
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MixBus {
+    #[serde(default = "default_unit_volume")]
     pub volume: f32,
+    #[serde(default)]
     pub muted: bool,
 }
 
@@ -655,10 +1333,16 @@ impl Default for MixBus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppMatcher {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_name: Option<String>,
 }
 
 impl AppMatcher {
@@ -668,7 +1352,95 @@ impl AppMatcher {
             binary: None,
             process_name: None,
             window_class: None,
+            media_name: None,
         }
+    }
+
+    pub fn from_process_name(process_name: impl Into<String>) -> Self {
+        Self {
+            app_id: None,
+            binary: None,
+            process_name: Some(process_name.into()),
+            window_class: None,
+            media_name: None,
+        }
+    }
+
+    pub fn from_binary(binary: impl Into<String>) -> Self {
+        Self {
+            app_id: None,
+            binary: Some(binary.into()),
+            process_name: None,
+            window_class: None,
+            media_name: None,
+        }
+    }
+
+    pub fn from_window_class(window_class: impl Into<String>) -> Self {
+        Self {
+            app_id: None,
+            binary: None,
+            process_name: None,
+            window_class: Some(window_class.into()),
+            media_name: None,
+        }
+    }
+
+    pub fn from_media_name(media_name: impl Into<String>) -> Self {
+        Self {
+            app_id: None,
+            binary: None,
+            process_name: None,
+            window_class: None,
+            media_name: Some(media_name.into()),
+        }
+    }
+
+    pub fn from_stream(stream: &AppStream) -> Option<Self> {
+        Self {
+            app_id: stream.app_id.clone(),
+            binary: stream
+                .binary
+                .clone()
+                .or_else(|| stream.process_name.clone()),
+            process_name: stream.process_name.clone(),
+            window_class: stream.window_class.clone(),
+            media_name: stream.media_name.clone(),
+        }
+        .normalized()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.app_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+            && self
+                .binary
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            && self
+                .process_name
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            && self
+                .window_class
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            && self
+                .media_name
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+    }
+
+    fn normalized(self) -> Option<Self> {
+        let matcher = Self {
+            app_id: clean_optional_matcher(self.app_id),
+            binary: clean_optional_matcher(self.binary),
+            process_name: clean_optional_matcher(self.process_name),
+            window_class: clean_optional_matcher(self.window_class),
+            media_name: clean_optional_matcher(self.media_name),
+        };
+        (!matcher.is_empty()).then_some(matcher)
     }
 }
 
@@ -679,12 +1451,116 @@ pub struct AppRoute {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AppVolumePreset {
+    pub matcher: AppMatcher,
+    #[serde(default = "default_unit_volume")]
+    pub volume: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KnownApp {
+    pub matcher: AppMatcher,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_name: Option<String>,
+    pub last_seen_unix: i64,
+    #[serde(default)]
+    pub forgotten: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppIdentityOverride {
+    pub source: AppMatcher,
+    pub target: AppMatcher,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppLabelOverride {
+    pub matcher: AppMatcher,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DevicePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_input: Option<DeviceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_output: Option<DeviceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restorable_input: Option<DeviceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restorable_output: Option<DeviceId>,
+    #[serde(default)]
+    pub active_input_fallback: bool,
+    #[serde(default)]
+    pub active_output_fallback: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupTemplate {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub details: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigBackup {
+    pub backup_version: u32,
+    pub exported_unix: i64,
+    pub config: MixerConfig,
+    #[serde(default)]
+    pub scenes: Vec<Scene>,
+}
+
+impl ConfigBackup {
+    pub fn new(config: MixerConfig, scenes: Vec<Scene>) -> Result<Self, ModelError> {
+        let backup = Self {
+            backup_version: BACKUP_VERSION,
+            exported_unix: OffsetDateTime::now_utc().unix_timestamp(),
+            config: config.normalized()?,
+            scenes: scenes
+                .into_iter()
+                .filter_map(|scene| {
+                    Scene::new(scene.name, scene.config.normalized().ok()?)
+                        .ok()
+                        .map(|mut normalized| {
+                            normalized.id = scene.id;
+                            normalized.created_unix = scene.created_unix;
+                            normalized
+                        })
+                })
+                .collect(),
+        };
+        backup.validate()?;
+        Ok(backup)
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.backup_version == 0 {
+            return Err(ModelError::InvalidConfig(
+                "backup version must be non-zero".into(),
+            ));
+        }
+        self.config.clone().normalized()?;
+        for scene in &self.scenes {
+            scene.config.clone().normalized()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EffectInstance {
+    #[serde(default)]
     pub instance_id: EffectInstanceId,
     pub effect_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default)]
     pub bypassed: bool,
+    #[serde(default)]
     pub params: BTreeMap<String, f32>,
 }
 
@@ -757,14 +1633,49 @@ impl Default for EffectCatalog {
                         "deep_filter_net_ladspa.so".into(),
                     ],
                 },
-                vec![param(
-                    "attenuation_limit_db",
-                    "Reduction Limit",
-                    0.0,
-                    100.0,
-                    100.0,
-                    " dB",
-                )],
+                vec![
+                    param(
+                        "attenuation_limit_db",
+                        "Reduction Limit",
+                        0.0,
+                        100.0,
+                        100.0,
+                        " dB",
+                    ),
+                    param(
+                        "min_processing_threshold_db",
+                        "Min Threshold",
+                        -15.0,
+                        35.0,
+                        -15.0,
+                        " dB",
+                    ),
+                    param(
+                        "max_erb_processing_threshold_db",
+                        "Max ERB Threshold",
+                        -15.0,
+                        35.0,
+                        35.0,
+                        " dB",
+                    ),
+                    param(
+                        "max_df_processing_threshold_db",
+                        "Max DF Threshold",
+                        -15.0,
+                        35.0,
+                        35.0,
+                        " dB",
+                    ),
+                    param(
+                        "min_processing_buffer_frames",
+                        "Min Buffer",
+                        0.0,
+                        10.0,
+                        0.0,
+                        " frames",
+                    ),
+                    param("post_filter_beta", "Post Filter Beta", 0.0, 0.05, 0.0, ""),
+                ],
             ),
             effect(
                 "rnnoise",
@@ -774,9 +1685,9 @@ impl Default for EffectCatalog {
                     library_names: vec!["librnnoise_ladspa.so".into(), "rnnoise_ladspa.so".into()],
                 },
                 vec![
-                    param("vad_threshold", "VAD Threshold", 0.0, 100.0, 50.0, "%"),
-                    param("hold_ms", "Hold Open", 0.0, 2000.0, 200.0, " ms"),
-                    param("lead_in_ms", "Lead-In", 0.0, 500.0, 0.0, " ms"),
+                    param("vad_threshold", "VAD Threshold", 0.0, 99.0, 50.0, "%"),
+                    param("hold_ms", "Hold Open", 0.0, 1000.0, 200.0, " ms"),
+                    param("lead_in_ms", "Lead-In", 0.0, 200.0, 0.0, " ms"),
                 ],
             ),
             effect(
@@ -808,10 +1719,10 @@ impl Default for EffectCatalog {
                     library_names: vec!["sc4_1882.so".into(), "compressor.so".into()],
                 },
                 vec![
-                    param("threshold_db", "Threshold", -60.0, 0.0, -20.0, " dB"),
+                    param("threshold_db", "Threshold", -30.0, 0.0, -20.0, " dB"),
                     param("ratio", "Ratio", 1.0, 20.0, 4.0, ":1"),
-                    param("attack_ms", "Attack", 0.1, 200.0, 5.0, " ms"),
-                    param("release_ms", "Release", 5.0, 1000.0, 100.0, " ms"),
+                    param("attack_ms", "Attack", 1.5, 200.0, 5.0, " ms"),
+                    param("release_ms", "Release", 5.0, 800.0, 100.0, " ms"),
                     param("makeup_gain_db", "Makeup", 0.0, 24.0, 0.0, " dB"),
                 ],
             ),
@@ -819,9 +1730,7 @@ impl Default for EffectCatalog {
                 "gate",
                 "Noise Gate",
                 "Attenuate quiet room tone",
-                PluginHint::Ladspa {
-                    library_names: vec!["gate.so".into(), "noise_gate.so".into()],
-                },
+                PluginHint::PipeWireBuiltin,
                 vec![
                     param("threshold_db", "Threshold", -80.0, 0.0, -40.0, " dB"),
                     param("attack_ms", "Attack", 0.1, 100.0, 2.5, " ms"),
@@ -834,7 +1743,12 @@ impl Default for EffectCatalog {
                 "limiter",
                 "Limiter",
                 "Brick-wall peak ceiling",
-                PluginHint::PipeWireBuiltin,
+                PluginHint::Ladspa {
+                    library_names: vec![
+                        "fast_lookahead_limiter_1913.so".into(),
+                        "hard_limiter_1413.so".into(),
+                    ],
+                },
                 vec![
                     param("input_gain_db", "Input Gain", -20.0, 20.0, 0.0, " dB"),
                     param("ceiling_db", "Ceiling", -20.0, 0.0, -1.0, " dB"),
@@ -1049,10 +1963,18 @@ pub struct DeviceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppStream {
     pub id: AppStreamId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_class: Option<String>,
     pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routed_channel_id: Option<ChannelId>,
     pub volume: f32,
     pub muted: bool,
@@ -1072,7 +1994,7 @@ pub struct EffectAvailability {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeGraph {
     pub inputs: Vec<DeviceInfo>,
     pub outputs: Vec<DeviceInfo>,
@@ -1081,22 +2003,11 @@ pub struct RuntimeGraph {
     pub effect_availability: Vec<EffectAvailability>,
 }
 
-impl Default for RuntimeGraph {
-    fn default() -> Self {
-        Self {
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            app_streams: Vec::new(),
-            meters: Vec::new(),
-            effect_availability: Vec::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EngineStatus {
     pub dry_run: bool,
     pub healthy: bool,
+    pub audio_graph_running: bool,
     pub message: String,
     pub last_refresh_unix: i64,
 }
@@ -1106,6 +2017,7 @@ impl Default for EngineStatus {
         Self {
             dry_run: false,
             healthy: true,
+            audio_graph_running: false,
             message: "Ready".into(),
             last_refresh_unix: 0,
         }
@@ -1190,12 +2102,223 @@ fn valid_unit(value: f32) -> Result<f32, ModelError> {
     }
 }
 
+fn default_unit_volume() -> f32 {
+    1.0
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn offset_index(index: usize, direction: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let target = index as i64 + i64::from(direction);
+    target.clamp(0, len.saturating_sub(1) as i64) as usize
+}
+
 fn clean_name(name: impl AsRef<str>) -> Result<String, ModelError> {
     let name = name.as_ref().trim();
     if name.is_empty() {
         return Err(ModelError::InvalidName);
     }
     Ok(name.chars().take(64).collect())
+}
+
+fn clean_optional_matcher(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn clean_optional_label(value: Option<String>) -> Option<String> {
+    value.and_then(|value| clean_app_display_name(&value))
+}
+
+fn clean_app_display_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.chars().take(96).collect())
+}
+
+fn matcher_display_name(matcher: &AppMatcher) -> String {
+    matcher
+        .app_id
+        .as_deref()
+        .or(matcher.process_name.as_deref())
+        .or(matcher.binary.as_deref())
+        .or(matcher.window_class.as_deref())
+        .or(matcher.media_name.as_deref())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "Unknown app".into())
+}
+
+fn app_matcher_key(matcher: &AppMatcher) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        matcher.app_id.as_deref().unwrap_or_default(),
+        matcher.binary.as_deref().unwrap_or_default(),
+        matcher.process_name.as_deref().unwrap_or_default(),
+        matcher.window_class.as_deref().unwrap_or_default(),
+        matcher.media_name.as_deref().unwrap_or_default()
+    )
+}
+
+fn app_matchers_overlap(left: &AppMatcher, right: &AppMatcher) -> bool {
+    matcher_matches_matcher(left, right) || matcher_matches_matcher(right, left)
+}
+
+fn app_matcher_specificity(matcher: &AppMatcher) -> usize {
+    [
+        matcher.app_id.as_deref(),
+        matcher.binary.as_deref(),
+        matcher.process_name.as_deref(),
+        matcher.window_class.as_deref(),
+        matcher.media_name.as_deref(),
+    ]
+    .into_iter()
+    .filter(|value| value.is_some_and(|value| !value.trim().is_empty()))
+    .count()
+}
+
+fn matcher_matches_matcher(pattern: &AppMatcher, candidate: &AppMatcher) -> bool {
+    let fields = [
+        (&pattern.app_id, &candidate.app_id),
+        (&pattern.binary, &candidate.binary),
+        (&pattern.process_name, &candidate.process_name),
+        (&pattern.window_class, &candidate.window_class),
+        (&pattern.media_name, &candidate.media_name),
+    ];
+    let mut has_pattern = false;
+    for (pattern, candidate) in fields {
+        let Some(pattern) = pattern.as_deref().filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        has_pattern = true;
+        let Some(candidate) = candidate.as_deref() else {
+            return false;
+        };
+        if !pattern.eq_ignore_ascii_case(candidate) {
+            return false;
+        }
+    }
+    has_pattern
+}
+
+fn normalize_effect_chain(
+    effects: Vec<EffectInstance>,
+    catalog: &EffectCatalog,
+    drop_unknown: bool,
+) -> Result<Vec<EffectInstance>, ModelError> {
+    let mut normalized = Vec::new();
+    for mut effect in effects {
+        effect.effect_id = effect.effect_id.trim().to_string();
+        let definition = match catalog
+            .effects
+            .iter()
+            .find(|definition| definition.id == effect.effect_id)
+        {
+            Some(definition) => definition,
+            None if drop_unknown => continue,
+            None => return Err(ModelError::EffectNotFound(effect.effect_id)),
+        };
+
+        effect.instance_id = effect.instance_id.trim().to_string();
+        if effect.instance_id.is_empty() {
+            effect.instance_id = Uuid::new_v4().to_string();
+        }
+        effect.name = clean_optional_name(effect.name);
+        effect.params = normalize_effect_params(effect.params, definition);
+        normalized.push(effect);
+    }
+    Ok(normalized)
+}
+
+fn validate_effect_chain(
+    effects: &[EffectInstance],
+    catalog: &EffectCatalog,
+) -> Result<(), ModelError> {
+    for effect in effects {
+        if effect.instance_id.trim().is_empty() {
+            return Err(ModelError::InvalidConfig(
+                "effect instance id must not be empty".into(),
+            ));
+        }
+        let definition = effect_definition(catalog, &effect.effect_id)?;
+        for key in effect.params.keys() {
+            effect_param_definition(definition, key)?;
+        }
+        for param in &definition.params {
+            let value = effect.params.get(&param.id).ok_or_else(|| {
+                ModelError::InvalidConfig(format!(
+                    "{} effect missing '{}' parameter",
+                    definition.name, param.label
+                ))
+            })?;
+            if !value.is_finite() || *value < param.min || *value > param.max {
+                return Err(ModelError::InvalidConfig(format!(
+                    "{} effect parameter '{}' is out of range",
+                    definition.name, param.label
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_effect_params(
+    params: BTreeMap<String, f32>,
+    definition: &EffectDefinition,
+) -> BTreeMap<String, f32> {
+    definition
+        .params
+        .iter()
+        .map(|param| {
+            let value = params.get(&param.id).copied().unwrap_or(param.default);
+            (param.id.clone(), clamp_param_value(value, param))
+        })
+        .collect()
+}
+
+fn effect_definition<'a>(
+    catalog: &'a EffectCatalog,
+    effect_id: &str,
+) -> Result<&'a EffectDefinition, ModelError> {
+    catalog
+        .effects
+        .iter()
+        .find(|definition| definition.id == effect_id)
+        .ok_or_else(|| ModelError::EffectNotFound(effect_id.into()))
+}
+
+fn effect_param_definition<'a>(
+    definition: &'a EffectDefinition,
+    param_id: &str,
+) -> Result<&'a EffectParamDefinition, ModelError> {
+    definition
+        .params
+        .iter()
+        .find(|param| param.id == param_id)
+        .ok_or_else(|| {
+            ModelError::InvalidConfig(format!(
+                "{} effect has no '{}' parameter",
+                definition.name, param_id
+            ))
+        })
+}
+
+fn clamp_param_value(value: f32, param: &EffectParamDefinition) -> f32 {
+    if value.is_finite() {
+        value.clamp(param.min, param.max)
+    } else {
+        param.default
+    }
+}
+
+fn clean_optional_name(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().chars().take(64).collect::<String>())
+        .filter(|value| !value.is_empty())
 }
 
 fn ensure_unique_names<'a>(
@@ -1243,6 +2366,397 @@ fn slugify(value: &str) -> String {
         }
     }
     slug.trim_matches('_').to_string()
+}
+
+pub fn setup_templates() -> Vec<SetupTemplate> {
+    vec![
+        setup_template(
+            "streaming",
+            "Streaming",
+            "WaveLinux 3.1-style starter for OBS: mic, system, game, chat, music, browser, and SFX routed into Monitor and Stream.",
+            &[
+                "Monitor and Stream mixes",
+                "Seven ready-to-route source channels",
+                "Broadcast mic FX chain",
+                "Saved routes and offline volume presets for common apps",
+            ],
+        ),
+        setup_template(
+            "microphonefx",
+            "MicrophoneFX / Discord",
+            "A dedicated virtual microphone mix for Discord, Teams, games, and browser calls.",
+            &[
+                "Adds a MicrophoneFX virtual source",
+                "Routes mic, SFX, music, and chat into a call-safe mix",
+                "Keeps system/game audio mostly out of the microphone feed",
+                "Starts with speech cleanup effects on Hardware In",
+            ],
+        ),
+        setup_template(
+            "discord_mix",
+            "Discord Mix",
+            "One-click virtual microphone mix for Discord with mic, music bed, SFX, and chat-safe levels.",
+            &[
+                "Adds a Discord Mix virtual source",
+                "Routes Hardware In, SFX, and optional music into Discord",
+                "Keeps system/game/browser audio muted from the mic feed",
+                "Uses speech cleanup and conservative limiter settings",
+            ],
+        ),
+        setup_template(
+            "podcast",
+            "Podcast",
+            "Multi-mix layout for recording voice, remote guests, browser audio, music beds, and soundboard cues.",
+            &[
+                "Adds Podcast and Guest Mix outputs",
+                "Separates browser/guest audio from local monitoring",
+                "Keeps music/SFX lower in the recording mix",
+                "Uses conservative voice processing",
+            ],
+        ),
+        setup_template(
+            "work_call",
+            "Work Call",
+            "Clean meeting setup with microphone processing, browser call routing, and a simple Call Mix virtual source.",
+            &[
+                "Adds Call Mix for conferencing apps",
+                "Prioritizes mic clarity and low background noise",
+                "Routes browsers and chat apps into the call channel",
+                "Keeps music and game audio out by default",
+            ],
+        ),
+    ]
+}
+
+fn setup_template(id: &str, name: &str, description: &str, details: &[&str]) -> SetupTemplate {
+    SetupTemplate {
+        id: id.into(),
+        name: name.into(),
+        description: description.into(),
+        details: details.iter().map(|detail| (*detail).into()).collect(),
+    }
+}
+
+fn config_for_setup_template(template: &SetupTemplate) -> Result<MixerConfig, ModelError> {
+    let config = match template.id.as_str() {
+        "streaming" => streaming_template_config(),
+        "microphonefx" => microphonefx_template_config(),
+        "discord_mix" => discord_mix_template_config(),
+        "podcast" => podcast_template_config(),
+        "work_call" => work_call_template_config(),
+        other => return Err(ModelError::TemplateNotFound(other.into())),
+    };
+    config.normalized()
+}
+
+fn discord_mix_template_config() -> MixerConfig {
+    let mut config = microphonefx_template_config();
+    if let Some(mix) = config.mixes.iter_mut().find(|mix| mix.id == "microphonefx") {
+        mix.id = "discord_mix".into();
+        mix.name = "Discord Mix".into();
+        mix.virtual_sink_name = "wavelinux_mix_discord_mix".into();
+        mix.virtual_source_name = "wavelinux_mix_discord_mix_source".into();
+    }
+    for channel in &mut config.channels {
+        if let Some(bus) = channel.mix_buses.remove("microphonefx") {
+            channel.mix_buses.insert("discord_mix".into(), bus);
+        }
+    }
+    config
+}
+
+fn streaming_template_config() -> MixerConfig {
+    let mut config = template_config(
+        vec![
+            Mix::new_fixed("monitor", "Monitor"),
+            Mix::new_fixed("stream", "Stream"),
+        ],
+        vec![
+            template_channel(
+                "hardware_in",
+                "Hardware In",
+                ChannelKind::Generic,
+                voice_fx_chain(),
+            ),
+            template_channel("system", "System", ChannelKind::System, Vec::new()),
+            template_channel("game", "Game", ChannelKind::Application, Vec::new()),
+            template_channel("chat", "Chat", ChannelKind::Application, Vec::new()),
+            template_channel("music", "Music", ChannelKind::Application, Vec::new()),
+            template_channel("browser", "Browser", ChannelKind::Application, Vec::new()),
+            template_channel("sfx", "SFX", ChannelKind::Soundboard, Vec::new()),
+        ],
+    );
+
+    set_template_bus(&mut config, "hardware_in", "monitor", 0.84, false);
+    set_template_bus(&mut config, "hardware_in", "stream", 0.88, false);
+    set_template_bus(&mut config, "system", "stream", 0.72, false);
+    set_template_bus(&mut config, "game", "stream", 0.74, false);
+    set_template_bus(&mut config, "chat", "stream", 0.68, false);
+    set_template_bus(&mut config, "music", "stream", 0.52, false);
+    set_template_bus(&mut config, "browser", "stream", 0.68, false);
+    set_template_bus(&mut config, "sfx", "stream", 0.62, false);
+    config.app_routes = vec![
+        route_app("discord", "chat"),
+        route_app("com.discordapp.discord", "chat"),
+        route_app("spotify", "music"),
+        route_app("firefox", "browser"),
+        route_app("com.google.chrome", "browser"),
+        route_app("com.brave.browser", "browser"),
+        route_app("com.valvesoftware.steam", "game"),
+        route_app("steam", "game"),
+    ];
+    config.app_volume_presets = vec![
+        volume_app("discord", 0.82),
+        volume_app("spotify", 0.66),
+        volume_app("firefox", 0.78),
+        volume_app("steam", 0.86),
+    ];
+    config
+}
+
+fn microphonefx_template_config() -> MixerConfig {
+    let mut config = template_config(
+        vec![
+            Mix::new_fixed("monitor", "Monitor"),
+            Mix::new_fixed("stream", "Stream"),
+            Mix::new_fixed("microphonefx", "MicrophoneFX"),
+        ],
+        vec![
+            template_channel(
+                "hardware_in",
+                "Hardware In",
+                ChannelKind::Generic,
+                voice_fx_chain(),
+            ),
+            template_channel("system", "System", ChannelKind::System, Vec::new()),
+            template_channel("chat", "Chat", ChannelKind::Application, Vec::new()),
+            template_channel("music", "Music", ChannelKind::Application, Vec::new()),
+            template_channel("sfx", "SFX", ChannelKind::Soundboard, Vec::new()),
+            template_channel("browser", "Browser", ChannelKind::Application, Vec::new()),
+        ],
+    );
+
+    for channel_id in ["system", "chat", "browser"] {
+        set_template_bus(&mut config, channel_id, "microphonefx", 0.0, true);
+    }
+    set_template_bus(&mut config, "hardware_in", "microphonefx", 0.9, false);
+    set_template_bus(&mut config, "sfx", "microphonefx", 0.48, false);
+    set_template_bus(&mut config, "music", "microphonefx", 0.24, false);
+    set_template_bus(&mut config, "chat", "stream", 0.6, false);
+    set_template_bus(&mut config, "music", "stream", 0.5, false);
+    config.app_routes = vec![
+        route_app("discord", "chat"),
+        route_app("com.discordapp.discord", "chat"),
+        route_app("spotify", "music"),
+        route_app("firefox", "browser"),
+    ];
+    config.app_volume_presets = vec![volume_app("discord", 0.78), volume_app("spotify", 0.58)];
+    config
+}
+
+fn podcast_template_config() -> MixerConfig {
+    let mut config = template_config(
+        vec![
+            Mix::new_fixed("monitor", "Monitor"),
+            Mix::new_fixed("stream", "Stream"),
+            Mix::new_fixed("podcast", "Podcast"),
+            Mix::new_fixed("guest_mix", "Guest Mix"),
+        ],
+        vec![
+            template_channel(
+                "hardware_in",
+                "Hardware In",
+                ChannelKind::Generic,
+                voice_fx_chain(),
+            ),
+            template_channel(
+                "guest",
+                "Guest",
+                ChannelKind::Application,
+                voice_light_fx_chain(),
+            ),
+            template_channel("browser", "Browser", ChannelKind::Application, Vec::new()),
+            template_channel("music", "Music", ChannelKind::Application, Vec::new()),
+            template_channel("sfx", "SFX", ChannelKind::Soundboard, Vec::new()),
+            template_channel("system", "System", ChannelKind::System, Vec::new()),
+        ],
+    );
+
+    set_template_bus(&mut config, "hardware_in", "podcast", 0.9, false);
+    set_template_bus(&mut config, "guest", "podcast", 0.82, false);
+    set_template_bus(&mut config, "browser", "podcast", 0.64, false);
+    set_template_bus(&mut config, "music", "podcast", 0.38, false);
+    set_template_bus(&mut config, "sfx", "podcast", 0.52, false);
+    set_template_bus(&mut config, "system", "podcast", 0.0, true);
+    set_template_bus(&mut config, "hardware_in", "guest_mix", 0.0, true);
+    set_template_bus(&mut config, "guest", "guest_mix", 0.9, false);
+    set_template_bus(&mut config, "browser", "guest_mix", 0.7, false);
+    set_template_bus(&mut config, "music", "guest_mix", 0.2, false);
+    config.app_routes = vec![
+        route_app("discord", "guest"),
+        route_app("zoom", "guest"),
+        route_app("us.zoom.zoom", "guest"),
+        route_app("firefox", "browser"),
+        route_app("spotify", "music"),
+    ];
+    config.app_volume_presets = vec![
+        volume_app("discord", 0.82),
+        volume_app("zoom", 0.82),
+        volume_app("spotify", 0.48),
+    ];
+    config
+}
+
+fn work_call_template_config() -> MixerConfig {
+    let mut config = template_config(
+        vec![
+            Mix::new_fixed("monitor", "Monitor"),
+            Mix::new_fixed("stream", "Stream"),
+            Mix::new_fixed("call_mix", "Call Mix"),
+        ],
+        vec![
+            template_channel(
+                "hardware_in",
+                "Hardware In",
+                ChannelKind::Generic,
+                voice_fx_chain(),
+            ),
+            template_channel("chat", "Chat", ChannelKind::Application, Vec::new()),
+            template_channel("browser", "Browser", ChannelKind::Application, Vec::new()),
+            template_channel("system", "System", ChannelKind::System, Vec::new()),
+            template_channel("music", "Music", ChannelKind::Application, Vec::new()),
+        ],
+    );
+
+    set_template_bus(&mut config, "hardware_in", "call_mix", 0.9, false);
+    set_template_bus(&mut config, "chat", "call_mix", 0.0, true);
+    set_template_bus(&mut config, "browser", "call_mix", 0.0, true);
+    set_template_bus(&mut config, "system", "call_mix", 0.0, true);
+    set_template_bus(&mut config, "music", "call_mix", 0.0, true);
+    set_template_bus(&mut config, "music", "stream", 0.0, true);
+    config.app_routes = vec![
+        route_app("discord", "chat"),
+        route_app("slack", "chat"),
+        route_app("com.microsoft.teams", "chat"),
+        route_app("zoom", "chat"),
+        route_app("firefox", "browser"),
+        route_app("com.google.chrome", "browser"),
+    ];
+    config.app_volume_presets = vec![
+        volume_app("discord", 0.8),
+        volume_app("slack", 0.8),
+        volume_app("zoom", 0.82),
+    ];
+    config
+}
+
+fn template_config(mixes: Vec<Mix>, mut channels: Vec<Channel>) -> MixerConfig {
+    for channel in &mut channels {
+        channel.ensure_mix_buses(&mixes);
+    }
+    MixerConfig {
+        mixes,
+        channels,
+        ..MixerConfig::default()
+    }
+}
+
+fn template_channel(
+    id: &str,
+    name: &str,
+    kind: ChannelKind,
+    effects: Vec<EffectInstance>,
+) -> Channel {
+    let mut channel = Channel::new_fixed(id, name, kind);
+    channel.effects = effects;
+    channel
+}
+
+fn set_template_bus(
+    config: &mut MixerConfig,
+    channel_id: &str,
+    mix_id: &str,
+    volume: f32,
+    muted: bool,
+) {
+    if let Some(bus) = config
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id == channel_id)
+        .and_then(|channel| channel.mix_buses.get_mut(mix_id))
+    {
+        bus.volume = clamp_unit(volume);
+        bus.muted = muted;
+    }
+}
+
+fn route_app(app_id: &str, channel_id: &str) -> AppRoute {
+    AppRoute {
+        matcher: AppMatcher::from_app_id(app_id),
+        channel_id: channel_id.into(),
+    }
+}
+
+fn volume_app(app_id: &str, volume: f32) -> AppVolumePreset {
+    AppVolumePreset {
+        matcher: AppMatcher::from_app_id(app_id),
+        volume: clamp_unit(volume),
+    }
+}
+
+fn voice_fx_chain() -> Vec<EffectInstance> {
+    vec![
+        effect_instance("deepfilternet", &[("attenuation_limit_db", 24.0)]),
+        effect_instance("highpass", &[("frequency_hz", 80.0)]),
+        effect_instance(
+            "eq",
+            &[
+                ("low_freq_hz", 120.0),
+                ("low_gain_db", -2.0),
+                ("mid_freq_hz", 2500.0),
+                ("mid_gain_db", 2.0),
+                ("high_freq_hz", 8000.0),
+                ("high_gain_db", 1.5),
+            ],
+        ),
+        effect_instance(
+            "compressor",
+            &[
+                ("threshold_db", -18.0),
+                ("ratio", 4.0),
+                ("attack_ms", 5.0),
+                ("release_ms", 100.0),
+                ("makeup_gain_db", 3.0),
+            ],
+        ),
+        effect_instance("limiter", &[("input_gain_db", 0.0), ("ceiling_db", -1.0)]),
+    ]
+}
+
+fn voice_light_fx_chain() -> Vec<EffectInstance> {
+    vec![
+        effect_instance("highpass", &[("frequency_hz", 80.0)]),
+        effect_instance(
+            "compressor",
+            &[
+                ("threshold_db", -20.0),
+                ("ratio", 2.0),
+                ("attack_ms", 10.0),
+                ("release_ms", 120.0),
+                ("makeup_gain_db", 2.0),
+            ],
+        ),
+        effect_instance("limiter", &[("ceiling_db", -1.0)]),
+    ]
+}
+
+fn effect_instance(effect_id: &str, params: &[(&str, f32)]) -> EffectInstance {
+    let mut effect = EffectInstance::new(effect_id);
+    effect.params = params
+        .iter()
+        .map(|(key, value)| ((*key).into(), *value))
+        .collect();
+    effect
 }
 
 fn effect(
@@ -1315,7 +2829,98 @@ mod tests {
         assert!(config.channels.len() <= MAX_CHANNELS);
         assert!(config.software_channel_count() <= MAX_SOFTWARE_CHANNELS);
         assert!(config.hardware_input_count() <= MAX_HARDWARE_INPUTS);
+        assert_eq!(config.channels[0].id, "hardware_in");
+        assert_eq!(config.channels[0].kind, ChannelKind::Generic);
+        assert!(config
+            .channels
+            .iter()
+            .any(|channel| channel.id == "system" && channel.kind == ChannelKind::System));
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_partial_config_deserializes_and_repairs_defaults() {
+        let raw = r#"
+        {
+          "version": 1,
+          "mixes": [
+            {"id": "monitor", "name": "Monitor"}
+          ],
+          "channels": [
+            {
+              "id": "hardware_in",
+              "name": "Hardware In",
+              "kind": "generic",
+              "mix_buses": {
+                "monitor": {}
+              }
+            }
+          ],
+          "app_routes": [],
+          "settings": {},
+          "audio": {}
+        }
+        "#;
+
+        let config: MixerConfig = serde_json::from_str(raw).unwrap();
+        let config = config.normalized().unwrap();
+        assert!(config.settings.auto_check_updates);
+        assert!(!config.settings.restore_audio_graph_on_launch);
+        assert!(!config.settings.lock_default_output);
+        assert_eq!(config.audio.sample_rate_hz, SAMPLE_RATE_HZ);
+        assert_eq!(
+            config.mixes[0].virtual_source_name,
+            "wavelinux_mix_monitor_source"
+        );
+        assert_eq!(
+            config.channels[0].virtual_sink_name,
+            "wavelinux_channel_hardware_in"
+        );
+        assert_eq!(config.channels[0].mix_buses["monitor"].volume, 1.0);
+    }
+
+    #[test]
+    fn version_three_config_disables_default_output_lock() {
+        let mut config = MixerConfig {
+            version: 3,
+            ..MixerConfig::default()
+        };
+        config.settings.lock_default_output = true;
+
+        let config = config.normalized().unwrap();
+
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert!(!config.settings.lock_default_output);
+    }
+
+    #[test]
+    fn legacy_mic_channel_migrates_to_generic_hardware_input() {
+        let mut config = MixerConfig::default();
+        let hardware = config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        hardware.id = "mic".into();
+        hardware.name = "Mic".into();
+        hardware.kind = ChannelKind::Microphone;
+        hardware.virtual_sink_name = "wavelinux_channel_mic".into();
+        config.app_routes.push(AppRoute {
+            matcher: AppMatcher::from_app_id("voice-recorder"),
+            channel_id: "mic".into(),
+        });
+
+        let config = config.normalized().unwrap();
+        let hardware = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        assert_eq!(hardware.name, "Hardware In");
+        assert_eq!(hardware.kind, ChannelKind::Generic);
+        assert_eq!(hardware.virtual_sink_name, "wavelinux_channel_hardware_in");
+        assert_eq!(config.app_routes[0].channel_id, "hardware_in");
+        assert!(!config.channels.iter().any(|channel| channel.id == "mic"));
     }
 
     #[test]
@@ -1338,6 +2943,225 @@ mod tests {
     }
 
     #[test]
+    fn setup_templates_apply_complete_layouts() {
+        let mut config = MixerConfig::default();
+        let template = config.apply_setup_template("microphonefx").unwrap();
+
+        assert_eq!(template.id, "microphonefx");
+        assert!(config.mixes.iter().any(|mix| mix.id == "microphonefx"));
+        assert!(config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .is_some_and(|channel| channel.effects.len() >= 3));
+        assert!(config
+            .app_routes
+            .iter()
+            .any(|route| route.channel_id == "chat"));
+        assert!(config
+            .app_volume_presets
+            .iter()
+            .any(|preset| (preset.volume - 0.78).abs() < f32::EPSILON));
+        config.validate().unwrap();
+
+        let template = config.apply_setup_template("discord_mix").unwrap();
+        assert_eq!(template.id, "discord_mix");
+        assert!(config.mixes.iter().any(|mix| {
+            mix.id == "discord_mix"
+                && mix.virtual_sink_name == "wavelinux_mix_discord_mix"
+                && mix.virtual_source_name == "wavelinux_mix_discord_mix_source"
+        }));
+        assert!(config.channels.iter().all(|channel| {
+            channel.mix_buses.contains_key("discord_mix")
+                && !channel.mix_buses.contains_key("microphonefx")
+        }));
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn app_volume_presets_dedupe_and_clamp() {
+        let mut config = MixerConfig::default();
+        let matcher = AppMatcher::from_app_id("spotify");
+        config.set_app_volume_preset(matcher.clone(), 0.45).unwrap();
+        config.set_app_volume_preset(matcher.clone(), 1.0).unwrap();
+
+        assert_eq!(config.app_volume_presets.len(), 1);
+        assert_eq!(config.app_volume_presets[0].volume, 1.0);
+        assert!(config.remove_app_volume_preset(matcher).is_some());
+        assert!(config.app_volume_presets.is_empty());
+    }
+
+    #[test]
+    fn app_history_remembers_forgets_and_restores_streams() {
+        let mut config = MixerConfig::default();
+        let stream = AppStream {
+            id: "42".into(),
+            app_id: Some("firefox".into()),
+            binary: Some("firefox".into()),
+            process_name: Some("firefox".into()),
+            window_class: Some("firefox".into()),
+            display_name: " Firefox ".into(),
+            media_name: Some(" YouTube ".into()),
+            routed_channel_id: None,
+            volume: 0.75,
+            muted: false,
+        };
+
+        let remembered = config.remember_app_stream(&stream, 100).unwrap().unwrap();
+        assert_eq!(remembered.display_name, "Firefox");
+        assert_eq!(config.app_history[0].media_name.as_deref(), Some("YouTube"));
+        assert!(config.remember_app_stream(&stream, 120).unwrap().is_none());
+
+        config
+            .assign_app_to_channel("browser", remembered.matcher.clone())
+            .unwrap();
+        config
+            .set_app_volume_preset(remembered.matcher.clone(), 0.42)
+            .unwrap();
+        assert!(config.forget_app(remembered.matcher.clone()).is_some());
+        assert!(config.app_history[0].forgotten);
+        assert!(config.app_routes.is_empty());
+        assert!(config.app_volume_presets.is_empty());
+        assert!(config.restore_app(remembered.matcher).is_some());
+        assert!(!config.app_history[0].forgotten);
+    }
+
+    #[test]
+    fn app_identity_overrides_rewrite_routes_and_raw_removal() {
+        let mut config = MixerConfig::default();
+        let raw = AppMatcher::from_process_name("Discord");
+        let canonical = AppMatcher::from_app_id("com.discordapp.Discord");
+
+        config
+            .assign_app_to_channel("chat", raw.clone())
+            .expect("route raw app");
+        config
+            .set_app_volume_preset(raw.clone(), 0.42)
+            .expect("preset raw app");
+        let pinned = config
+            .pin_app_identity(raw.clone(), "Voice Chat")
+            .expect("pin identity");
+        assert_eq!(pinned.display_name, "Voice Chat");
+        assert_eq!(
+            config.label_for_matcher(&raw).as_deref(),
+            Some("Voice Chat")
+        );
+
+        let merged = config
+            .merge_app_identity(raw.clone(), canonical.clone())
+            .expect("merge identity");
+        assert_eq!(merged.matcher, canonical);
+        assert_eq!(config.resolve_app_matcher(&raw), canonical);
+        assert!(config
+            .app_routes
+            .iter()
+            .any(|route| route.matcher == canonical && route.channel_id == "chat"));
+        assert!(config.app_volume_presets.iter().any(
+            |preset| preset.matcher == canonical && (preset.volume - 0.42).abs() < f32::EPSILON
+        ));
+
+        assert!(config.remove_app_route(raw.clone()).is_some());
+        assert!(config.remove_app_volume_preset(raw).is_some());
+        assert!(config.app_routes.is_empty());
+        assert!(config.app_volume_presets.is_empty());
+    }
+
+    #[test]
+    fn pinned_stream_labels_persist_for_wrapper_app_media() {
+        let mut config = MixerConfig::default();
+        let slack_stream = AppStream {
+            id: "1".into(),
+            app_id: Some("ferdium".into()),
+            binary: Some("ferdium".into()),
+            process_name: Some("ferdium".into()),
+            window_class: Some("Ferdium".into()),
+            display_name: "Ferdium".into(),
+            media_name: Some("Slack".into()),
+            routed_channel_id: None,
+            volume: 0.75,
+            muted: false,
+        };
+        let discord_stream = AppStream {
+            media_name: Some("Discord".into()),
+            ..slack_stream.clone()
+        };
+        let slack_matcher = AppMatcher::from_stream(&slack_stream).unwrap();
+        let discord_matcher = AppMatcher::from_stream(&discord_stream).unwrap();
+
+        config
+            .pin_app_identity(AppMatcher::from_app_id("ferdium"), "All Ferdium")
+            .unwrap();
+        config
+            .pin_app_identity(slack_matcher.clone(), "Work Slack")
+            .unwrap();
+        let remembered = config
+            .remember_app_stream(&slack_stream, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(remembered.display_name, "Work Slack");
+        assert_eq!(
+            config.label_for_matcher(&slack_matcher).as_deref(),
+            Some("Work Slack")
+        );
+        assert_eq!(
+            config.label_for_matcher(&discord_matcher).as_deref(),
+            Some("All Ferdium")
+        );
+
+        let remembered = config
+            .remember_app_stream(&slack_stream, 200)
+            .unwrap()
+            .unwrap();
+        assert_eq!(remembered.display_name, "Work Slack");
+        assert!(config
+            .remember_app_stream(&discord_stream, 200)
+            .unwrap()
+            .is_some());
+        assert!(config
+            .app_history
+            .iter()
+            .any(|app| app.display_name == "All Ferdium"
+                && app.media_name.as_deref() == Some("Discord")));
+    }
+
+    #[test]
+    fn device_policy_tracks_selected_hardware_and_monitor_devices() {
+        let mut config = MixerConfig::default();
+
+        config
+            .set_channel_input("hardware_in", Some("alsa_input.usb_interface".into()))
+            .unwrap();
+        assert_eq!(
+            config.device_policy.preferred_input.as_deref(),
+            Some("alsa_input.usb_interface")
+        );
+
+        config
+            .set_mix_monitor_output("monitor", Some("alsa_output.usb_headphones".into()))
+            .unwrap();
+        assert_eq!(
+            config.device_policy.preferred_output.as_deref(),
+            Some("alsa_output.usb_headphones")
+        );
+    }
+
+    #[test]
+    fn mixes_can_be_reordered_without_losing_buses() {
+        let mut config = MixerConfig::default();
+        let podcast = config.create_mix("Podcast").unwrap();
+        let moved = config.move_mix(&podcast.id, -10).unwrap();
+        assert_eq!(moved.id, podcast.id);
+        assert_eq!(config.mixes[0].id, podcast.id);
+        assert!(config
+            .channels
+            .iter()
+            .all(|channel| channel.mix_buses.contains_key(&podcast.id)));
+
+        config.move_mix(&podcast.id, 10).unwrap();
+        assert_eq!(config.mixes.last().unwrap().id, podcast.id);
+    }
+
+    #[test]
     fn channel_limits_are_enforced_by_wave_link_3_kind() {
         let mut config = MixerConfig::default();
 
@@ -1346,9 +3170,6 @@ mod tests {
             .unwrap();
         config
             .create_channel("Alerts", ChannelKind::Soundboard)
-            .unwrap();
-        config
-            .create_channel("System", ChannelKind::System)
             .unwrap();
         let err = config
             .create_channel("Ninth Software Channel", ChannelKind::Application)
@@ -1377,7 +3198,7 @@ mod tests {
     fn channel_volume_rejects_out_of_range_values() {
         let mut config = MixerConfig::default();
         let err = config
-            .set_channel_volume("mic", "monitor", 1.2)
+            .set_channel_volume("hardware_in", "monitor", 1.2)
             .unwrap_err();
         assert!(matches!(err, ModelError::InvalidVolume(_)));
     }
@@ -1386,16 +3207,16 @@ mod tests {
     fn linked_channel_volume_updates_every_bus() {
         let mut config = MixerConfig::default();
         let custom = config.create_mix("Discord Mix").unwrap();
-        config.set_channel_linked("mic", true).unwrap();
+        config.set_channel_linked("hardware_in", true).unwrap();
         config
-            .set_channel_volume("mic", custom.id.clone(), 0.42)
+            .set_channel_volume("hardware_in", custom.id.clone(), 0.42)
             .unwrap();
-        let mic = config
+        let hardware_in = config
             .channels
             .iter()
-            .find(|channel| channel.id == "mic")
+            .find(|channel| channel.id == "hardware_in")
             .unwrap();
-        assert!(mic
+        assert!(hardware_in
             .mix_buses
             .values()
             .all(|bus| (bus.volume - 0.42).abs() < f32::EPSILON));
@@ -1405,22 +3226,59 @@ mod tests {
     fn channel_input_can_be_assigned_and_cleared() {
         let mut config = MixerConfig::default();
         config
-            .set_channel_input("mic", Some("alsa_input.usb_mic".into()))
+            .set_channel_input("hardware_in", Some("alsa_input.usb_interface".into()))
             .unwrap();
-        let mic = config
+        let hardware_in = config
             .channels
             .iter()
-            .find(|channel| channel.id == "mic")
+            .find(|channel| channel.id == "hardware_in")
             .unwrap();
-        assert_eq!(mic.source_device.as_deref(), Some("alsa_input.usb_mic"));
+        assert_eq!(
+            hardware_in.source_device.as_deref(),
+            Some("alsa_input.usb_interface")
+        );
 
-        config.set_channel_input("mic", Some("".into())).unwrap();
-        let mic = config
+        config
+            .set_channel_input("hardware_in", Some("".into()))
+            .unwrap();
+        let hardware_in = config
             .channels
             .iter()
-            .find(|channel| channel.id == "mic")
+            .find(|channel| channel.id == "hardware_in")
             .unwrap();
-        assert!(mic.source_device.is_none());
+        assert!(hardware_in.source_device.is_none());
+    }
+
+    #[test]
+    fn channel_input_mode_is_hardware_only() {
+        let mut config = MixerConfig::default();
+        let hardware_in = config
+            .set_channel_input_mode("hardware_in", ChannelInputMode::MonoLeft)
+            .unwrap();
+        assert_eq!(hardware_in.input_mode, ChannelInputMode::MonoLeft);
+        assert_eq!(ChannelInputMode::SumMono.channels(), 1);
+        assert_eq!(ChannelInputMode::SumMono.channel_map(), "mono");
+
+        let err = config
+            .set_channel_input_mode("music", ChannelInputMode::MonoRight)
+            .unwrap_err();
+        assert!(matches!(err, ModelError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn channels_can_be_reordered_with_routes_intact() {
+        let mut config = MixerConfig::default();
+        config
+            .assign_app_to_channel("music", AppMatcher::from_app_id("spotify"))
+            .unwrap();
+
+        let moved = config.move_channel("music", -10).unwrap();
+        assert_eq!(moved.id, "music");
+        assert_eq!(config.channels[0].id, "music");
+        assert_eq!(config.app_routes[0].channel_id, "music");
+
+        config.move_channel("music", 10).unwrap();
+        assert_eq!(config.channels.last().unwrap().id, "music");
     }
 
     #[test]
@@ -1430,6 +3288,38 @@ mod tests {
         let scene = Scene::new("Streaming", config.clone()).unwrap();
         assert_eq!(scene.name, "Streaming");
         assert_eq!(scene.config.mixes.len(), config.mixes.len());
+    }
+
+    #[test]
+    fn config_backup_round_trips_config_and_scenes() {
+        let mut config = MixerConfig::default();
+        config.create_mix("Discord Mix").unwrap();
+        config
+            .set_channel_input_mode("hardware_in", ChannelInputMode::MonoRight)
+            .unwrap();
+        let scene = Scene::new("Discord", config.clone()).unwrap();
+
+        let backup = ConfigBackup::new(config, vec![scene.clone()]).unwrap();
+
+        assert_eq!(backup.backup_version, BACKUP_VERSION);
+        assert_eq!(backup.scenes.len(), 1);
+        assert_eq!(backup.scenes[0].id, scene.id);
+        assert!(backup.config.settings.keep_running_in_tray);
+        assert_eq!(
+            backup
+                .config
+                .channels
+                .iter()
+                .find(|channel| channel.id == "hardware_in")
+                .unwrap()
+                .input_mode,
+            ChannelInputMode::MonoRight
+        );
+        backup.validate().unwrap();
+
+        let mut invalid = backup;
+        invalid.backup_version = 0;
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
@@ -1443,6 +3333,35 @@ mod tests {
         assert!(ids.contains("rnnoise"));
         assert!(ids.contains("deepfilternet"));
         assert!(ids.contains("limiter"));
+    }
+
+    #[test]
+    fn effect_catalog_matches_known_plugin_control_ranges() {
+        let catalog = EffectCatalog::default();
+        let deepfilter = catalog
+            .effects
+            .iter()
+            .find(|effect| effect.id == "deepfilternet")
+            .unwrap();
+        assert!(
+            deepfilter
+                .params
+                .iter()
+                .any(|param| param.id == "post_filter_beta"
+                    && (param.max - 0.05).abs() < f32::EPSILON)
+        );
+
+        let compressor = catalog
+            .effects
+            .iter()
+            .find(|effect| effect.id == "compressor")
+            .unwrap();
+        let threshold = compressor
+            .params
+            .iter()
+            .find(|param| param.id == "threshold_db")
+            .unwrap();
+        assert_eq!(threshold.min, -30.0);
     }
 
     #[test]
@@ -1469,13 +3388,62 @@ mod tests {
     }
 
     #[test]
+    fn effect_chains_are_normalized_to_catalog_ranges() {
+        let mut config = MixerConfig::default();
+        let mut limiter = EffectInstance::new(" limiter ");
+        limiter.instance_id = " limiter-1 ".into();
+        limiter.name = Some("  Broadcast limiter  ".into());
+        limiter.params.insert("input_gain_db".into(), 999.0);
+        limiter.params.insert("stale_param".into(), 12.0);
+
+        let channel = config
+            .set_effect_chain("hardware_in", vec![limiter])
+            .unwrap();
+        let effect = &channel.effects[0];
+        assert_eq!(effect.instance_id, "limiter-1");
+        assert_eq!(effect.effect_id, "limiter");
+        assert_eq!(effect.name.as_deref(), Some("Broadcast limiter"));
+        assert_eq!(effect.params.get("input_gain_db"), Some(&20.0));
+        assert_eq!(effect.params.get("ceiling_db"), Some(&-1.0));
+        assert!(!effect.params.contains_key("stale_param"));
+    }
+
+    #[test]
+    fn unknown_effects_are_rejected_or_dropped_during_repair() {
+        let mut config = MixerConfig::default();
+        let err = config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("missing")])
+            .unwrap_err();
+        assert_eq!(err, ModelError::EffectNotFound("missing".into()));
+
+        config.channels[0]
+            .effects
+            .push(EffectInstance::new("missing"));
+        let mut gate = EffectInstance::new("gate");
+        gate.params.insert("threshold_db".into(), -999.0);
+        gate.params.insert("release_ms".into(), f32::INFINITY);
+        config.channels[0].effects.push(gate);
+
+        let config = config.normalized().unwrap();
+        let effects = &config.channels[0].effects;
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].effect_id, "gate");
+        assert_eq!(effects[0].params.get("threshold_db"), Some(&-80.0));
+        assert_eq!(effects[0].params.get("release_ms"), Some(&200.0));
+    }
+
+    #[test]
     fn settings_can_be_replaced() {
         let mut config = MixerConfig::default();
         let mut settings = config.settings.clone();
         settings.start_at_login = true;
+        settings.keep_running_in_tray = true;
+        settings.restore_audio_graph_on_launch = true;
         settings.theme = ThemeMode::Dark;
         let updated = config.set_settings(settings);
         assert!(updated.start_at_login);
+        assert!(updated.keep_running_in_tray);
+        assert!(updated.restore_audio_graph_on_launch);
         assert_eq!(config.settings.theme, ThemeMode::Dark);
     }
 
@@ -1502,5 +3470,43 @@ mod tests {
         assert_eq!(removed.channel_id, "music");
         assert!(config.app_routes.is_empty());
         assert_eq!(config.remove_app_route(matcher), None);
+    }
+
+    #[test]
+    fn app_matchers_are_trimmed_and_must_not_be_empty() {
+        let mut config = MixerConfig::default();
+        let route = config
+            .assign_app_to_channel("chat", AppMatcher::from_process_name(" Discord "))
+            .unwrap();
+        assert_eq!(route.matcher.process_name.as_deref(), Some("Discord"));
+
+        let err = config
+            .assign_app_to_channel("chat", AppMatcher::from_app_id("   "))
+            .unwrap_err();
+        assert_eq!(err, ModelError::InvalidMatcher);
+    }
+
+    #[test]
+    fn normalized_config_drops_invalid_app_routes() {
+        let mut config = MixerConfig::default();
+        config.app_routes.push(AppRoute {
+            matcher: AppMatcher::from_app_id(""),
+            channel_id: "music".into(),
+        });
+        config.app_routes.push(AppRoute {
+            matcher: AppMatcher::from_binary("spotify"),
+            channel_id: "missing".into(),
+        });
+        config.app_routes.push(AppRoute {
+            matcher: AppMatcher::from_window_class("Spotify"),
+            channel_id: "music".into(),
+        });
+
+        let config = config.normalized().unwrap();
+        assert_eq!(config.app_routes.len(), 1);
+        assert_eq!(
+            config.app_routes[0].matcher.window_class.as_deref(),
+            Some("Spotify")
+        );
     }
 }

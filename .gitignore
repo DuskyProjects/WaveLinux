@@ -8,4 +8,10 @@
 *.AppImage
 *.deb
 *.rpm
-
+.env
+.env.*
+*.key
+*.key.pub
+*.pem
+*.sig
+*.sig.zip

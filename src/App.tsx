@@ -15,7 +15,6 @@ import {
   GitBranch,
   GripVertical,
   Headphones,
-  Link2,
   Mic,
   MonitorSpeaker,
   Music2,
@@ -27,25 +26,38 @@ import {
   SlidersHorizontal,
   Sparkles,
   Trash2,
-  Unlink,
   Volume2,
   VolumeX,
   WandSparkles,
 } from "lucide-react";
-import { Fragment, useCallback, useEffect, useState } from "react";
-import type { CSSProperties, MouseEvent as ReactMouseEvent } from "react";
-import { invoke } from "./tauri";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type {
+  KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+} from "react";
+import { initialSnapshot, invoke } from "./tauri";
 import type {
   AppStateSnapshot,
+  AppMatcher,
   AppStream,
+  AppVolumePreset,
   Channel,
+  ChannelInputMode,
   ChannelKind,
+  CommandExecution,
+  ConfigBackup,
   EffectDefinition,
+  EffectAvailability,
   EffectInstance,
+  GraphDebugReport,
+  LevelMeter,
   Mix,
   MixBus,
   MixerSettings,
+  RepairReport,
   Scene,
+  SetupTemplate,
   SoundCheckReport,
 } from "./types";
 
@@ -60,16 +72,50 @@ const views: Array<{ id: View; label: string; icon: typeof SlidersHorizontal }> 
   { id: "settings", label: "Settings", icon: Settings },
 ];
 
+const inputModeOptions: Array<{ id: ChannelInputMode; label: string }> = [
+  { id: "stereo", label: "Stereo" },
+  { id: "mono_left", label: "Left to stereo" },
+  { id: "mono_right", label: "Right to stereo" },
+  { id: "sum_mono", label: "Sum to mono" },
+  { id: "swap_lr", label: "Swap L/R" },
+];
+
+function initialView(): View {
+  if (typeof window === "undefined") return "mixer";
+  const params = new URLSearchParams(window.location.search);
+  const requested = params.get("view") ?? window.location.hash.replace(/^#\/?/, "");
+  return views.some((view) => view.id === requested) ? (requested as View) : "mixer";
+}
+
 const MAX_SOFTWARE_CHANNELS = 8;
 const MAX_HARDWARE_INPUTS = 4;
+const matcherKinds = ["app_id", "process_name", "binary", "window_class", "media_name"] as const;
+type MatcherKind = (typeof matcherKinds)[number];
+
+type AudioActionReport = {
+  title: string;
+  commands: CommandExecution[];
+  plannedCount?: number;
+  finishedAt: number;
+};
+
+type HeldMeterMap = Record<string, { level: number; seenAt: number }>;
+type OfflineRoutingEntry = {
+  matcher: AppMatcher;
+  displayName: string;
+  meta: string;
+  channel_id?: string;
+  volumePreset?: AppVolumePreset;
+};
 
 export default function App() {
-  const [state, setState] = useState<AppStateSnapshot | null>(null);
-  const [activeView, setActiveView] = useState<View>("mixer");
+  const [state, setState] = useState<AppStateSnapshot | null>(() => initialSnapshot());
+  const [activeView, setActiveView] = useState<View>(() => initialView());
   const [activeMixId, setActiveMixId] = useState("monitor");
-  const [selectedChannelId, setSelectedChannelId] = useState("mic");
+  const [selectedChannelId, setSelectedChannelId] = useState("hardware_in");
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [audioActionReport, setAudioActionReport] = useState<AudioActionReport | null>(null);
 
   const refresh = useCallback(async () => {
     const next = await invoke<AppStateSnapshot>("get_state");
@@ -78,7 +124,7 @@ export default function App() {
       setActiveMixId(next.config.mixes[0]?.id ?? "monitor");
     }
     if (!next.config.channels.some((channel) => channel.id === selectedChannelId)) {
-      setSelectedChannelId(next.config.channels[0]?.id ?? "mic");
+      setSelectedChannelId(next.config.channels[0]?.id ?? "hardware_in");
     }
   }, [activeMixId, selectedChannelId]);
 
@@ -92,11 +138,33 @@ export default function App() {
           setToast(message);
         }
         return result;
+      } catch (error) {
+        setToast(String(error));
+        throw error;
       } finally {
         setBusy(false);
       }
     },
     [refresh],
+  );
+
+  const recordAudioAction = useCallback((title: string, commands: CommandExecution[], plannedCount?: number) => {
+    setAudioActionReport({ title, commands, plannedCount, finishedAt: Date.now() });
+    setToast(audioActionToast(title, commands, plannedCount));
+  }, []);
+
+  const startOrRepairAudio = useCallback(async () => {
+    const title = state?.engine.audio_graph_running ? "Repair Audio" : "Start Audio";
+    const report = await run<RepairReport>("repair_audio_graph");
+    recordAudioAction(title, report.outputs, report.planned.commands.length);
+  }, [recordAudioAction, run, state?.engine.audio_graph_running]);
+
+  const runAudioCommandList = useCallback(
+    async (command: string, title: string) => {
+      const outputs = await run<CommandExecution[]>(command);
+      recordAudioAction(title, outputs);
+    },
+    [recordAudioAction, run],
   );
 
   useEffect(() => {
@@ -105,7 +173,7 @@ export default function App() {
       invoke<AppStateSnapshot>("observe_state")
         .then(setState)
         .catch(() => undefined);
-    }, 500);
+    }, 1000);
     return () => window.clearInterval(timer);
   }, [refresh]);
 
@@ -154,7 +222,8 @@ export default function App() {
             <span>{state?.engine.message ?? "Starting"}</span>
           </div>
           <div className="engine-meta">
-            {state?.engine.dry_run ? "Dry run" : "Live graph"} · {state?.config.audio.sample_rate_hz ?? 48000} Hz
+            {state?.engine.dry_run ? "Dry run" : state?.engine.audio_graph_running ? "Graph running" : "Graph stopped"} ·{" "}
+            {state?.config.audio.sample_rate_hz ?? 48000} Hz
           </div>
         </div>
       </aside>
@@ -163,20 +232,37 @@ export default function App() {
         <header className="topbar">
           <div>
             <h1>{viewTitle(activeView)}</h1>
-            <p>{state ? `${state.config.mixes.length} mixes · ${state.config.channels.length} channels` : "Loading"}</p>
+            <p>
+              {state
+                ? `${state.config.mixes.length} mixes · ${state.config.channels.length} channels${
+                    state.config.settings.restore_audio_graph_on_launch ? " · startup restore on" : ""
+                  }`
+                : "Loading"}
+            </p>
           </div>
           <div className="top-actions">
             <button className="icon-button" onClick={() => refresh()} title="Refresh" type="button">
               <RefreshCw size={17} />
             </button>
+            {state?.engine.audio_graph_running && (
+              <button
+                className="secondary-button danger"
+                disabled={busy}
+                onClick={() => void runAudioCommandList("cleanup_audio_graph", "Stop Audio")}
+                type="button"
+              >
+                <Trash2 size={17} />
+                Stop
+              </button>
+            )}
             <button
               className="primary-button"
-              disabled={busy}
-              onClick={() => run("repair_audio_graph", undefined, "Graph repair queued")}
+              disabled={busy || !state}
+              onClick={() => void startOrRepairAudio()}
               type="button"
             >
               <WandSparkles size={17} />
-              Repair
+              {state?.engine.audio_graph_running ? "Repair" : "Start Audio"}
             </button>
           </div>
         </header>
@@ -205,8 +291,16 @@ export default function App() {
                 run={run}
               />
             )}
-            {activeView === "scenes" && <ScenesView run={run} />}
-            {activeView === "diagnostics" && <DiagnosticsView state={state} run={run} />}
+            {activeView === "scenes" && <ScenesView run={run} state={state} />}
+            {activeView === "diagnostics" && (
+              <DiagnosticsView
+                audioActionReport={audioActionReport}
+                onCleanup={() => runAudioCommandList("cleanup_audio_graph", "Cleanup Audio")}
+                onPrune={() => runAudioCommandList("cleanup_stale_audio_graph", "Prune Stale Audio")}
+                state={state}
+                run={run}
+              />
+            )}
             {activeView === "settings" && <SettingsView state={state} run={run} />}
           </>
         )}
@@ -233,14 +327,24 @@ function MixerView({
   busy: boolean;
 }) {
   const outputs = state.graph.outputs.filter((output) => !output.is_virtual);
-  const inputs = state.graph.inputs.filter((input) => !isWaveLinuxManagedDevice(input));
   const softwareChannelCount = state.config.channels.filter((channel) => !isHardwareChannel(channel)).length;
   const hardwareInputCount = state.config.channels.filter(isHardwareChannel).length;
   const [menu, setMenu] = useState<{ x: number; y: number; channelId: string } | null>(null);
   const menuChannel = menu
     ? state.config.channels.find((channel) => channel.id === menu.channelId)
     : undefined;
-  const matrixStyle = { "--mix-count": state.config.mixes.length } as CSSProperties;
+  const menuChannelIndex = menu
+    ? state.config.channels.findIndex((channel) => channel.id === menu.channelId)
+    : -1;
+  const [heldMeters, setHeldMeters] = useState<HeldMeterMap>({});
+  const primaryMixes = primaryBusMixes(state.config.mixes);
+  const selectedMix =
+    state.config.mixes.find((mix) => mix.id === activeMixId) ??
+    state.config.mixes[0];
+  const metersUnavailable =
+    state.engine.audio_graph_running &&
+    !state.engine.dry_run &&
+    state.graph.meters.length === 0;
 
   useEffect(() => {
     if (!menu) return;
@@ -256,8 +360,36 @@ function MixerView({
     };
   }, [menu]);
 
+  useEffect(() => {
+    const now = Date.now();
+    const activeIds = new Set(state.graph.meters.map((meter) => meter.node_id));
+    setHeldMeters((previous) => {
+      const next: HeldMeterMap = {};
+      for (const [nodeId, held] of Object.entries(previous)) {
+        if (activeIds.has(nodeId) || now - held.seenAt < 2500) {
+          next[nodeId] = held;
+        }
+      }
+      for (const meter of state.graph.meters) {
+        const level = levelFromMeter(meter);
+        const previousLevel = next[meter.node_id]?.level ?? 0;
+        next[meter.node_id] = {
+          level: Math.max(level, previousLevel * 0.6),
+          seenAt: now,
+        };
+      }
+      return next;
+    });
+  }, [state.graph.meters]);
+
+  const meterLevels = useMemo(
+    () => meterLevelMap(state, heldMeters),
+    [heldMeters, state.engine.audio_graph_running, state.graph.meters],
+  );
+  const levelFor = useCallback((nodeId: string) => meterLevels[nodeId] ?? 0, [meterLevels]);
+
   return (
-    <section className="view-stack">
+    <section className="view-stack mixer-view-stack">
       <div className="mix-tabs">
         {state.config.mixes.map((mix) => (
           <button
@@ -272,7 +404,7 @@ function MixerView({
             title={`${mix.name} virtual source`}
           >
             <Radio size={16} />
-            {mix.name}
+            {mixTabLabel(mix)}
           </button>
         ))}
         <button
@@ -289,14 +421,26 @@ function MixerView({
         </button>
       </div>
 
-      <div className="mixer-layout">
-        <div className="mix-matrix-panel">
-          <div className="matrix-toolbar">
+      <div className="mixer-layout classic">
+        <div className="source-strip-panel">
+          <div className="source-toolbar">
             <div>
-              <h2>Mix Matrix</h2>
-              <span>Inputs down the side, independent mixes across the top</span>
+              <h2>Sources</h2>
+              <span>
+                {metersUnavailable
+                  ? "Meters unavailable: no live meter data"
+                  : selectedMix
+                    ? `${selectedMix.name} mix selected`
+                    : "Monitor and Stream"}
+              </span>
             </div>
             <div className="panel-actions">
+              {metersUnavailable && (
+                <span className="meter-warning" title="No live pw-record meter samples are available yet">
+                  <Gauge size={14} />
+                  Meters unavailable
+                </span>
+              )}
               <button
                 className="secondary-button"
                 disabled={hardwareInputCount >= MAX_HARDWARE_INPUTS || busy}
@@ -326,93 +470,104 @@ function MixerView({
             </div>
           </div>
 
-          <div className="matrix-scroller">
-            <div className="mix-matrix-grid" style={matrixStyle}>
-              <div className="matrix-cell matrix-corner">Input</div>
-              {state.config.mixes.map((mix) => (
-                <MixHeaderCell
-                  active={mix.id === activeMixId}
-                  busy={busy}
-                  key={mix.id}
-                  mix={mix}
-                  mixCount={state.config.mixes.length}
-                  outputs={outputs}
+          <div className="channel-rail">
+            {state.config.channels.map((channel) => {
+              const sourceLevel = levelFor(channel.id);
+              return (
+                <ChannelStrip
+                  channel={channel}
+                  key={channel.id}
+                  level={sourceLevel}
+                  mixes={primaryMixes}
+                  onFocus={() => setSelectedChannelId(channel.id)}
+                  onOpenMenu={(event) => {
+                    event.preventDefault();
+                    setSelectedChannelId(channel.id);
+                    setMenu({
+                      x: Math.max(12, Math.min(event.clientX, window.innerWidth - 250)),
+                      y: Math.max(12, Math.min(event.clientY, window.innerHeight - 360)),
+                      channelId: channel.id,
+                    });
+                  }}
                   run={run}
-                  setActiveMixId={setActiveMixId}
                 />
-              ))}
-
-              {state.config.channels.map((channel, index) => (
-                <Fragment key={channel.id}>
-                  <ChannelHeaderCell
-                    appCount={state.graph.app_streams.filter((stream) => stream.routed_channel_id === channel.id).length}
-                    channel={channel}
-                    inputs={inputs}
-                    onFocus={() => setSelectedChannelId(channel.id)}
-                    onOpenMenu={(event) => {
-                      event.preventDefault();
-                      setSelectedChannelId(channel.id);
-                      setMenu({
-                        x: Math.max(12, Math.min(event.clientX, window.innerWidth - 250)),
-                        y: Math.max(12, Math.min(event.clientY, window.innerHeight - 360)),
-                        channelId: channel.id,
-                      });
-                    }}
-                    run={run}
-                  />
-                  {state.config.mixes.map((mix, mixIndex) => {
-                    const bus = channel.mix_buses[mix.id] ?? { volume: 1, muted: false };
-                    const sourceLevel = meterLevel(state, channel.id, pseudoLevel(channel.id, index));
-                    return (
-                      <MatrixBusCell
-                        bus={bus}
-                        channel={channel}
-                        key={`${channel.id}-${mix.id}`}
-                        mix={mix}
-                        run={run}
-                        vuLevel={
-                          bus.muted || mix.muted
-                            ? 0
-                            : busVuLevel(sourceLevel * bus.volume * mix.volume, mixIndex)
-                        }
-                      />
-                    );
-                  })}
-                </Fragment>
-              ))}
-            </div>
+              );
+            })}
+            <button
+              className="add-channel"
+              disabled={softwareChannelCount >= MAX_SOFTWARE_CHANNELS || busy}
+              onClick={() => {
+                const name = window.prompt("Channel name", "Podcast");
+                if (name) void run("create_channel", { name, kind: "application" satisfies ChannelKind }, "Channel created");
+              }}
+              type="button"
+            >
+              <CirclePlus size={18} />
+              Add
+            </button>
           </div>
         </div>
 
-        <div className="mix-control-panel">
-          <div className="panel-header">
+        <div className="master-panel">
+          <div className="master-mix-title">
             <div>
-              <h2>Outputs</h2>
-              <span>Master levels and monitor routes</span>
+              <strong>{selectedMix ? `${selectedMix.name} Mix` : "Mix"}</strong>
+              <span>{selectedMix?.virtual_source_name ?? "No virtual source"}</span>
             </div>
+            <Radio size={18} />
           </div>
 
-          <div className="output-stack">
-            {state.config.mixes.map((mix, index) => (
-              <MasterMixCard
+          <div className="master-bus-grid">
+            {primaryMixes.map((mix) => (
+              <MasterBusControl
                 key={mix.id}
                 mix={mix}
-                outputs={outputs}
                 run={run}
-                vuLevel={mix.muted ? 0 : meterLevel(state, mix.id, busVuLevel(0.62, index)) * mix.volume}
+                vuLevel={mix.muted ? 0 : levelFor(mix.id) * mix.volume}
               />
             ))}
           </div>
 
+          {selectedMix && (
+              <>
+                <label className="field-label" htmlFor="active-mix-monitor-output">
+                  Monitor output
+                </label>
+                <select
+                id="active-mix-monitor-output"
+                onChange={(event) =>
+                  void run("set_mix_monitor_output", {
+                    mixId: selectedMix.id,
+                    output: event.currentTarget.value || null,
+                  }).catch(() => undefined)
+                  }
+                  value={selectedMix.monitor_output ?? ""}
+                >
+                  <option value="">
+                    {state.config.settings.monitor_follows_default_output
+                      ? "Follow system default output"
+                      : "No monitor route"}
+                  </option>
+                {outputs.map((output) => (
+                  <option key={output.id} value={output.id}>
+                    {output.description}
+                  </option>
+                ))}
+              </select>
+            </>
+          )}
+
           <div className="master-stats">
-            <Stat icon={MonitorSpeaker} label="Output" value={outputs.length.toString()} />
+            <Stat icon={MonitorSpeaker} label="Outputs" value={outputs.length.toString()} />
             <Stat icon={Cable} label="Apps" value={state.graph.app_streams.length.toString()} />
-            <Stat icon={Cpu} label="DSP" value={availableEffects(state).toString()} />
+            <Stat icon={Gauge} label="Meters" value={metersUnavailable ? "Unavailable" : state.graph.meters.length.toString()} />
           </div>
         </div>
       </div>
       {menu && menuChannel && (
         <ChannelContextMenu
+          canMoveDown={menuChannelIndex >= 0 && menuChannelIndex < state.config.channels.length - 1}
+          canMoveUp={menuChannelIndex > 0}
           channel={menuChannel}
           mixes={state.config.mixes}
           onClose={() => setMenu(null)}
@@ -422,324 +577,6 @@ function MixerView({
         />
       )}
     </section>
-  );
-}
-
-function MixHeaderCell({
-  mix,
-  active,
-  busy,
-  mixCount,
-  outputs,
-  run,
-  setActiveMixId,
-}: {
-  mix: Mix;
-  active: boolean;
-  busy: boolean;
-  mixCount: number;
-  outputs: AppStateSnapshot["graph"]["outputs"];
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
-  setActiveMixId: (mixId: string) => void;
-}) {
-  return (
-    <div className={active ? "matrix-cell mix-header-cell active" : "matrix-cell mix-header-cell"} onClick={() => setActiveMixId(mix.id)}>
-      <div className="mix-header-main">
-        <GripVertical size={14} />
-        <Radio size={15} />
-        <strong title={mix.name}>{mix.name}</strong>
-      </div>
-      <span title={mix.virtual_source_name}>{mix.virtual_source_name}</span>
-      <div className="mix-header-actions">
-        <button
-          className="mini-icon-button"
-          onClick={(event) => {
-            event.stopPropagation();
-            void run(
-              "set_mix_mute",
-              { mixId: mix.id, muted: !mix.muted },
-              mix.muted ? `${mix.name} unmuted` : `${mix.name} muted`,
-            );
-          }}
-          title={`Mute ${mix.name}`}
-          type="button"
-        >
-          {mix.muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
-        </button>
-        <button
-          className="mini-icon-button"
-          onClick={(event) => {
-            event.stopPropagation();
-            const name = window.prompt("Mix name", mix.name);
-            if (name && name !== mix.name) void run("rename_mix", { mixId: mix.id, name }, "Mix renamed");
-          }}
-          title="Rename mix"
-          type="button"
-        >
-          <Pencil size={14} />
-        </button>
-        <button
-          className="mini-icon-button danger"
-          disabled={mixCount <= 1 || busy}
-          onClick={(event) => {
-            event.stopPropagation();
-            if (window.confirm(`Delete ${mix.name}?`)) {
-              void run("delete_mix", { mixId: mix.id }, "Mix deleted");
-            }
-          }}
-          title="Delete mix"
-          type="button"
-        >
-          <Trash2 size={14} />
-        </button>
-      </div>
-      <select
-        className="matrix-output-select"
-        onClick={(event) => event.stopPropagation()}
-        onChange={(event) =>
-          run("set_mix_monitor_output", {
-            mixId: mix.id,
-            output: event.currentTarget.value || null,
-          })
-        }
-        value={mix.monitor_output ?? ""}
-      >
-        <option value="">No monitor route</option>
-        {outputs.map((output) => (
-          <option key={output.id} value={output.id}>
-            {output.description}
-          </option>
-        ))}
-      </select>
-    </div>
-  );
-}
-
-function ChannelHeaderCell({
-  channel,
-  appCount,
-  inputs,
-  onFocus,
-  onOpenMenu,
-  run,
-}: {
-  channel: Channel;
-  appCount: number;
-  inputs: AppStateSnapshot["graph"]["inputs"];
-  onFocus: () => void;
-  onOpenMenu: (event: ReactMouseEvent<HTMLElement>) => void;
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
-}) {
-  const Icon = channelIcon(channel.kind);
-  const selectedInput =
-    channel.source_device === "@DEFAULT_SOURCE@"
-      ? "Default input"
-      : inputs.find((input) => input.id === channel.source_device)?.description;
-  return (
-    <div className="matrix-cell channel-header-cell" onClick={onFocus} onContextMenu={onOpenMenu}>
-      <div className="channel-header-main">
-        <Icon size={17} />
-        <div>
-          <strong title={channel.name}>{channel.name}</strong>
-          <span title={selectedInput ?? "No audio source"}>
-            {appCount} apps · {channel.effects.length} FX · {selectedInput ?? "No input"}
-          </span>
-        </div>
-      </div>
-      <button
-        className={channel.linked ? "mini-icon-button active" : "mini-icon-button"}
-        onClick={(event) => {
-          event.stopPropagation();
-          void run(
-            "set_channel_linked",
-            { channelId: channel.id, linked: !channel.linked },
-            channel.linked ? "Sliders unlinked" : "Sliders linked",
-          );
-        }}
-        title={channel.linked ? "Unlink mix sliders" : "Link mix sliders"}
-        type="button"
-      >
-        {channel.linked ? <Link2 size={14} /> : <Unlink size={14} />}
-      </button>
-      <select
-        className="channel-input-select"
-        onChange={(event) => {
-          event.stopPropagation();
-          void run(
-            "set_channel_input",
-            {
-              channelId: channel.id,
-              sourceDevice: event.currentTarget.value || null,
-            },
-            "Input route updated",
-          );
-        }}
-        onClick={(event) => event.stopPropagation()}
-        title="Audio source"
-        value={channel.source_device ?? ""}
-      >
-        <option value="">No audio source</option>
-        <option value="@DEFAULT_SOURCE@">Default input</option>
-        {inputs.map((input) => (
-          <option key={input.id} value={input.id}>
-            {input.description}
-          </option>
-        ))}
-      </select>
-    </div>
-  );
-}
-
-function MatrixBusCell({
-  channel,
-  mix,
-  bus,
-  run,
-  vuLevel,
-}: {
-  channel: Channel;
-  mix: Mix;
-  bus: MixBus;
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
-  vuLevel: number;
-}) {
-  const [draft, setDraft] = useState(Math.round(bus.volume * 100));
-
-  useEffect(() => {
-    setDraft(Math.round(bus.volume * 100));
-  }, [bus.volume]);
-
-  const commit = useCallback(() => {
-    void run("set_channel_volume", {
-      channelId: channel.id,
-      mixId: mix.id,
-      volume: draft / 100,
-    });
-  }, [channel.id, draft, mix.id, run]);
-
-  return (
-    <div className={bus.muted || mix.muted ? "matrix-cell matrix-bus-cell muted" : "matrix-cell matrix-bus-cell"}>
-      <div className="cell-meter-row">
-        <button
-          className={bus.muted ? "mini-icon-button danger active" : "mini-icon-button"}
-          onClick={() =>
-            run("set_channel_mute", {
-              channelId: channel.id,
-              mixId: mix.id,
-              muted: !bus.muted,
-            })
-          }
-          title={`Mute ${channel.name} in ${mix.name}`}
-          type="button"
-        >
-          {bus.muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
-        </button>
-        <strong>{draft}</strong>
-      </div>
-      <div className="cell-vu-slider">
-        <div className="cell-vu-fill" style={{ width: `${Math.round(vuLevel * 100)}%` }} />
-        <div className="cell-vu-cap" style={{ left: `${Math.round(vuLevel * 100)}%` }} />
-        <div className="cell-vu-thumb" style={{ left: thumbPositionHorizontal(draft) }} />
-        <input
-          aria-label={`${channel.name} to ${mix.name} volume`}
-          max={100}
-          min={0}
-          onChange={(event) => setDraft(Number(event.currentTarget.value))}
-          onKeyUp={commit}
-          onMouseUp={commit}
-          onPointerUp={commit}
-          onTouchEnd={commit}
-          type="range"
-          value={draft}
-        />
-      </div>
-    </div>
-  );
-}
-
-function MasterMixCard({
-  mix,
-  outputs,
-  run,
-  vuLevel,
-}: {
-  mix: Mix;
-  outputs: AppStateSnapshot["graph"]["outputs"];
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
-  vuLevel: number;
-}) {
-  const [draft, setDraft] = useState(Math.round(mix.volume * 100));
-
-  useEffect(() => {
-    setDraft(Math.round(mix.volume * 100));
-  }, [mix.volume]);
-
-  const commit = useCallback(() => {
-    void run("set_mix_volume", {
-      mixId: mix.id,
-      volume: draft / 100,
-    });
-  }, [draft, mix.id, run]);
-
-  return (
-    <article className={mix.muted ? "master-mix-card muted" : "master-mix-card"}>
-      <div className="master-mix-title">
-        <div>
-          <strong>{mix.name}</strong>
-          <span>{mix.virtual_source_name}</span>
-        </div>
-        <button
-          className={mix.muted ? "mini-icon-button danger active" : "mini-icon-button"}
-          onClick={() =>
-            run(
-              "set_mix_mute",
-              { mixId: mix.id, muted: !mix.muted },
-              mix.muted ? `${mix.name} unmuted` : `${mix.name} muted`,
-            )
-          }
-          title={`Mute ${mix.name}`}
-          type="button"
-        >
-          {mix.muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
-        </button>
-      </div>
-      <div className="cell-vu-slider master">
-        <div className="cell-vu-fill" style={{ width: `${Math.round(vuLevel * 100)}%` }} />
-        <div className="cell-vu-cap" style={{ left: `${Math.round(vuLevel * 100)}%` }} />
-        <div className="cell-vu-thumb" style={{ left: thumbPositionHorizontal(draft) }} />
-        <input
-          aria-label={`${mix.name} master volume`}
-          max={100}
-          min={0}
-          onChange={(event) => setDraft(Number(event.currentTarget.value))}
-          onKeyUp={commit}
-          onMouseUp={commit}
-          onPointerUp={commit}
-          onTouchEnd={commit}
-          type="range"
-          value={draft}
-        />
-      </div>
-      <div className="master-mix-footer">
-        <strong>{draft}</strong>
-        <select
-          onChange={(event) =>
-            run("set_mix_monitor_output", {
-              mixId: mix.id,
-              output: event.currentTarget.value || null,
-            })
-          }
-          value={mix.monitor_output ?? ""}
-        >
-          <option value="">No monitor route</option>
-          {outputs.map((output) => (
-            <option key={output.id} value={output.id}>
-              {output.description}
-            </option>
-          ))}
-        </select>
-      </div>
-    </article>
   );
 }
 
@@ -766,14 +603,14 @@ function ChannelStrip({
         <span>{channel.name}</span>
       </div>
       <div className="strip-buses">
-        {mixes.map((mix, index) => (
+        {mixes.map((mix) => (
           <ChannelBusControl
             bus={channel.mix_buses[mix.id] ?? { volume: 1, muted: false }}
             channel={channel}
             key={mix.id}
             mix={mix}
             run={run}
-            vuLevel={busVuLevel(level, index)}
+            vuLevel={(channel.mix_buses[mix.id]?.muted ?? false) ? 0 : level * (channel.mix_buses[mix.id]?.volume ?? 1)}
           />
         ))}
       </div>
@@ -783,6 +620,8 @@ function ChannelStrip({
 
 function ChannelContextMenu({
   channel,
+  canMoveDown,
+  canMoveUp,
   mixes,
   onClose,
   run,
@@ -790,6 +629,8 @@ function ChannelContextMenu({
   y,
 }: {
   channel: Channel;
+  canMoveDown: boolean;
+  canMoveUp: boolean;
   mixes: Mix[];
   onClose: () => void;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
@@ -799,6 +640,27 @@ function ChannelContextMenu({
   return (
     <div className="context-menu" style={{ left: x, top: y }} onClick={(event) => event.stopPropagation()}>
       <div className="context-menu-title">{channel.name}</div>
+      <button
+        disabled={!canMoveUp}
+        type="button"
+        onClick={() =>
+          void run("move_channel", { channelId: channel.id, direction: -1 }, "Channel moved")
+            .finally(onClose)
+        }
+      >
+        Move Up
+      </button>
+      <button
+        disabled={!canMoveDown}
+        type="button"
+        onClick={() =>
+          void run("move_channel", { channelId: channel.id, direction: 1 }, "Channel moved")
+            .finally(onClose)
+        }
+      >
+        Move Down
+      </button>
+      <div className="context-menu-separator" />
       <button
         type="button"
         onClick={() => {
@@ -871,41 +733,38 @@ function ChannelBusControl({
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
   vuLevel: number;
 }) {
-  const [draft, setDraft] = useState(Math.round(bus.volume * 100));
+  const [draft, setDraft] = useState(volumeToPercent(bus.volume));
+  const lastCommitted = useRef(draft);
 
   useEffect(() => {
-    setDraft(Math.round(bus.volume * 100));
+    const next = volumeToPercent(bus.volume);
+    setDraft(next);
+    lastCommitted.current = next;
   }, [bus.volume]);
 
-  const commit = useCallback(() => {
+  const commit = useCallback((nextValue = draft) => {
+    const next = sliderPercent(nextValue);
+    setDraft(next);
+    if (lastCommitted.current === next) return;
+    lastCommitted.current = next;
     void run("set_channel_volume", {
       channelId: channel.id,
       mixId: mix.id,
-      volume: draft / 100,
-    });
+      volume: next / 100,
+    }).catch(() => undefined);
   }, [channel.id, draft, mix.id, run]);
 
   return (
     <div className="bus-control">
       <div className="bus-label">{compactMixLabel(mix)}</div>
-      <div className={bus.muted ? "vu-slider muted" : "vu-slider"}>
-        <div className="vu-fill" style={{ height: `${Math.round(vuLevel * 100)}%` }} />
-        <div className="vu-cap" style={{ bottom: `${Math.round(vuLevel * 100)}%` }} />
-        <div className="vu-thumb" style={{ bottom: thumbPosition(draft) }} />
-        <input
-          aria-label={`${channel.name} ${mix.name} volume`}
-          className="vu-fader"
-          max={100}
-          min={0}
-          onChange={(event) => setDraft(Number(event.currentTarget.value))}
-          onKeyUp={commit}
-          onMouseUp={commit}
-          onPointerUp={commit}
-          onTouchEnd={commit}
-          type="range"
-          value={draft}
-        />
-      </div>
+      <VuSlider
+        ariaLabel={`${channel.name} ${mix.name} volume`}
+        muted={bus.muted}
+        onCommit={commit}
+        onDraft={setDraft}
+        value={draft}
+        vuLevel={vuLevel}
+      />
       <button
         className={bus.muted ? "mute-button active" : "mute-button"}
         onClick={(event) => {
@@ -935,48 +794,46 @@ function MasterBusControl({
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
   vuLevel: number;
 }) {
-  const [draft, setDraft] = useState(Math.round(mix.volume * 100));
+  const [draft, setDraft] = useState(volumeToPercent(mix.volume));
+  const lastCommitted = useRef(draft);
 
   useEffect(() => {
-    setDraft(Math.round(mix.volume * 100));
+    const next = volumeToPercent(mix.volume);
+    setDraft(next);
+    lastCommitted.current = next;
   }, [mix.volume]);
 
-  const commit = useCallback(() => {
+  const commit = useCallback((nextValue = draft) => {
+    const next = sliderPercent(nextValue);
+    setDraft(next);
+    if (lastCommitted.current === next) return;
+    lastCommitted.current = next;
     void run("set_mix_volume", {
       mixId: mix.id,
-      volume: draft / 100,
-    });
+      volume: next / 100,
+    }).catch(() => undefined);
   }, [draft, mix.id, run]);
 
   return (
     <div className="master-bus-control">
       <div className="master-bus-title">{compactMixLabel(mix)}</div>
-      <div className={mix.muted ? "vu-slider master muted" : "vu-slider master"}>
-        <div className="vu-fill" style={{ height: `${Math.round(vuLevel * 100)}%` }} />
-        <div className="vu-cap" style={{ bottom: `${Math.round(vuLevel * 100)}%` }} />
-        <div className="vu-thumb" style={{ bottom: thumbPosition(draft) }} />
-        <input
-          aria-label={`${mix.name} master volume`}
-          className="vu-fader"
-          max={100}
-          min={0}
-          onChange={(event) => setDraft(Number(event.currentTarget.value))}
-          onKeyUp={commit}
-          onMouseUp={commit}
-          onPointerUp={commit}
-          onTouchEnd={commit}
-          type="range"
-          value={draft}
-        />
-      </div>
+      <VuSlider
+        ariaLabel={`${mix.name} master volume`}
+        master
+        muted={mix.muted}
+        onCommit={commit}
+        onDraft={setDraft}
+        value={draft}
+        vuLevel={vuLevel}
+      />
       <button
         className={mix.muted ? "mute-button active" : "mute-button"}
         onClick={() =>
-          run(
+          void run(
             "set_mix_mute",
             { mixId: mix.id, muted: !mix.muted },
             mix.muted ? `${mix.name} unmuted` : `${mix.name} muted`,
-          )
+          ).catch(() => undefined)
         }
         title={`Mute ${mix.name}`}
         type="button"
@@ -988,6 +845,135 @@ function MasterBusControl({
   );
 }
 
+function VuSlider({
+  ariaLabel,
+  master = false,
+  muted = false,
+  onCommit,
+  onDraft,
+  value,
+  vuLevel,
+}: {
+  ariaLabel: string;
+  master?: boolean;
+  muted?: boolean;
+  onCommit: (value: number) => void;
+  onDraft: (value: number) => void;
+  value: number;
+  vuLevel: number;
+}) {
+  const draggingPointerId = useRef<number | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const className = [
+    "vu-slider",
+    master ? "master" : "",
+    muted ? "muted" : "",
+    isDragging ? "dragging" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const valueFromPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (rect.height <= 0) return value;
+    const ratio = 1 - (event.clientY - rect.top) / rect.height;
+    return sliderPercent(ratio * 100);
+  };
+
+  const updateFromPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const next = valueFromPointer(event);
+    onDraft(next);
+    return next;
+  };
+
+  const finishDrag = (event?: ReactPointerEvent<HTMLDivElement>) => {
+    if (event && event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    draggingPointerId.current = null;
+    setIsDragging(false);
+  };
+
+  const adjustFromKey = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 10 : 1;
+    const next = (() => {
+      switch (event.key) {
+        case "ArrowUp":
+        case "ArrowRight":
+          return value + step;
+        case "ArrowDown":
+        case "ArrowLeft":
+          return value - step;
+        case "PageUp":
+          return value + 10;
+        case "PageDown":
+          return value - 10;
+        case "Home":
+          return 0;
+        case "End":
+          return 100;
+        default:
+          return null;
+      }
+    })();
+    if (next === null) return;
+    event.preventDefault();
+    const clamped = sliderPercent(next);
+    onDraft(clamped);
+    onCommit(clamped);
+  };
+
+  return (
+    <div
+      aria-label={ariaLabel}
+      aria-valuemax={100}
+      aria-valuemin={0}
+      aria-valuenow={value}
+      className={className}
+      onDoubleClick={() => {
+        onDraft(100);
+        onCommit(100);
+      }}
+      onKeyDown={adjustFromKey}
+      onPointerCancel={(event) => {
+        if (draggingPointerId.current === event.pointerId) {
+          finishDrag(event);
+        }
+      }}
+      onPointerDown={(event) => {
+        event.preventDefault();
+        event.currentTarget.focus({ preventScroll: true });
+        event.currentTarget.setPointerCapture(event.pointerId);
+        draggingPointerId.current = event.pointerId;
+        setIsDragging(true);
+        updateFromPointer(event);
+      }}
+      onPointerMove={(event) => {
+        if (draggingPointerId.current !== event.pointerId) return;
+        updateFromPointer(event);
+      }}
+      onPointerUp={(event) => {
+        if (draggingPointerId.current !== event.pointerId) return;
+        const next = updateFromPointer(event);
+        onCommit(next);
+        finishDrag(event);
+      }}
+      onLostPointerCapture={() => {
+        draggingPointerId.current = null;
+        setIsDragging(false);
+      }}
+      role="slider"
+      tabIndex={0}
+    >
+      <div className="vu-track">
+        <div className="vu-fill" style={{ height: trackSize(vuLevel) }} />
+        <div className="vu-cap" style={{ bottom: trackPosition(vuLevel) }} />
+      </div>
+      <div className="vu-thumb" style={{ bottom: thumbPosition(value) }} />
+    </div>
+  );
+}
+
 function RoutingView({
   state,
   run,
@@ -995,6 +981,28 @@ function RoutingView({
   state: AppStateSnapshot;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
+  const [matcherKind, setMatcherKind] = useState<MatcherKind>("app_id");
+  const [matcherValue, setMatcherValue] = useState("");
+  const [targetChannelId, setTargetChannelId] = useState(state.config.channels[0]?.id ?? "");
+
+  useEffect(() => {
+    if (!state.config.channels.some((channel) => channel.id === targetChannelId)) {
+      setTargetChannelId(state.config.channels[0]?.id ?? "");
+    }
+  }, [state.config.channels, targetChannelId]);
+
+  const addRule = async () => {
+    const value = matcherValue.trim();
+    if (!value || !targetChannelId) return;
+    await run(
+      "assign_app_to_channel",
+      { channelId: targetChannelId, matcher: matcherFromKind(matcherKind, value) },
+      "Routing rule saved",
+    );
+    setMatcherValue("");
+  };
+  const offlineEntries = offlineRoutingEntries(state);
+
   return (
     <section className="two-column">
       <div className="panel">
@@ -1014,23 +1022,103 @@ function RoutingView({
           <h2>Offline Rules</h2>
           <GitBranch size={18} />
         </div>
+        <div className="rule-editor">
+          <select
+            aria-label="Rule matcher type"
+            onChange={(event) => setMatcherKind(event.currentTarget.value as MatcherKind)}
+            value={matcherKind}
+          >
+            {matcherKinds.map((kind) => (
+              <option key={kind} value={kind}>
+                {matcherKindLabel(kind)}
+              </option>
+            ))}
+          </select>
+          <input
+            aria-label="Rule matcher value"
+            onChange={(event) => setMatcherValue(event.currentTarget.value)}
+            onKeyUp={(event) => {
+              if (event.key === "Enter") void addRule();
+            }}
+            placeholder="com.discordapp.Discord"
+            type="text"
+            value={matcherValue}
+          />
+          <select
+            aria-label="Rule channel"
+            onChange={(event) => setTargetChannelId(event.currentTarget.value)}
+            value={targetChannelId}
+          >
+            {state.config.channels.map((channel) => (
+              <option key={channel.id} value={channel.id}>
+                {channel.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="secondary-button"
+            disabled={!matcherValue.trim() || !targetChannelId}
+            onClick={() => void addRule()}
+            type="button"
+          >
+            <CirclePlus size={16} />
+            Rule
+          </button>
+        </div>
         <div className="rules-grid">
-          {state.config.app_routes.map((route, index) => {
-            const channel = state.config.channels.find((item) => item.id === route.channel_id);
+          {offlineEntries.map((entry, index) => {
+            const channel = state.config.channels.find((item) => item.id === entry.channel_id);
             return (
-              <div className="rule-row" key={`${route.channel_id}-${index}`}>
-                <span>{route.matcher.app_id ?? route.matcher.process_name ?? route.matcher.binary ?? "Any"}</span>
-                <strong>{channel?.name ?? route.channel_id}</strong>
+              <div className="rule-row" key={`${routeKey(entry.matcher)}-${index}`}>
+                <div>
+                  <strong>{entry.displayName}</strong>
+                  <span>{entry.meta}</span>
+                </div>
+                <select
+                  aria-label={`Route ${entry.displayName} to channel`}
+                  onChange={(event) => {
+                    const channelId = event.currentTarget.value;
+                    if (channelId) {
+                      void run(
+                        "assign_app_to_channel",
+                        { channelId, matcher: entry.matcher },
+                        "Routing rule updated",
+                      );
+                    } else {
+                      void run("remove_app_route", { matcher: entry.matcher }, "Routing rule removed");
+                    }
+                  }}
+                  value={channel?.id ?? ""}
+                >
+                  <option value="">Unassigned</option>
+                  {state.config.channels.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+                <OfflineVolumeControl
+                  label={entry.displayName}
+                  matcher={entry.matcher}
+                  preset={entry.volumePreset}
+                  run={run}
+                />
+                <AppIdentityActions
+                  label={entry.displayName}
+                  matcher={entry.matcher}
+                  run={run}
+                  state={state}
+                />
                 <button
                   className="mini-icon-button danger"
                   onClick={() =>
-                    run(
-                      "remove_app_route",
-                      { matcher: route.matcher },
-                      "Routing rule removed",
-                    )
+                    void run(
+                      "forget_app",
+                      { matcher: entry.matcher },
+                      "App forgotten",
+                    ).catch(() => undefined)
                   }
-                  title="Remove saved routing rule"
+                  title="Forget remembered app and clear saved route"
                   type="button"
                 >
                   <Trash2 size={14} />
@@ -1038,10 +1126,63 @@ function RoutingView({
               </div>
             );
           })}
-          {state.config.app_routes.length === 0 && <EmptyState label="No saved routing rules" />}
+          {offlineEntries.length === 0 && <EmptyState label="No saved or remembered apps" />}
         </div>
       </div>
     </section>
+  );
+}
+
+function OfflineVolumeControl({
+  label,
+  matcher,
+  preset,
+  run,
+}: {
+  label: string;
+  matcher: AppMatcher;
+  preset?: AppVolumePreset;
+  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+}) {
+  const [draft, setDraft] = useState(volumeToPercent(preset?.volume ?? 1));
+  const lastCommitted = useRef(draft);
+
+  useEffect(() => {
+    const next = volumeToPercent(preset?.volume ?? 1);
+    setDraft(next);
+    lastCommitted.current = next;
+  }, [preset?.volume]);
+
+  const commit = useCallback((nextValue = draft) => {
+    const next = sliderPercent(nextValue);
+    setDraft(next);
+    if (lastCommitted.current === next) return;
+    lastCommitted.current = next;
+    void run(
+      "set_app_volume_preset",
+      { matcher, volume: next / 100 },
+      "App volume preset saved",
+    ).catch(() => undefined);
+  }, [draft, matcher, run]);
+
+  return (
+    <label className="route-volume-control" title="Offline app volume preset">
+      <Volume2 size={14} />
+      <input
+        aria-label={`${label} saved volume`}
+        max={100}
+        min={0}
+        onBlur={(event) => commit(Number(event.currentTarget.value))}
+        onChange={(event) => setDraft(sliderPercent(Number(event.currentTarget.value)))}
+        onKeyUp={(event) => {
+          if (shouldCommitSliderKey(event)) commit(Number(event.currentTarget.value));
+        }}
+        onPointerUp={(event) => commit(Number(event.currentTarget.value))}
+        type="range"
+        value={draft}
+      />
+      <strong>{draft}</strong>
+    </label>
   );
 }
 
@@ -1054,18 +1195,32 @@ function StreamRouteRow({
   stream: AppStream;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
-  const [draftVolume, setDraftVolume] = useState(Math.round(stream.volume * 100));
+  const [draftVolume, setDraftVolume] = useState(volumeToPercent(stream.volume));
+  const lastCommitted = useRef(draftVolume);
 
   useEffect(() => {
-    setDraftVolume(Math.round(stream.volume * 100));
+    const next = volumeToPercent(stream.volume);
+    setDraftVolume(next);
+    lastCommitted.current = next;
   }, [stream.volume]);
 
-  const commitVolume = useCallback(() => {
-    void run("set_app_stream_volume", {
-      streamId: stream.id,
-      volume: draftVolume / 100,
-    });
-  }, [draftVolume, run, stream.id]);
+  const commitVolume = useCallback((nextValue = draftVolume) => {
+    const next = sliderPercent(nextValue);
+    setDraftVolume(next);
+    if (lastCommitted.current === next) return;
+    lastCommitted.current = next;
+    void (async () => {
+      const volume = next / 100;
+      await run("set_app_stream_volume", {
+        streamId: stream.id,
+        volume,
+      });
+      await run("set_app_volume_preset", {
+        matcher: matcherForStream(stream),
+        volume,
+      });
+    })().catch(() => undefined);
+  }, [draftVolume, run, stream]);
 
   const routeStream = async (channelId: string) => {
     if (!channelId) {
@@ -1105,7 +1260,7 @@ function StreamRouteRow({
         <option value="">Unassigned</option>
         {state.config.channels.map((channel) => (
           <option key={channel.id} value={channel.id}>
-          {channel.name}
+            {channel.name}
           </option>
         ))}
       </select>
@@ -1115,23 +1270,106 @@ function StreamRouteRow({
           aria-label={`${stream.display_name} volume`}
           max={100}
           min={0}
-          onChange={(event) => setDraftVolume(Number(event.currentTarget.value))}
-          onKeyUp={commitVolume}
-          onMouseUp={commitVolume}
-          onPointerUp={commitVolume}
-          onTouchEnd={commitVolume}
+          onBlur={(event) => commitVolume(Number(event.currentTarget.value))}
+          onChange={(event) => setDraftVolume(sliderPercent(Number(event.currentTarget.value)))}
+          onKeyUp={(event) => {
+            if (shouldCommitSliderKey(event)) commitVolume(Number(event.currentTarget.value));
+          }}
+          onPointerUp={(event) => commitVolume(Number(event.currentTarget.value))}
           type="range"
           value={draftVolume}
         />
         <strong>{draftVolume}</strong>
       </label>
+      <AppIdentityActions
+        label={stream.display_name}
+        matcher={matcherForStream(stream)}
+        run={run}
+        state={state}
+      />
       <button
         className={stream.muted ? "icon-button danger active" : "icon-button"}
-        onClick={() => run("set_app_stream_mute", { streamId: stream.id, muted: !stream.muted })}
+        onClick={() =>
+          void run("set_app_stream_mute", {
+            streamId: stream.id,
+            muted: !stream.muted,
+          }).catch(() => undefined)
+        }
         title="Mute app"
         type="button"
       >
         {stream.muted ? <VolumeX size={17} /> : <Volume2 size={17} />}
+      </button>
+    </div>
+  );
+}
+
+function AppIdentityActions({
+  label,
+  matcher,
+  run,
+  state,
+}: {
+  label: string;
+  matcher: AppMatcher;
+  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  state: AppStateSnapshot;
+}) {
+  const mergeTargets = state.config.app_history.filter(
+    (app) => !app.forgotten && routeKey(app.matcher) !== routeKey(matcher),
+  );
+
+  return (
+    <div className="identity-actions">
+      <button
+        className="mini-icon-button"
+        onClick={() => {
+          const next = window.prompt("Pinned app label", label);
+          if (next?.trim()) {
+            void run("pin_app_identity", { matcher, label: next.trim() }, "App identity pinned");
+          }
+        }}
+        title="Pin or rename app identity"
+        type="button"
+      >
+        <Pencil size={14} />
+      </button>
+      <button
+        className="mini-icon-button"
+        disabled={mergeTargets.length === 0}
+        onClick={() => {
+          const targetName = window.prompt(
+            "Merge this app into which remembered app?",
+            mergeTargets[0]?.display_name ?? "",
+          );
+          if (!targetName?.trim()) return;
+          const target = mergeTargets.find(
+            (app) =>
+              app.display_name.toLowerCase() === targetName.trim().toLowerCase() ||
+              matcherLabel(app.matcher).toLowerCase() === targetName.trim().toLowerCase(),
+          );
+          if (!target) {
+            window.alert("No remembered app matched that name.");
+            return;
+          }
+          void run(
+            "merge_app_identity",
+            { source: matcher, target: target.matcher },
+            "App identities merged",
+          );
+        }}
+        title="Merge into remembered app"
+        type="button"
+      >
+        <GitBranch size={14} />
+      </button>
+      <button
+        className="mini-icon-button"
+        onClick={() => void run("reset_app_identity", { matcher }, "App identity reset").catch(() => undefined)}
+        title="Reset app identity"
+        type="button"
+      >
+        <RefreshCw size={14} />
       </button>
     </div>
   );
@@ -1151,6 +1389,7 @@ function EffectsView({
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
   const selectedEffects = selectedChannel?.effects ?? [];
+  const microphoneInputs = state.graph.inputs.filter(isMicrophoneSource);
   const [effectClipboard, setEffectClipboard] = useState<EffectInstance | null>(null);
   const updateEffects = (effects: EffectInstance[], message?: string) => {
     if (!selectedChannel) return;
@@ -1241,7 +1480,11 @@ function EffectsView({
               type="button"
             >
               <span>{channel.name}</span>
-              <small>{channel.effects.length}</small>
+              <small>
+                {isHardwareChannel(channel)
+                  ? channelInputLabel(channel, microphoneInputs)
+                  : `${channel.effects.length} FX`}
+              </small>
             </button>
           ))}
         </div>
@@ -1274,11 +1517,68 @@ function EffectsView({
             </button>
           </div>
         </div>
+        {selectedChannel && isHardwareChannel(selectedChannel) && (
+          <div className="hardware-source-card">
+            <label className="field-label" htmlFor="effects-microphone-source">
+              Microphone
+            </label>
+            <select
+              id="effects-microphone-source"
+              onChange={(event) =>
+                void run(
+                  "set_channel_input",
+                  {
+                    channelId: selectedChannel.id,
+                    sourceDevice: event.currentTarget.value || null,
+                    source_device: event.currentTarget.value || null,
+                  },
+                  "Microphone updated",
+                ).catch(() => undefined)
+              }
+              value={selectedChannel.source_device ?? ""}
+            >
+              <option value="">Default mic</option>
+              {selectedChannel.source_device === "@DEFAULT_SOURCE@" && (
+                <option value="@DEFAULT_SOURCE@">Default mic</option>
+              )}
+              {microphoneInputs.map((input) => (
+                <option key={input.id} value={input.id}>
+                  {input.description}
+                </option>
+              ))}
+            </select>
+            <label className="field-label" htmlFor="effects-input-mode">
+              Input mode
+            </label>
+            <select
+              id="effects-input-mode"
+              onChange={(event) =>
+                void run(
+                  "set_channel_input_mode",
+                  {
+                    channelId: selectedChannel.id,
+                    inputMode: event.currentTarget.value,
+                    input_mode: event.currentTarget.value,
+                  },
+                  "Input mode updated",
+                ).catch(() => undefined)
+              }
+              value={selectedChannel.input_mode}
+            >
+              {inputModeOptions.map((mode) => (
+                <option key={mode.id} value={mode.id}>
+                  {mode.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <div className="effect-chain">
           {selectedEffects.map((effect, index) => {
             const definition = state.catalog.effects.find((item) => item.id === effect.effect_id);
             return (
               <EffectBlock
+                availability={state.graph.effect_availability.find((item) => item.effect_id === effect.effect_id)}
                 channelId={selectedChannel?.id ?? ""}
                 definition={definition}
                 effect={effect}
@@ -1327,6 +1627,7 @@ function EffectsView({
 }
 
 function EffectBlock({
+  availability,
   channelId,
   effect,
   definition,
@@ -1339,6 +1640,7 @@ function EffectBlock({
   onRename,
   run,
 }: {
+  availability?: EffectAvailability;
   channelId: string;
   effect: EffectInstance;
   definition?: EffectDefinition;
@@ -1399,11 +1701,11 @@ function EffectBlock({
           <button
             className={effect.bypassed ? "mini-icon-button active" : "mini-icon-button"}
             onClick={() =>
-              run("bypass_effect", {
+              void run("bypass_effect", {
                 channelId,
                 instanceId: effect.instance_id,
                 bypassed: !effect.bypassed,
-              })
+              }).catch(() => undefined)
             }
             type="button"
             title="Bypass effect"
@@ -1420,6 +1722,12 @@ function EffectBlock({
           </button>
         </div>
       </div>
+      {availability && !availability.available && (
+        <div className="effect-warning">
+          <CircleAlert size={15} />
+          <span>{availability.detail}</span>
+        </div>
+      )}
       {definition && definition.presets.length > 0 && (
         <div className="preset-row">
           {definition.presets.map((preset) => (
@@ -1443,12 +1751,12 @@ function EffectBlock({
           unit={param.unit}
           value={effect.params[param.id] ?? param.default}
           onChange={(value) =>
-            run("set_effect_param", {
+            void run("set_effect_param", {
               channelId,
               instanceId: effect.instance_id,
               paramId: param.id,
               value,
-            })
+            }).catch(() => undefined)
           }
         />
       ))}
@@ -1458,51 +1766,196 @@ function EffectBlock({
 
 function ScenesView({
   run,
+  state,
 }: {
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  state: AppStateSnapshot;
 }) {
   const [scenes, setScenes] = useState<Scene[]>([]);
+  const [templates, setTemplates] = useState<SetupTemplate[]>([]);
+  const importInput = useRef<HTMLInputElement | null>(null);
   const refreshScenes = useCallback(async () => {
     const next = await invoke<Scene[]>("list_scenes");
     setScenes(Array.isArray(next) ? next : []);
   }, []);
+  const refreshTemplates = useCallback(async () => {
+    const next = await invoke<SetupTemplate[]>("list_setup_templates");
+    setTemplates(Array.isArray(next) ? next : []);
+  }, []);
 
   useEffect(() => {
     refreshScenes().catch(() => setScenes([]));
-  }, [refreshScenes]);
+    refreshTemplates().catch(() => setTemplates([]));
+  }, [refreshScenes, refreshTemplates]);
+
+  const importSceneFile = async (file: File) => {
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as unknown;
+      if (isBackupExport(parsed)) {
+        if (!window.confirm("Import this WaveLinux backup and replace the current setup and saved scenes?")) return;
+        await run<ConfigBackup>("import_backup", { backup: parsed }, "Backup imported");
+        await refreshScenes();
+        return;
+      }
+      if (!isSceneExport(parsed)) {
+        window.alert("That file is not a WaveLinux scene or backup export.");
+        return;
+      }
+      await run<Scene>("import_scene", { scene: parsed }, "Scene imported");
+      await refreshScenes();
+    } catch (error) {
+      window.alert(`Import failed: ${String(error)}`);
+    }
+  };
+
+  const exportBackup = async () => {
+    const backup = await run<ConfigBackup>("export_backup", undefined, "Backup exported");
+    const blob = new Blob([JSON.stringify(backup, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = backupFileName(backup);
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportScene = (scene: Scene) => {
+    const blob = new Blob([JSON.stringify(scene, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = sceneFileName(scene);
+    link.click();
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <section className="panel single-panel">
       <div className="panel-header">
         <h2>Scenes</h2>
-        <button
-          className="primary-button"
-          onClick={async () => {
-            const name = window.prompt("Scene name", "Streaming");
-            if (!name) return;
-            await run("save_scene", { name }, "Scene saved");
-            await refreshScenes();
-          }}
-          type="button"
-        >
-          <Save size={16} />
-          Save
-        </button>
-      </div>
-      <div className="scene-grid">
-        {scenes.map((scene) => (
+        <div className="panel-actions">
+          <input
+            ref={importInput}
+            accept="application/json,.json"
+            hidden
+            onChange={(event) => {
+              const file = event.currentTarget.files?.[0];
+              event.currentTarget.value = "";
+              if (file) void importSceneFile(file);
+            }}
+            type="file"
+          />
           <button
-            className="scene-tile"
-            key={scene.id}
+            className="secondary-button"
+            onClick={() => importInput.current?.click()}
+            type="button"
+          >
+            <ArrowUp size={16} />
+            Import
+          </button>
+          <button
+            className="secondary-button"
+            onClick={() => void exportBackup()}
+            type="button"
+            title="Export the full mixer setup and saved scene library"
+          >
+            <ArrowDown size={16} />
+            Backup
+          </button>
+          <button
+            className="primary-button"
             onClick={async () => {
-              await run("load_scene", { sceneId: scene.id }, "Scene loaded");
+              const name = window.prompt("Scene name", "Streaming");
+              if (!name) return;
+              await run("save_scene", { name }, "Scene saved");
               await refreshScenes();
             }}
             type="button"
           >
-            <strong>{scene.name}</strong>
-            <span>{scene.config.mixes.length} mixes · {scene.config.channels.length} channels</span>
+            <Save size={16} />
+            Save
           </button>
+        </div>
+      </div>
+      <div className="template-section">
+        <div className="subsection-header">
+          <strong>Quick Starts</strong>
+          <span>
+            3.1-style setup snapshots for common workflows · current setup has{" "}
+            {state.config.mixes.length} mixes and {state.config.channels.length} channels
+          </span>
+        </div>
+        <div className="template-grid">
+          {templates.map((template) => (
+            <article className="template-card" key={template.id}>
+              <div>
+                <strong>{template.name}</strong>
+                <span>{template.description}</span>
+              </div>
+              <ul>
+                {template.details.slice(0, 4).map((detail) => (
+                  <li key={detail}>{detail}</li>
+                ))}
+              </ul>
+              <button
+                className="secondary-button"
+                onClick={async () => {
+                  if (!window.confirm(`Replace the current mixer layout with "${template.name}"?`)) return;
+                  await run("apply_setup_template", { templateId: template.id, template_id: template.id }, "Template applied");
+                  await refreshScenes();
+                }}
+                type="button"
+              >
+                <WandSparkles size={16} />
+                Apply
+              </button>
+            </article>
+          ))}
+          {templates.length === 0 && <EmptyState label="No setup templates available" />}
+        </div>
+      </div>
+      <div className="scene-grid">
+        {scenes.map((scene) => (
+          <article className="scene-tile" key={scene.id}>
+            <button
+              className="scene-load-button"
+              onClick={async () => {
+                await run("load_scene", sceneIdArgs(scene.id), "Scene loaded");
+                await refreshScenes();
+              }}
+              type="button"
+            >
+              <strong>{scene.name}</strong>
+              <span>{scene.config.mixes.length} mixes · {scene.config.channels.length} channels</span>
+            </button>
+            <div className="scene-actions">
+              <button
+                className="mini-icon-button"
+                onClick={() => exportScene(scene)}
+                title="Export scene"
+                type="button"
+              >
+                <ArrowDown size={14} />
+              </button>
+              <button
+                className="mini-icon-button danger"
+                onClick={async () => {
+                  if (!window.confirm(`Delete scene "${scene.name}"?`)) return;
+                  await run("delete_scene", sceneIdArgs(scene.id), "Scene deleted");
+                  await refreshScenes();
+                }}
+                title="Delete scene"
+                type="button"
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          </article>
         ))}
         {scenes.length === 0 && <EmptyState label="No saved scenes" />}
       </div>
@@ -1511,13 +1964,20 @@ function ScenesView({
 }
 
 function DiagnosticsView({
+  audioActionReport,
+  onCleanup,
+  onPrune,
   state,
   run,
 }: {
+  audioActionReport: AudioActionReport | null;
+  onCleanup: () => void | Promise<unknown>;
+  onPrune: () => void | Promise<unknown>;
   state: AppStateSnapshot;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
   const [report, setReport] = useState<SoundCheckReport | null>(null);
+  const [graphReport, setGraphReport] = useState<GraphDebugReport | null>(null);
   const diagnostics = report?.diagnostics ?? state.diagnostics;
   return (
     <section className="two-column">
@@ -1535,8 +1995,27 @@ function DiagnosticsView({
             </button>
             <button
               className="secondary-button"
-              onClick={() => run("cleanup_audio_graph", undefined, "Managed audio graph removed")}
+              onClick={async () => setGraphReport(await run<GraphDebugReport>("get_graph_debug_report"))}
               type="button"
+              title="Inspect WaveLinux-managed PipeWire modules, routes, and planned commands"
+            >
+              <Clipboard size={16} />
+              Graph
+            </button>
+            <button
+              className="secondary-button"
+              onClick={() => void onPrune()}
+              type="button"
+              title="Remove old WaveLinux modules without rebuilding the active graph"
+            >
+              <WandSparkles size={16} />
+              Prune
+            </button>
+            <button
+              className="secondary-button danger"
+              onClick={() => void onCleanup()}
+              type="button"
+              title="Disruptive: unload every WaveLinux-managed audio module"
             >
               <Trash2 size={16} />
               Cleanup
@@ -1567,12 +2046,197 @@ function DiagnosticsView({
               <Stat icon={Radio} label="Mixes" value={String(report.virtual_mix_count)} />
               <Stat icon={Sparkles} label="Missing FX" value={String(report.missing_effects.length)} />
             </div>
+            <div className="debug-log">
+              <div className="debug-log-header">
+                <strong>Debug Log</strong>
+                <code>{report.debug_log_path}</code>
+              </div>
+              {report.recent_log_lines.length > 0 ? (
+                <pre>{report.recent_log_lines.join("\n")}</pre>
+              ) : (
+                <EmptyState label="No debug log entries yet" />
+              )}
+            </div>
           </div>
         ) : (
           <EmptyState label="No sound check report" />
         )}
+        {graphReport && <GraphDebugSummary report={graphReport} />}
+        {audioActionReport && <AudioActionSummary report={audioActionReport} />}
+        <LatencySummary state={state} />
+        <EffectAvailabilitySummary state={state} />
       </div>
     </section>
+  );
+}
+
+function LatencySummary({ state }: { state: AppStateSnapshot }) {
+  const heavyFx = state.config.channels.flatMap((channel) =>
+    channel.effects
+      .filter((effect) => !effect.bypassed && ["deepfilternet", "rnnoise", "convolver"].includes(effect.effect_id))
+      .map((effect) => `${channel.name}: ${effect.effect_id}`),
+  );
+  const activeMixRoutes = state.config.channels.length * state.config.mixes.length;
+  const estimatedMicPath = heavyFx.length > 0 ? "30 ms+" : "20-30 ms";
+
+  return (
+    <div className="latency-card command-report">
+      <div className="command-report-header">
+        <div>
+          <strong>Latency</strong>
+          <span>PipeWire path estimate for monitoring and virtual mic use</span>
+        </div>
+        <div className={heavyFx.length ? "command-pill warning" : "command-pill"}>
+          {heavyFx.length ? "Review FX" : "Low"}
+        </div>
+      </div>
+      <div className="command-stats">
+        <Stat icon={Gauge} label="Loopbacks" value="10 ms" />
+        <Stat icon={Mic} label="Mic path" value={estimatedMicPath} />
+        <Stat icon={GitBranch} label="Routes" value={String(activeMixRoutes)} />
+      </div>
+      {heavyFx.length > 0 && (
+        <div className="latency-note">
+          <CircleAlert size={15} />
+          <span>{heavyFx.join(", ")}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GraphDebugSummary({ report }: { report: GraphDebugReport }) {
+  const visibleCommands = report.planned.commands.slice(0, 6);
+  const visibleModules = report.managed_modules.slice(0, 6);
+  const routeCount = report.sink_input_routes.length + report.source_output_routes.length;
+
+  return (
+    <div className="graph-debug command-report">
+      <div className="command-report-header">
+        <div>
+          <strong>Graph Debug</strong>
+          <span>{report.audio_graph_running ? "Managed graph is present" : "Managed graph is stopped"}</span>
+        </div>
+        <div className={report.stale_processes.length ? "command-pill warning" : "command-pill"}>
+          {report.stale_processes.length ? `${report.stale_processes.length} stale` : "Clean"}
+        </div>
+      </div>
+      <div className="command-stats">
+        <Stat icon={WandSparkles} label="Planned" value={String(report.planned.commands.length)} />
+        <Stat icon={Cable} label="Modules" value={String(report.managed_modules.length)} />
+        <Stat icon={GitBranch} label="Routes" value={String(routeCount)} />
+      </div>
+      <div className="graph-debug-grid">
+        <div className="graph-debug-section">
+          <strong>Managed Modules</strong>
+          {visibleModules.map((module) => (
+            <code key={module.module_id}>
+              {module.module_id} {module.role ?? "module"} {module.node_name ?? module.sink_name ?? module.source_name ?? ""}
+            </code>
+          ))}
+          {visibleModules.length === 0 && <span>No WaveLinux modules visible</span>}
+        </div>
+        <div className="graph-debug-section">
+          <strong>Planned Commands</strong>
+          {visibleCommands.map((command, index) => (
+            <code key={`${command.description}-${index}`}>{command.description || commandLine(command.program, command.args)}</code>
+          ))}
+          {visibleCommands.length === 0 && <span>Graph already matches config</span>}
+        </div>
+      </div>
+      <div className="debug-log">
+        <div className="debug-log-header">
+          <strong>Engine Log</strong>
+          <code>{report.debug_log_path}</code>
+        </div>
+        {report.recent_log_lines.length > 0 ? (
+          <pre>{report.recent_log_lines.join("\n")}</pre>
+        ) : (
+          <EmptyState label="No debug log entries yet" />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AudioActionSummary({ report }: { report: AudioActionReport }) {
+  const failures = report.commands.filter((command) => command.error).length;
+  const skipped = report.commands.filter((command) => command.skipped).length;
+  const ran = Math.max(0, report.commands.length - skipped);
+  const visibleCommands = report.commands.slice(0, 8);
+
+  return (
+    <div className="command-report">
+      <div className="command-report-header">
+        <div>
+          <strong>{report.title}</strong>
+          <span>{new Date(report.finishedAt).toLocaleTimeString()}</span>
+        </div>
+        <div className={failures ? "command-pill error" : "command-pill"}>
+          {failures ? `${failures} failed` : `${ran} ran`}
+        </div>
+      </div>
+      <div className="command-stats">
+        <Stat icon={WandSparkles} label="Planned" value={String(report.plannedCount ?? report.commands.length)} />
+        <Stat icon={Check} label="Skipped" value={String(skipped)} />
+        <Stat icon={CircleAlert} label="Errors" value={String(failures)} />
+      </div>
+      <div className="command-list">
+        {visibleCommands.map((execution, index) => (
+          <div className={execution.error ? "command-row error" : "command-row"} key={`${execution.command.description}-${index}`}>
+            <div>
+              <strong>{execution.command.description || execution.command.program || "Audio command"}</strong>
+              <span>{execution.skipped ? "Skipped" : execution.command.domain}</span>
+            </div>
+            <code className="command-line">{commandLine(execution.command.program, execution.command.args)}</code>
+            {execution.error && <span className="command-error">{execution.error}</span>}
+          </div>
+        ))}
+        {report.commands.length > visibleCommands.length && (
+          <div className="command-row compact">
+            <span>{report.commands.length - visibleCommands.length} more commands</span>
+          </div>
+        )}
+        {report.commands.length === 0 && <EmptyState label="No host commands were needed" />}
+      </div>
+    </div>
+  );
+}
+
+function EffectAvailabilitySummary({ state }: { state: AppStateSnapshot }) {
+  const availabilityById = new Map(state.graph.effect_availability.map((item) => [item.effect_id, item]));
+  const available = state.graph.effect_availability.filter((item) => item.available).length;
+  const total = state.catalog.effects.length;
+
+  return (
+    <div className="fx-availability">
+      <div className="command-report-header">
+        <div>
+          <strong>Effect Availability</strong>
+          <span>{available}/{total} open DSP replacements detected</span>
+        </div>
+        <div className={available === total ? "command-pill" : "command-pill warning"}>
+          {available === total ? "Ready" : `${total - available} missing`}
+        </div>
+      </div>
+      <div className="fx-availability-list">
+        {state.catalog.preferred_order.map((effectId) => {
+          const definition = state.catalog.effects.find((effect) => effect.id === effectId);
+          if (!definition) return null;
+          const availability = availabilityById.get(effectId);
+          const isAvailable = availability?.available ?? false;
+          return (
+            <div className={isAvailable ? "fx-availability-row" : "fx-availability-row missing"} key={effectId}>
+              {isAvailable ? <Check size={15} /> : <CircleAlert size={15} />}
+              <div>
+                <strong>{definition.name}</strong>
+                <span>{availability?.detail ?? "Not probed"}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -1601,6 +2265,20 @@ function SettingsView({
           value={state.config.settings.start_at_login}
         />
         <Toggle
+          label="Restore audio graph on launch"
+          onChange={(value) =>
+            updateSettings({ ...state.config.settings, restore_audio_graph_on_launch: value })
+          }
+          value={state.config.settings.restore_audio_graph_on_launch}
+        />
+        <Toggle
+          label="Monitor follows default output"
+          onChange={(value) =>
+            updateSettings({ ...state.config.settings, monitor_follows_default_output: value })
+          }
+          value={state.config.settings.monitor_follows_default_output}
+        />
+        <Toggle
           label="Lock default input"
           onChange={(value) =>
             updateSettings({ ...state.config.settings, lock_default_input: value })
@@ -1623,7 +2301,7 @@ function SettingsView({
         />
       </div>
       <div className="system-grid">
-        <Stat icon={Cpu} label="Engine" value={state.engine.dry_run ? "Dry" : "Live"} />
+        <Stat icon={Cpu} label="Engine" value={state.engine.audio_graph_running ? "Running" : "Stopped"} />
         <Stat icon={Radio} label="Rate" value={`${state.config.audio.sample_rate_hz / 1000} kHz`} />
         <Stat icon={AudioLines} label="Format" value={`${state.config.audio.bit_depth}-bit`} />
       </div>
@@ -1649,23 +2327,42 @@ function VolumeFader({
   onChange: (value: number) => void | Promise<unknown>;
 }) {
   const normalizedPercent = unit === "%" && min === 0 && max === 1;
-  const display = normalizedPercent ? Math.round(value * 100) : Math.round(value * 10) / 10;
-  const sliderValue = normalizedPercent ? value * 100 : value;
   const sliderMin = normalizedPercent ? 0 : min;
   const sliderMax = normalizedPercent ? 100 : max;
+  const incomingSliderValue = normalizedPercent ? value * 100 : value;
+  const [draft, setDraft] = useState(incomingSliderValue);
+  const lastCommitted = useRef(incomingSliderValue);
+  const display = normalizedPercent ? Math.round(draft) : Math.round(draft * 10) / 10;
+
+  useEffect(() => {
+    const next = normalizedPercent ? value * 100 : value;
+    setDraft(next);
+    lastCommitted.current = next;
+  }, [normalizedPercent, value]);
+
+  const commit = useCallback((raw: number) => {
+    const next = Number.isFinite(raw) ? Math.max(sliderMin, Math.min(sliderMax, raw)) : incomingSliderValue;
+    setDraft(next);
+    if (lastCommitted.current === next) return;
+    lastCommitted.current = next;
+    void onChange(normalizedPercent ? next / 100 : next);
+  }, [incomingSliderValue, normalizedPercent, onChange, sliderMax, sliderMin]);
+
   return (
     <label className={compact ? "fader-row compact" : "fader-row"}>
       <span>{label}</span>
       <input
         max={sliderMax}
         min={sliderMin}
-        onChange={(event) => {
-          const raw = Number(event.currentTarget.value);
-          void onChange(normalizedPercent ? raw / 100 : raw);
+        onBlur={(event) => commit(Number(event.currentTarget.value))}
+        onChange={(event) => setDraft(Number(event.currentTarget.value))}
+        onKeyUp={(event) => {
+          if (shouldCommitSliderKey(event)) commit(Number(event.currentTarget.value));
         }}
+        onPointerUp={(event) => commit(Number(event.currentTarget.value))}
         step={unit === "%" ? 1 : 0.1}
         type="range"
-        value={sliderValue}
+        value={draft}
       />
       <strong>{display}{unit}</strong>
     </label>
@@ -1721,19 +2418,193 @@ function primaryBusMixes(mixes: Mix[]): Mix[] {
   return primary.length === 2 ? primary : mixes.slice(0, 2);
 }
 
+function mixTabLabel(mix: Mix): string {
+  if (mix.id === "monitor") return "Monitor Mix";
+  if (mix.id === "stream") return "Stream Mix";
+  return mix.name;
+}
+
 function compactMixLabel(mix: Mix): string {
   if (mix.id === "monitor") return "MON";
   if (mix.id === "stream") return "STR";
   return mix.name.slice(0, 3).toUpperCase();
 }
 
-function matcherForStream(stream: AppStream) {
-  return {
+function matcherForStream(stream: AppStream): AppMatcher {
+  const matcher = {
     app_id: stream.app_id ?? null,
-    binary: stream.process_name ?? null,
+    binary: stream.binary ?? stream.process_name ?? null,
     process_name: stream.process_name ?? null,
+    window_class: stream.window_class ?? null,
+    media_name: stream.media_name ?? null,
+  };
+  if (!matcherIsEmpty(matcher)) return matcher;
+
+  return {
+    app_id: fallbackMatcherValueForStream(stream),
+    binary: null,
+    process_name: null,
     window_class: null,
   };
+}
+
+function matcherIsEmpty(matcher: AppMatcher): boolean {
+  return matcherKinds.every((kind) => !matcher[kind]?.trim());
+}
+
+function fallbackMatcherValueForStream(stream: AppStream): string {
+  const candidates = [
+    stream.media_name,
+    stream.display_name && !/^Stream\s+\d+$/i.test(stream.display_name) ? stream.display_name : null,
+    stream.id ? `stream-${stream.id}` : null,
+  ];
+  const value = candidates
+    .map((candidate) => candidate?.trim())
+    .find((candidate): candidate is string => Boolean(candidate));
+  return `stream:${value ?? "unknown"}`;
+}
+
+function matcherFromKind(kind: MatcherKind, value: string): AppMatcher {
+  const cleaned = value.trim();
+  return {
+    app_id: kind === "app_id" ? cleaned : null,
+    binary: kind === "binary" ? cleaned : null,
+    process_name: kind === "process_name" ? cleaned : null,
+    window_class: kind === "window_class" ? cleaned : null,
+    media_name: kind === "media_name" ? cleaned : null,
+  };
+}
+
+function matcherKindLabel(kind: MatcherKind): string {
+  return {
+    app_id: "App ID",
+    process_name: "Process",
+    binary: "Binary",
+    window_class: "Window Class",
+    media_name: "Media Name",
+  }[kind];
+}
+
+function matcherEntries(matcher: AppMatcher): Array<[MatcherKind, string]> {
+  return matcherKinds
+    .map((kind) => [kind, matcher[kind]?.trim() ?? ""] as [MatcherKind, string])
+    .filter(([, value]) => value.length > 0);
+}
+
+function matcherLabel(matcher: AppMatcher): string {
+  return matcherEntries(matcher)[0]?.[1] ?? "Unknown app";
+}
+
+function matcherTypeLabel(matcher: AppMatcher): string {
+  const entries = matcherEntries(matcher);
+  if (entries.length === 0) return "No matcher";
+  return entries.map(([kind]) => matcherKindLabel(kind)).join(" + ");
+}
+
+function routeKey(matcher: AppMatcher): string {
+  const entries = matcherEntries(matcher);
+  if (entries.length === 0) return "empty";
+  return entries.map(([kind, value]) => `${kind}:${value}`).join("|");
+}
+
+function volumePresetForMatcher(
+  presets: AppVolumePreset[] | undefined,
+  matcher: AppMatcher,
+): AppVolumePreset | undefined {
+  const key = routeKey(matcher);
+  return presets?.find((preset) => routeKey(preset.matcher) === key);
+}
+
+function offlineRoutingEntries(state: AppStateSnapshot): OfflineRoutingEntry[] {
+  const entries = new Map<string, OfflineRoutingEntry>();
+  for (const app of state.config.app_history ?? []) {
+    if (app.forgotten) continue;
+    const key = routeKey(app.matcher);
+    entries.set(key, {
+      matcher: app.matcher,
+      displayName: app.display_name || matcherLabel(app.matcher),
+      meta: [matcherTypeLabel(app.matcher), formatLastSeen(app.last_seen_unix)].filter(Boolean).join(" · "),
+      channel_id: undefined,
+      volumePreset: volumePresetForMatcher(state.config.app_volume_presets, app.matcher),
+    });
+  }
+
+  for (const route of state.config.app_routes) {
+    const key = routeKey(route.matcher);
+    const existing = entries.get(key);
+    entries.set(key, {
+      matcher: route.matcher,
+      displayName: existing?.displayName ?? matcherLabel(route.matcher),
+      meta: existing?.meta ?? matcherTypeLabel(route.matcher),
+      channel_id: route.channel_id,
+      volumePreset: existing?.volumePreset ?? volumePresetForMatcher(state.config.app_volume_presets, route.matcher),
+    });
+  }
+
+  return [...entries.values()].sort((left, right) => {
+    const leftRouted = left.channel_id ? 0 : 1;
+    const rightRouted = right.channel_id ? 0 : 1;
+    return leftRouted - rightRouted || left.displayName.localeCompare(right.displayName);
+  });
+}
+
+function formatLastSeen(lastSeenUnix: number): string {
+  if (!Number.isFinite(lastSeenUnix) || lastSeenUnix <= 0) return "";
+  const elapsedSeconds = Math.max(0, Math.round(Date.now() / 1000 - lastSeenUnix));
+  if (elapsedSeconds < 120) return "Seen now";
+  const minutes = Math.round(elapsedSeconds / 60);
+  if (minutes < 60) return `Seen ${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `Seen ${hours}h ago`;
+  return `Seen ${Math.round(hours / 24)}d ago`;
+}
+
+function isSceneExport(value: unknown): value is Scene {
+  if (!value || typeof value !== "object") return false;
+  const scene = value as Partial<Scene>;
+  return (
+    typeof scene.name === "string" &&
+    Boolean(scene.config) &&
+    typeof scene.config === "object" &&
+    Array.isArray(scene.config.mixes) &&
+    Array.isArray(scene.config.channels)
+  );
+}
+
+function isBackupExport(value: unknown): value is ConfigBackup {
+  if (!value || typeof value !== "object") return false;
+  const backup = value as Partial<ConfigBackup>;
+  return (
+    typeof backup.backup_version === "number" &&
+    Boolean(backup.config) &&
+    typeof backup.config === "object" &&
+    Array.isArray(backup.config.mixes) &&
+    Array.isArray(backup.config.channels) &&
+    (backup.scenes === undefined || Array.isArray(backup.scenes))
+  );
+}
+
+function sceneFileName(scene: Scene): string {
+  return `${slugForFile(scene.name) || "wavelinux-scene"}.wavelinux-scene.json`;
+}
+
+function backupFileName(backup: ConfigBackup): string {
+  const date = new Date((backup.exported_unix || Math.floor(Date.now() / 1000)) * 1000)
+    .toISOString()
+    .slice(0, 10);
+  return `wavelinux-backup-${date}.json`;
+}
+
+function sceneIdArgs(sceneId: string): Record<string, string> {
+  return { sceneId, scene_id: sceneId };
+}
+
+function slugForFile(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function availableEffects(state: AppStateSnapshot): number {
@@ -1749,7 +2620,34 @@ function isWaveLinuxManagedDevice(
 ): boolean {
   return (
     device.is_virtual &&
-    (device.id.startsWith("wavelinux_") || device.name.startsWith("wavelinux_"))
+    (looksLikeWaveLinuxNode(device.id) || looksLikeWaveLinuxNode(device.name))
+  );
+}
+
+function looksLikeWaveLinuxNode(value: string): boolean {
+  return value.toLowerCase().includes("wavelinux");
+}
+
+function isMicrophoneSource(device: AppStateSnapshot["graph"]["inputs"][number]): boolean {
+  const name = device.name.toLowerCase();
+  const description = device.description.toLowerCase();
+  return (
+    !isWaveLinuxManagedDevice(device) &&
+    !name.endsWith(".monitor") &&
+    !description.startsWith("monitor of ") &&
+    !description.includes(" monitor")
+  );
+}
+
+function channelInputLabel(
+  channel: Pick<Channel, "source_device">,
+  inputs: AppStateSnapshot["graph"]["inputs"],
+): string {
+  if (channel.source_device === "@DEFAULT_SOURCE@") return "Default mic";
+  if (!channel.source_device) return "Default mic";
+  return (
+    inputs.find((input) => input.id === channel.source_device)?.description ??
+    channel.source_device
   );
 }
 
@@ -1761,30 +2659,70 @@ function channelIcon(kind: ChannelKind): typeof Headphones {
   return Headphones;
 }
 
-function pseudoLevel(seed: string, index: number): number {
-  const time = Date.now() / 1000;
-  const base = seed.split("").reduce((sum, char) => sum + char.charCodeAt(0), 0);
-  return Math.max(0.08, Math.min(0.92, 0.45 + Math.sin(time * 1.4 + base + index) * 0.28));
-}
-
-function busVuLevel(level: number, busIndex: number): number {
-  const offset = busIndex === 0 ? 0.08 : -0.04;
-  return Math.max(0.04, Math.min(0.96, level + offset));
-}
-
-function meterLevel(state: AppStateSnapshot, nodeId: string, fallback: number): number {
-  const meter = state.graph.meters.find((item) => item.node_id === nodeId);
-  if (!meter) return fallback;
+function levelFromMeter(meter: LevelMeter): number {
   const peak = Math.max(meter.peak_left, meter.peak_right);
   return Math.max(0, Math.min(1, Math.sqrt(Math.max(0, peak))));
 }
 
-function thumbPosition(percent: number): string {
-  const clamped = Math.max(0, Math.min(100, percent));
-  return `clamp(0px, calc(${clamped}% - 11px), calc(100% - 22px))`;
+function meterLevelMap(
+  state: AppStateSnapshot,
+  heldMeters?: HeldMeterMap,
+): Record<string, number> {
+  const levels: Record<string, number> = {};
+  for (const meter of state.graph.meters) {
+    levels[meter.node_id] = levelFromMeter(meter);
+  }
+  if (!state.engine.audio_graph_running || !heldMeters) return levels;
+
+  const now = Date.now();
+  for (const [nodeId, held] of Object.entries(heldMeters)) {
+    if (nodeId in levels) continue;
+    const ageSeconds = Math.max(0, (now - held.seenAt) / 1000);
+    if (ageSeconds < 2.5) {
+      levels[nodeId] = Math.max(0, Math.min(1, held.level * Math.exp(-ageSeconds * 1.6)));
+    }
+  }
+  return levels;
 }
 
-function thumbPositionHorizontal(percent: number): string {
+function audioActionToast(title: string, commands: CommandExecution[], plannedCount?: number): string {
+  const failures = commands.filter((command) => command.error).length;
+  const skipped = commands.filter((command) => command.skipped).length;
+  const ran = Math.max(0, commands.length - skipped);
+  if (failures > 0) return `${title}: ${failures} command${failures === 1 ? "" : "s"} failed`;
+  if (ran === 0 && skipped > 0) return `${title}: no live graph changes needed`;
+  if (plannedCount !== undefined && plannedCount === 0) return `${title}: graph already matched config`;
+  return `${title}: ${ran} command${ran === 1 ? "" : "s"} applied`;
+}
+
+function commandLine(program: string, args: string[]): string {
+  if (!program) return "No command";
+  return [program, ...args].map((part) => (part.includes(" ") ? `"${part}"` : part)).join(" ");
+}
+
+function sliderPercent(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function volumeToPercent(volume: number): number {
+  return sliderPercent(volume * 100);
+}
+
+function shouldCommitSliderKey(event: ReactKeyboardEvent<HTMLInputElement>): boolean {
+  return event.key === "Enter";
+}
+
+function thumbPosition(percent: number): string {
   const clamped = Math.max(0, Math.min(100, percent));
-  return `clamp(0px, calc(${clamped}% - 10px), calc(100% - 20px))`;
+  return `calc(13px + (100% - 26px) * ${clamped / 100})`;
+}
+
+function trackPosition(level: number): string {
+  const clamped = Math.max(0, Math.min(1, level));
+  return `calc((100% - 2px) * ${clamped})`;
+}
+
+function trackSize(level: number): string {
+  const clamped = Math.max(0, Math.min(1, level));
+  return `${clamped * 100}%`;
 }

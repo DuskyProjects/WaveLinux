@@ -1,15 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, State};
-use wavelinux_engine::{EngineError, SoundCheckReport, WaveLinuxEngine};
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use wavelinux_engine::{EngineError, GraphDebugReport, SoundCheckReport, WaveLinuxEngine};
 use wavelinux_model::{
-    AppMatcher, AppRoute, AppStateSnapshot, Channel, ChannelKind, EffectInstance, Mix, MixBus,
-    MixerSettings, Scene,
+    AppMatcher, AppRoute, AppStateSnapshot, AppVolumePreset, Channel, ChannelInputMode,
+    ChannelKind, ConfigBackup, EffectInstance, KnownApp, Mix, MixBus, MixerConfig, MixerSettings,
+    Scene, SetupTemplate,
 };
 
 struct EngineState {
@@ -34,6 +36,11 @@ fn create_mix(engine: State<'_, EngineState>, name: String) -> Result<Mix, Strin
 #[tauri::command]
 fn rename_mix(engine: State<'_, EngineState>, mix_id: String, name: String) -> Result<Mix, String> {
     tauri_result(engine.engine.rename_mix(mix_id, name))
+}
+
+#[tauri::command]
+fn move_mix(engine: State<'_, EngineState>, mix_id: String, direction: i32) -> Result<Mix, String> {
+    tauri_result(engine.engine.move_mix(mix_id, direction))
 }
 
 #[tauri::command]
@@ -87,6 +94,15 @@ fn rename_channel(
 }
 
 #[tauri::command]
+fn move_channel(
+    engine: State<'_, EngineState>,
+    channel_id: String,
+    direction: i32,
+) -> Result<Channel, String> {
+    tauri_result(engine.engine.move_channel(channel_id, direction))
+}
+
+#[tauri::command]
 fn delete_channel(engine: State<'_, EngineState>, channel_id: String) -> Result<Channel, String> {
     tauri_result(engine.engine.delete_channel(channel_id))
 }
@@ -107,6 +123,28 @@ fn set_channel_input(
     source_device: Option<String>,
 ) -> Result<Channel, String> {
     tauri_result(engine.engine.set_channel_input(channel_id, source_device))
+}
+
+#[tauri::command]
+fn set_hardware_input_device(
+    engine: State<'_, EngineState>,
+    channel_id: String,
+    source_device: Option<String>,
+) -> Result<Channel, String> {
+    tauri_result(
+        engine
+            .engine
+            .set_hardware_input_device(channel_id, source_device),
+    )
+}
+
+#[tauri::command]
+fn set_channel_input_mode(
+    engine: State<'_, EngineState>,
+    channel_id: String,
+    input_mode: ChannelInputMode,
+) -> Result<Channel, String> {
+    tauri_result(engine.engine.set_channel_input_mode(channel_id, input_mode))
 }
 
 #[tauri::command]
@@ -152,6 +190,65 @@ fn remove_app_route(
     matcher: AppMatcher,
 ) -> Result<Option<AppRoute>, String> {
     tauri_result(engine.engine.remove_app_route(matcher))
+}
+
+#[tauri::command]
+fn set_app_volume_preset(
+    engine: State<'_, EngineState>,
+    matcher: AppMatcher,
+    volume: f32,
+) -> Result<AppVolumePreset, String> {
+    tauri_result(engine.engine.set_app_volume_preset(matcher, volume))
+}
+
+#[tauri::command]
+fn remove_app_volume_preset(
+    engine: State<'_, EngineState>,
+    matcher: AppMatcher,
+) -> Result<Option<AppVolumePreset>, String> {
+    tauri_result(engine.engine.remove_app_volume_preset(matcher))
+}
+
+#[tauri::command]
+fn forget_app(
+    engine: State<'_, EngineState>,
+    matcher: AppMatcher,
+) -> Result<Option<KnownApp>, String> {
+    tauri_result(engine.engine.forget_app(matcher))
+}
+
+#[tauri::command]
+fn restore_app(
+    engine: State<'_, EngineState>,
+    matcher: AppMatcher,
+) -> Result<Option<KnownApp>, String> {
+    tauri_result(engine.engine.restore_app(matcher))
+}
+
+#[tauri::command]
+fn pin_app_identity(
+    engine: State<'_, EngineState>,
+    matcher: AppMatcher,
+    label: String,
+) -> Result<KnownApp, String> {
+    tauri_result(engine.engine.pin_app_identity(matcher, label))
+}
+
+#[tauri::command]
+fn merge_app_identity(
+    engine: State<'_, EngineState>,
+    source: AppMatcher,
+    target: AppMatcher,
+) -> Result<KnownApp, String> {
+    tauri_result(engine.engine.merge_app_identity(source, target))
+}
+
+#[tauri::command]
+fn reset_app_identity(
+    engine: State<'_, EngineState>,
+    matcher: AppMatcher,
+) -> Result<Option<KnownApp>, String> {
+    tauri_result(engine.engine.reset_app_identity(matcher))
 }
 
 #[tauri::command]
@@ -238,6 +335,11 @@ fn run_diagnostics(engine: State<'_, EngineState>) -> Result<SoundCheckReport, S
 }
 
 #[tauri::command]
+fn get_graph_debug_report(engine: State<'_, EngineState>) -> Result<GraphDebugReport, String> {
+    tauri_result(engine.engine.get_graph_debug_report())
+}
+
+#[tauri::command]
 fn repair_audio_graph(
     engine: State<'_, EngineState>,
 ) -> Result<wavelinux_engine::RepairReport, String> {
@@ -252,8 +354,38 @@ fn cleanup_audio_graph(
 }
 
 #[tauri::command]
+fn cleanup_stale_audio_graph(
+    engine: State<'_, EngineState>,
+) -> Result<Vec<wavelinux_engine::CommandExecution>, String> {
+    tauri_result(engine.engine.cleanup_stale_audio_graph())
+}
+
+#[tauri::command]
+fn restore_device(engine: State<'_, EngineState>, kind: String) -> Result<MixerConfig, String> {
+    tauri_result(engine.engine.restore_device(kind))
+}
+
+#[tauri::command]
 fn save_scene(engine: State<'_, EngineState>, name: String) -> Result<Scene, String> {
     tauri_result(engine.engine.save_scene(name))
+}
+
+#[tauri::command]
+fn import_scene(engine: State<'_, EngineState>, scene: Scene) -> Result<Scene, String> {
+    tauri_result(engine.engine.import_scene(scene))
+}
+
+#[tauri::command]
+fn export_backup(engine: State<'_, EngineState>) -> Result<ConfigBackup, String> {
+    tauri_result(engine.engine.export_backup())
+}
+
+#[tauri::command]
+fn import_backup(
+    engine: State<'_, EngineState>,
+    backup: ConfigBackup,
+) -> Result<ConfigBackup, String> {
+    tauri_result(engine.engine.import_backup(backup))
 }
 
 #[tauri::command]
@@ -262,15 +394,63 @@ fn load_scene(engine: State<'_, EngineState>, scene_id: String) -> Result<Scene,
 }
 
 #[tauri::command]
+fn delete_scene(engine: State<'_, EngineState>, scene_id: String) -> Result<Scene, String> {
+    tauri_result(engine.engine.delete_scene(scene_id))
+}
+
+#[tauri::command]
 fn list_scenes(engine: State<'_, EngineState>) -> Result<Vec<Scene>, String> {
     tauri_result(engine.engine.list_scenes())
+}
+
+#[tauri::command]
+fn list_setup_templates(engine: State<'_, EngineState>) -> Vec<SetupTemplate> {
+    engine.engine.list_setup_templates()
+}
+
+#[tauri::command]
+fn apply_setup_template(
+    engine: State<'_, EngineState>,
+    template_id: String,
+) -> Result<SetupTemplate, String> {
+    tauri_result(engine.engine.apply_setup_template(template_id))
 }
 
 fn tauri_result<T>(result: Result<T, EngineError>) -> Result<T, String> {
     result.map_err(|err| err.to_string())
 }
 
-fn build_tray(app: &AppHandle, engine: Arc<WaveLinuxEngine>) -> tauri::Result<()> {
+fn shutdown_audio_graph(engine: &WaveLinuxEngine, shutdown_started: &AtomicBool) {
+    if shutdown_started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    engine.stop_background();
+    let _ = engine.cleanup_audio_graph();
+}
+
+fn show_main_window(app: &AppHandle) {
+    let window = app.get_webview_window("main").or_else(|| {
+        WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            .title("WaveLinux 4.0")
+            .inner_size(1280.0, 820.0)
+            .min_inner_size(960.0, 640.0)
+            .resizable(true)
+            .build()
+            .ok()
+    });
+    if let Some(window) = window {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn build_tray(
+    app: &AppHandle,
+    engine: Arc<WaveLinuxEngine>,
+    shutdown_started: Arc<AtomicBool>,
+    allow_exit: Arc<AtomicBool>,
+) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show WaveLinux", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
@@ -282,14 +462,11 @@ fn build_tray(app: &AppHandle, engine: Arc<WaveLinuxEngine>) -> tauri::Result<()
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "show" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                show_main_window(app);
             }
             "quit" => {
-                engine.stop_background();
-                let _ = engine.cleanup_audio_graph();
+                allow_exit.store(true, Ordering::SeqCst);
+                shutdown_audio_graph(&engine, &shutdown_started);
                 app.exit(0);
             }
             _ => {}
@@ -301,10 +478,7 @@ fn build_tray(app: &AppHandle, engine: Arc<WaveLinuxEngine>) -> tauri::Result<()
                 ..
             } = event
             {
-                if let Some(window) = tray.app_handle().get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                show_main_window(tray.app_handle());
             }
         })
         .build(app)?;
@@ -315,8 +489,18 @@ fn main() {
     let engine = WaveLinuxEngine::from_xdg().expect("failed to start WaveLinux engine");
     let background = engine.spawn_background();
     let tray_engine = Arc::clone(&engine);
+    let run_engine = Arc::clone(&engine);
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+    let allow_exit = Arc::new(AtomicBool::new(false));
+    let tray_shutdown = Arc::clone(&shutdown_started);
+    let run_shutdown = Arc::clone(&shutdown_started);
+    let tray_allow_exit = Arc::clone(&allow_exit);
+    let run_allow_exit = Arc::clone(&allow_exit);
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .manage(EngineState {
@@ -327,20 +511,31 @@ fn main() {
             observe_state,
             create_mix,
             rename_mix,
+            move_mix,
             delete_mix,
             set_mix_volume,
             set_mix_mute,
             set_mix_monitor_output,
             create_channel,
             rename_channel,
+            move_channel,
             delete_channel,
             set_channel_linked,
             set_channel_input,
+            set_hardware_input_device,
+            set_channel_input_mode,
             set_settings,
             set_channel_volume,
             set_channel_mute,
             assign_app_to_channel,
             remove_app_route,
+            set_app_volume_preset,
+            remove_app_volume_preset,
+            forget_app,
+            restore_app,
+            pin_app_identity,
+            merge_app_identity,
+            reset_app_identity,
             move_app_stream,
             move_app_stream_to_default,
             set_app_stream_volume,
@@ -350,24 +545,48 @@ fn main() {
             bypass_effect,
             run_sound_check,
             run_diagnostics,
+            get_graph_debug_report,
             repair_audio_graph,
             cleanup_audio_graph,
+            cleanup_stale_audio_graph,
+            restore_device,
             save_scene,
+            import_scene,
+            export_backup,
+            import_backup,
             load_scene,
+            delete_scene,
             list_scenes,
+            list_setup_templates,
+            apply_setup_template,
         ])
         .setup(move |app| {
-            build_tray(app.handle(), Arc::clone(&tray_engine))?;
+            build_tray(
+                app.handle(),
+                Arc::clone(&tray_engine),
+                Arc::clone(&tray_shutdown),
+                Arc::clone(&tray_allow_exit),
+            )?;
             Ok(())
         })
-        .on_window_event(|window, event| {
+        .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running WaveLinux");
+        .build(tauri::generate_context!())
+        .expect("error while building WaveLinux");
+
+    app.run(move |_app, event| match event {
+        tauri::RunEvent::ExitRequested { api, .. } if !run_allow_exit.load(Ordering::SeqCst) => {
+            api.prevent_exit();
+        }
+        tauri::RunEvent::Exit => {
+            shutdown_audio_graph(&run_engine, &run_shutdown);
+        }
+        _ => {}
+    });
 
     engine.stop_background();
     let _ = background.join();

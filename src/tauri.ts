@@ -3,10 +3,13 @@ import type {
   AppMatcher,
   AppStateSnapshot,
   Channel,
+  ConfigBackup,
   EffectCatalog,
   EffectInstance,
+  GraphDebugReport,
   Mix,
   Scene,
+  SetupTemplate,
 } from "./types";
 
 const isTauri =
@@ -26,7 +29,21 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
   return demoMutation(command, args) as T;
 }
 
+export function initialSnapshot(): AppStateSnapshot | null {
+  return isTauri ? null : cloneDemoState();
+}
+
 function demoMutation(command: string, args?: Record<string, unknown>): unknown {
+  if (command === "list_setup_templates") {
+    return structuredClone(demoSetupTemplates);
+  }
+
+  if (command === "apply_setup_template") {
+    const templateId = stringArg(args, "templateId") || stringArg(args, "template_id");
+    applyDemoSetupTemplate(templateId);
+    return structuredClone(demoSetupTemplates.find((template) => template.id === templateId) ?? demoSetupTemplates[0]);
+  }
+
   if (command === "list_scenes") {
     return structuredClone(demoScenes);
   }
@@ -43,11 +60,54 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return structuredClone(scene);
   }
 
+  if (command === "import_scene") {
+    const scene = args?.scene as Scene | undefined;
+    const name = String(scene?.name ?? "Imported Scene").trim() || "Imported Scene";
+    const imported: Scene = {
+      id: `${slug(name) || "scene"}_${crypto.randomUUID()}`,
+      name,
+      created_unix: Math.floor(Date.now() / 1000),
+      config: structuredClone(scene?.config ?? demoState.config),
+    };
+    demoScenes.unshift(imported);
+    return structuredClone(imported);
+  }
+
+  if (command === "export_backup") {
+    return {
+      backup_version: 1,
+      exported_unix: Math.floor(Date.now() / 1000),
+      config: structuredClone(demoState.config),
+      scenes: structuredClone(demoScenes),
+    } satisfies ConfigBackup;
+  }
+
+  if (command === "import_backup") {
+    const backup = args?.backup as ConfigBackup | undefined;
+    if (backup?.config) {
+      demoState.config = structuredClone(backup.config);
+      demoScenes.splice(0, demoScenes.length, ...(backup.scenes ?? []).map((scene) => structuredClone(scene)));
+      return structuredClone(backup);
+    }
+    return {};
+  }
+
   if (command === "load_scene") {
-    const scene = demoScenes.find((scene) => scene.id === stringArg(args, "sceneId"));
+    const sceneId = stringArg(args, "sceneId") || stringArg(args, "scene_id");
+    const scene = demoScenes.find((scene) => scene.id === sceneId);
     if (scene) {
       demoState.config = structuredClone(scene.config);
       return structuredClone(scene);
+    }
+    return {};
+  }
+
+  if (command === "delete_scene") {
+    const sceneId = stringArg(args, "sceneId") || stringArg(args, "scene_id");
+    const index = demoScenes.findIndex((scene) => scene.id === sceneId);
+    if (index >= 0) {
+      const [removed] = demoScenes.splice(index, 1);
+      return structuredClone(removed);
     }
     return {};
   }
@@ -69,6 +129,39 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       channel.mix_buses[id] = { volume: 1, muted: false };
     }
     return mix;
+  }
+
+  if (command === "rename_mix") {
+    const mix = findMix(stringArg(args, "mixId"));
+    const name = stringArg(args, "name");
+    if (mix && name) mix.name = name;
+    return mix ?? {};
+  }
+
+  if (command === "move_mix") {
+    const mixId = stringArg(args, "mixId");
+    const direction = rawNumberArg(args, "direction", 0);
+    const index = demoState.config.mixes.findIndex((mix) => mix.id === mixId);
+    const target = offsetIndex(index, direction, demoState.config.mixes.length);
+    if (index >= 0 && target !== index) {
+      const [mix] = demoState.config.mixes.splice(index, 1);
+      demoState.config.mixes.splice(target, 0, mix);
+      return mix;
+    }
+    return findMix(mixId) ?? {};
+  }
+
+  if (command === "delete_mix") {
+    const mixId = stringArg(args, "mixId");
+    const index = demoState.config.mixes.findIndex((mix) => mix.id === mixId);
+    if (index >= 0 && demoState.config.mixes.length > 1) {
+      const [removed] = demoState.config.mixes.splice(index, 1);
+      for (const channel of demoState.config.channels) {
+        delete channel.mix_buses[mixId];
+      }
+      return removed;
+    }
+    return {};
   }
 
   if (command === "set_mix_volume") {
@@ -107,6 +200,7 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
           : "application",
       virtual_sink_name: `wavelinux_channel_${id}`,
       source_device: null,
+      input_mode: "stereo",
       linked: false,
       mix_buses: Object.fromEntries(
         demoState.config.mixes.map((mix) => [mix.id, { volume: 1, muted: false }]),
@@ -125,18 +219,41 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return channel ?? {};
   }
 
+  if (command === "move_channel") {
+    const channelId = stringArg(args, "channelId");
+    const direction = rawNumberArg(args, "direction", 0);
+    const index = demoState.config.channels.findIndex((channel) => channel.id === channelId);
+    const target = offsetIndex(index, direction, demoState.config.channels.length);
+    if (index >= 0 && target !== index) {
+      const [channel] = demoState.config.channels.splice(index, 1);
+      demoState.config.channels.splice(target, 0, channel);
+      return channel;
+    }
+    return findChannel(channelId) ?? {};
+  }
+
   if (command === "set_channel_linked") {
     const channel = findChannel(stringArg(args, "channelId"));
     if (channel) channel.linked = boolArg(args, "linked", channel.linked);
     return channel ?? {};
   }
 
-  if (command === "set_channel_input") {
+  if (command === "set_channel_input" || command === "set_hardware_input_device") {
     const channel = findChannel(stringArg(args, "channelId"));
     if (channel) {
       const sourceDevice = stringArg(args, "sourceDevice");
       channel.source_device = sourceDevice || null;
+      if (channel.id === "hardware_in") {
+        demoState.config.device_policy.preferred_input = channel.source_device;
+      }
     }
+    return channel ?? {};
+  }
+
+  if (command === "set_channel_input_mode") {
+    const channel = findChannel(stringArg(args, "channelId"));
+    const inputMode = stringArg(args, "inputMode") || stringArg(args, "input_mode");
+    if (channel && isChannelInputMode(inputMode)) channel.input_mode = inputMode;
     return channel ?? {};
   }
 
@@ -156,12 +273,45 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
   if (command === "set_settings") {
     if (args?.settings && typeof args.settings === "object") {
       demoState.config.settings = args.settings as AppStateSnapshot["config"]["settings"];
+      demoState.config.settings.keep_running_in_tray = true;
     }
     return demoState.config.settings;
   }
 
+  if (command === "repair_audio_graph") {
+    demoState.engine.audio_graph_running = true;
+    demoState.engine.message = "Audio graph running";
+    return { dry_run: true, planned: { commands: [], managed_nodes: [] }, outputs: [] };
+  }
+
   if (command === "cleanup_audio_graph") {
+    demoState.engine.audio_graph_running = false;
+    demoState.engine.message = "Audio graph stopped";
     return [];
+  }
+
+  if (command === "cleanup_stale_audio_graph") {
+    return [];
+  }
+
+  if (command === "restore_device") {
+    const kind = stringArg(args, "kind");
+    if (kind === "input") {
+      demoState.config.channels
+        .filter((channel) => channel.kind === "generic")
+        .forEach((channel) => {
+          channel.source_device = demoState.config.device_policy.restorable_input ?? "alsa_input.usb_interface";
+        });
+      demoState.config.device_policy.active_input_fallback = false;
+    }
+    if (kind === "output") {
+      const monitor = findMix("monitor");
+      if (monitor) {
+        monitor.monitor_output = demoState.config.device_policy.restorable_output ?? "alsa_output.usb";
+      }
+      demoState.config.device_policy.active_output_fallback = false;
+    }
+    return demoState.config;
   }
 
   if (command === "run_sound_check" || command === "run_diagnostics") {
@@ -172,7 +322,13 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       missing_effects: demoState.graph.effect_availability
         .filter((effect) => !effect.available)
         .map((effect) => effect.effect_id),
+      debug_log_path: "/home/dusky/.config/wavelinux/wavelinux-engine.log",
+      recent_log_lines: ["demo diagnostics run", "demo mode has no live engine log"],
     };
+  }
+
+  if (command === "get_graph_debug_report") {
+    return demoGraphDebugReport();
   }
 
   if (command === "set_channel_volume") {
@@ -215,28 +371,30 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
 
   if (command === "assign_app_to_channel") {
     const channelId = stringArg(args, "channelId");
-    const matcher = args?.matcher;
+    const matcher = args?.matcher as AppMatcher | undefined;
     if (channelId && matcher && typeof matcher === "object") {
+      const resolved = resolveDemoMatcher(matcher);
       demoState.config.app_routes = demoState.config.app_routes.filter(
-        (route) => JSON.stringify(route.matcher) !== JSON.stringify(matcher),
+        (route) => matcherKey(route.matcher) !== matcherKey(resolved),
       );
       demoState.config.app_routes.push({
         channel_id: channelId,
-        matcher: matcher as AppStateSnapshot["config"]["app_routes"][number]["matcher"],
+        matcher: resolved,
       });
     }
     return demoState.config.app_routes.at(-1) ?? {};
   }
 
   if (command === "remove_app_route") {
-    const matcher = args?.matcher;
+    const matcher = args?.matcher as AppMatcher | undefined;
     if (matcher && typeof matcher === "object") {
+      const key = matcherKey(resolveDemoMatcher(matcher));
       const before = demoState.config.app_routes.length;
       demoState.config.app_routes = demoState.config.app_routes.filter(
-        (route) => JSON.stringify(route.matcher) !== JSON.stringify(matcher),
+        (route) => matcherKey(route.matcher) !== key && matcherKey(route.matcher) !== matcherKey(matcher),
       );
       if (before !== demoState.config.app_routes.length) {
-        return { matcher: matcher as AppMatcher, channel_id: "" };
+        return { matcher, channel_id: "" };
       }
     }
     return null;
@@ -249,6 +407,133 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return {};
   }
 
+  if (command === "set_app_volume_preset") {
+    const matcher = args?.matcher as AppMatcher | undefined;
+    if (matcher && typeof matcher === "object") {
+      const resolved = resolveDemoMatcher(matcher);
+      const key = matcherKey(resolved);
+      demoState.config.app_volume_presets = demoState.config.app_volume_presets.filter(
+        (preset) => matcherKey(preset.matcher) !== key,
+      );
+      demoState.config.app_volume_presets.push({
+        matcher: resolved,
+        volume: numberArg(args, "volume", 1),
+      });
+      return demoState.config.app_volume_presets.at(-1) ?? {};
+    }
+    return {};
+  }
+
+  if (command === "remove_app_volume_preset") {
+    const matcher = args?.matcher as AppMatcher | undefined;
+    if (matcher && typeof matcher === "object") {
+      const key = matcherKey(resolveDemoMatcher(matcher));
+      const before = demoState.config.app_volume_presets.length;
+      demoState.config.app_volume_presets = demoState.config.app_volume_presets.filter(
+        (preset) => matcherKey(preset.matcher) !== key && matcherKey(preset.matcher) !== matcherKey(matcher),
+      );
+      if (before !== demoState.config.app_volume_presets.length) {
+        return { matcher, volume: 1 };
+      }
+    }
+    return null;
+  }
+
+  if (command === "forget_app") {
+    const matcher = args?.matcher as AppMatcher | undefined;
+    if (matcher && typeof matcher === "object") {
+      const key = matcherKey(resolveDemoMatcher(matcher));
+      const rawKey = matcherKey(matcher);
+      demoState.config.app_routes = demoState.config.app_routes.filter(
+        (route) => matcherKey(route.matcher) !== key && matcherKey(route.matcher) !== rawKey,
+      );
+      demoState.config.app_volume_presets = demoState.config.app_volume_presets.filter(
+        (preset) => matcherKey(preset.matcher) !== key && matcherKey(preset.matcher) !== rawKey,
+      );
+      const app = demoState.config.app_history.find((item) => matcherKey(item.matcher) === key || matcherKey(item.matcher) === rawKey);
+      if (app) {
+        app.forgotten = true;
+        return app;
+      }
+    }
+    return null;
+  }
+
+  if (command === "restore_app") {
+    const matcher = args?.matcher as AppMatcher | undefined;
+    if (matcher && typeof matcher === "object") {
+      const key = matcherKey(resolveDemoMatcher(matcher));
+      const rawKey = matcherKey(matcher);
+      const app = demoState.config.app_history.find((item) => matcherKey(item.matcher) === key || matcherKey(item.matcher) === rawKey);
+      if (app) {
+        app.forgotten = false;
+        return app;
+      }
+    }
+    return null;
+  }
+
+  if (command === "pin_app_identity") {
+    const matcher = args?.matcher as AppMatcher | undefined;
+    const label = stringArg(args, "label").trim();
+    if (matcher && typeof matcher === "object" && label) {
+      const resolved = resolveDemoMatcher(matcher);
+      demoState.config.app_label_overrides = demoState.config.app_label_overrides.filter(
+        (item) => matcherKey(item.matcher) !== matcherKey(resolved),
+      );
+      demoState.config.app_label_overrides.push({ matcher: resolved, label });
+      const app = upsertDemoKnownApp(resolved, label);
+      return structuredClone(app);
+    }
+    return {};
+  }
+
+  if (command === "merge_app_identity") {
+    const source = args?.source as AppMatcher | undefined;
+    const target = args?.target as AppMatcher | undefined;
+    if (source && target && typeof source === "object" && typeof target === "object") {
+      const resolvedTarget = resolveDemoMatcher(target);
+      demoState.config.app_identity_overrides = demoState.config.app_identity_overrides.filter(
+        (item) => matcherKey(item.source) !== matcherKey(source),
+      );
+      demoState.config.app_identity_overrides.push({ source, target: resolvedTarget });
+      for (const route of demoState.config.app_routes) {
+        if (matcherKey(route.matcher) === matcherKey(source)) route.matcher = resolvedTarget;
+      }
+      for (const preset of demoState.config.app_volume_presets) {
+        if (matcherKey(preset.matcher) === matcherKey(source)) preset.matcher = resolvedTarget;
+      }
+      const sourceApp = demoState.config.app_history.find((app) => matcherKey(app.matcher) === matcherKey(source));
+      if (sourceApp) sourceApp.forgotten = true;
+      const targetApp = upsertDemoKnownApp(
+        resolvedTarget,
+        findDemoKnownApp(resolvedTarget)?.display_name ?? matcherDisplayName(resolvedTarget),
+      );
+      return structuredClone(targetApp);
+    }
+    return {};
+  }
+
+  if (command === "reset_app_identity") {
+    const matcher = args?.matcher as AppMatcher | undefined;
+    if (matcher && typeof matcher === "object") {
+      const key = matcherKey(matcher);
+      demoState.config.app_identity_overrides = demoState.config.app_identity_overrides.filter(
+        (item) => matcherKey(item.source) !== key && matcherKey(item.target) !== key,
+      );
+      demoState.config.app_label_overrides = demoState.config.app_label_overrides.filter(
+        (item) => matcherKey(item.matcher) !== key,
+      );
+      const app = findDemoKnownApp(matcher);
+      if (app) {
+        app.display_name = matcherDisplayName(app.matcher);
+        app.forgotten = false;
+        return structuredClone(app);
+      }
+    }
+    return null;
+  }
+
   if (command === "set_app_stream_mute") {
     const streamId = stringArg(args, "streamId");
     const stream = demoState.graph.app_streams.find((item) => item.id === streamId);
@@ -259,7 +544,9 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
   if (command === "set_effect_chain") {
     const channel = findChannel(stringArg(args, "channelId"));
     if (channel && Array.isArray(args?.effects)) {
-      channel.effects = args.effects as EffectInstance[];
+      channel.effects = (args.effects as EffectInstance[])
+        .map(normalizeDemoEffect)
+        .filter((effect): effect is EffectInstance => Boolean(effect));
     }
     return channel ?? {};
   }
@@ -267,7 +554,12 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
   if (command === "set_effect_param") {
     const channel = findChannel(stringArg(args, "channelId"));
     const effect = channel?.effects.find((item) => item.instance_id === stringArg(args, "instanceId"));
-    if (effect) effect.params[stringArg(args, "paramId")] = rawNumberArg(args, "value", 0);
+    const paramId = stringArg(args, "paramId");
+    const definition = catalog.effects.find((item) => item.id === effect?.effect_id);
+    const param = definition?.params.find((item) => item.id === paramId);
+    if (effect && param) {
+      effect.params[paramId] = clampNumber(rawNumberArg(args, "value", param.default), param.min, param.max, param.default);
+    }
     return channel ?? {};
   }
 
@@ -293,6 +585,87 @@ function findChannel(channelId: string): Channel | undefined {
   return demoState.config.channels.find((channel) => channel.id === channelId);
 }
 
+function matcherKey(matcher: AppMatcher): string {
+  return [
+    matcher.app_id ? `app:${matcher.app_id.toLowerCase()}` : "",
+    matcher.process_name ? `process:${matcher.process_name.toLowerCase()}` : "",
+    matcher.binary ? `binary:${matcher.binary.toLowerCase()}` : "",
+    matcher.window_class ? `class:${matcher.window_class.toLowerCase()}` : "",
+    matcher.media_name ? `media:${matcher.media_name.toLowerCase()}` : "",
+  ]
+    .filter(Boolean)
+    .join("|");
+}
+
+function matcherDisplayName(matcher: AppMatcher): string {
+  return matcher.app_id ?? matcher.process_name ?? matcher.binary ?? matcher.window_class ?? matcher.media_name ?? "Unknown app";
+}
+
+function findDemoKnownApp(matcher: AppMatcher) {
+  const key = matcherKey(matcher);
+  return demoState.config.app_history.find((app) => matcherKey(app.matcher) === key);
+}
+
+function resolveDemoMatcher(matcher: AppMatcher): AppMatcher {
+  return demoState.config.app_identity_overrides.find((item) => matcherKey(item.source) === matcherKey(matcher))?.target ?? matcher;
+}
+
+function upsertDemoKnownApp(matcher: AppMatcher, displayName: string) {
+  const existing = findDemoKnownApp(matcher);
+  if (existing) {
+    existing.display_name = displayName;
+    existing.forgotten = false;
+    return existing;
+  }
+  const app = {
+    matcher,
+    display_name: displayName,
+    media_name: null,
+    last_seen_unix: Math.floor(Date.now() / 1000),
+    forgotten: false,
+  };
+  demoState.config.app_history.push(app);
+  return app;
+}
+
+function demoGraphDebugReport(): GraphDebugReport {
+  return {
+    dry_run: true,
+    audio_graph_running: demoState.engine.audio_graph_running,
+    planned: {
+      commands: demoState.engine.audio_graph_running
+        ? []
+        : [
+            {
+              domain: "device",
+              program: "pactl",
+              args: ["load-module", "module-null-sink", "sink_name=wavelinux_mix_stream"],
+              description: "create stream mix sink",
+            },
+          ],
+      managed_nodes: demoState.config.mixes.map((mix) => mix.virtual_sink_name),
+    },
+    managed_modules: demoState.engine.audio_graph_running
+      ? demoState.config.mixes.map((mix, index) => ({
+          module_id: String(100 + index),
+          role: "mix",
+          channel_id: null,
+          mix_id: mix.id,
+          node_name: mix.virtual_sink_name,
+          source_name: mix.virtual_source_name,
+          sink_name: mix.virtual_sink_name,
+        }))
+      : [],
+    sink_input_routes: [],
+    source_output_routes: [],
+    stale_processes: [],
+    graph: structuredClone(demoState.graph),
+    diagnostics: structuredClone(demoState.diagnostics),
+    debug_log_path: "/home/dusky/.config/wavelinux/wavelinux-engine.log",
+    recent_log_lines: ["demo graph report", "no live PipeWire graph in browser mode"],
+  };
+}
+
 function stringArg(args: Record<string, unknown> | undefined, key: string): string {
   const value = args?.[key];
   return typeof value === "string" ? value : "";
@@ -308,9 +681,18 @@ function rawNumberArg(args: Record<string, unknown> | undefined, key: string, fa
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function offsetIndex(index: number, direction: number, length: number): number {
+  if (index < 0 || length <= 0) return index;
+  return Math.max(0, Math.min(length - 1, index + Math.trunc(direction)));
+}
+
 function boolArg(args: Record<string, unknown> | undefined, key: string, fallback: boolean): boolean {
   const value = args?.[key];
   return typeof value === "boolean" ? value : fallback;
+}
+
+function isChannelInputMode(value: string): value is Channel["input_mode"] {
+  return ["stereo", "mono_left", "mono_right", "sum_mono", "swap_lr"].includes(value);
 }
 
 function slug(value: string): string {
@@ -347,6 +729,46 @@ const catalog: EffectCatalog = {
           default: 100,
           unit: " dB",
         },
+        {
+          id: "min_processing_threshold_db",
+          label: "Min Threshold",
+          min: -15,
+          max: 35,
+          default: -15,
+          unit: " dB",
+        },
+        {
+          id: "max_erb_processing_threshold_db",
+          label: "Max ERB Threshold",
+          min: -15,
+          max: 35,
+          default: 35,
+          unit: " dB",
+        },
+        {
+          id: "max_df_processing_threshold_db",
+          label: "Max DF Threshold",
+          min: -15,
+          max: 35,
+          default: 35,
+          unit: " dB",
+        },
+        {
+          id: "min_processing_buffer_frames",
+          label: "Min Buffer",
+          min: 0,
+          max: 10,
+          default: 0,
+          unit: " frames",
+        },
+        {
+          id: "post_filter_beta",
+          label: "Post Filter Beta",
+          min: 0,
+          max: 0.05,
+          default: 0,
+          unit: "",
+        },
       ],
       presets: [
         { name: "Natural 12 dB", values: { attenuation_limit_db: 12 } },
@@ -360,9 +782,9 @@ const catalog: EffectCatalog = {
       description: "RNNoise speech cleanup",
       plugin_hint: {},
       params: [
-        { id: "vad_threshold", label: "VAD Threshold", min: 0, max: 100, default: 50, unit: "%" },
-        { id: "hold_ms", label: "Hold Open", min: 0, max: 2000, default: 200, unit: " ms" },
-        { id: "lead_in_ms", label: "Lead-In", min: 0, max: 500, default: 0, unit: " ms" },
+        { id: "vad_threshold", label: "VAD Threshold", min: 0, max: 99, default: 50, unit: "%" },
+        { id: "hold_ms", label: "Hold Open", min: 0, max: 1000, default: 200, unit: " ms" },
+        { id: "lead_in_ms", label: "Lead-In", min: 0, max: 200, default: 0, unit: " ms" },
       ],
       presets: [
         { name: "Gentle", values: { vad_threshold: 25, hold_ms: 250, lead_in_ms: 0 } },
@@ -437,10 +859,10 @@ const catalog: EffectCatalog = {
       description: "Dynamic range control",
       plugin_hint: {},
       params: [
-        { id: "threshold_db", label: "Threshold", min: -60, max: 0, default: -20, unit: " dB" },
+        { id: "threshold_db", label: "Threshold", min: -30, max: 0, default: -20, unit: " dB" },
         { id: "ratio", label: "Ratio", min: 1, max: 20, default: 4, unit: ":1" },
-        { id: "attack_ms", label: "Attack", min: 0.1, max: 200, default: 5, unit: " ms" },
-        { id: "release_ms", label: "Release", min: 5, max: 1000, default: 100, unit: " ms" },
+        { id: "attack_ms", label: "Attack", min: 1.5, max: 200, default: 5, unit: " ms" },
+        { id: "release_ms", label: "Release", min: 5, max: 800, default: 100, unit: " ms" },
         { id: "makeup_gain_db", label: "Makeup", min: 0, max: 24, default: 0, unit: " dB" },
       ],
       presets: [
@@ -503,9 +925,178 @@ const catalog: EffectCatalog = {
   ],
 };
 
+function normalizeDemoEffect(effect: EffectInstance): EffectInstance | null {
+  const effectId = String(effect.effect_id ?? "").trim();
+  const definition = catalog.effects.find((item) => item.id === effectId);
+  if (!definition) return null;
+  const params = Object.fromEntries(
+    definition.params.map((param) => [
+      param.id,
+      clampNumber(effect.params?.[param.id], param.min, param.max, param.default),
+    ]),
+  );
+  const name = typeof effect.name === "string" ? effect.name.trim() : "";
+  const instanceId =
+    typeof effect.instance_id === "string" && effect.instance_id.trim()
+      ? effect.instance_id.trim()
+      : crypto.randomUUID();
+  return {
+    ...effect,
+    instance_id: instanceId,
+    effect_id: definition.id,
+    name: name || null,
+    bypassed: Boolean(effect.bypassed),
+    params,
+  };
+}
+
+function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(min, Math.min(max, value))
+    : fallback;
+}
+
+const demoSetupTemplates: SetupTemplate[] = [
+  {
+    id: "streaming",
+    name: "Streaming",
+    description: "Monitor and Stream with mic, game, chat, music, browser, and SFX routing.",
+    details: ["Monitor and Stream mixes", "Broadcast mic FX", "Common app routes", "Offline volume presets"],
+  },
+  {
+    id: "microphonefx",
+    name: "MicrophoneFX / Discord",
+    description: "Adds a dedicated virtual mic mix for calls, games, and Discord.",
+    details: ["MicrophoneFX virtual source", "Mic plus SFX/music", "Call-safe routing", "Speech cleanup FX"],
+  },
+  {
+    id: "discord_mix",
+    name: "Discord Mix",
+    description: "One-click virtual mic mix for Discord with mic, SFX, music bed, and chat-safe levels.",
+    details: ["Discord Mix virtual source", "Mic plus SFX/music", "System muted from mic", "Speech cleanup FX"],
+  },
+  {
+    id: "podcast",
+    name: "Podcast",
+    description: "Recording layout for guests, browser audio, music beds, and soundboard cues.",
+    details: ["Podcast and Guest Mix", "Guest channel", "Lower music bed", "Voice processing"],
+  },
+  {
+    id: "work_call",
+    name: "Work Call",
+    description: "Clean meeting setup with a Call Mix and low-noise microphone chain.",
+    details: ["Call Mix virtual source", "Chat/browser routing", "Music muted from calls", "Speech-first FX"],
+  },
+];
+
+function applyDemoSetupTemplate(templateId: string) {
+  const baseMixes = [
+    {
+      id: "monitor",
+      name: "Monitor",
+      virtual_sink_name: "wavelinux_mix_monitor",
+      virtual_source_name: "wavelinux_mix_monitor_source",
+      monitor_output: "alsa_output.usb",
+      volume: 0.86,
+      muted: false,
+    },
+    {
+      id: "stream",
+      name: "Stream",
+      virtual_sink_name: "wavelinux_mix_stream",
+      virtual_source_name: "wavelinux_mix_stream_source",
+      monitor_output: null,
+      volume: 1,
+      muted: false,
+    },
+  ];
+  const extraMix =
+    templateId === "microphonefx"
+      ? [{ id: "microphonefx", name: "MicrophoneFX" }]
+      : templateId === "discord_mix"
+        ? [{ id: "discord_mix", name: "Discord Mix" }]
+      : templateId === "podcast"
+        ? [{ id: "podcast", name: "Podcast" }, { id: "guest_mix", name: "Guest Mix" }]
+        : templateId === "work_call"
+          ? [{ id: "call_mix", name: "Call Mix" }]
+          : [];
+  demoState.config.mixes = [
+    ...baseMixes,
+    ...extraMix.map((mix) => {
+      const id = slug(mix.id);
+      return {
+        id,
+        name: mix.name,
+        virtual_sink_name: `wavelinux_mix_${id}`,
+        virtual_source_name: `wavelinux_mix_${id}_source`,
+        monitor_output: null,
+        volume: 1,
+        muted: false,
+      };
+    }),
+  ];
+  const channels = templateId === "podcast"
+    ? ["Hardware In", "Guest", "Browser", "Music", "SFX", "System"]
+    : templateId === "work_call"
+      ? ["Hardware In", "Chat", "Browser", "System", "Music"]
+      : templateId === "microphonefx" || templateId === "discord_mix"
+        ? ["Hardware In", "System", "Chat", "Music", "SFX", "Browser"]
+        : ["Hardware In", "System", "Game", "Chat", "Music", "Browser", "SFX"];
+  demoState.config.channels = channels.map((name, index) => {
+    const id = slug(name);
+    const effects: EffectInstance[] =
+      index === 0
+        ? [
+            { instance_id: "demo-deepfilter", effect_id: "deepfilternet", name: null, bypassed: false, params: { attenuation_limit_db: 24 } },
+            { instance_id: "demo-compressor", effect_id: "compressor", name: null, bypassed: false, params: {} },
+            { instance_id: "demo-limiter", effect_id: "limiter", name: null, bypassed: false, params: {} },
+          ]
+        : [];
+    return {
+      id,
+      name,
+      kind: index === 0 ? "generic" : id === "system" ? "system" : id === "sfx" ? "soundboard" : "application",
+      virtual_sink_name: `wavelinux_channel_${id}`,
+      source_device: index === 0 ? "alsa_input.usb_interface" : null,
+      input_mode: "stereo",
+      linked: false,
+      mix_buses: Object.fromEntries(
+        demoState.config.mixes.map((mix) => [mix.id, { volume: 0.8, muted: false }]),
+      ),
+      app_matchers: [],
+      effects,
+    } satisfies Channel;
+  });
+  demoState.config.app_routes = [
+    { matcher: { app_id: "discord", binary: null, process_name: null, window_class: null }, channel_id: demoState.config.channels.some((channel) => channel.id === "guest") ? "guest" : "chat" },
+    { matcher: { app_id: "spotify", binary: null, process_name: null, window_class: null }, channel_id: "music" },
+    { matcher: { app_id: "firefox", binary: null, process_name: null, window_class: null }, channel_id: "browser" },
+  ].filter((route) => demoState.config.channels.some((channel) => channel.id === route.channel_id));
+  demoState.config.app_volume_presets = [
+    { matcher: { app_id: "discord", binary: null, process_name: null, window_class: null }, volume: 0.82 },
+    { matcher: { app_id: "spotify", binary: null, process_name: null, window_class: null }, volume: 0.62 },
+    { matcher: { app_id: "firefox", binary: null, process_name: null, window_class: null }, volume: 0.78 },
+  ];
+  demoState.config.app_history = [
+    { matcher: { app_id: "discord", binary: null, process_name: null, window_class: null }, display_name: "Discord", media_name: "Voice", last_seen_unix: Math.floor(Date.now() / 1000), forgotten: false },
+    { matcher: { app_id: "spotify", binary: null, process_name: null, window_class: null }, display_name: "Spotify", media_name: "Playback", last_seen_unix: Math.floor(Date.now() / 1000) - 1800, forgotten: false },
+    { matcher: { app_id: "firefox", binary: null, process_name: null, window_class: null }, display_name: "Firefox", media_name: "YouTube", last_seen_unix: Math.floor(Date.now() / 1000) - 360, forgotten: false },
+  ];
+  demoState.config.app_identity_overrides = [];
+  demoState.config.app_label_overrides = [];
+  demoState.config.device_policy = {
+    preferred_input: "alsa_input.usb_interface",
+    preferred_output: "alsa_output.usb",
+    restorable_input: null,
+    restorable_output: null,
+    active_input_fallback: false,
+    active_output_fallback: false,
+  };
+}
+
 export const demoState: AppStateSnapshot = {
   config: {
-    version: 1,
+    version: 4,
     audio: {
       sample_rate_hz: 48000,
       bit_depth: 24,
@@ -515,6 +1106,9 @@ export const demoState: AppStateSnapshot = {
     settings: {
       theme: "system",
       start_at_login: false,
+      keep_running_in_tray: true,
+      restore_audio_graph_on_launch: false,
+      monitor_follows_default_output: true,
       lock_default_input: false,
       lock_default_output: false,
       auto_check_updates: true,
@@ -543,21 +1137,22 @@ export const demoState: AppStateSnapshot = {
       {
         id: "discord_mix",
         name: "Discord Mix",
-        virtual_sink_name: "wavelinux_mix_discord",
-        virtual_source_name: "wavelinux_mix_discord_source",
+        virtual_sink_name: "wavelinux_mix_discord_mix",
+        virtual_source_name: "wavelinux_mix_discord_mix_source",
         monitor_output: null,
         volume: 1,
         muted: false,
       },
     ],
-    channels: ["Hardware In", "Game", "Chat", "Music", "Browser", "SFX"].map((name, index) => {
+    channels: ["Hardware In", "System", "Game", "Chat", "Music", "Browser", "SFX"].map((name, index) => {
       const id = slug(name);
       return {
         id,
         name,
-        kind: index === 0 ? "generic" : index === 5 ? "soundboard" : "application",
+        kind: index === 0 ? "generic" : id === "system" ? "system" : id === "sfx" ? "soundboard" : "application",
         virtual_sink_name: `wavelinux_channel_${id}`,
         source_device: index === 0 ? "alsa_input.usb_interface" : null,
+        input_mode: "stereo",
         linked: false,
         mix_buses: {
           monitor: { volume: index === 0 ? 0.82 : 0.76, muted: false },
@@ -575,6 +1170,26 @@ export const demoState: AppStateSnapshot = {
       } satisfies Channel;
     }),
     app_routes: [],
+    app_volume_presets: [
+      { matcher: { app_id: "discord", binary: null, process_name: null, window_class: null }, volume: 0.82 },
+      { matcher: { app_id: "spotify", binary: null, process_name: null, window_class: null }, volume: 0.66 },
+      { matcher: { app_id: "firefox", binary: null, process_name: null, window_class: null }, volume: 0.76 },
+    ],
+    app_history: [
+      { matcher: { app_id: "discord", binary: null, process_name: null, window_class: null }, display_name: "Discord", media_name: "Voice", last_seen_unix: Math.floor(Date.now() / 1000), forgotten: false },
+      { matcher: { app_id: "spotify", binary: null, process_name: null, window_class: null }, display_name: "Spotify", media_name: "Playback", last_seen_unix: Math.floor(Date.now() / 1000) - 1800, forgotten: false },
+      { matcher: { app_id: "firefox", binary: null, process_name: null, window_class: null }, display_name: "Firefox", media_name: "YouTube", last_seen_unix: Math.floor(Date.now() / 1000) - 360, forgotten: false },
+    ],
+    app_identity_overrides: [],
+    app_label_overrides: [],
+    device_policy: {
+      preferred_input: "alsa_input.usb_interface",
+      preferred_output: "alsa_output.usb",
+      restorable_input: null,
+      restorable_output: null,
+      active_input_fallback: false,
+      active_output_fallback: false,
+    },
   },
   graph: {
     inputs: [
@@ -588,9 +1203,9 @@ export const demoState: AppStateSnapshot = {
       { id: "bluez_output.headset", name: "bluez_output.headset", description: "Bluetooth Headset", is_default: false, is_virtual: false },
     ],
     app_streams: [
-      { id: "42", app_id: "firefox", process_name: "firefox", display_name: "Firefox", media_name: "YouTube", routed_channel_id: "browser", volume: 0.76, muted: false },
-      { id: "77", app_id: "discord", process_name: "Discord", display_name: "Discord", media_name: "Voice", routed_channel_id: "chat", volume: 0.86, muted: false },
-      { id: "81", app_id: "spotify", process_name: "spotify", display_name: "Spotify", media_name: "Playback", routed_channel_id: "music", volume: 0.66, muted: false },
+      { id: "42", app_id: "firefox", binary: "firefox", process_name: "firefox", window_class: "firefox", display_name: "Firefox", media_name: "YouTube", routed_channel_id: "browser", volume: 0.76, muted: false },
+      { id: "77", app_id: "discord", binary: "Discord", process_name: "Discord", window_class: "discord", display_name: "Discord", media_name: "Voice", routed_channel_id: "chat", volume: 0.86, muted: false },
+      { id: "81", app_id: "spotify", binary: "spotify", process_name: "spotify", window_class: "spotify", display_name: "Spotify", media_name: "Playback", routed_channel_id: "music", volume: 0.66, muted: false },
     ],
     meters: [],
     effect_availability: catalog.effects.map((effect) => ({
@@ -606,6 +1221,12 @@ export const demoState: AppStateSnapshot = {
     { code: "host_command.pipewire", severity: "info", message: "pipewire is available", action: null },
     { code: "plugin.deepfilternet", severity: "info", message: "DeepFilterNet LADSPA detected", action: null },
   ],
-  engine: { dry_run: true, healthy: true, message: "Demo mode", last_refresh_unix: 0 },
+  engine: {
+    dry_run: true,
+    healthy: true,
+    audio_graph_running: false,
+    message: "Demo mode",
+    last_refresh_unix: 0,
+  },
   catalog,
 };
