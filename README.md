@@ -1,4 +1,5 @@
 # WaveLinux 4.0
+<img width="1895" height="1108" alt="image" src="https://github.com/user-attachments/assets/22b52de8-d97d-4664-9772-c1c358122144" />
 
 WaveLinux 4.0 is a Linux-first creator audio mixer built with Rust, Tauri,
 React, TypeScript, and PipeWire. It is a fresh application that carries the
@@ -34,7 +35,7 @@ Linux audio hardware is the target.
 - AppImage, deb, rpm, and AUR packaging
 - Signed in-app update checks for AppImage installs
 
-## Supported Platform
+## Supported Platforms
 
 WaveLinux 4.0 targets PipeWire-based Linux desktops.
 
