@@ -1,0 +1,48 @@
+{
+  "id": "apple.airpods-pro",
+  "name": "Apple AirPods Pro",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "bluetooth",
+      "node_name_contains": ["bluez"],
+      "description_contains": ["airpods pro"]
+    },
+    {
+      "bus": "bluetooth",
+      "description_contains": ["airpods"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "bluetooth_a2dp": true,
+    "bluetooth_hfp": true,
+    "duplex_a2dp": false,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 90,
+    "bluetooth_floor_msec": 90
+  },
+  "routing_policy": {
+    "output_priority": 62,
+    "allow_auto_select_input": false,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {
+    "preferred_a2dp_codecs": ["aac", "sbc_xq", "sbc"],
+    "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"]
+  },
+  "confidence": "medium",
+  "quirks": [
+    "On Linux, using the headset microphone should be treated as call-mode fallback, not an optimized music playback state."
+  ],
+  "source_notes": [
+    "Seeded from common AirPods Linux behavior and Bluetooth A2DP/HFP profile limits."
+  ],
+  "maintainer": "WaveLinux"
+}

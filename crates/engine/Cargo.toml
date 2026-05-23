@@ -8,7 +8,9 @@ authors.workspace = true
 
 [dependencies]
 directories.workspace = true
+minisign-verify = "0.2"
 pipewire = { version = "0.9", features = ["v0_3_44"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -18,4 +20,5 @@ wavelinux-model = { path = "../model" }
 wavelinux-pw = { path = "../pw" }
 
 [dev-dependencies]
+include_dir.workspace = true
 tempfile.workspace = true

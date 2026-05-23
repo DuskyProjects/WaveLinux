@@ -1,0 +1,43 @@
+{
+  "id": "focusrite.vocaster-two",
+  "name": "Focusrite Vocaster Two",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["vocaster", "two"]
+    },
+    {
+      "bus": "usb",
+      "node_name_contains": ["vocaster"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 25,
+    "low_latency_msec": 12
+  },
+  "routing_policy": {
+    "input_priority": 84,
+    "output_priority": 60,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Podcast interfaces often expose loopback mixes; do not mistake loopback channels for physical microphones."
+  ],
+  "source_notes": [
+    "Seeded from common Vocaster creator-interface behavior and published 48 kHz podcast workflow."
+  ],
+  "maintainer": "WaveLinux"
+}

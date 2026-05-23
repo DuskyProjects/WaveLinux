@@ -115,6 +115,55 @@ export interface DevicePolicy {
   restorable_output?: string | null;
   active_input_fallback: boolean;
   active_output_fallback: boolean;
+  hardware_profile_assignments: Record<string, string>;
+  fallback_hardware_profile: FallbackHardwareProfile;
+}
+
+export type DeviceBus = "usb" | "bluetooth" | "pci" | "platform" | "virtual" | "unknown";
+export type ProfileConfidence = "low" | "medium" | "high";
+export type BluetoothMicPolicy =
+  | "never_if_hfp"
+  | "allow_explicit_call_mode"
+  | "allow_duplex_a2dp_if_supported"
+  | "advisory_only";
+
+export interface LatencyPolicy {
+  stable_msec?: number | null;
+  low_latency_msec?: number | null;
+  bluetooth_floor_msec?: number | null;
+}
+
+export interface RoutingPolicy {
+  input_priority?: number | null;
+  output_priority?: number | null;
+  allow_auto_select_input: boolean;
+  allow_auto_select_output: boolean;
+  prefer_non_bluetooth_input: boolean;
+}
+
+export interface FallbackHardwareProfile {
+  id: string;
+  name: string;
+  latency_policy: LatencyPolicy;
+  routing_policy: RoutingPolicy;
+  bluetooth_mic_policy: BluetoothMicPolicy;
+  confidence: ProfileConfidence;
+}
+
+export interface HardwareProfileSummary {
+  id: string;
+  name: string;
+  source: string;
+  confidence: ProfileConfidence;
+  latency_policy: LatencyPolicy;
+  routing_policy: RoutingPolicy;
+  bluetooth_mic_policy: BluetoothMicPolicy;
+}
+
+export interface HardwareProfileUiState {
+  profiles: HardwareProfileSummary[];
+  assignments: Record<string, string>;
+  fallback_profile: FallbackHardwareProfile;
 }
 
 export interface MixerConfig {
@@ -139,6 +188,22 @@ export interface DeviceInfo {
   is_available: boolean;
   is_default: boolean;
   is_virtual: boolean;
+  bus?: DeviceBus | null;
+  vendor_id?: string | null;
+  product_id?: string | null;
+  alsa_card?: string | null;
+  alsa_device?: string | null;
+  driver?: string | null;
+  bluetooth_modalias?: string | null;
+  active_profile?: string | null;
+  active_codec?: string | null;
+  pipewire_properties?: Record<string, string>;
+  matched_profile_id?: string | null;
+  matched_profile_source?: string | null;
+  profile_confidence?: ProfileConfidence | null;
+  active_latency_policy?: LatencyPolicy | null;
+  active_routing_policy?: RoutingPolicy | null;
+  active_bluetooth_mic_policy?: BluetoothMicPolicy | null;
 }
 
 export interface AppStream {

@@ -1,0 +1,42 @@
+{
+  "id": "blue.snowball",
+  "name": "Blue Snowball USB Microphone",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["blue", "snowball"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["snowball", "microphone"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": false,
+    "duplex": false,
+    "usb_audio_class": true,
+    "sample_rates_hz": [44100, 48000]
+  },
+  "latency_policy": {
+    "stable_msec": 32,
+    "low_latency_msec": 18
+  },
+  "routing_policy": {
+    "input_priority": 75,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Older USB microphones should use a slightly more conservative buffer than modern interfaces."
+  ],
+  "source_notes": [
+    "Seeded from common Blue Snowball USB microphone behavior."
+  ],
+  "maintainer": "WaveLinux"
+}

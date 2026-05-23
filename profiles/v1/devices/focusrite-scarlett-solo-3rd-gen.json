@@ -1,0 +1,43 @@
+{
+  "id": "focusrite.scarlett-solo-3rd-gen",
+  "name": "Focusrite Scarlett Solo 3rd Gen",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["scarlett", "solo"]
+    },
+    {
+      "bus": "usb",
+      "node_name_contains": ["scarlett", "solo"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [44100, 48000, 88200, 96000, 176400, 192000]
+  },
+  "latency_policy": {
+    "stable_msec": 20,
+    "low_latency_msec": 8
+  },
+  "routing_policy": {
+    "input_priority": 82,
+    "output_priority": 62,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Prefer 48 kHz for desktop and app compatibility; higher rates are available for DAW-style work when the PipeWire graph supports them."
+  ],
+  "source_notes": [
+    "Focusrite Scarlett 3rd Gen documentation lists supported sample rates through 192 kHz."
+  ],
+  "maintainer": "WaveLinux"
+}

@@ -1,0 +1,43 @@
+{
+  "id": "rode.nt-usb-plus",
+  "name": "RODE NT-USB+",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["nt-usb+"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["rode", "nt-usb"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 25,
+    "low_latency_msec": 12
+  },
+  "routing_policy": {
+    "input_priority": 86,
+    "output_priority": 22,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "48 kHz capture should be treated as the stable maximum for automatic desktop use."
+  ],
+  "source_notes": [
+    "RODE NT-USB+ published specifications and reviews describe 24-bit/48 kHz USB operation."
+  ],
+  "maintainer": "WaveLinux"
+}

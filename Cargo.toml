@@ -16,9 +16,16 @@ authors = ["WaveLinux contributors"]
 [workspace.dependencies]
 anyhow = "1"
 directories = "6"
+include_dir = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "macros", "serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

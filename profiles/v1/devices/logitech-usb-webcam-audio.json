@@ -1,0 +1,50 @@
+{
+  "id": "logitech.usb-webcam-audio",
+  "name": "Logitech USB Webcam Audio",
+  "revision": 2,
+  "matches": [
+    {
+      "bus": "usb",
+      "vendor_id": "046d",
+      "description_contains": ["logitech", "webcam"]
+    },
+    {
+      "bus": "usb",
+      "vendor_id": "046d",
+      "description_contains": ["logitech", "microphone"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["webcam", "microphone"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": false,
+    "duplex": false,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000, 44100]
+  },
+  "latency_policy": {
+    "stable_msec": 25,
+    "low_latency_msec": 12
+  },
+  "routing_policy": {
+    "input_priority": 60,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Webcam microphones are acceptable fallbacks when they keep Bluetooth headphones on A2DP, but dedicated USB microphones should rank higher.",
+    "Do not match generic Logitech receivers or mice; this profile requires webcam or microphone identity text."
+  ],
+  "source_notes": [
+    "Seeded as a common UVC/UAC webcam audio endpoint profile.",
+    "Local USB inventory includes Logitech devices that are not audio endpoints, so matching is intentionally narrow."
+  ],
+  "maintainer": "WaveLinux"
+}

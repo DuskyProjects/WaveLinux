@@ -1,0 +1,43 @@
+{
+  "id": "blue.yeti",
+  "name": "Blue Yeti USB Microphone",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["blue", "yeti"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["yeti", "microphone"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 28,
+    "low_latency_msec": 14
+  },
+  "routing_policy": {
+    "input_priority": 82,
+    "output_priority": 22,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Many Yeti endpoints expose a stereo capture path for a mono capsule mode; preserve channel layout reported by ALSA/PipeWire."
+  ],
+  "source_notes": [
+    "Seeded from common Blue Yeti USB Audio Class microphone behavior and creator Linux reports."
+  ],
+  "maintainer": "WaveLinux"
+}

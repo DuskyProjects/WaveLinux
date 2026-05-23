@@ -1,0 +1,44 @@
+{
+  "id": "audient.id4-mkii",
+  "name": "Audient iD4 MKII",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["audient", "id4"]
+    },
+    {
+      "bus": "usb",
+      "node_name_contains": ["audient", "id4"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "channels": 2,
+    "sample_rates_hz": [44100, 48000, 88200, 96000]
+  },
+  "latency_policy": {
+    "stable_msec": 22,
+    "low_latency_msec": 10
+  },
+  "routing_policy": {
+    "input_priority": 85,
+    "output_priority": 65,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "high",
+  "quirks": [
+    "USB bus power quality affects headphone output headroom; avoid aggressive latency immediately after hotplug."
+  ],
+  "source_notes": [
+    "Audient iD4 MKII specifications list 2 input and 2 output channels and documented DSP mixer latency at 44.1 through 96 kHz."
+  ],
+  "maintainer": "WaveLinux"
+}

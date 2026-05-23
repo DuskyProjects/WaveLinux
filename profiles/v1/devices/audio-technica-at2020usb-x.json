@@ -1,0 +1,43 @@
+{
+  "id": "audio-technica.at2020usb-x",
+  "name": "Audio-Technica AT2020USB-X",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["at2020usb"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["audio-technica", "2020"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000, 96000]
+  },
+  "latency_policy": {
+    "stable_msec": 25,
+    "low_latency_msec": 12
+  },
+  "routing_policy": {
+    "input_priority": 84,
+    "output_priority": 22,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Keep headphone output monitor-capable but not default playback unless explicitly selected."
+  ],
+  "source_notes": [
+    "Seeded from common AT2020USB-X USB microphone behavior and published 24-bit/96 kHz positioning."
+  ],
+  "maintainer": "WaveLinux"
+}

@@ -1,0 +1,44 @@
+{
+  "id": "presonus.audiobox-usb96",
+  "name": "PreSonus AudioBox USB 96",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["audiobox", "usb 96"]
+    },
+    {
+      "bus": "usb",
+      "node_name_contains": ["audiobox", "usb96"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "channels": 2,
+    "sample_rates_hz": [44100, 48000, 88200, 96000]
+  },
+  "latency_policy": {
+    "stable_msec": 25,
+    "low_latency_msec": 12
+  },
+  "routing_policy": {
+    "input_priority": 78,
+    "output_priority": 58,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Treat as a stable USB interface, but avoid assuming 192 kHz support on the USB 96 model."
+  ],
+  "source_notes": [
+    "Seeded from common AudioBox USB 96 published 96 kHz capability and USB interface behavior."
+  ],
+  "maintainer": "WaveLinux"
+}

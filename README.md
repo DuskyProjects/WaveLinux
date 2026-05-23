@@ -1,6 +1,8 @@
-# WaveLinux 4.0
+# WaveLinux 4.1
+<!-- Keep this screenshot in the README as the permanent project preview. -->
+<img width="1895" height="1108" alt="image" src="https://github.com/user-attachments/assets/22b52de8-d97d-4664-9772-c1c358122144" />
 
-WaveLinux 4.0 is a Linux-first creator audio mixer built with Rust, Tauri,
+WaveLinux 4.1 is a Linux-first creator audio mixer built with Rust, Tauri,
 React, TypeScript, and PipeWire. It is a fresh application that carries the
 WaveLinux name forward while replacing the old Python implementation with a
 new native desktop stack.
@@ -11,8 +13,44 @@ diagnostics, tray behavior, package builds, and open-source DSP replacements.
 
 WaveLinux is not an Elgato hardware control panel. Vendor-specific microphone
 features, Stream Deck integration, proprietary marketplace effects, and
-hardware Clipguard behavior are intentionally out of scope for 4.0. Standard
-Linux audio hardware is the target.
+hardware Clipguard behavior are intentionally out of scope for WaveLinux.
+Standard Linux audio hardware is the target.
+
+## WaveLinux 4.1 Release Notes
+
+WaveLinux 4.1 is the background optimization and hardware profile release. It
+adds safe audio-only hardware profiles, Bluetooth headset protection, searchable
+profile assignment, lower-lag mixer controls, better metering, and release
+packaging updates without changing the mixer-first workflow.
+
+Highlights:
+
+- Hardware profiles are now individual JSON device files under `profiles/v1`
+  with schema docs, examples, local overrides, signed remote bundle support,
+  install-time hardware prewarm, and an editable safe generic fallback profile.
+- Profiles stay audio-only and cannot execute commands, write host config, or
+  bypass Bluetooth/profile guardrails.
+- Bluetooth headset policy protects A2DP playback. HFP/HSP microphones are
+  refused as an optimization when they would destroy playback quality, and
+  capture is routed to DJI, USB, internal, or other non-Bluetooth microphones
+  when available.
+- The Settings page now contains Profiles and Health tabs, while the main mixer
+  navigation stays focused on mixing, routing, effects, scenes, and settings.
+- Profile and route selectors are searchable, anchored to their controls, and
+  sized for readable hardware/profile names.
+- Mixer commands use optimistic UI updates and coalesced backend refreshes so
+  faders, toggles, and low-latency settings no longer freeze the app while audio
+  commands run.
+- Hardware input meters now show the real selected microphone before effects,
+  then the microphone-only post-FX signal when effects are active.
+- Channel Stream/Monitor meters now follow the effective channel-send and
+  destination mix/master level, so source strip VUs and mix VUs agree.
+- The effects microphone export is named `wavelinux-mic` / `WaveLinux-mic` so
+  Discord, OBS, and browser capture menus are easier to understand.
+- Startup repair resets real non-Bluetooth microphone sources to 100% and
+  unmuted, while ignoring WaveLinux virtual/monitor sources.
+- Release, local-native, AUR, and profile asset scripts were updated for the
+  new profile system and 4.1 packaging.
 
 ## Features
 
@@ -25,6 +63,10 @@ Linux audio hardware is the target.
 - Automatic monitor output policy: Bluetooth, USB audio, jack, then speakers
 - Automatic microphone policy: USB mic, microphone jack, built-in mic, then Bluetooth input
 - Bluetooth A2DP profile protection when possible
+- Hardware profile matching for common USB, Bluetooth, PCI, and platform audio endpoints
+- Editable safe generic default profile plus per-device manual profile assignment
+- Local profile overrides that survive app updates without executable hooks
+- Signed remote hardware profile downloads from GitHub Releases
 - Hotplug recovery for inputs and outputs
 - Real channel/mix metering with stale-sample decay
 - Per-source effect chains through PipeWire filter-chain and LADSPA/open plugins
@@ -34,9 +76,9 @@ Linux audio hardware is the target.
 - AppImage, deb, rpm, and AUR packaging
 - Signed in-app update checks for AppImage installs
 
-## Supported Platform
+## Supported Platforms
 
-WaveLinux 4.0 targets PipeWire-based Linux desktops.
+WaveLinux 4.1 targets PipeWire-based Linux desktops.
 
 Required host services and tools:
 
@@ -80,11 +122,21 @@ yarn install:local
 The local installer places the AppImage and launcher here:
 
 ```bash
-~/.local/share/wavelinux/WaveLinux_4.0.0_amd64.AppImage
+~/.local/share/wavelinux/WaveLinux_4.1.0_amd64.AppImage
 ~/.local/bin/wavelinux
 ```
 
 It also installs the desktop entry and icons under the usual XDG user paths.
+By default, local development installs seed the checkout's audio hardware
+profiles into:
+
+```bash
+~/.config/wavelinux/hardware-profiles/v1/local/wavelinux-local-seed
+```
+
+The installer also runs a hardware profile prewarm check so WaveLinux can fetch
+signed remote profile bundles for detected audio devices when release assets
+are available.
 
 ## Dependency Checks
 
@@ -122,6 +174,43 @@ yarn install:alsa-aliases
 
 This is opt-in and uses a marked block in `~/.asoundrc` so uninstall can remove
 only WaveLinux-owned aliases.
+
+## Hardware Profiles
+
+WaveLinux uses background hardware profiles to choose safer default routing,
+latency, codec, and Bluetooth microphone behavior without requiring new mixer
+controls. Profiles are data-only JSON files; they cannot run commands, write
+host audio configuration, or bypass hard safety guardrails.
+
+Profile resolution prefers the safest local data first:
+
+- Local user profiles in `~/.config/wavelinux/hardware-profiles/v1/local`
+- Signed remote profiles cached from GitHub Releases
+- The editable safe generic default profile, `default.generic-audio`
+
+The Settings page includes Profiles under its tab bar. It lists real hardware
+audio devices only, lets you assign a profile to a device, and edits the
+currently selected profile in the side editor. Editing a downloaded or seeded
+profile creates a safe local override under:
+
+```bash
+~/.config/wavelinux/hardware-profiles/v1/local/wavelinux-user-overrides
+```
+
+Unknown devices fall back to `default.generic-audio`. That profile is intended
+to be conservative enough for nearly any audio endpoint and can be edited from
+the same Profiles view.
+
+Bluetooth headset profiles protect playback quality. If a headset microphone
+would force HFP/HSP and degrade A2DP playback, WaveLinux keeps the headset on
+A2DP and routes capture to a non-Bluetooth microphone when one is available.
+HFP/HSP remains a compatibility fallback, not a performance optimization.
+
+Profile authoring files live in `profiles/v1`:
+
+- `profiles/v1/schema.json`
+- `profiles/v1/examples`
+- `profiles/v1/README.md`
 
 ## Daily Use
 
@@ -222,10 +311,10 @@ Generate updater metadata:
 
 ```bash
 python3 scripts/build-updater-manifest.py \
-  --artifact target/release/bundle/appimage/WaveLinux_4.0.0_amd64.AppImage \
-  --version 4.0.0 \
+  --artifact target/release/bundle/appimage/WaveLinux_4.1.0_amd64.AppImage.tar.gz \
+  --version 4.1.0 \
   --repo DuskyProjects/WaveLinux \
-  --tag v4.0.0 \
+  --tag v4.1.0 \
   --output target/release/bundle/latest.json
 ```
 
@@ -249,10 +338,11 @@ Required GitHub Actions secrets:
 - `crates/engine`: config, scenes, diagnostics, graph orchestration, and state
 - `crates/model`: shared data model and migrations
 - `crates/pw`: PipeWire/PulseAudio command planning, parsing, and DSP rendering
+- `profiles/v1`: hardware profile schema, examples, author docs, and device seeds
 - `src`: React/TypeScript UI
 - `scripts`: installers, release helpers, dependency checks, and validation
 - `packaging/aur`: Arch/AUR package metadata
 
 ## License
 
-WaveLinux 4.0 is licensed under GPL-3.0-only.
+WaveLinux 4.1 is licensed under GPL-3.0-only.

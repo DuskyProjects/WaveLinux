@@ -1,0 +1,43 @@
+{
+  "id": "hyperx.cloud-ii-usb",
+  "name": "HyperX Cloud II USB",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["hyperx", "cloud ii"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["cloud ii", "usb"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 28,
+    "low_latency_msec": 16
+  },
+  "routing_policy": {
+    "input_priority": 66,
+    "output_priority": 56,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "USB headset microphones are acceptable fallbacks, but dedicated creator microphones rank higher."
+  ],
+  "source_notes": [
+    "Seeded from common HyperX USB headset behavior."
+  ],
+  "maintainer": "WaveLinux"
+}

@@ -1,0 +1,42 @@
+{
+  "id": "elgato.cam-link-4k",
+  "name": "Elgato Cam Link 4K Audio",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["cam link", "audio"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["elgato", "cam link"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": false,
+    "duplex": false,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 50,
+    "low_latency_msec": 30
+  },
+  "routing_policy": {
+    "input_priority": 45,
+    "allow_auto_select_input": false,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Capture-card audio can be delayed relative to live microphones; avoid selecting it as the default voice mic automatically."
+  ],
+  "source_notes": [
+    "Seeded as a common UVC capture-card audio endpoint profile."
+  ],
+  "maintainer": "WaveLinux"
+}

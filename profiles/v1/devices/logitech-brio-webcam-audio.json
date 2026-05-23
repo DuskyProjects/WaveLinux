@@ -1,0 +1,43 @@
+{
+  "id": "logitech.brio-webcam-audio",
+  "name": "Logitech Brio Webcam Audio",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "vendor_id": "046d",
+      "description_contains": ["brio"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["logitech", "brio"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": false,
+    "duplex": false,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000, 44100]
+  },
+  "latency_policy": {
+    "stable_msec": 35,
+    "low_latency_msec": 20
+  },
+  "routing_policy": {
+    "input_priority": 56,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Webcam mic fallback should not outrank dedicated audio interfaces."
+  ],
+  "source_notes": [
+    "Seeded from common Logitech Brio UVC/UAC webcam behavior."
+  ],
+  "maintainer": "WaveLinux"
+}

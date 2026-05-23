@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/DuskyProjects/WaveLinux/profiles/v1/schema.json",
+  "title": "WaveLinux Hardware Profile v1",
+  "oneOf": [
+    { "$ref": "#/$defs/profile" },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profiles": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/profile" }
+        }
+      },
+      "required": ["profiles"]
+    }
+  ],
+  "$defs": {
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "revision": { "type": "integer", "minimum": 1 },
+        "matches": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/match" }
+        },
+        "capabilities": { "$ref": "#/$defs/capabilities" },
+        "latency_policy": { "$ref": "#/$defs/latency_policy" },
+        "routing_policy": { "$ref": "#/$defs/routing_policy" },
+        "bluetooth_mic_policy": {
+          "enum": [
+            "never_if_hfp",
+            "allow_explicit_call_mode",
+            "allow_duplex_a2dp_if_supported",
+            "advisory_only"
+          ]
+        },
+        "codec_policy": { "$ref": "#/$defs/codec_policy" },
+        "confidence": { "enum": ["low", "medium", "high"] },
+        "quirks": { "type": "array", "items": { "type": "string" } },
+        "source_notes": { "type": "array", "items": { "type": "string" } },
+        "maintainer": { "type": "string" }
+      },
+      "required": ["id", "name", "matches", "capabilities"]
+    },
+    "match": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bus": {
+          "enum": ["usb", "bluetooth", "pci", "platform", "virtual", "unknown"]
+        },
+        "vendor_id": { "type": "string" },
+        "product_id": { "type": "string" },
+        "node_name_contains": { "type": "array", "items": { "type": "string" } },
+        "description_contains": { "type": "array", "items": { "type": "string" } },
+        "property_contains": { "type": "array", "items": { "type": "string" } },
+        "driver_contains": { "type": "array", "items": { "type": "string" } },
+        "bluetooth_modalias_contains": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": { "input": { "const": true } },
+          "required": ["input"]
+        },
+        {
+          "properties": { "output": { "const": true } },
+          "required": ["output"]
+        }
+      ],
+      "properties": {
+        "input": { "type": "boolean" },
+        "output": { "type": "boolean" },
+        "duplex": { "type": "boolean" },
+        "bluetooth_a2dp": { "type": "boolean" },
+        "bluetooth_hfp": { "type": "boolean" },
+        "duplex_a2dp": { "type": "boolean" },
+        "usb_audio_class": { "type": "boolean" },
+        "channels": { "type": "integer", "minimum": 1, "maximum": 32 },
+        "sample_rates_hz": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 8000 }
+        }
+      }
+    },
+    "latency_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stable_msec": { "type": "integer", "minimum": 1, "maximum": 500 },
+        "low_latency_msec": { "type": "integer", "minimum": 1, "maximum": 500 },
+        "bluetooth_floor_msec": { "type": "integer", "minimum": 1, "maximum": 500 }
+      }
+    },
+    "routing_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input_priority": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "output_priority": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "allow_auto_select_input": { "type": "boolean" },
+        "allow_auto_select_output": { "type": "boolean" },
+        "prefer_non_bluetooth_input": { "type": "boolean" }
+      }
+    },
+    "codec_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "preferred_a2dp_codecs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "avoid_codecs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "ldac_quality": { "enum": ["auto", "hq", "sq", "mq"] }
+      }
+    }
+  }
+}

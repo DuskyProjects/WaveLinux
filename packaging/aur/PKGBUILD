@@ -1,11 +1,12 @@
 # Maintainer: WaveLinux contributors <https://github.com/DuskyProjects/WaveLinux>
 pkgname=wavelinux
-pkgver=4.0.0
+pkgver=4.1.0
 pkgrel=1
 pkgdesc="Rust and PipeWire creator audio mixer for Linux"
 arch=('x86_64')
 url="https://github.com/DuskyProjects/WaveLinux"
 license=('GPL-3.0-only')
+install=$pkgname.install
 depends=(
   'pipewire'
   'pipewire-pulse'
@@ -38,7 +39,12 @@ build() {
   yarn install --frozen-lockfile
   node node_modules/.bin/tsc --noEmit
   node node_modules/.bin/vite build
-  cargo build --release -p wavelinux-app
+  cargo build --release --locked -p wavelinux-app
+}
+
+check() {
+  cd "WaveLinux-$pkgver"
+  cargo test --workspace --locked
 }
 
 package() {

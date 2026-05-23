@@ -51,7 +51,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          NO_STRIP: "1"
+          NO_STRIP: "0"
         run: yarn desktop:release
 
       - name: Build updater latest.json
@@ -90,5 +90,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
+          name: WaveLinux ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
           prerelease: ${{ contains(github.ref_name, 'pre') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
           files: target/release/upload/*

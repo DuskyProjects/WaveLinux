@@ -1,0 +1,43 @@
+{
+  "id": "steelseries.arctis-7-usb",
+  "name": "SteelSeries Arctis 7 USB/Wireless Dongle",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["steelseries", "arctis 7"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["arctis", "chat"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 30,
+    "low_latency_msec": 18
+  },
+  "routing_policy": {
+    "input_priority": 66,
+    "output_priority": 56,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "SteelSeries USB dongles often expose game/chat endpoints; preserve endpoint names and do not collapse app routes."
+  ],
+  "source_notes": [
+    "Seeded from common SteelSeries USB wireless headset behavior."
+  ],
+  "maintainer": "WaveLinux"
+}

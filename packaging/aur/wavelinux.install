@@ -1,0 +1,45 @@
+_wavelinux_prewarm_hardware_profiles() {
+  local user="${SUDO_USER:-}"
+  if [[ -z "$user" && -n "${PKEXEC_UID:-}" ]]; then
+    user="$(getent passwd "$PKEXEC_UID" | cut -d: -f1)"
+  fi
+
+  if [[ -z "$user" || "$user" == "root" ]]; then
+    echo "WaveLinux will download signed hardware profiles on first launch."
+    echo "To prewarm them now, run: wavelinux --prewarm-hardware-profiles"
+    return 0
+  fi
+
+  local uid home runtime_dir
+  uid="$(id -u "$user" 2>/dev/null || true)"
+  home="$(getent passwd "$user" | cut -d: -f6)"
+  runtime_dir="/run/user/$uid"
+
+  if [[ -z "$uid" || -z "$home" || ! -d "$runtime_dir" ]]; then
+    echo "WaveLinux will download signed hardware profiles on first launch."
+    echo "To prewarm them after logging in, run: wavelinux --prewarm-hardware-profiles"
+    return 0
+  fi
+
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u "$user" -- env \
+      HOME="$home" \
+      USER="$user" \
+      LOGNAME="$user" \
+      XDG_RUNTIME_DIR="$runtime_dir" \
+      wavelinux --prewarm-hardware-profiles >/dev/null 2>&1 || {
+        echo "WaveLinux hardware profile prewarm was skipped; it will retry on first launch."
+      }
+  else
+    echo "WaveLinux will download signed hardware profiles on first launch."
+    echo "To prewarm them now, run: wavelinux --prewarm-hardware-profiles"
+  fi
+}
+
+post_install() {
+  _wavelinux_prewarm_hardware_profiles
+}
+
+post_upgrade() {
+  _wavelinux_prewarm_hardware_profiles
+}

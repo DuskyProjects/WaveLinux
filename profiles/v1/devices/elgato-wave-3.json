@@ -1,0 +1,44 @@
+{
+  "id": "elgato.wave-3",
+  "name": "Elgato Wave:3",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["wave:3"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["elgato", "wave"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000, 96000]
+  },
+  "latency_policy": {
+    "stable_msec": 25,
+    "low_latency_msec": 12
+  },
+  "routing_policy": {
+    "input_priority": 88,
+    "output_priority": 25,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "high",
+  "quirks": [
+    "Headphone output exists, but should not steal default playback automatically.",
+    "Prefer 48 kHz for normal desktop capture unless the graph is intentionally running at 96 kHz."
+  ],
+  "source_notes": [
+    "Elgato Wave:3 specifications list 24-bit resolution and 48/96 kHz sample rates, plus a 3.5 mm headphone output."
+  ],
+  "maintainer": "WaveLinux"
+}

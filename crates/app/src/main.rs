@@ -15,11 +15,15 @@ use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 use time::format_description::well_known::Rfc3339;
-use wavelinux_engine::{EngineError, GraphDebugReport, SoundCheckReport, WaveLinuxEngine};
+use wavelinux_engine::{
+    prewarm_hardware_profiles_from_xdg, EngineError, GraphDebugReport,
+    HardwareProfilePrewarmReport, SoundCheckReport, WaveLinuxEngine,
+};
 use wavelinux_model::{
     AppMatcher, AppRoute, AppStateSnapshot, AppVolumePreset, Channel, ChannelInputMode,
-    ChannelKind, ConfigBackup, EffectInstance, KnownApp, LevelMeter, Mix, MixBus, MixerConfig,
-    MixerSettings, Scene, SetupTemplate,
+    ChannelKind, ConfigBackup, EffectInstance, FallbackHardwareProfile, HardwareProfileUiState,
+    KnownApp, LatencyPolicy, LevelMeter, Mix, MixBus, MixerConfig, MixerSettings, RoutingPolicy,
+    Scene, SetupTemplate,
 };
 
 struct EngineState {
@@ -200,6 +204,54 @@ fn set_settings(
     settings: MixerSettings,
 ) -> Result<MixerSettings, String> {
     tauri_result(engine.engine.set_settings(settings))
+}
+
+#[tauri::command]
+fn list_hardware_profiles(
+    engine: State<'_, EngineState>,
+) -> Result<HardwareProfileUiState, String> {
+    tauri_result(engine.engine.list_hardware_profiles())
+}
+
+#[tauri::command]
+fn set_device_hardware_profile(
+    engine: State<'_, EngineState>,
+    device_id: String,
+    profile_id: Option<String>,
+) -> Result<HardwareProfileUiState, String> {
+    tauri_result(
+        engine
+            .engine
+            .set_device_hardware_profile(device_id, profile_id),
+    )
+}
+
+#[tauri::command]
+fn set_fallback_hardware_profile(
+    engine: State<'_, EngineState>,
+    fallback_profile: FallbackHardwareProfile,
+) -> Result<HardwareProfileUiState, String> {
+    tauri_result(
+        engine
+            .engine
+            .set_fallback_hardware_profile(fallback_profile),
+    )
+}
+
+#[tauri::command]
+fn set_hardware_profile_policy(
+    engine: State<'_, EngineState>,
+    profile_id: String,
+    name: Option<String>,
+    latency_policy: LatencyPolicy,
+    routing_policy: RoutingPolicy,
+) -> Result<HardwareProfileUiState, String> {
+    tauri_result(engine.engine.set_hardware_profile_policy(
+        profile_id,
+        name,
+        latency_policy,
+        routing_policy,
+    ))
 }
 
 #[tauri::command]
@@ -646,7 +698,7 @@ fn shutdown_audio_graph(engine: &WaveLinuxEngine, shutdown_started: &AtomicBool)
 fn show_main_window(app: &AppHandle) {
     let window = app.get_webview_window("main").or_else(|| {
         WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-            .title("WaveLinux 4.0")
+            .title("WaveLinux 4.1")
             .inner_size(1280.0, 820.0)
             .min_inner_size(960.0, 640.0)
             .resizable(true)
@@ -698,7 +750,7 @@ fn build_tray(
 
     TrayIconBuilder::with_id("main")
         .icon(icon)
-        .tooltip("WaveLinux 4.0")
+        .tooltip("WaveLinux 4.1")
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "show" => {
@@ -725,7 +777,45 @@ fn build_tray(
     Ok(())
 }
 
+fn run_hardware_profile_prewarm() -> i32 {
+    match prewarm_hardware_profiles_from_xdg() {
+        Ok(report) => {
+            print_hardware_profile_prewarm_report(&report);
+            0
+        }
+        Err(err) => {
+            eprintln!("WaveLinux hardware profile prewarm failed: {err}");
+            1
+        }
+    }
+}
+
+fn print_hardware_profile_prewarm_report(report: &HardwareProfilePrewarmReport) {
+    println!(
+        "WaveLinux hardware profile prewarm: devices={} matched={} fetched={} diagnostics={}",
+        report.devices,
+        report.matched,
+        report.fetched,
+        report.diagnostics.len()
+    );
+    for diagnostic in &report.diagnostics {
+        eprintln!(
+            "[{:?}] {}: {}",
+            diagnostic.severity, diagnostic.code, diagnostic.message
+        );
+    }
+}
+
 fn main() {
+    if std::env::args().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--prewarm-hardware-profiles" | "--check-hardware-profiles"
+        )
+    }) {
+        std::process::exit(run_hardware_profile_prewarm());
+    }
+
     let shutdown_started = Arc::new(AtomicBool::new(false));
     let allow_exit = Arc::new(AtomicBool::new(false));
     let run_allow_exit = Arc::clone(&allow_exit);
@@ -757,6 +847,10 @@ fn main() {
             set_hardware_input_device,
             set_channel_input_mode,
             set_settings,
+            list_hardware_profiles,
+            set_device_hardware_profile,
+            set_fallback_hardware_profile,
+            set_hardware_profile_policy,
             set_channel_volume,
             set_channel_mute,
             assign_app_to_channel,

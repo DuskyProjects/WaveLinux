@@ -52,7 +52,11 @@ import type {
   EffectDefinition,
   EffectAvailability,
   EffectInstance,
+  FallbackHardwareProfile,
   GraphDebugReport,
+  HardwareProfileSummary,
+  HardwareProfileUiState,
+  DeviceInfo,
   LevelMeter,
   Mix,
   MixBus,
@@ -65,14 +69,13 @@ import type {
   UpdateInstallResult,
 } from "./types";
 
-type View = "mixer" | "routing" | "effects" | "scenes" | "diagnostics" | "settings";
+type View = "mixer" | "routing" | "effects" | "scenes" | "settings";
 
 const views: Array<{ id: View; label: string; icon: typeof SlidersHorizontal }> = [
   { id: "mixer", label: "Mixer", icon: SlidersHorizontal },
   { id: "routing", label: "Routing", icon: GitBranch },
   { id: "effects", label: "Effects", icon: Sparkles },
   { id: "scenes", label: "Scenes", icon: Save },
-  { id: "diagnostics", label: "Health", icon: Activity },
   { id: "settings", label: "Settings", icon: Settings },
 ];
 
@@ -95,6 +98,7 @@ function initialView(): View {
 
 const MAX_SOFTWARE_CHANNELS = 8;
 const AUTO_MONITOR_OUTPUT_VALUE = "__auto_monitor_output__";
+const SELECT_VISIBLE_OPTION_LIMIT = 80;
 const UI_METER_ATTACK_SECONDS = 0.018;
 const UI_METER_RELEASE_SECONDS = 0.34;
 const UI_METER_FLOOR = 0.003;
@@ -128,6 +132,8 @@ type SelectOption = {
   disabled?: boolean;
 };
 
+type SettingsTab = "general" | "profiles" | "health";
+
 export default function App() {
   const [state, setState] = useState<AppStateSnapshot | null>(() => initialSnapshot());
   const [activeView, setActiveView] = useState<View>(() => initialView());
@@ -138,21 +144,55 @@ export default function App() {
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const autoUpdateCheckStarted = useRef(false);
+  const refreshTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const refreshInFlight = useRef(false);
+  const refreshQueued = useRef(false);
+
+  const applySnapshot = useCallback((next: AppStateSnapshot) => {
+    setState(next);
+    setSelectedChannelId((current) =>
+      next.config.channels.some((channel) => channel.id === current)
+        ? current
+        : next.config.channels[0]?.id ?? "hardware_in",
+    );
+  }, []);
 
   const refresh = useCallback(async () => {
     const next = await invoke<AppStateSnapshot>("get_state");
-    setState(next);
-    if (!next.config.channels.some((channel) => channel.id === selectedChannelId)) {
-      setSelectedChannelId(next.config.channels[0]?.id ?? "hardware_in");
-    }
-  }, [selectedChannelId]);
+    applySnapshot(next);
+  }, [applySnapshot]);
 
+  const scheduleRefresh = useCallback((delayMs = 120) => {
+    if (refreshTimer.current !== null) {
+      window.clearTimeout(refreshTimer.current);
+    }
+    refreshTimer.current = window.setTimeout(() => {
+      refreshTimer.current = null;
+      if (refreshInFlight.current) {
+        refreshQueued.current = true;
+        return;
+      }
+      refreshInFlight.current = true;
+      invoke<AppStateSnapshot>("observe_state")
+        .then(applySnapshot)
+        .catch(() => undefined)
+        .finally(() => {
+          refreshInFlight.current = false;
+          if (refreshQueued.current) {
+            refreshQueued.current = false;
+            scheduleRefresh(delayMs);
+          }
+        });
+    }, delayMs);
+  }, [applySnapshot]);
+
+  // UI actions should not wait on a full state refresh. This helper invokes the
+  // backend command, then coalesces a lightweight refresh in the background.
   const run = useCallback(
     async <T,>(command: string, args?: Record<string, unknown>, message?: string): Promise<T> => {
-      setBusy(true);
       try {
         const result = await invoke<T>(command, args);
-        await refresh();
+        scheduleRefresh();
         if (message) {
           setToast(message);
         }
@@ -160,11 +200,264 @@ export default function App() {
       } catch (error) {
         setToast(String(error));
         throw error;
-      } finally {
-        setBusy(false);
       }
     },
-    [refresh],
+    [scheduleRefresh],
+  );
+
+  const patchMixVolume = useCallback((mixId: string, volume: number) => {
+    setState((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        config: {
+          ...current.config,
+          mixes: current.config.mixes.map((mix) =>
+            mix.id === mixId ? { ...mix, volume } : mix,
+          ),
+        },
+      };
+    });
+  }, []);
+
+  const patchMix = useCallback((mixId: string, patch: Partial<Mix>) => {
+    setState((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        config: {
+          ...current.config,
+          mixes: current.config.mixes.map((mix) =>
+            mix.id === mixId ? { ...mix, ...patch } : mix,
+          ),
+        },
+      };
+    });
+  }, []);
+
+  const patchChannelBusVolume = useCallback((channelId: string, mixId: string, volume: number) => {
+    setState((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        config: {
+          ...current.config,
+          channels: current.config.channels.map((channel) => {
+            if (channel.id !== channelId) return channel;
+            const mixBuses = Object.fromEntries(
+              Object.entries(channel.mix_buses).map(([busMixId, bus]) => [
+                busMixId,
+                channel.linked || busMixId === mixId ? { ...bus, volume } : bus,
+              ]),
+            );
+            return { ...channel, mix_buses: mixBuses };
+          }),
+        },
+      };
+    });
+  }, []);
+
+  const patchChannelBus = useCallback((channelId: string, mixId: string, patch: Partial<MixBus>) => {
+    setState((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        config: {
+          ...current.config,
+          channels: current.config.channels.map((channel) => {
+            if (channel.id !== channelId) return channel;
+            const bus = channel.mix_buses[mixId] ?? { volume: 1, muted: false };
+            return {
+              ...channel,
+              mix_buses: {
+                ...channel.mix_buses,
+                [mixId]: { ...bus, ...patch },
+              },
+            };
+          }),
+        },
+      };
+    });
+  }, []);
+
+  const patchChannel = useCallback((channelId: string, patch: Partial<Channel>) => {
+    setState((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        config: {
+          ...current.config,
+          channels: current.config.channels.map((channel) =>
+            channel.id === channelId ? { ...channel, ...patch } : channel,
+          ),
+        },
+      };
+    });
+  }, []);
+
+  const patchAppStream = useCallback((streamId: string, patch: Partial<AppStream>) => {
+    setState((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        graph: {
+          ...current.graph,
+          app_streams: current.graph.app_streams.map((stream) =>
+            stream.id === streamId ? { ...stream, ...patch } : stream,
+          ),
+        },
+      };
+    });
+  }, []);
+
+  const setMixVolumeFast = useCallback(
+    async (mixId: string, volume: number) => {
+      patchMixVolume(mixId, volume);
+      try {
+        const mix = await invoke<Mix>("set_mix_volume", { mixId, volume });
+        patchMixVolume(mix.id, mix.volume);
+      } catch (error) {
+        setToast(String(error));
+        await refresh().catch(() => undefined);
+      }
+    },
+    [patchMixVolume, refresh],
+  );
+
+  const setChannelBusVolumeFast = useCallback(
+    async (channelId: string, mixId: string, volume: number) => {
+      patchChannelBusVolume(channelId, mixId, volume);
+      try {
+        const bus = await invoke<MixBus>("set_channel_volume", { channelId, mixId, volume });
+        patchChannelBusVolume(channelId, mixId, bus.volume);
+      } catch (error) {
+        setToast(String(error));
+        await refresh().catch(() => undefined);
+      }
+    },
+    [patchChannelBusVolume, refresh],
+  );
+
+  const setMixMuteFast = useCallback(
+    async (mixId: string, muted: boolean) => {
+      patchMix(mixId, { muted });
+      try {
+        const mix = await invoke<Mix>("set_mix_mute", { mixId, muted });
+        patchMix(mix.id, { muted: mix.muted });
+      } catch (error) {
+        setToast(String(error));
+        await refresh().catch(() => undefined);
+      }
+    },
+    [patchMix, refresh],
+  );
+
+  const setChannelBusMuteFast = useCallback(
+    async (channelId: string, mixId: string, muted: boolean) => {
+      patchChannelBus(channelId, mixId, { muted });
+      try {
+        const bus = await invoke<MixBus>("set_channel_mute", { channelId, mixId, muted });
+        patchChannelBus(channelId, mixId, { muted: bus.muted });
+      } catch (error) {
+        setToast(String(error));
+        await refresh().catch(() => undefined);
+      }
+    },
+    [patchChannelBus, refresh],
+  );
+
+  const setChannelInputFast = useCallback(
+    async (channelId: string, sourceDevice: string | null) => {
+      patchChannel(channelId, { source_device: sourceDevice });
+      try {
+        const channel = await invoke<Channel>("set_channel_input", {
+          channelId,
+          channel_id: channelId,
+          sourceDevice,
+          source_device: sourceDevice,
+        });
+        patchChannel(channel.id, { source_device: channel.source_device ?? null });
+        scheduleRefresh();
+      } catch (error) {
+        setToast(String(error));
+        await refresh().catch(() => undefined);
+      }
+    },
+    [patchChannel, refresh, scheduleRefresh],
+  );
+
+  const patchSettings = useCallback((settings: MixerSettings) => {
+    setState((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        config: {
+          ...current.config,
+          settings,
+        },
+      };
+    });
+  }, []);
+
+  const patchSettingsFromPartial = useCallback((patch: Partial<MixerSettings>) => {
+    setState((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        config: {
+          ...current.config,
+          settings: {
+            ...current.config.settings,
+            ...patch,
+          },
+        },
+      };
+    });
+  }, []);
+
+  const setMixMonitorOutputFast = useCallback(
+    async (mixId: string, output: string | null) => {
+      patchMix(mixId, { monitor_output: output });
+      patchSettingsFromPartial({ monitor_follows_default_output: false });
+      try {
+        const mix = await invoke<Mix>("set_mix_monitor_output", { mixId, output });
+        patchMix(mix.id, { monitor_output: mix.monitor_output ?? null });
+        scheduleRefresh();
+      } catch (error) {
+        setToast(String(error));
+        await refresh().catch(() => undefined);
+      }
+    },
+    [patchMix, patchSettingsFromPartial, refresh, scheduleRefresh],
+  );
+
+  const setSettingsFast = useCallback(
+    async (settings: MixerSettings) => {
+      patchSettings(settings);
+      try {
+        const next = await invoke<MixerSettings>("set_settings", { settings });
+        patchSettings(next);
+        scheduleRefresh();
+        setToast("Settings updated");
+      } catch (error) {
+        setToast(String(error));
+        await refresh().catch(() => undefined);
+      }
+    },
+    [patchSettings, refresh, scheduleRefresh],
+  );
+
+  const setAppStreamMuteFast = useCallback(
+    async (streamId: string, muted: boolean) => {
+      patchAppStream(streamId, { muted });
+      try {
+        await invoke("set_app_stream_mute", { streamId, muted });
+      } catch (error) {
+        setToast(String(error));
+        await refresh().catch(() => undefined);
+      }
+    },
+    [patchAppStream, refresh],
   );
 
   const recordAudioAction = useCallback((title: string, commands: CommandExecution[], plannedCount?: number) => {
@@ -174,16 +467,32 @@ export default function App() {
 
   const startOrRepairAudio = useCallback(async () => {
     const title = state?.engine.audio_graph_running ? "Repair Audio" : "Start Audio";
-    const report = await run<RepairReport>("repair_audio_graph");
-    recordAudioAction(title, report.outputs, report.planned.commands.length);
-  }, [recordAudioAction, run, state?.engine.audio_graph_running]);
+    setBusy(true);
+    try {
+      const report = await invoke<RepairReport>("repair_audio_graph");
+      scheduleRefresh(0);
+      recordAudioAction(title, report.outputs, report.planned.commands.length);
+    } catch (error) {
+      setToast(String(error));
+    } finally {
+      setBusy(false);
+    }
+  }, [recordAudioAction, scheduleRefresh, state?.engine.audio_graph_running]);
 
   const runAudioCommandList = useCallback(
     async (command: string, title: string) => {
-      const outputs = await run<CommandExecution[]>(command);
-      recordAudioAction(title, outputs);
+      setBusy(true);
+      try {
+        const outputs = await invoke<CommandExecution[]>(command);
+        scheduleRefresh(0);
+        recordAudioAction(title, outputs);
+      } catch (error) {
+        setToast(String(error));
+      } finally {
+        setBusy(false);
+      }
     },
-    [recordAudioAction, run],
+    [recordAudioAction, scheduleRefresh],
   );
 
   const checkUpdates = useCallback(async (showToast = true) => {
@@ -210,11 +519,19 @@ export default function App() {
     const intervalMs = state?.engine.audio_graph_running ? 750 : 1000;
     const timer = window.setInterval(() => {
       invoke<AppStateSnapshot>("observe_state")
-        .then(setState)
+        .then(applySnapshot)
         .catch(() => undefined);
     }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [refresh, state?.engine.audio_graph_running]);
+  }, [applySnapshot, refresh, state?.engine.audio_graph_running]);
+
+  useEffect(() => {
+    return () => {
+      if (refreshTimer.current !== null) {
+        window.clearTimeout(refreshTimer.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!toast) return;
@@ -242,7 +559,7 @@ export default function App() {
           </div>
           <div>
             <strong>WaveLinux</strong>
-            <span>4.0</span>
+            <span>4.1</span>
           </div>
         </div>
 
@@ -321,35 +638,42 @@ export default function App() {
                 state={state}
                 setSelectedChannelId={setSelectedChannelId}
                 run={run}
+                setChannelBusVolume={setChannelBusVolumeFast}
+                setChannelBusMute={setChannelBusMuteFast}
+                setChannelInput={setChannelInputFast}
+                setMixMonitorOutput={setMixMonitorOutputFast}
+                setMixMute={setMixMuteFast}
+                setMixVolume={setMixVolumeFast}
+                setSettings={setSettingsFast}
                 busy={busy}
               />
             )}
-            {activeView === "routing" && <RoutingView state={state} run={run} />}
+            {activeView === "routing" && (
+              <RoutingView
+                state={state}
+                run={run}
+                setAppStreamMute={setAppStreamMuteFast}
+              />
+            )}
             {activeView === "effects" && (
               <EffectsView
                 state={state}
                 selectedChannel={selectedChannel}
                 selectedChannelId={selectedChannelId}
                 setSelectedChannelId={setSelectedChannelId}
-                run={run}
+                setChannelInput={setChannelInputFast}
               />
             )}
             {activeView === "scenes" && <ScenesView run={run} state={state} />}
-            {activeView === "diagnostics" && (
-              <DiagnosticsView
-                audioActionReport={audioActionReport}
-                onCleanup={() => runAudioCommandList("cleanup_audio_graph", "Cleanup Audio")}
-                onPrune={() => runAudioCommandList("cleanup_stale_audio_graph", "Prune Stale Audio")}
-                state={state}
-                run={run}
-              />
-            )}
             {activeView === "settings" && (
               <SettingsView
+                audioActionReport={audioActionReport}
                 state={state}
                 run={run}
+                setSettings={setSettingsFast}
                 updateBusy={updateBusy}
                 updateInfo={updateInfo}
+                onCleanup={() => runAudioCommandList("cleanup_audio_graph", "Cleanup Audio")}
                 onCheckUpdates={() => void checkUpdates(true).catch(() => undefined)}
                 onInstallUpdate={() => {
                   setUpdateBusy(true);
@@ -361,6 +685,7 @@ export default function App() {
                 onOpenReleases={() => {
                   void invoke("open_release_page").catch((error) => setToast(String(error)));
                 }}
+                onPrune={() => runAudioCommandList("cleanup_stale_audio_graph", "Prune Stale Audio")}
               />
             )}
           </>
@@ -376,11 +701,25 @@ function MixerView({
   state,
   setSelectedChannelId,
   run,
+  setChannelBusVolume,
+  setChannelBusMute,
+  setChannelInput,
+  setMixMonitorOutput,
+  setMixMute,
+  setMixVolume,
+  setSettings,
   busy,
 }: {
   state: AppStateSnapshot;
   setSelectedChannelId: (channelId: string) => void;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  setChannelBusVolume: (channelId: string, mixId: string, volume: number) => Promise<void>;
+  setChannelBusMute: (channelId: string, mixId: string, muted: boolean) => Promise<void>;
+  setChannelInput: (channelId: string, sourceDevice: string | null) => Promise<void>;
+  setMixMonitorOutput: (mixId: string, output: string | null) => Promise<void>;
+  setMixMute: (mixId: string, muted: boolean) => Promise<void>;
+  setMixVolume: (mixId: string, volume: number) => Promise<void>;
+  setSettings: (settings: MixerSettings) => Promise<void>;
   busy: boolean;
 }) {
   const outputs = state.graph.outputs.filter((output) => !output.is_virtual);
@@ -504,7 +843,9 @@ function MixerView({
                       channelId: channel.id,
                     });
                   }}
-                  run={run}
+                  setChannelBusMute={setChannelBusMute}
+                  setChannelBusVolume={setChannelBusVolume}
+                  setChannelInput={setChannelInput}
                 />
               );
             })}
@@ -537,7 +878,8 @@ function MixerView({
               <MasterBusControl
                 key={mix.id}
                 mix={mix}
-                run={run}
+                setMixMute={setMixMute}
+                setMixVolume={setMixVolume}
                 vuLevel={levelFor(mix.id)}
               />
             ))}
@@ -553,22 +895,13 @@ function MixerView({
                 id="active-mix-monitor-output"
                 onChange={(value) => {
                   if (value === AUTO_MONITOR_OUTPUT_VALUE) {
-                    void run(
-                      "set_settings",
-                      {
-                        settings: {
-                          ...state.config.settings,
-                          monitor_follows_default_output: true,
-                        },
-                      },
-                      "Auto monitor output enabled",
-                    ).catch(() => undefined);
+                    void setSettings({
+                      ...state.config.settings,
+                      monitor_follows_default_output: true,
+                    }).catch(() => undefined);
                     return;
                   }
-                  void run("set_mix_monitor_output", {
-                    mixId: monitorMix.id,
-                    output: value || null,
-                  }).catch(() => undefined);
+                  void setMixMonitorOutput(monitorMix.id, value || null).catch(() => undefined);
                 }}
                 options={[
                   {
@@ -600,6 +933,7 @@ function MixerView({
           mixes={state.config.mixes}
           onClose={() => setMenu(null)}
           run={run}
+          setChannelBusMute={setChannelBusMute}
           x={menu.x}
           y={menu.y}
         />
@@ -615,7 +949,9 @@ function ChannelStrip({
   levelFor,
   onFocus,
   onOpenMenu,
-  run,
+  setChannelBusMute,
+  setChannelBusVolume,
+  setChannelInput,
 }: {
   channel: Channel;
   mixes: Mix[];
@@ -623,7 +959,9 @@ function ChannelStrip({
   levelFor: (nodeId: string) => number;
   onFocus: () => void;
   onOpenMenu: (event: ReactMouseEvent<HTMLElement>) => void;
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  setChannelBusMute: (channelId: string, mixId: string, muted: boolean) => Promise<void>;
+  setChannelBusVolume: (channelId: string, mixId: string, volume: number) => Promise<void>;
+  setChannelInput: (channelId: string, sourceDevice: string | null) => Promise<void>;
 }) {
   const Icon = channelIcon(channel.kind);
   const isHardware = isHardwareChannel(channel);
@@ -650,7 +988,8 @@ function ChannelStrip({
             channel={channel}
             key={mix.id}
             mix={mix}
-            run={run}
+            setChannelBusMute={setChannelBusMute}
+            setChannelBusVolume={setChannelBusVolume}
             vuLevel={channelBusVuLevel(
               channel,
               mix,
@@ -666,16 +1005,7 @@ function ChannelStrip({
           ariaLabel={`${displayName} microphone`}
           onChange={(nextValue) => {
             const value = nextValue || null;
-            void run(
-              "set_hardware_input_device",
-              {
-                channelId: channel.id,
-                channel_id: channel.id,
-                sourceDevice: value,
-                source_device: value,
-              },
-              "Microphone updated",
-            ).catch(() => undefined);
+            void setChannelInput(channel.id, value).catch(() => undefined);
           }}
           options={[
             { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto mic") },
@@ -704,6 +1034,7 @@ function ChannelContextMenu({
   mixes,
   onClose,
   run,
+  setChannelBusMute,
   x,
   y,
 }: {
@@ -713,6 +1044,7 @@ function ChannelContextMenu({
   mixes: Mix[];
   onClose: () => void;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  setChannelBusMute: (channelId: string, mixId: string, muted: boolean) => Promise<void>;
   x: number;
   y: number;
 }) {
@@ -773,11 +1105,7 @@ function ChannelContextMenu({
             key={mix.id}
             type="button"
             onClick={() =>
-              void run("set_channel_mute", {
-                channelId: channel.id,
-                mixId: mix.id,
-                muted: !(bus?.muted ?? false),
-              }).finally(onClose)
+              void setChannelBusMute(channel.id, mix.id, !(bus?.muted ?? false)).finally(onClose)
             }
           >
             {bus?.muted ? "Unmute" : "Mute"} {mix.name}
@@ -820,38 +1148,57 @@ function AppSelect({
   const rootRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const searchRef = useRef<HTMLInputElement | null>(null);
+  const selectSearchOnFocusRef = useRef(true);
   const [open, setOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
-  const [position, setPosition] = useState({ left: 0, top: 0, width: 180, maxHeight: 260 });
+  const [position, setPosition] = useState({ left: 0, top: 0, width: 360, maxHeight: 260 });
   const selectedIndex = options.findIndex((option) => option.value === value);
   const selectedOption = selectedIndex >= 0 ? options[selectedIndex] : options[0];
+  const filteredOptions = useMemo(
+    () => filterSelectOptions(options, searchQuery),
+    [options, searchQuery],
+  );
+  const visibleOptions = useMemo(
+    () => visibleSelectOptions(filteredOptions, value),
+    [filteredOptions, value],
+  );
 
   const positionMenu = useCallback(() => {
     const button = buttonRef.current;
     if (!button) return;
     const rect = button.getBoundingClientRect();
-    const gap = 6;
-    const maxHeight = Math.min(260, Math.max(120, window.innerHeight - 24));
-    const spaceBelow = window.innerHeight - rect.bottom - gap - 12;
-    const spaceAbove = rect.top - gap - 12;
-    const opensUp = spaceBelow < 160 && spaceAbove > spaceBelow;
-    const height = Math.min(maxHeight, Math.max(120, opensUp ? spaceAbove : spaceBelow));
+    const viewportMargin = 12;
+    const left = Math.max(viewportMargin, Math.min(rect.left, window.innerWidth - viewportMargin - 240));
+    const availableRight = Math.max(240, window.innerWidth - left - viewportMargin);
+    const readableWidth = Math.min(520, availableRight, Math.max(360, rect.width));
+    const maxHeight = Math.min(320, Math.max(140, window.innerHeight - viewportMargin * 2));
+    const height = Math.min(maxHeight, Math.max(140, window.innerHeight - rect.top - viewportMargin));
     setPosition({
-      left: Math.max(12, Math.min(rect.left, window.innerWidth - rect.width - 12)),
-      top: opensUp ? Math.max(12, rect.top - gap - height) : Math.min(window.innerHeight - 12 - height, rect.bottom + gap),
-      width: rect.width,
+      left,
+      top: Math.max(viewportMargin, Math.min(rect.top, window.innerHeight - viewportMargin - height)),
+      width: readableWidth,
       maxHeight: height,
     });
   }, []);
 
-  const openMenu = useCallback(() => {
+  const openMenu = useCallback((initialSearch = "") => {
     if (disabled || options.length === 0) return;
-    setActiveIndex(selectedIndex >= 0 ? selectedIndex : firstEnabledOptionIndex(options));
+    const nextQuery = initialSearch;
+    const nextOptions = visibleSelectOptions(filterSelectOptions(options, nextQuery), value);
+    const nextSelectedIndex = nextOptions.findIndex((option) => option.value === value);
+    selectSearchOnFocusRef.current = nextQuery.length === 0;
+    setSearchQuery(nextQuery);
+    setActiveIndex(nextSelectedIndex >= 0 ? nextSelectedIndex : firstEnabledOptionIndex(nextOptions));
     positionMenu();
     setOpen(true);
-  }, [disabled, options, positionMenu, selectedIndex]);
+  }, [disabled, options, positionMenu, value]);
 
-  const closeMenu = useCallback(() => setOpen(false), []);
+  const closeMenu = useCallback(() => {
+    setOpen(false);
+    setSearchQuery("");
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -886,6 +1233,28 @@ function AppSelect({
     };
   }, [closeMenu, open, positionMenu]);
 
+  useEffect(() => {
+    if (!open) return;
+    const frame = window.requestAnimationFrame(() => {
+      searchRef.current?.focus({ preventScroll: true });
+      if (selectSearchOnFocusRef.current) {
+        searchRef.current?.select();
+      } else {
+        const length = searchRef.current?.value.length ?? 0;
+        searchRef.current?.setSelectionRange(length, length);
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    setActiveIndex((current) => {
+      if (visibleOptions[current] && !visibleOptions[current].disabled) return current;
+      return firstEnabledOptionIndex(visibleOptions);
+    });
+  }, [open, visibleOptions]);
+
   const choose = useCallback((option: SelectOption) => {
     if (option.disabled) return;
     closeMenu();
@@ -895,8 +1264,30 @@ function AppSelect({
     buttonRef.current?.focus({ preventScroll: true });
   }, [closeMenu, onChange, value]);
 
-  const moveActive = (direction: 1 | -1) => {
-    setActiveIndex((current) => nextEnabledOptionIndex(options, current, direction));
+  const moveActive = useCallback((direction: 1 | -1) => {
+    setActiveIndex((current) => nextEnabledOptionIndex(visibleOptions, current, direction));
+  }, [visibleOptions]);
+
+  const chooseActive = useCallback(() => {
+    const option = visibleOptions[activeIndex];
+    if (option) choose(option);
+  }, [activeIndex, choose, visibleOptions]);
+
+  const handleSearchKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      moveActive(1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveActive(-1);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      chooseActive();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeMenu();
+      buttonRef.current?.focus({ preventScroll: true });
+    }
   };
 
   return (
@@ -926,11 +1317,14 @@ function AppSelect({
             else moveActive(-1);
           } else if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
-            if (open && options[activeIndex]) {
-              choose(options[activeIndex]);
+            if (open) {
+              chooseActive();
             } else {
               openMenu();
             }
+          } else if (!open && isPrintableSelectSearchKey(event)) {
+            event.preventDefault();
+            openMenu(event.key);
           }
         }}
         type="button"
@@ -938,11 +1332,10 @@ function AppSelect({
         <span>{selectedOption?.label ?? "Select"}</span>
         <ArrowDown size={15} />
       </button>
-      {open && (
+      {open && typeof document !== "undefined" && createPortal(
         <div
           className="app-select-menu"
           ref={menuRef}
-          role="listbox"
           style={{
             left: position.left,
             maxHeight: position.maxHeight,
@@ -950,26 +1343,46 @@ function AppSelect({
             width: position.width,
           }}
         >
-          {options.map((option, index) => (
-            <button
-              aria-selected={option.value === value}
-              className={[
-                "app-select-option",
-                option.value === value ? "selected" : "",
-                index === activeIndex ? "active" : "",
-              ].filter(Boolean).join(" ")}
-              disabled={option.disabled}
-              key={`${option.value}-${index}`}
-              onClick={() => choose(option)}
-              onMouseEnter={() => setActiveIndex(index)}
-              role="option"
-              type="button"
-            >
-              <span>{option.label}</span>
-              {option.value === value && <Check size={14} />}
-            </button>
-          ))}
-        </div>
+          <input
+            aria-label={`${ariaLabel} search`}
+            className="app-select-search"
+            onChange={(event) => setSearchQuery(event.currentTarget.value)}
+            onKeyDown={handleSearchKeyDown}
+            placeholder="Search"
+            ref={searchRef}
+            value={searchQuery}
+          />
+          <div className="app-select-options" role="listbox">
+            {visibleOptions.map((option, index) => (
+              <button
+                aria-selected={option.value === value}
+                className={[
+                  "app-select-option",
+                  option.value === value ? "selected" : "",
+                  index === activeIndex ? "active" : "",
+                ].filter(Boolean).join(" ")}
+                disabled={option.disabled}
+                key={`${option.value}-${index}`}
+                onClick={() => choose(option)}
+                role="option"
+                title={option.label}
+                type="button"
+              >
+                <span>{option.label}</span>
+                {option.value === value && <Check size={14} />}
+              </button>
+            ))}
+            {filteredOptions.length === 0 && (
+              <div className="app-select-empty">No matching options</div>
+            )}
+            {filteredOptions.length > visibleOptions.length && (
+              <div className="app-select-empty">
+                Showing {visibleOptions.length} of {filteredOptions.length}
+              </div>
+            )}
+          </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
@@ -990,17 +1403,48 @@ function nextEnabledOptionIndex(options: SelectOption[], current: number, direct
   return current;
 }
 
+function filterSelectOptions(options: SelectOption[], query: string): SelectOption[] {
+  const needles = normalizeSelectSearch(query)
+    .split(" ")
+    .filter(Boolean);
+  if (needles.length === 0) return options;
+  return options.filter((option) => {
+    const haystack = normalizeSelectSearch(`${option.label} ${option.value}`);
+    return needles.every((needle) => haystack.includes(needle));
+  });
+}
+
+function visibleSelectOptions(options: SelectOption[], selectedValue: string): SelectOption[] {
+  if (options.length <= SELECT_VISIBLE_OPTION_LIMIT) return options;
+  const visible = options.slice(0, SELECT_VISIBLE_OPTION_LIMIT);
+  if (!selectedValue || visible.some((option) => option.value === selectedValue)) {
+    return visible;
+  }
+  const selectedOption = options.find((option) => option.value === selectedValue);
+  return selectedOption ? [selectedOption, ...visible.slice(0, SELECT_VISIBLE_OPTION_LIMIT - 1)] : visible;
+}
+
+function normalizeSelectSearch(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function isPrintableSelectSearchKey(event: ReactKeyboardEvent<HTMLElement>): boolean {
+  return event.key.length === 1 && !event.altKey && !event.ctrlKey && !event.metaKey;
+}
+
 function ChannelBusControl({
   channel,
   mix,
   bus,
-  run,
+  setChannelBusMute,
+  setChannelBusVolume,
   vuLevel,
 }: {
   channel: Channel;
   mix: Mix;
   bus: MixBus;
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  setChannelBusMute: (channelId: string, mixId: string, muted: boolean) => Promise<void>;
+  setChannelBusVolume: (channelId: string, mixId: string, volume: number) => Promise<void>;
   vuLevel: number;
 }) {
   const [draft, setDraft] = useState(volumeToPercent(bus.volume));
@@ -1017,12 +1461,8 @@ function ChannelBusControl({
     setDraft(next);
     if (lastCommitted.current === next) return;
     lastCommitted.current = next;
-    void run("set_channel_volume", {
-      channelId: channel.id,
-      mixId: mix.id,
-      volume: next / 100,
-    }).catch(() => undefined);
-  }, [channel.id, draft, mix.id, run]);
+    void setChannelBusVolume(channel.id, mix.id, next / 100).catch(() => undefined);
+  }, [channel.id, draft, mix.id, setChannelBusVolume]);
 
   return (
     <div className="bus-control">
@@ -1039,11 +1479,7 @@ function ChannelBusControl({
         className={bus.muted ? "mute-button active" : "mute-button"}
         onClick={(event) => {
           event.stopPropagation();
-          void run("set_channel_mute", {
-            channelId: channel.id,
-            mixId: mix.id,
-            muted: !bus.muted,
-          });
+          void setChannelBusMute(channel.id, mix.id, !bus.muted).catch(() => undefined);
         }}
         title={`Mute ${mix.name}`}
         type="button"
@@ -1057,11 +1493,13 @@ function ChannelBusControl({
 
 function MasterBusControl({
   mix,
-  run,
+  setMixMute,
+  setMixVolume,
   vuLevel,
 }: {
   mix: Mix;
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  setMixMute: (mixId: string, muted: boolean) => Promise<void>;
+  setMixVolume: (mixId: string, volume: number) => Promise<void>;
   vuLevel: number;
 }) {
   const [draft, setDraft] = useState(volumeToPercent(mix.volume));
@@ -1078,11 +1516,8 @@ function MasterBusControl({
     setDraft(next);
     if (lastCommitted.current === next) return;
     lastCommitted.current = next;
-    void run("set_mix_volume", {
-      mixId: mix.id,
-      volume: next / 100,
-    }).catch(() => undefined);
-  }, [draft, mix.id, run]);
+    void setMixVolume(mix.id, next / 100).catch(() => undefined);
+  }, [draft, mix.id, setMixVolume]);
 
   return (
     <div className="master-bus-control">
@@ -1099,11 +1534,7 @@ function MasterBusControl({
       <button
         className={mix.muted ? "mute-button active" : "mute-button"}
         onClick={() =>
-          void run(
-            "set_mix_mute",
-            { mixId: mix.id, muted: !mix.muted },
-            mix.muted ? `${mix.name} unmuted` : `${mix.name} muted`,
-          ).catch(() => undefined)
+          void setMixMute(mix.id, !mix.muted).catch(() => undefined)
         }
         title={`Mute ${mix.name}`}
         type="button"
@@ -1253,9 +1684,11 @@ function VuSlider({
 function RoutingView({
   state,
   run,
+  setAppStreamMute,
 }: {
   state: AppStateSnapshot;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  setAppStreamMute: (streamId: string, muted: boolean) => Promise<void>;
 }) {
   const [matcherKind, setMatcherKind] = useState<MatcherKind>("app_id");
   const [matcherValue, setMatcherValue] = useState("");
@@ -1288,7 +1721,13 @@ function RoutingView({
         </div>
         <div className="route-list">
           {state.graph.app_streams.map((stream) => (
-            <StreamRouteRow key={stream.id} state={state} stream={stream} run={run} />
+            <StreamRouteRow
+              key={stream.id}
+              state={state}
+              stream={stream}
+              run={run}
+              setAppStreamMute={setAppStreamMute}
+            />
           ))}
           {state.graph.app_streams.length === 0 && <EmptyState label="No active app streams" />}
         </div>
@@ -1372,7 +1811,6 @@ function RoutingView({
                   label={entry.displayName}
                   matcher={entry.matcher}
                   preset={entry.volumePreset}
-                  run={run}
                 />
                 <AppIdentityActions
                   label={entry.displayName}
@@ -1408,12 +1846,10 @@ function OfflineVolumeControl({
   label,
   matcher,
   preset,
-  run,
 }: {
   label: string;
   matcher: AppMatcher;
   preset?: AppVolumePreset;
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
   const [draft, setDraft] = useState(volumeToPercent(preset?.volume ?? 1));
   const lastCommitted = useRef(draft);
@@ -1429,12 +1865,8 @@ function OfflineVolumeControl({
     setDraft(next);
     if (lastCommitted.current === next) return;
     lastCommitted.current = next;
-    void run(
-      "set_app_volume_preset",
-      { matcher, volume: next / 100 },
-      "App volume preset saved",
-    ).catch(() => undefined);
-  }, [draft, matcher, run]);
+    void invoke("set_app_volume_preset", { matcher, volume: next / 100 }).catch(() => undefined);
+  }, [draft, matcher]);
 
   return (
     <label className="route-volume-control" title="Offline app volume preset">
@@ -1461,61 +1893,109 @@ function StreamRouteRow({
   state,
   stream,
   run,
+  setAppStreamMute,
 }: {
   state: AppStateSnapshot;
   stream: AppStream;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  setAppStreamMute: (streamId: string, muted: boolean) => Promise<void>;
 }) {
-  const [draftVolume, setDraftVolume] = useState(volumeToPercent(stream.volume));
+  const [draftVolume, setDraftVolume] = useState(appVolumeToPercent(stream.volume));
+  const [draftRoute, setDraftRoute] = useState(stream.routed_channel_id ?? "");
   const lastCommitted = useRef(draftVolume);
+  const volumeApplyInFlight = useRef(false);
+  const queuedVolume = useRef<number | null>(null);
+  const presetSaveTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const optimisticVolumeUntil = useRef(0);
+  const optimisticRouteUntil = useRef(0);
 
   useEffect(() => {
-    const next = volumeToPercent(stream.volume);
+    if (
+      volumeApplyInFlight.current ||
+      queuedVolume.current !== null ||
+      Date.now() < optimisticVolumeUntil.current
+    ) {
+      return;
+    }
+    const next = appVolumeToPercent(stream.volume);
     setDraftVolume(next);
     lastCommitted.current = next;
   }, [stream.volume]);
 
+  useEffect(() => {
+    if (Date.now() < optimisticRouteUntil.current) return;
+    setDraftRoute(stream.routed_channel_id ?? "");
+  }, [stream.routed_channel_id]);
+
+  useEffect(() => {
+    return () => {
+      if (presetSaveTimer.current !== null) {
+        window.clearTimeout(presetSaveTimer.current);
+      }
+    };
+  }, []);
+
+  const flushQueuedVolume = useCallback(() => {
+    if (volumeApplyInFlight.current) return;
+    const next = queuedVolume.current;
+    if (next === null) return;
+    queuedVolume.current = null;
+    volumeApplyInFlight.current = true;
+    optimisticVolumeUntil.current = Date.now() + 1500;
+    void invoke("set_app_stream_volume", {
+      streamId: stream.id,
+      volume: next / 100,
+    })
+      .catch(() => undefined)
+      .finally(() => {
+        volumeApplyInFlight.current = false;
+        if (queuedVolume.current !== null) {
+          flushQueuedVolume();
+        } else {
+          optimisticVolumeUntil.current = Date.now() + 750;
+        }
+      });
+  }, [stream.id]);
+
   const commitVolume = useCallback((nextValue = draftVolume) => {
-    const next = sliderPercent(nextValue);
+    const next = appVolumePercent(nextValue);
     setDraftVolume(next);
     if (lastCommitted.current === next) return;
     lastCommitted.current = next;
-    void (async () => {
-      const volume = next / 100;
-      await run("set_app_stream_volume", {
-        streamId: stream.id,
-        volume,
-      });
-      await run("set_app_volume_preset", {
+    optimisticVolumeUntil.current = Date.now() + 1500;
+    queuedVolume.current = next;
+    flushQueuedVolume();
+    const volume = next / 100;
+    if (presetSaveTimer.current !== null) {
+      window.clearTimeout(presetSaveTimer.current);
+    }
+    presetSaveTimer.current = window.setTimeout(() => {
+      void invoke("set_app_volume_preset", {
         matcher: matcherForStream(stream),
         volume,
-      });
-    })().catch(() => undefined);
-  }, [draftVolume, run, stream]);
+      }).catch(() => undefined);
+    }, 250);
+  }, [draftVolume, flushQueuedVolume, stream]);
 
   const routeStream = async (channelId: string) => {
+    setDraftRoute(channelId);
+    optimisticRouteUntil.current = Date.now() + 1500;
     if (!channelId) {
       const matcher = matcherForStream(stream);
-      await run("remove_app_route", { matcher });
-      await run(
-        "move_app_stream_to_default",
-        { streamId: stream.id },
-        "Route cleared",
-      );
+      await invoke("remove_app_route", { matcher });
+      await invoke("move_app_stream_to_default", { streamId: stream.id });
+      optimisticRouteUntil.current = Date.now() + 750;
       return;
     }
-    await run("move_app_stream", {
+    await invoke("move_app_stream", {
       streamId: stream.id,
       channelId,
     });
-    await run(
-      "assign_app_to_channel",
-      {
-        channelId,
-        matcher: matcherForStream(stream),
-      },
-      "Route saved",
-    );
+    await invoke("assign_app_to_channel", {
+      channelId,
+      matcher: matcherForStream(stream),
+    });
+    optimisticRouteUntil.current = Date.now() + 750;
   };
 
   return (
@@ -1526,7 +2006,7 @@ function StreamRouteRow({
       </div>
       <AppSelect
         ariaLabel={`Route ${stream.display_name} to channel`}
-        onChange={(value) => void routeStream(value)}
+        onChange={(value) => void routeStream(value).catch(() => setDraftRoute(stream.routed_channel_id ?? ""))}
         options={[
           { value: "", label: "Unassigned" },
           ...state.config.channels.map((channel) => ({
@@ -1534,16 +2014,16 @@ function StreamRouteRow({
             label: channelDisplayName(channel),
           })),
         ]}
-        value={stream.routed_channel_id ?? ""}
+        value={draftRoute}
       />
       <label className="route-volume-control" title="App stream volume">
         <Volume2 size={14} />
         <input
           aria-label={`${stream.display_name} volume`}
           max={100}
-          min={0}
+          min={1}
           onBlur={(event) => commitVolume(Number(event.currentTarget.value))}
-          onChange={(event) => setDraftVolume(sliderPercent(Number(event.currentTarget.value)))}
+          onChange={(event) => setDraftVolume(appVolumePercent(Number(event.currentTarget.value)))}
           onKeyUp={(event) => {
             if (shouldCommitSliderKey(event)) commitVolume(Number(event.currentTarget.value));
           }}
@@ -1562,10 +2042,7 @@ function StreamRouteRow({
       <button
         className={stream.muted ? "icon-button danger active" : "icon-button"}
         onClick={() =>
-          void run("set_app_stream_mute", {
-            streamId: stream.id,
-            muted: !stream.muted,
-          }).catch(() => undefined)
+          void setAppStreamMute(stream.id, !stream.muted).catch(() => undefined)
         }
         title="Mute app"
         type="button"
@@ -1702,13 +2179,13 @@ function EffectsView({
   selectedChannel,
   selectedChannelId,
   setSelectedChannelId,
-  run,
+  setChannelInput,
 }: {
   state: AppStateSnapshot;
   selectedChannel?: Channel;
   selectedChannelId: string;
   setSelectedChannelId: (channelId: string) => void;
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  setChannelInput: (channelId: string, sourceDevice: string | null) => Promise<void>;
 }) {
   const microphoneInputs = useMemo(
     () => sortedMicrophoneInputs(state.graph.inputs),
@@ -1968,15 +2445,7 @@ function EffectsView({
               ariaLabel="Microphone"
               id="effects-microphone-source"
               onChange={(value) =>
-                void run(
-                  "set_channel_input",
-                  {
-                    channelId: selectedChannel.id,
-                    sourceDevice: value || null,
-                    source_device: value || null,
-                  },
-                  "Microphone updated",
-                ).catch(() => undefined)
+                void setChannelInput(selectedChannel.id, value || null).catch(() => undefined)
               }
               options={[
                 { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto hardware input") },
@@ -2268,7 +2737,7 @@ function ScenesView({
   };
 
   return (
-    <section className="panel single-panel">
+    <section className="panel single-panel scene-panel">
       <div className="panel-header">
         <h2>Scenes</h2>
         <div className="panel-actions">
@@ -2700,184 +3169,538 @@ function EffectAvailabilitySummary({ state }: { state: AppStateSnapshot }) {
 }
 
 function SettingsView({
+  audioActionReport,
   state,
   run,
+  setSettings,
   updateBusy,
   updateInfo,
+  onCleanup,
   onCheckUpdates,
   onInstallUpdate,
   onOpenReleases,
+  onPrune,
 }: {
+  audioActionReport: AudioActionReport | null;
   state: AppStateSnapshot;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  setSettings: (settings: MixerSettings) => Promise<void>;
   updateBusy: boolean;
   updateInfo: UpdateInfo | null;
+  onCleanup: () => void | Promise<unknown>;
   onCheckUpdates: () => void;
   onInstallUpdate: () => void;
   onOpenReleases: () => void;
+  onPrune: () => void | Promise<unknown>;
 }) {
-  const updateSettings = (settings: MixerSettings) =>
-    run("set_settings", { settings }, "Settings updated");
+  const updateSettings = (settings: MixerSettings) => void setSettings(settings);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
+
+  return (
+    <section className={settingsTab === "health" ? "settings-view wide" : "settings-view"}>
+      <div className="panel settings-tabs-panel">
+        <div className="panel-header">
+          <h2>Settings</h2>
+          <Settings size={18} />
+        </div>
+        <div className="settings-tabs" role="tablist" aria-label="Settings sections">
+          <button
+            className={settingsTab === "general" ? "settings-tab active" : "settings-tab"}
+            onClick={() => setSettingsTab("general")}
+            role="tab"
+            type="button"
+          >
+            <Settings size={16} />
+            General
+          </button>
+          <button
+            className={settingsTab === "profiles" ? "settings-tab active" : "settings-tab"}
+            onClick={() => setSettingsTab("profiles")}
+            role="tab"
+            type="button"
+          >
+            <Cable size={16} />
+            Profiles
+          </button>
+          <button
+            className={settingsTab === "health" ? "settings-tab active" : "settings-tab"}
+            onClick={() => setSettingsTab("health")}
+            role="tab"
+            type="button"
+          >
+            <Activity size={16} />
+            Health
+          </button>
+        </div>
+      </div>
+
+      {settingsTab === "general" && (
+        <section className="panel single-panel settings-content-panel">
+          <div className="settings-grid">
+            <Toggle
+              label="Start at login"
+              onChange={(value) =>
+                updateSettings({ ...state.config.settings, start_at_login: value })
+              }
+              value={state.config.settings.start_at_login}
+            />
+            <Toggle
+              label="Restore audio graph on launch"
+              onChange={(value) =>
+                updateSettings({ ...state.config.settings, restore_audio_graph_on_launch: value })
+              }
+              value={state.config.settings.restore_audio_graph_on_launch}
+            />
+            <Toggle
+              label="Auto monitor output"
+              onChange={(value) =>
+                updateSettings({ ...state.config.settings, monitor_follows_default_output: value })
+              }
+              value={state.config.settings.monitor_follows_default_output}
+            />
+            <Toggle
+              label="Control default microphone"
+              onChange={(value) =>
+                updateSettings({ ...state.config.settings, lock_default_input: value })
+              }
+              value={state.config.settings.lock_default_input}
+            />
+            <Toggle
+              label="Lock default output"
+              onChange={(value) =>
+                updateSettings({ ...state.config.settings, lock_default_output: value })
+              }
+              value={state.config.settings.lock_default_output}
+            />
+            <Toggle
+              label="Auto-check updates"
+              onChange={(value) =>
+                updateSettings({ ...state.config.settings, auto_check_updates: value })
+              }
+              value={state.config.settings.auto_check_updates}
+            />
+            <Toggle
+              label="Auto-install AppImage updates"
+              onChange={(value) =>
+                updateSettings({ ...state.config.settings, auto_install_updates: value })
+              }
+              value={state.config.settings.auto_install_updates}
+            />
+            <div className="settings-control">
+              <span>Release channel</span>
+              <AppSelect
+                ariaLabel="Release channel"
+                onChange={(value) =>
+                  void updateSettings({
+                    ...state.config.settings,
+                    release_channel: value === "beta" ? "beta" : "stable",
+                  })
+                }
+                options={[
+                  { value: "stable", label: "Stable" },
+                  { value: "beta", label: "Pre-release" },
+                ]}
+                value={state.config.settings.release_channel}
+              />
+            </div>
+          </div>
+          <div className="settings-section">
+            <div className="panel-header compact">
+              <h2>Updates</h2>
+              <Download size={18} />
+            </div>
+            <div className="update-card">
+              <div>
+                <strong>{updateInfo?.message ?? "Update status has not been checked"}</strong>
+                <span>
+                  {updateInfo
+                    ? `${updateInfo.channel} · current ${updateInfo.current_version}${updateInfo.version ? ` · latest ${updateInfo.version}` : ""}`
+                    : "Signed AppImage updates, plus deb/rpm/AUR package releases"}
+                </span>
+              </div>
+              <div className="panel-actions">
+                <button className="secondary-button" disabled={updateBusy} onClick={onCheckUpdates} type="button">
+                  <RefreshCw size={16} />
+                  Check
+                </button>
+                <button
+                  className="secondary-button"
+                  disabled={updateBusy || !updateInfo?.available || !updateInfo.install_supported}
+                  onClick={onInstallUpdate}
+                  title={
+                    updateInfo?.install_supported === false
+                      ? "Install through your package manager or use the AppImage"
+                      : "Download, verify, install, and restart"
+                  }
+                  type="button"
+                >
+                  <Download size={16} />
+                  Install
+                </button>
+                <button className="secondary-button" onClick={onOpenReleases} type="button">
+                  <ExternalLink size={16} />
+                  Releases
+                </button>
+              </div>
+            </div>
+          </div>
+          <div className="settings-section">
+            <div className="panel-header compact">
+              <h2>Sync</h2>
+              <Gauge size={18} />
+            </div>
+            <div className="settings-grid">
+              <Toggle
+                label="Low-latency mic monitoring"
+                onChange={(value) =>
+                  updateSettings({ ...state.config.settings, low_latency_mic_monitoring: value })
+                }
+                value={state.config.settings.low_latency_mic_monitoring}
+              />
+              <VolumeFader
+                label="Stream source delay"
+                max={250}
+                min={0}
+                unit="ms"
+                value={state.config.settings.stream_sync_delay_msec}
+                onChange={(value) =>
+                  updateSettings({
+                    ...state.config.settings,
+                    stream_sync_delay_msec: Math.round(value),
+                  })
+                }
+              />
+              <VolumeFader
+                label="Monitor source delay"
+                max={250}
+                min={0}
+                unit="ms"
+                value={state.config.settings.monitor_sync_delay_msec}
+                onChange={(value) =>
+                  updateSettings({
+                    ...state.config.settings,
+                    monitor_sync_delay_msec: Math.round(value),
+                  })
+                }
+              />
+            </div>
+          </div>
+          <div className="system-grid">
+            <Stat icon={Cpu} label="Engine" value={state.engine.audio_graph_running ? "Running" : "Stopped"} />
+            <Stat icon={Radio} label="Rate" value={`${state.config.audio.sample_rate_hz / 1000} kHz`} />
+            <Stat icon={AudioLines} label="Format" value={`${state.config.audio.bit_depth}-bit`} />
+          </div>
+        </section>
+      )}
+
+      {settingsTab === "profiles" && <HardwareProfilesView state={state} />}
+
+      {settingsTab === "health" && (
+        <DiagnosticsView
+          audioActionReport={audioActionReport}
+          onCleanup={onCleanup}
+          onPrune={onPrune}
+          state={state}
+          run={run}
+        />
+      )}
+    </section>
+  );
+}
+
+function HardwareProfilesView({
+  state,
+}: {
+  state: AppStateSnapshot;
+}) {
+  const [hardwareProfiles, setHardwareProfiles] = useState<HardwareProfileUiState | null>(null);
+  const [hardwareProfileError, setHardwareProfileError] = useState<string | null>(null);
+  const fallbackProfile = hardwareProfiles?.fallback_profile ?? state.config.device_policy.fallback_hardware_profile;
+  const fallbackSummary = useMemo(() => hardwareProfileSummaryFromFallback(fallbackProfile), [fallbackProfile]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+  const [profileNameDraft, setProfileNameDraft] = useState(fallbackSummary.name);
+  const hardwareDevices = useMemo(
+    () => [
+      ...state.graph.inputs
+        .filter(isHardwareProfileDevice)
+        .map((device) => ({ device, kind: "Input" })),
+      ...state.graph.outputs
+        .filter(isHardwareProfileDevice)
+        .map((device) => ({ device, kind: "Output" })),
+    ],
+    [state.graph.inputs, state.graph.outputs],
+  );
+  const profileSummaries = useMemo(() => {
+    const profilesById = new Map<string, HardwareProfileSummary>();
+    for (const profile of hardwareProfiles?.profiles ?? []) {
+      profilesById.set(profile.id, profile);
+    }
+    profilesById.set(fallbackSummary.id, fallbackSummary);
+    return Array.from(profilesById.values());
+  }, [fallbackSummary, hardwareProfiles?.profiles]);
+  const profileById = useMemo(
+    () => new Map(profileSummaries.map((profile) => [profile.id, profile])),
+    [profileSummaries],
+  );
+  const profileOptions = useMemo(() => {
+    const options: SelectOption[] = [{ value: "", label: "Auto match" }];
+    for (const profile of profileSummaries) {
+      options.push({ value: profile.id, label: hardwareProfileOptionLabel(profile) });
+    }
+    const missingAssignments = new Set(
+      Object.values(hardwareProfiles?.assignments ?? {}).filter((profileId) => !profileById.has(profileId)),
+    );
+    for (const { device } of hardwareDevices) {
+      if (device.matched_profile_id && !profileById.has(device.matched_profile_id)) {
+        missingAssignments.add(device.matched_profile_id);
+      }
+    }
+    for (const profileId of missingAssignments) {
+      options.push({ value: profileId, label: `Missing profile: ${profileId}`, disabled: true });
+    }
+    return options;
+  }, [hardwareDevices, hardwareProfiles?.assignments, profileById, profileSummaries]);
+  const resolvedProfileIdForDevice = useCallback(
+    (device: DeviceInfo) =>
+      hardwareProfiles?.assignments[device.id] || device.matched_profile_id || fallbackProfile.id,
+    [fallbackProfile.id, hardwareProfiles?.assignments],
+  );
+  const selectedDeviceEntry = useMemo(
+    () => hardwareDevices.find(({ device }) => device.id === selectedDeviceId) ?? hardwareDevices[0] ?? null,
+    [hardwareDevices, selectedDeviceId],
+  );
+  const currentProfileId = selectedDeviceEntry
+    ? resolvedProfileIdForDevice(selectedDeviceEntry.device)
+    : fallbackProfile.id;
+  const currentProfile = profileById.get(currentProfileId) ?? fallbackSummary;
+
+  const loadHardwareProfiles = useCallback(async () => {
+    try {
+      const next = await invoke<HardwareProfileUiState>("list_hardware_profiles");
+      setHardwareProfiles(next);
+      setHardwareProfileError(null);
+    } catch (error) {
+      setHardwareProfileError(String(error));
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadHardwareProfiles();
+  }, [loadHardwareProfiles]);
+
+  useEffect(() => {
+    if (hardwareDevices.length === 0) {
+      setSelectedDeviceId(null);
+      return;
+    }
+    if (!selectedDeviceId || !hardwareDevices.some(({ device }) => device.id === selectedDeviceId)) {
+      setSelectedDeviceId(hardwareDevices[0].device.id);
+    }
+  }, [hardwareDevices, selectedDeviceId]);
+
+  useEffect(() => {
+    setProfileNameDraft(currentProfile.name);
+  }, [currentProfile.id, currentProfile.name]);
+
+  const assignHardwareProfile = async (deviceId: string, profileId: string) => {
+    try {
+      const next = await invoke<HardwareProfileUiState>(
+        "set_device_hardware_profile",
+        {
+          deviceId,
+          device_id: deviceId,
+          profileId: profileId || null,
+          profile_id: profileId || null,
+        },
+      );
+      setHardwareProfiles(next);
+      setHardwareProfileError(null);
+    } catch (error) {
+      setHardwareProfileError(String(error));
+    }
+  };
+
+  const updateCurrentProfile = async (profile: HardwareProfileSummary) => {
+    try {
+      const next = await invoke<HardwareProfileUiState>(
+        "set_hardware_profile_policy",
+        {
+          profileId: profile.id,
+          profile_id: profile.id,
+          name: profile.name,
+          latencyPolicy: profile.latency_policy,
+          latency_policy: profile.latency_policy,
+          routingPolicy: profile.routing_policy,
+          routing_policy: profile.routing_policy,
+        },
+      );
+      setHardwareProfiles(next);
+      setHardwareProfileError(null);
+    } catch (error) {
+      setHardwareProfileError(String(error));
+    }
+  };
+
+  const updateCurrentLatency = (key: keyof HardwareProfileSummary["latency_policy"], value: number) => {
+    void updateCurrentProfile({
+      ...currentProfile,
+      latency_policy: {
+        ...currentProfile.latency_policy,
+        [key]: Math.round(value),
+      },
+    }).catch(() => undefined);
+  };
+
+  const updateCurrentRouting = (key: keyof HardwareProfileSummary["routing_policy"], value: number | boolean) => {
+    void updateCurrentProfile({
+      ...currentProfile,
+      routing_policy: {
+        ...currentProfile.routing_policy,
+        [key]: typeof value === "number" ? Math.round(value) : value,
+      },
+    }).catch(() => undefined);
+  };
+
+  const commitCurrentProfileName = () => {
+    const name = profileNameDraft.trim();
+    if (!name || name === currentProfile.name) {
+      setProfileNameDraft(currentProfile.name);
+      return;
+    }
+    void updateCurrentProfile({ ...currentProfile, name }).catch(() => undefined);
+  };
 
   return (
     <section className="panel single-panel">
       <div className="panel-header">
-        <h2>Settings</h2>
-        <Settings size={18} />
+        <h2>Hardware Profiles</h2>
+        <Cable size={18} />
       </div>
-      <div className="settings-grid">
-        <Toggle
-          label="Start at login"
-          onChange={(value) =>
-            updateSettings({ ...state.config.settings, start_at_login: value })
-          }
-          value={state.config.settings.start_at_login}
-        />
-        <Toggle
-          label="Restore audio graph on launch"
-          onChange={(value) =>
-            updateSettings({ ...state.config.settings, restore_audio_graph_on_launch: value })
-          }
-          value={state.config.settings.restore_audio_graph_on_launch}
-        />
-        <Toggle
-          label="Auto monitor output"
-          onChange={(value) =>
-            updateSettings({ ...state.config.settings, monitor_follows_default_output: value })
-          }
-          value={state.config.settings.monitor_follows_default_output}
-        />
-        <Toggle
-          label="Control default microphone"
-          onChange={(value) =>
-            updateSettings({ ...state.config.settings, lock_default_input: value })
-          }
-          value={state.config.settings.lock_default_input}
-        />
-        <Toggle
-          label="Lock default output"
-          onChange={(value) =>
-            updateSettings({ ...state.config.settings, lock_default_output: value })
-          }
-          value={state.config.settings.lock_default_output}
-        />
-        <Toggle
-          label="Auto-check updates"
-          onChange={(value) =>
-            updateSettings({ ...state.config.settings, auto_check_updates: value })
-          }
-          value={state.config.settings.auto_check_updates}
-        />
-        <Toggle
-          label="Auto-install AppImage updates"
-          onChange={(value) =>
-            updateSettings({ ...state.config.settings, auto_install_updates: value })
-          }
-          value={state.config.settings.auto_install_updates}
-        />
-        <div className="settings-control">
-          <span>Release channel</span>
-          <AppSelect
-            ariaLabel="Release channel"
-            onChange={(value) =>
-              void updateSettings({
-                ...state.config.settings,
-                release_channel: value === "beta" ? "beta" : "stable",
-              })
-            }
-            options={[
-              { value: "stable", label: "Stable" },
-              { value: "beta", label: "Pre-release" },
-            ]}
-            value={state.config.settings.release_channel}
-          />
+      {hardwareProfileError && (
+        <div className="effect-warning">
+          <CircleAlert size={15} />
+          <span>{hardwareProfileError}</span>
         </div>
-      </div>
-      <div className="settings-section">
-        <div className="panel-header compact">
-          <h2>Updates</h2>
-          <Download size={18} />
-        </div>
-        <div className="update-card">
-          <div>
-            <strong>{updateInfo?.message ?? "Update status has not been checked"}</strong>
-            <span>
-              {updateInfo
-                ? `${updateInfo.channel} · current ${updateInfo.current_version}${updateInfo.version ? ` · latest ${updateInfo.version}` : ""}`
-                : "Signed AppImage updates, plus deb/rpm/AUR package releases"}
-            </span>
-          </div>
-          <div className="panel-actions">
-            <button className="secondary-button" disabled={updateBusy} onClick={onCheckUpdates} type="button">
-              <RefreshCw size={16} />
-              Check
-            </button>
-            <button
-              className="secondary-button"
-              disabled={updateBusy || !updateInfo?.available || !updateInfo.install_supported}
-              onClick={onInstallUpdate}
-              title={
-                updateInfo?.install_supported === false
-                  ? "Install through your package manager or use the AppImage"
-                  : "Download, verify, install, and restart"
+      )}
+      <div className="hardware-profile-grid">
+        <div className="profile-editor">
+          <label className="field-label" htmlFor="profiles-current-profile-name">
+            Current profile
+          </label>
+          <input
+            className="text-field"
+            id="profiles-current-profile-name"
+            onBlur={commitCurrentProfileName}
+            onChange={(event) => setProfileNameDraft(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.currentTarget.blur();
               }
-              type="button"
-            >
-              <Download size={16} />
-              Install
-            </button>
-            <button className="secondary-button" onClick={onOpenReleases} type="button">
-              <ExternalLink size={16} />
-              Releases
-            </button>
+            }}
+            value={profileNameDraft}
+          />
+          <div className="profile-editor-meta">
+            <strong>{currentProfile.source}</strong>
+            <span>{currentProfile.confidence}</span>
           </div>
-        </div>
-      </div>
-      <div className="settings-section">
-        <div className="panel-header compact">
-          <h2>Sync</h2>
-          <Gauge size={18} />
-        </div>
-        <div className="settings-grid">
+          {selectedDeviceEntry && (
+            <div className="profile-editor-meta">
+              <strong>{selectedDeviceEntry.kind}</strong>
+              <span>{selectedDeviceEntry.device.description || selectedDeviceEntry.device.name}</span>
+            </div>
+          )}
+          <VolumeFader
+            compact
+            label="Stable"
+            max={500}
+            min={5}
+            unit=" ms"
+            value={currentProfile.latency_policy.stable_msec ?? 35}
+            onChange={(value) => updateCurrentLatency("stable_msec", value)}
+          />
+          <VolumeFader
+            compact
+            label="Low latency"
+            max={500}
+            min={5}
+            unit=" ms"
+            value={currentProfile.latency_policy.low_latency_msec ?? 20}
+            onChange={(value) => updateCurrentLatency("low_latency_msec", value)}
+          />
+          <VolumeFader
+            compact
+            label="Bluetooth floor"
+            max={500}
+            min={50}
+            unit=" ms"
+            value={currentProfile.latency_policy.bluetooth_floor_msec ?? 120}
+            onChange={(value) => updateCurrentLatency("bluetooth_floor_msec", value)}
+          />
+          <VolumeFader
+            compact
+            label="Input priority"
+            max={100}
+            min={0}
+            unit=""
+            value={currentProfile.routing_policy.input_priority ?? 35}
+            onChange={(value) => updateCurrentRouting("input_priority", value)}
+          />
+          <VolumeFader
+            compact
+            label="Output priority"
+            max={100}
+            min={0}
+            unit=""
+            value={currentProfile.routing_policy.output_priority ?? 30}
+            onChange={(value) => updateCurrentRouting("output_priority", value)}
+          />
           <Toggle
-            label="Low-latency mic monitoring"
-            onChange={(value) =>
-              updateSettings({ ...state.config.settings, low_latency_mic_monitoring: value })
-            }
-            value={state.config.settings.low_latency_mic_monitoring}
+            label="Auto-select input"
+            onChange={(value) => updateCurrentRouting("allow_auto_select_input", value)}
+            value={currentProfile.routing_policy.allow_auto_select_input}
           />
-          <VolumeFader
-            label="Stream source delay"
-            max={250}
-            min={0}
-            unit="ms"
-            value={state.config.settings.stream_sync_delay_msec}
-            onChange={(value) =>
-              updateSettings({
-                ...state.config.settings,
-                stream_sync_delay_msec: Math.round(value),
-              })
-            }
+          <Toggle
+            label="Auto-select output"
+            onChange={(value) => updateCurrentRouting("allow_auto_select_output", value)}
+            value={currentProfile.routing_policy.allow_auto_select_output}
           />
-          <VolumeFader
-            label="Monitor source delay"
-            max={250}
-            min={0}
-            unit="ms"
-            value={state.config.settings.monitor_sync_delay_msec}
-            onChange={(value) =>
-              updateSettings({
-                ...state.config.settings,
-                monitor_sync_delay_msec: Math.round(value),
-              })
-            }
+          <Toggle
+            label="Prefer wired input"
+            onChange={(value) => updateCurrentRouting("prefer_non_bluetooth_input", value)}
+            value={currentProfile.routing_policy.prefer_non_bluetooth_input}
           />
         </div>
-      </div>
-      <div className="system-grid">
-        <Stat icon={Cpu} label="Engine" value={state.engine.audio_graph_running ? "Running" : "Stopped"} />
-        <Stat icon={Radio} label="Rate" value={`${state.config.audio.sample_rate_hz / 1000} kHz`} />
-        <Stat icon={AudioLines} label="Format" value={`${state.config.audio.bit_depth}-bit`} />
+        <div className="profile-device-list">
+          {hardwareDevices.map(({ device, kind }) => {
+            const assignment = hardwareProfiles?.assignments[device.id] ?? "";
+            const resolvedProfileId = resolvedProfileIdForDevice(device);
+            const activeProfile = profileById.get(resolvedProfileId);
+            const selected = selectedDeviceEntry?.device.id === device.id;
+            return (
+              <div
+                className={selected ? "profile-device-row selected" : "profile-device-row"}
+                key={`${kind}-${device.id}`}
+                onClick={() => setSelectedDeviceId(device.id)}
+                onFocus={() => setSelectedDeviceId(device.id)}
+              >
+                <div>
+                  <strong>{device.description || device.name}</strong>
+                  <span>
+                    {kind} · {device.bus ?? "unknown"} · {activeProfile?.name ?? device.matched_profile_id ?? "Auto"}
+                  </span>
+                </div>
+                <AppSelect
+                  ariaLabel={`${device.description || device.name} profile`}
+                  disabled={!hardwareProfiles}
+                  onChange={(value) => void assignHardwareProfile(device.id, value).catch(() => undefined)}
+                  options={profileOptions}
+                  value={assignment || resolvedProfileId}
+                />
+              </div>
+            );
+          })}
+          {hardwareDevices.length === 0 && <EmptyState label="No hardware devices detected" />}
+        </div>
       </div>
     </section>
   );
@@ -2980,9 +3803,32 @@ function viewTitle(view: View): string {
     routing: "Routing",
     effects: "Effects",
     scenes: "Scenes",
-    diagnostics: "Health",
     settings: "Settings",
   }[view];
+}
+
+function hardwareProfileOptionLabel(profile: HardwareProfileSummary): string {
+  return `${profile.name} · ${profile.source}`;
+}
+
+function hardwareProfileSummaryFromFallback(profile: FallbackHardwareProfile): HardwareProfileSummary {
+  return {
+    id: profile.id,
+    name: profile.name,
+    source: "default",
+    confidence: profile.confidence,
+    latency_policy: profile.latency_policy,
+    routing_policy: profile.routing_policy,
+    bluetooth_mic_policy: profile.bluetooth_mic_policy,
+  };
+}
+
+function isHardwareProfileDevice(device: DeviceInfo): boolean {
+  if (device.is_virtual || device.bus === "virtual") return false;
+  const text = [device.id, device.name, device.description].join(" ").toLowerCase();
+  if (text.includes("wavelinux")) return false;
+  if (text.includes(".monitor") || text.includes("monitor of")) return false;
+  return true;
 }
 
 function primaryBusMixes(mixes: Mix[]): Mix[] {
@@ -3462,21 +4308,13 @@ function channelBusMeterId(channelId: string, mixId: string): string {
   return `channel:${channelId}:mix:${mixId}`;
 }
 
-function channelRawMeterId(channelId: string): string {
-  return `channel:${channelId}:raw`;
-}
-
 function channelBusVuLevel(
   channel: Channel,
   mix: Mix,
-  bus: MixBus,
+  _bus: MixBus,
   levelFor: (nodeId: string) => number,
 ): number {
-  const busLevel = levelFor(channelBusMeterId(channel.id, mix.id));
-  if (busLevel > 0) return busLevel;
-  if (bus.muted || bus.volume <= 0) return 0;
-  const channelLevel = Math.max(levelFor(channel.id), levelFor(channelRawMeterId(channel.id)));
-  return Math.max(0, Math.min(1, channelLevel * bus.volume));
+  return levelFor(channelBusMeterId(channel.id, mix.id));
 }
 
 function normalizeSourceEffects(effects: EffectInstance[], preferredInstanceId?: string): EffectInstance[] {
@@ -3534,6 +4372,14 @@ function sliderPercent(value: number): number {
 
 function volumeToPercent(volume: number): number {
   return sliderPercent(volume * 100);
+}
+
+function appVolumePercent(value: number): number {
+  return Math.max(1, Math.min(100, Math.round(value)));
+}
+
+function appVolumeToPercent(volume: number): number {
+  return appVolumePercent(volume * 100);
 }
 
 function shouldCommitSliderKey(event: ReactKeyboardEvent<HTMLInputElement>): boolean {

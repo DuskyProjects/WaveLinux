@@ -16,6 +16,6 @@ if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" && -z "${TAURI_SIGNING_PRIVATE_KEY_PAT
 fi
 
 cd "$ROOT_DIR/crates/app"
-export NO_STRIP="${NO_STRIP:-1}"
+export NO_STRIP="${NO_STRIP:-0}"
 exec "$ROOT_DIR/node_modules/.bin/tauri" build \
   --config '{"bundle":{"createUpdaterArtifacts":true}}'

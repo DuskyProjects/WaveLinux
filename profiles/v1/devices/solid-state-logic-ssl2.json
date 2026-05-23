@@ -1,0 +1,44 @@
+{
+  "id": "solid-state-logic.ssl2",
+  "name": "Solid State Logic SSL 2",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["ssl 2"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["solid state logic"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "channels": 2,
+    "sample_rates_hz": [44100, 48000, 88200, 96000, 176400, 192000]
+  },
+  "latency_policy": {
+    "stable_msec": 22,
+    "low_latency_msec": 10
+  },
+  "routing_policy": {
+    "input_priority": 84,
+    "output_priority": 64,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Keep the main duplex interface path preferred over webcam or Bluetooth microphones."
+  ],
+  "source_notes": [
+    "Seeded from common SSL 2 USB interface capabilities and published 24-bit/192 kHz positioning."
+  ],
+  "maintainer": "WaveLinux"
+}
