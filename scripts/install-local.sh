@@ -19,9 +19,19 @@ if [[ ! -f "$APPIMAGE" ]]; then
   exit 1
 fi
 
+dependency_args=()
+if [[ "${WAVELINUX_INSTALL_DEPS:-0}" == "1" ]]; then
+  dependency_args+=(--install)
+fi
+if [[ "${WAVELINUX_INSTALL_EFFECTS:-0}" == "1" ]]; then
+  dependency_args+=(--install-effects)
+fi
+bash "$ROOT_DIR/scripts/check-dependencies.sh" "${dependency_args[@]}"
+
 install -d "$BIN_DIR" "$SUPPORT_DIR" "$APP_DIR" "$ICON_BASE/32x32/apps" "$ICON_BASE/128x128/apps" "$ICON_BASE/256x256/apps" "$ICON_BASE/512x512/apps" "$ICON_BASE/scalable/apps"
 install -m 0755 "$APPIMAGE" "$INSTALLED_APPIMAGE"
 install -m 0755 "$ROOT_DIR/scripts/wavelinux-launcher.sh" "$LAUNCHER"
+install -m 0755 "$ROOT_DIR/scripts/check-dependencies.sh" "$SUPPORT_DIR/check-dependencies.sh"
 install -m 0755 "$ROOT_DIR/scripts/install-alsa-aliases.sh" "$SUPPORT_DIR/install-alsa-aliases.sh"
 install -m 0755 "$ROOT_DIR/scripts/remove-alsa-aliases.sh" "$SUPPORT_DIR/remove-alsa-aliases.sh"
 install -m 0644 "$ROOT_DIR/scripts/sanitize-runtime-env.sh" "$INSTALLED_SANITIZER"

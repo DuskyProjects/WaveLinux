@@ -1,49 +1,169 @@
 # WaveLinux 4.0
 
-WaveLinux 4.0 is a new Linux-first, open-source creator audio mixer built with
-Rust, Tauri, React, and PipeWire. It carries the WaveLinux name, but the app,
-architecture, and product direction start fresh.
+WaveLinux 4.0 is a Linux-first creator audio mixer built with Rust, Tauri,
+React, TypeScript, and PipeWire. It is a fresh application that carries the
+WaveLinux name forward while replacing the old Python implementation with a
+new native desktop stack.
 
-The v1 target is software parity for generic audio hardware and desktop audio:
+The goal is Wave Link-style software mixing for Linux: virtual source faders,
+separate Monitor and Stream mixes, app routing, microphone processing, scenes,
+diagnostics, tray behavior, package builds, and open-source DSP replacements.
 
+WaveLinux is not an Elgato hardware control panel. Vendor-specific microphone
+features, Stream Deck integration, proprietary marketplace effects, and
+hardware Clipguard behavior are intentionally out of scope for 4.0. Standard
+Linux audio hardware is the target.
+
+## Features
+
+- PipeWire and WirePlumber audio graph management
 - Up to 5 virtual mixes
-- Up to 8 software channels plus 4 hardware input channels
-- Hardware input routing for any PipeWire capture source: USB interfaces,
-  headset microphones, capture cards, line inputs, Bluetooth sources, monitor
-  sources, and other non-WaveLinux audio sources
-- Unlimited app streams grouped into channels
-- Per-channel/per-mix volume and mute
-- Virtual mix sources for OBS, Discord, Teams, games, and browsers
-- Open DSP chains through PipeWire filter-chain/LADSPA/LV2 replacements
-- Scenes, diagnostics, startup restore, and packaged Linux desktop builds
+- Up to 8 software routes plus hardware input routes
+- Two faders per source: Monitor and Stream
+- Virtual mix outputs for OBS, Discord, browsers, games, meetings, and tools
+- App stream discovery, saved routing, app identity overrides, and offline rules
+- Automatic monitor output policy: Bluetooth, USB audio, jack, then speakers
+- Automatic microphone policy: USB mic, microphone jack, built-in mic, then Bluetooth input
+- Bluetooth A2DP profile protection when possible
+- Hotplug recovery for inputs and outputs
+- Real channel/mix metering with stale-sample decay
+- Per-source effect chains through PipeWire filter-chain and LADSPA/open plugins
+- DeepFilterNet, RNNoise, high-pass, EQ, compressor, gate, and limiter catalog entries
+- Scenes, setup templates, diagnostics, sound checks, graph repair, and cleanup
+- Close-to-tray desktop behavior with tray Quit for full graph cleanup
+- AppImage, deb, rpm, and AUR packaging
+- Signed in-app update checks for AppImage installs
 
-Vendor-specific device features such as proprietary gain control, hardware clip
-protection, Stream Deck integration, and marketplace effects are outside the v1
-scope. WaveLinux should work with standard Linux audio devices instead of
-special-casing one hardware family.
+## Supported Platform
 
-## Desktop Development
+WaveLinux 4.0 targets PipeWire-based Linux desktops.
 
-WaveLinux is a local Tauri desktop app. The browser/Vite target exists only as
-a quick UI preview and should not be treated as the product runtime.
+Required host services and tools:
 
-Host requirements:
+- PipeWire
+- WirePlumber
+- pipewire-pulse
+- `pactl`
+- `wpctl`
+- `pw-cli`
+- `pw-dump`
 
-- Rust 1.80 or newer
-- Node + Yarn
-- PipeWire, WirePlumber, and pipewire-pulse
-- `pactl`, `wpctl`, `pw-cli`, and `pw-dump`
+Recommended optional effect packages:
 
-Install frontend dependencies:
+- SWH LADSPA plugins for compressor, gate, and limiter support
+- RNNoise LADSPA/noise-suppression-for-voice
+- DeepFilterNet LADSPA support when available for your distro
+
+## Install
+
+Download the latest release artifact from GitHub Releases:
+
+```bash
+https://github.com/DuskyProjects/WaveLinux/releases
+```
+
+Available formats:
+
+- AppImage: portable desktop build and the primary self-update format
+- deb: Debian and Ubuntu-family package
+- rpm: Fedora/openSUSE-family package
+- AUR metadata: Arch package recipe
+
+For local development installs from a checkout:
 
 ```bash
 yarn install
+yarn desktop:build
+yarn install:local
 ```
 
-Run the core tests:
+The local installer places the AppImage and launcher here:
 
 ```bash
-cargo test -p wavelinux-model -p wavelinux-pw -p wavelinux-engine
+~/.local/share/wavelinux/WaveLinux_4.0.0_amd64.AppImage
+~/.local/bin/wavelinux
+```
+
+It also installs the desktop entry and icons under the usual XDG user paths.
+
+## Dependency Checks
+
+Check runtime dependencies and optional effect plugins:
+
+```bash
+yarn deps:check
+```
+
+Install missing runtime dependencies and optional effect packages when a
+supported package manager is available:
+
+```bash
+yarn deps:install
+```
+
+Install only optional effect packages:
+
+```bash
+yarn effects:install
+```
+
+The dependency installer checks first. It does not install packages unless you
+explicitly run the install command or set the corresponding environment flags.
+
+## ALSA-Only Apps
+
+Most apps should see WaveLinux devices through PipeWire/PulseAudio. For legacy
+ALSA-only applications that cannot see those devices, install optional ALSA
+aliases:
+
+```bash
+yarn install:alsa-aliases
+```
+
+This is opt-in and uses a marked block in `~/.asoundrc` so uninstall can remove
+only WaveLinux-owned aliases.
+
+## Daily Use
+
+Launch WaveLinux from your app menu or:
+
+```bash
+wavelinux
+```
+
+WaveLinux opens without mutating the audio graph unless startup restore is
+enabled. Use Start Audio to create the virtual devices, Repair to rebuild stale
+routes, and Stop/Cleanup to unload managed nodes.
+
+Closing the window hides it to the tray so audio can keep running. Use Quit
+from the tray menu to exit fully and remove WaveLinux-managed PipeWire nodes.
+
+## Updates
+
+AppImage installs can check signed release metadata from inside Settings.
+
+Stable channel:
+
+```text
+https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json
+```
+
+Pre-release channel:
+
+```text
+https://github.com/DuskyProjects/WaveLinux/releases/download/prerelease/latest.json
+```
+
+If update metadata has not been published yet, the app reports that no signed
+metadata is available for the channel. Package-managed installs should update
+through their package manager.
+
+## Development
+
+Install dependencies:
+
+```bash
+yarn install
 ```
 
 Run the desktop app:
@@ -52,68 +172,87 @@ Run the desktop app:
 yarn dev
 ```
 
-The app starts with its managed PipeWire graph stopped unless
-**Restore audio graph on launch** is enabled. Use **Start Audio** in the top bar
-to create the virtual mixes and channel sinks, then **Stop** or **Cleanup** to
-remove WaveLinux-managed nodes.
-
-Closing the main window hides WaveLinux to the tray so audio keeps running for
-OBS, Discord, and other apps. Use **Quit** from the tray menu when you want to
-fully exit and unload WaveLinux-managed PipeWire nodes.
-
-Set `WAVELINUX_DRY_RUN=1` to inspect planned PipeWire commands without
-creating or moving audio nodes.
-
-Run the browser-only UI preview, when you explicitly want demo mode:
+Run the browser-only UI preview:
 
 ```bash
 yarn web:dev
 ```
 
-## Packaging
-
-Build the browser UI bundle used by CI:
+Dry-run audio graph commands without changing PipeWire:
 
 ```bash
-yarn build
+WAVELINUX_DRY_RUN=1 yarn dev
 ```
 
-Build the desktop bundles:
+Run all safe checks:
+
+```bash
+yarn test:all
+```
+
+Run live PipeWire integration tests only when you are ready for the test suite
+to create, route, and clean up real audio nodes:
+
+```bash
+WAVELINUX_RUN_LIVE_TESTS=1 cargo test -p wavelinux-engine -- --ignored --test-threads=1
+```
+
+## Build And Release
+
+Build web UI only:
+
+```bash
+yarn web:build
+```
+
+Build local desktop bundles:
 
 ```bash
 yarn desktop:build
 ```
 
-The build script sets `NO_STRIP=1` for linuxdeploy so AppImage bundling works
-on modern distributions whose system libraries use newer ELF sections.
-
-Install the current build without rebuilding:
-
-```bash
-yarn install:local
-```
-
-Install optional ALSA aliases for ALSA-only apps that cannot see PulseAudio or
-PipeWire devices directly:
-
-```bash
-yarn install:alsa-aliases
-```
-
-Generate or rotate the local Tauri release signing key:
+Build signed release bundles and updater signatures:
 
 ```bash
 yarn release:key
-yarn release:key --force
+yarn desktop:release
 ```
 
-The private key and password stay outside the repo under
-`~/.config/wavelinux/`. Keep the private key, password file, and CI secrets in
-sync when rotating release keys. To sign built artifacts:
+Generate updater metadata:
 
 ```bash
-yarn release:sign
+python3 scripts/build-updater-manifest.py \
+  --artifact target/release/bundle/appimage/WaveLinux_4.0.0_amd64.AppImage \
+  --version 4.0.0 \
+  --repo DuskyProjects/WaveLinux \
+  --tag v4.0.0 \
+  --output target/release/bundle/latest.json
 ```
 
-Flatpak packaging is intentionally deferred because virtual audio device
-management and PipeWire graph mutation are much more constrained in a sandbox.
+Stage AUR files:
+
+```bash
+yarn aur:build
+```
+
+The GitHub release workflow builds AppImage, deb, rpm, updater metadata, and
+AUR package files when a `v*` tag is pushed.
+
+Required GitHub Actions secrets:
+
+- `TAURI_SIGNING_PRIVATE_KEY`
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+
+## Project Layout
+
+- `crates/app`: Tauri desktop shell and IPC commands
+- `crates/engine`: config, scenes, diagnostics, graph orchestration, and state
+- `crates/model`: shared data model and migrations
+- `crates/pw`: PipeWire/PulseAudio command planning, parsing, and DSP rendering
+- `src`: React/TypeScript UI
+- `scripts`: installers, release helpers, dependency checks, and validation
+- `packaging/aur`: Arch/AUR package metadata
+
+## License
+
+WaveLinux 4.0 is licensed under GPL-3.0-only.

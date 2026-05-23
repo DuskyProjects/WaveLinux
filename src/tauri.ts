@@ -16,6 +16,16 @@ const isTauri =
   typeof window !== "undefined" &&
   ("__TAURI_INTERNALS__" in window || "__TAURI__" in window);
 
+const singleInstanceEffectIds = new Set([
+  "deepfilternet",
+  "rnnoise",
+  "highpass",
+  "eq",
+  "compressor",
+  "gate",
+  "limiter",
+]);
+
 export async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauri) {
     return tauriInvoke<T>(command, args);
@@ -191,19 +201,20 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
   if (command === "create_channel") {
     const name = String(args?.name ?? "New Channel");
     const id = slug(name);
+    const kind =
+      args?.kind === "microphone" ||
+      args?.kind === "soundboard" ||
+      args?.kind === "system" ||
+      args?.kind === "generic"
+        ? args.kind
+        : "application";
     const channel: Channel = {
       id,
       name,
-      kind:
-        args?.kind === "microphone" ||
-        args?.kind === "soundboard" ||
-        args?.kind === "system" ||
-        args?.kind === "generic"
-          ? args.kind
-          : "application",
+      kind,
       virtual_sink_name: `wavelinux_channel_${id}`,
       source_device: null,
-      input_mode: "stereo",
+      input_mode: kind === "generic" || kind === "microphone" ? "sum_mono" : "stereo",
       linked: false,
       mix_buses: Object.fromEntries(
         demoState.config.mixes.map((mix) => [
@@ -263,8 +274,9 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
 
   if (command === "set_channel_input_mode") {
     const channel = findChannel(stringArg(args, "channelId"));
-    const inputMode = stringArg(args, "inputMode") || stringArg(args, "input_mode");
-    if (channel && isChannelInputMode(inputMode)) channel.input_mode = inputMode;
+    if (channel && (channel.kind === "generic" || channel.kind === "microphone")) {
+      channel.input_mode = "sum_mono";
+    }
     return channel ?? {};
   }
 
@@ -287,6 +299,34 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       demoState.config.settings.keep_running_in_tray = true;
     }
     return demoState.config.settings;
+  }
+
+  if (command === "check_for_updates") {
+    return {
+      available: false,
+      install_supported: false,
+      current_version: "4.0.0",
+      version: null,
+      date: null,
+      body: null,
+      url: null,
+      release_url: "https://github.com/DuskyProjects/WaveLinux/releases",
+      channel: demoState.config.settings.release_channel,
+      endpoint: "https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json",
+      message: "WaveLinux is up to date",
+    };
+  }
+
+  if (command === "install_update") {
+    return {
+      installed: false,
+      version: null,
+      message: "Self-update is available for AppImage installs",
+    };
+  }
+
+  if (command === "open_release_page") {
+    return null;
   }
 
   if (command === "repair_audio_graph") {
@@ -555,9 +595,11 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
   if (command === "set_effect_chain") {
     const channel = findChannel(stringArg(args, "channelId"));
     if (channel && Array.isArray(args?.effects)) {
-      channel.effects = (args.effects as EffectInstance[])
-        .map(normalizeDemoEffect)
-        .filter((effect): effect is EffectInstance => Boolean(effect));
+      channel.effects = normalizeDemoEffectChain(
+        (args.effects as EffectInstance[])
+          .map(normalizeDemoEffect)
+          .filter((effect): effect is EffectInstance => Boolean(effect)),
+      );
     }
     return channel ?? {};
   }
@@ -578,6 +620,9 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     const channel = findChannel(stringArg(args, "channelId"));
     const effect = channel?.effects.find((item) => item.instance_id === stringArg(args, "instanceId"));
     if (effect) effect.bypassed = boolArg(args, "bypassed", effect.bypassed);
+    if (channel && effect && !effect.bypassed) {
+      channel.effects = normalizeDemoEffectChain(channel.effects, effect.instance_id);
+    }
     return channel ?? {};
   }
 
@@ -700,10 +745,6 @@ function offsetIndex(index: number, direction: number, length: number): number {
 function boolArg(args: Record<string, unknown> | undefined, key: string, fallback: boolean): boolean {
   const value = args?.[key];
   return typeof value === "boolean" ? value : fallback;
-}
-
-function isChannelInputMode(value: string): value is Channel["input_mode"] {
-  return ["stereo", "mono_left", "mono_right", "sum_mono", "swap_lr"].includes(value);
 }
 
 function slug(value: string): string {
@@ -961,6 +1002,31 @@ function normalizeDemoEffect(effect: EffectInstance): EffectInstance | null {
   };
 }
 
+function normalizeDemoEffectChain(effects: EffectInstance[], preferredInstanceId?: string): EffectInstance[] {
+  const singleInstanceIndexes = new Map<string, number[]>();
+  for (const [index, effect] of effects.entries()) {
+    if (!isSingleInstanceDemoEffect(effect.effect_id)) continue;
+    const indexes = singleInstanceIndexes.get(effect.effect_id) ?? [];
+    indexes.push(index);
+    singleInstanceIndexes.set(effect.effect_id, indexes);
+  }
+  if (singleInstanceIndexes.size === 0) return effects;
+
+  const keepIndexes = new Set<number>();
+  for (const indexes of singleInstanceIndexes.values()) {
+    const preferred = indexes.find((index) => effects[index]?.instance_id === preferredInstanceId);
+    const active = [...indexes].reverse().find((index) => effects[index] && !effects[index].bypassed);
+    const keepIndex = preferred ?? active ?? indexes.at(-1);
+    if (keepIndex !== undefined) keepIndexes.add(keepIndex);
+  }
+
+  return effects.filter((effect, index) => !isSingleInstanceDemoEffect(effect.effect_id) || keepIndexes.has(index));
+}
+
+function isSingleInstanceDemoEffect(effectId: string): boolean {
+  return singleInstanceEffectIds.has(effectId);
+}
+
 function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value)
     ? Math.max(min, Math.min(max, value))
@@ -1047,14 +1113,15 @@ function applyDemoSetupTemplate(templateId: string) {
     }),
   ];
   const channels = templateId === "podcast"
-    ? ["Hardware In", "Guest", "Browser", "Music", "SFX", "System"]
+    ? ["Input", "Guest", "Browser", "Music", "SFX", "System"]
     : templateId === "work_call"
-      ? ["Hardware In", "Chat", "Browser", "System", "Music"]
+      ? ["Input", "Chat", "Browser", "System", "Music"]
       : templateId === "microphonefx" || templateId === "discord_mix"
-        ? ["Hardware In", "System", "Chat", "Music", "SFX", "Browser"]
-        : ["Hardware In", "System", "Game", "Chat", "Music", "Browser", "SFX"];
+        ? ["Input", "System", "Chat", "Music", "SFX", "Browser"]
+        : ["Input", "System", "Game", "Chat", "Music", "Browser", "SFX"];
   demoState.config.channels = channels.map((name, index) => {
     const id = slug(name);
+    const kind = index === 0 ? "generic" : id === "system" ? "system" : id === "sfx" ? "soundboard" : "application";
     const effects: EffectInstance[] =
       index === 0
         ? [
@@ -1066,15 +1133,15 @@ function applyDemoSetupTemplate(templateId: string) {
     return {
       id,
       name,
-      kind: index === 0 ? "generic" : id === "system" ? "system" : id === "sfx" ? "soundboard" : "application",
+      kind,
       virtual_sink_name: `wavelinux_channel_${id}`,
       source_device: index === 0 ? "alsa_input.usb_interface" : null,
-      input_mode: "stereo",
+      input_mode: kind === "generic" ? "sum_mono" : "stereo",
       linked: false,
       mix_buses: Object.fromEntries(
         demoState.config.mixes.map((mix) => [
           mix.id,
-          { volume: mix.id === "monitor" && index === 0 ? 1 : 0.8, muted: mix.id === "monitor" && index === 0 },
+          { volume: mix.id === "monitor" && index === 0 ? 1 : 0.8, muted: false },
         ]),
       ),
       app_matchers: [],
@@ -1125,6 +1192,9 @@ export const demoState: AppStateSnapshot = {
       monitor_follows_default_output: true,
       lock_default_input: false,
       lock_default_output: false,
+      low_latency_mic_monitoring: false,
+      stream_sync_delay_msec: 0,
+      monitor_sync_delay_msec: 0,
       auto_check_updates: true,
       auto_install_updates: false,
       release_channel: "stable",
@@ -1158,18 +1228,19 @@ export const demoState: AppStateSnapshot = {
         muted: false,
       },
     ],
-    channels: ["Hardware In", "System", "Game", "Chat", "Music", "Browser", "SFX"].map((name, index) => {
+    channels: ["Input", "System", "Game", "Chat", "Music", "Browser", "SFX"].map((name, index) => {
       const id = slug(name);
+      const kind = index === 0 ? "generic" : id === "system" ? "system" : id === "sfx" ? "soundboard" : "application";
       return {
         id,
         name,
-        kind: index === 0 ? "generic" : id === "system" ? "system" : id === "sfx" ? "soundboard" : "application",
+        kind,
         virtual_sink_name: `wavelinux_channel_${id}`,
         source_device: index === 0 ? "alsa_input.usb_interface" : null,
-        input_mode: "stereo",
+        input_mode: kind === "generic" ? "sum_mono" : "stereo",
         linked: false,
         mix_buses: {
-          monitor: { volume: index === 0 ? 1 : 0.76, muted: index === 0 },
+          monitor: { volume: index === 0 ? 1 : 0.76, muted: false },
           stream: { volume: index === 2 ? 0.52 : 0.84, muted: false },
           discord_mix: { volume: index === 1 ? 0.2 : 0.75, muted: index === 3 },
         },
@@ -1207,14 +1278,14 @@ export const demoState: AppStateSnapshot = {
   },
   graph: {
     inputs: [
-      { id: "alsa_input.usb_interface", name: "alsa_input.usb_interface", description: "USB Interface Line In", is_default: true, is_virtual: false },
-      { id: "alsa_input.capture_card", name: "alsa_input.capture_card", description: "HDMI Capture Card Audio", is_default: false, is_virtual: false },
-      { id: "bluez_input.headset", name: "bluez_input.headset", description: "Bluetooth Headset Mic", is_default: false, is_virtual: false },
-      { id: "alsa_output.usb.monitor", name: "alsa_output.usb.monitor", description: "USB Headphones Monitor", is_default: false, is_virtual: false },
+      { id: "alsa_input.usb_interface", name: "alsa_input.usb_interface", description: "USB Interface Line In", is_available: true, is_default: true, is_virtual: false },
+      { id: "alsa_input.capture_card", name: "alsa_input.capture_card", description: "HDMI Capture Card Audio", is_available: true, is_default: false, is_virtual: false },
+      { id: "bluez_input.headset", name: "bluez_input.headset", description: "Bluetooth Headset Mic", is_available: true, is_default: false, is_virtual: false },
+      { id: "alsa_output.usb.monitor", name: "alsa_output.usb.monitor", description: "USB Headphones Monitor", is_available: true, is_default: false, is_virtual: false },
     ],
     outputs: [
-      { id: "alsa_output.usb", name: "alsa_output.usb", description: "USB Headphones", is_default: true, is_virtual: false },
-      { id: "bluez_output.headset", name: "bluez_output.headset", description: "Bluetooth Headset", is_default: false, is_virtual: false },
+      { id: "alsa_output.usb", name: "alsa_output.usb", description: "USB Headphones", is_available: true, is_default: true, is_virtual: false },
+      { id: "bluez_output.headset", name: "bluez_output.headset", description: "Bluetooth Headset", is_available: true, is_default: false, is_virtual: false },
     ],
     app_streams: [
       { id: "42", app_id: "firefox", binary: "firefox", process_name: "firefox", window_class: "firefox", display_name: "Firefox", media_name: "YouTube", routed_channel_id: "browser", volume: 0.76, muted: false },

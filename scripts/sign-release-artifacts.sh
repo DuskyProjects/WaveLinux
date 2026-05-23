@@ -15,6 +15,7 @@ fi
 shopt -s nullglob
 artifacts=(
   "$ROOT_DIR"/target/release/bundle/appimage/*.AppImage
+  "$ROOT_DIR"/target/release/bundle/appimage/*.AppImage.tar.gz
   "$ROOT_DIR"/target/release/bundle/deb/*.deb
   "$ROOT_DIR"/target/release/bundle/rpm/*.rpm
 )

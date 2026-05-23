@@ -11,6 +11,8 @@ import {
   Clipboard,
   Copy,
   Cpu,
+  Download,
+  ExternalLink,
   Gauge,
   GitBranch,
   GripVertical,
@@ -30,6 +32,7 @@ import {
   VolumeX,
   WandSparkles,
 } from "lucide-react";
+import { createPortal } from "react-dom";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   KeyboardEvent as ReactKeyboardEvent,
@@ -43,7 +46,6 @@ import type {
   AppStream,
   AppVolumePreset,
   Channel,
-  ChannelInputMode,
   ChannelKind,
   CommandExecution,
   ConfigBackup,
@@ -59,6 +61,8 @@ import type {
   Scene,
   SetupTemplate,
   SoundCheckReport,
+  UpdateInfo,
+  UpdateInstallResult,
 } from "./types";
 
 type View = "mixer" | "routing" | "effects" | "scenes" | "diagnostics" | "settings";
@@ -72,13 +76,15 @@ const views: Array<{ id: View; label: string; icon: typeof SlidersHorizontal }> 
   { id: "settings", label: "Settings", icon: Settings },
 ];
 
-const inputModeOptions: Array<{ id: ChannelInputMode; label: string }> = [
-  { id: "stereo", label: "Stereo" },
-  { id: "mono_left", label: "Left to stereo" },
-  { id: "mono_right", label: "Right to stereo" },
-  { id: "sum_mono", label: "Sum to mono" },
-  { id: "swap_lr", label: "Swap L/R" },
-];
+const singleInstanceEffectIds = new Set([
+  "deepfilternet",
+  "rnnoise",
+  "highpass",
+  "eq",
+  "compressor",
+  "gate",
+  "limiter",
+]);
 
 function initialView(): View {
   if (typeof window === "undefined") return "mixer";
@@ -88,7 +94,6 @@ function initialView(): View {
 }
 
 const MAX_SOFTWARE_CHANNELS = 8;
-const MAX_HARDWARE_INPUTS = 4;
 const AUTO_MONITOR_OUTPUT_VALUE = "__auto_monitor_output__";
 const UI_METER_ATTACK_SECONDS = 0.018;
 const UI_METER_RELEASE_SECONDS = 0.34;
@@ -111,6 +116,12 @@ type OfflineRoutingEntry = {
   volumePreset?: AppVolumePreset;
 };
 
+type MergeTarget = {
+  matcher: AppMatcher;
+  displayName: string;
+  meta: string;
+};
+
 type SelectOption = {
   value: string;
   label: string;
@@ -120,22 +131,21 @@ type SelectOption = {
 export default function App() {
   const [state, setState] = useState<AppStateSnapshot | null>(() => initialSnapshot());
   const [activeView, setActiveView] = useState<View>(() => initialView());
-  const [activeMixId, setActiveMixId] = useState("monitor");
   const [selectedChannelId, setSelectedChannelId] = useState("hardware_in");
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [audioActionReport, setAudioActionReport] = useState<AudioActionReport | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const autoUpdateCheckStarted = useRef(false);
 
   const refresh = useCallback(async () => {
     const next = await invoke<AppStateSnapshot>("get_state");
     setState(next);
-    if (!next.config.mixes.some((mix) => mix.id === activeMixId)) {
-      setActiveMixId(next.config.mixes[0]?.id ?? "monitor");
-    }
     if (!next.config.channels.some((channel) => channel.id === selectedChannelId)) {
       setSelectedChannelId(next.config.channels[0]?.id ?? "hardware_in");
     }
-  }, [activeMixId, selectedChannelId]);
+  }, [selectedChannelId]);
 
   const run = useCallback(
     async <T,>(command: string, args?: Record<string, unknown>, message?: string): Promise<T> => {
@@ -176,6 +186,25 @@ export default function App() {
     [recordAudioAction, run],
   );
 
+  const checkUpdates = useCallback(async (showToast = true) => {
+    setUpdateBusy(true);
+    try {
+      const next = await invoke<UpdateInfo>("check_for_updates");
+      setUpdateInfo(next);
+      if (showToast || next.available) setToast(next.message);
+      if (next.available && state?.config.settings.auto_install_updates && next.install_supported) {
+        const result = await invoke<UpdateInstallResult>("install_update");
+        setToast(result.message);
+      }
+      return next;
+    } catch (error) {
+      if (showToast) setToast(String(error));
+      throw error;
+    } finally {
+      setUpdateBusy(false);
+    }
+  }, [state?.config.settings.auto_install_updates]);
+
   useEffect(() => {
     refresh().catch((error) => setToast(String(error)));
     const intervalMs = state?.engine.audio_graph_running ? 750 : 1000;
@@ -192,6 +221,15 @@ export default function App() {
     const timer = window.setTimeout(() => setToast(null), 2400);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => {
+    if (!state?.config.settings.auto_check_updates || autoUpdateCheckStarted.current) return;
+    autoUpdateCheckStarted.current = true;
+    const timer = window.setTimeout(() => {
+      checkUpdates(false).catch(() => undefined);
+    }, 2500);
+    return () => window.clearTimeout(timer);
+  }, [checkUpdates, state?.config.settings.auto_check_updates]);
 
   const selectedChannel = state?.config.channels.find((channel) => channel.id === selectedChannelId);
 
@@ -226,7 +264,11 @@ export default function App() {
           })}
         </nav>
 
-        <div className="engine-card">
+        <div
+          aria-label={state?.engine.message ?? "Starting"}
+          className="engine-card"
+          title={state?.engine.message ?? "Starting"}
+        >
           <div className="engine-row">
             {state?.engine.healthy ? <BadgeCheck size={18} /> : <CircleAlert size={18} />}
             <span>{state?.engine.message ?? "Starting"}</span>
@@ -276,9 +318,7 @@ export default function App() {
           <>
             {activeView === "mixer" && (
               <MixerView
-                activeMixId={activeMixId}
                 state={state}
-                setActiveMixId={setActiveMixId}
                 setSelectedChannelId={setSelectedChannelId}
                 run={run}
                 busy={busy}
@@ -304,7 +344,25 @@ export default function App() {
                 run={run}
               />
             )}
-            {activeView === "settings" && <SettingsView state={state} run={run} />}
+            {activeView === "settings" && (
+              <SettingsView
+                state={state}
+                run={run}
+                updateBusy={updateBusy}
+                updateInfo={updateInfo}
+                onCheckUpdates={() => void checkUpdates(true).catch(() => undefined)}
+                onInstallUpdate={() => {
+                  setUpdateBusy(true);
+                  invoke<UpdateInstallResult>("install_update")
+                    .then((result) => setToast(result.message))
+                    .catch((error) => setToast(String(error)))
+                    .finally(() => setUpdateBusy(false));
+                }}
+                onOpenReleases={() => {
+                  void invoke("open_release_page").catch((error) => setToast(String(error)));
+                }}
+              />
+            )}
           </>
         )}
       </main>
@@ -316,22 +374,17 @@ export default function App() {
 
 function MixerView({
   state,
-  activeMixId,
-  setActiveMixId,
   setSelectedChannelId,
   run,
   busy,
 }: {
   state: AppStateSnapshot;
-  activeMixId: string;
-  setActiveMixId: (mixId: string) => void;
   setSelectedChannelId: (channelId: string) => void;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
   busy: boolean;
 }) {
   const outputs = state.graph.outputs.filter((output) => !output.is_virtual);
   const softwareChannelCount = state.config.channels.filter((channel) => !isHardwareChannel(channel)).length;
-  const hardwareInputCount = state.config.channels.filter(isHardwareChannel).length;
   const microphoneInputs = useMemo(
     () => sortedMicrophoneInputs(state.graph.inputs),
     [state.graph.inputs],
@@ -344,8 +397,8 @@ function MixerView({
     ? state.config.channels.findIndex((channel) => channel.id === menu.channelId)
     : -1;
   const primaryMixes = primaryBusMixes(state.config.mixes);
-  const selectedMix =
-    state.config.mixes.find((mix) => mix.id === activeMixId) ??
+  const monitorMix =
+    state.config.mixes.find((mix) => mix.id === "monitor") ??
     state.config.mixes[0];
   const [liveMeters, setLiveMeters] = useState<LevelMeter[]>(state.graph.meters);
   const metersUnavailable =
@@ -402,38 +455,7 @@ function MixerView({
   const levelFor = useCallback((nodeId: string) => meterLevels[nodeId] ?? 0, [meterLevels]);
 
   return (
-    <section className="view-stack mixer-view-stack">
-      <div className="mix-tabs">
-        {state.config.mixes.map((mix) => (
-          <button
-            className={mix.id === activeMixId ? "mix-tab active" : "mix-tab"}
-            key={mix.id}
-            onClick={() => setActiveMixId(mix.id)}
-            onDoubleClick={() => {
-              const name = window.prompt("Mix name", mix.name);
-              if (name && name !== mix.name) void run("rename_mix", { mixId: mix.id, name }, "Mix renamed");
-            }}
-            type="button"
-            title={`${mix.name} virtual source`}
-          >
-            <Radio size={16} />
-            {mixTabLabel(mix)}
-          </button>
-        ))}
-        <button
-          className="mix-tab add"
-          disabled={state.config.mixes.length >= 5 || busy}
-          onClick={() => {
-            const name = window.prompt("Mix name", "MicrophoneFX");
-            if (name) void run("create_mix", { name }, "Mix created");
-          }}
-          type="button"
-          title="Create mix"
-        >
-          <CirclePlus size={16} />
-        </button>
-      </div>
-
+    <section className="view-stack mixer-view-stack no-mix-tabs">
       <div className="mixer-layout classic">
         <div className="source-strip-panel">
           <div className="source-toolbar">
@@ -449,29 +471,16 @@ function MixerView({
               )}
               <button
                 className="secondary-button"
-                disabled={hardwareInputCount >= MAX_HARDWARE_INPUTS || busy}
-                onClick={() => {
-                  const name = window.prompt("Input name", "Hardware Input");
-                  if (name) void run("create_channel", { name, kind: "generic" satisfies ChannelKind }, "Input added");
-                }}
-                type="button"
-                title={`${hardwareInputCount}/${MAX_HARDWARE_INPUTS} hardware sources`}
-              >
-                <Cable size={16} />
-                Input
-              </button>
-              <button
-                className="secondary-button"
                 disabled={softwareChannelCount >= MAX_SOFTWARE_CHANNELS || busy}
                 onClick={() => {
-                  const name = window.prompt("Channel name", "Podcast");
-                  if (name) void run("create_channel", { name, kind: "application" satisfies ChannelKind }, "Channel created");
+                  const name = window.prompt("Route name", "Podcast");
+                  if (name) void run("create_channel", { name, kind: "application" satisfies ChannelKind }, "Route added");
                 }}
                 type="button"
-                title={`${softwareChannelCount}/${MAX_SOFTWARE_CHANNELS} software channels`}
+                title={`${softwareChannelCount}/${MAX_SOFTWARE_CHANNELS} source fader routes`}
               >
                 <CirclePlus size={16} />
-                App
+                Route
               </button>
             </div>
           </div>
@@ -503,13 +512,14 @@ function MixerView({
               className="add-channel"
               disabled={softwareChannelCount >= MAX_SOFTWARE_CHANNELS || busy}
               onClick={() => {
-                const name = window.prompt("Channel name", "Podcast");
-                if (name) void run("create_channel", { name, kind: "application" satisfies ChannelKind }, "Channel created");
+                const name = window.prompt("Route name", "Podcast");
+                if (name) void run("create_channel", { name, kind: "application" satisfies ChannelKind }, "Route added");
               }}
+              title="Add a source fader route"
               type="button"
             >
               <CirclePlus size={18} />
-              Add
+              Route
             </button>
           </div>
         </div>
@@ -517,7 +527,7 @@ function MixerView({
         <div className="master-panel">
           <div className="master-mix-title">
             <div>
-              <strong>{selectedMix ? `${selectedMix.name} Mix` : "Mix"}</strong>
+              <strong>Monitor Mix</strong>
             </div>
             <Radio size={18} />
           </div>
@@ -533,7 +543,7 @@ function MixerView({
             ))}
           </div>
 
-          {selectedMix && (
+          {monitorMix && (
             <>
               <label className="field-label" htmlFor="active-mix-monitor-output">
                 Monitor output
@@ -542,7 +552,7 @@ function MixerView({
                 ariaLabel="Monitor output"
                 id="active-mix-monitor-output"
                 onChange={(value) => {
-                  if (selectedMix.id === "monitor" && value === AUTO_MONITOR_OUTPUT_VALUE) {
+                  if (value === AUTO_MONITOR_OUTPUT_VALUE) {
                     void run(
                       "set_settings",
                       {
@@ -556,17 +566,15 @@ function MixerView({
                     return;
                   }
                   void run("set_mix_monitor_output", {
-                    mixId: selectedMix.id,
+                    mixId: monitorMix.id,
                     output: value || null,
                   }).catch(() => undefined);
                 }}
                 options={[
-                  ...(selectedMix.id === "monitor"
-                    ? [{
-                        value: AUTO_MONITOR_OUTPUT_VALUE,
-                        label: "Auto: Bluetooth, USB, jack, speakers",
-                      }]
-                    : []),
+                  {
+                    value: AUTO_MONITOR_OUTPUT_VALUE,
+                    label: "Auto: Bluetooth, USB, jack, speakers",
+                  },
                   { value: "", label: "No monitor route" },
                   ...outputs.map((output) => ({
                     value: output.id,
@@ -574,9 +582,9 @@ function MixerView({
                   })),
                 ]}
                 value={
-                  selectedMix.id === "monitor" && state.config.settings.monitor_follows_default_output
+                  state.config.settings.monitor_follows_default_output
                     ? AUTO_MONITOR_OUTPUT_VALUE
-                    : selectedMix.monitor_output ?? ""
+                    : monitorMix.monitor_output ?? ""
                 }
               />
             </>
@@ -619,6 +627,7 @@ function ChannelStrip({
 }) {
   const Icon = channelIcon(channel.kind);
   const isHardware = isHardwareChannel(channel);
+  const displayName = channelDisplayName(channel);
   const selectedInputMissing =
     isHardware &&
     channel.source_device &&
@@ -632,12 +641,29 @@ function ChannelStrip({
     >
       <div className="strip-title">
         <Icon size={17} />
-        <span>{channel.name}</span>
+        <span>{displayName}</span>
+      </div>
+      <div className="strip-buses">
+        {mixes.map((mix) => (
+          <ChannelBusControl
+            bus={channel.mix_buses[mix.id] ?? { volume: 1, muted: false }}
+            channel={channel}
+            key={mix.id}
+            mix={mix}
+            run={run}
+            vuLevel={channelBusVuLevel(
+              channel,
+              mix,
+              channel.mix_buses[mix.id] ?? { volume: 1, muted: false },
+              levelFor,
+            )}
+          />
+        ))}
       </div>
       {isHardware && (
         <AppSelect
           className="strip-device-select"
-          ariaLabel={`${channel.name} microphone`}
+          ariaLabel={`${displayName} microphone`}
           onChange={(nextValue) => {
             const value = nextValue || null;
             void run(
@@ -652,7 +678,7 @@ function ChannelStrip({
             ).catch(() => undefined);
           }}
           options={[
-            { value: "", label: "Auto mic" },
+            { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto mic") },
             ...(selectedInputMissing
               ? [{
                   value: channel.source_device ?? "",
@@ -667,18 +693,6 @@ function ChannelStrip({
           value={channel.source_device ?? ""}
         />
       )}
-      <div className="strip-buses">
-        {mixes.map((mix) => (
-          <ChannelBusControl
-            bus={channel.mix_buses[mix.id] ?? { volume: 1, muted: false }}
-            channel={channel}
-            key={mix.id}
-            mix={mix}
-            run={run}
-            vuLevel={levelFor(channelBusMeterId(channel.id, mix.id))}
-          />
-        ))}
-      </div>
     </article>
   );
 }
@@ -702,9 +716,10 @@ function ChannelContextMenu({
   x: number;
   y: number;
 }) {
+  const displayName = channelDisplayName(channel);
   return (
     <div className="context-menu" style={{ left: x, top: y }} onClick={(event) => event.stopPropagation()}>
-      <div className="context-menu-title">{channel.name}</div>
+      <div className="context-menu-title">{displayName}</div>
       <button
         disabled={!canMoveUp}
         type="button"
@@ -729,7 +744,7 @@ function ChannelContextMenu({
       <button
         type="button"
         onClick={() => {
-          const name = window.prompt("Channel name", channel.name);
+          const name = window.prompt("Channel name", displayName);
           if (name && name !== channel.name) {
             void run("rename_channel", { channelId: channel.id, name }, "Channel renamed");
           }
@@ -773,7 +788,7 @@ function ChannelContextMenu({
         className="danger"
         type="button"
         onClick={() => {
-          if (window.confirm(`Delete ${channel.name}?`)) {
+          if (window.confirm(`Delete ${displayName}?`)) {
             void run("delete_channel", { channelId: channel.id }, "Channel deleted");
           }
           onClose();
@@ -1013,7 +1028,7 @@ function ChannelBusControl({
     <div className="bus-control">
       <div className="bus-label">{compactMixLabel(mix)}</div>
       <VuSlider
-        ariaLabel={`${channel.name} ${mix.name} volume`}
+        ariaLabel={`${channelDisplayName(channel)} ${mix.name} volume`}
         muted={bus.muted}
         onCommit={commit}
         onDraft={setDraft}
@@ -1265,7 +1280,7 @@ function RoutingView({
   const offlineEntries = offlineRoutingEntries(state);
 
   return (
-    <section className="two-column">
+    <section className="two-column routing-view">
       <div className="panel">
         <div className="panel-header">
           <h2>Active Apps</h2>
@@ -1308,7 +1323,7 @@ function RoutingView({
             onChange={setTargetChannelId}
             options={state.config.channels.map((channel) => ({
               value: channel.id,
-              label: channel.name,
+              label: channelDisplayName(channel),
             }))}
             value={targetChannelId}
           />
@@ -1348,7 +1363,7 @@ function RoutingView({
                     { value: "", label: "Unassigned" },
                     ...state.config.channels.map((item) => ({
                       value: item.id,
-                      label: item.name,
+                      label: channelDisplayName(item),
                     })),
                   ]}
                   value={channel?.id ?? ""}
@@ -1516,7 +1531,7 @@ function StreamRouteRow({
           { value: "", label: "Unassigned" },
           ...state.config.channels.map((channel) => ({
             value: channel.id,
-            label: channel.name,
+            label: channelDisplayName(channel),
           })),
         ]}
         value={stream.routed_channel_id ?? ""}
@@ -1572,9 +1587,42 @@ function AppIdentityActions({
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
   state: AppStateSnapshot;
 }) {
-  const mergeTargets = state.config.app_history.filter(
-    (app) => !app.forgotten && routeKey(app.matcher) !== routeKey(matcher),
-  );
+  const [mergeOpen, setMergeOpen] = useState(false);
+  const mergeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const [mergePosition, setMergePosition] = useState<{ left: number; top: number } | null>(null);
+  const mergeTargets = mergeTargetsForState(state, matcher);
+
+  const updateMergePosition = useCallback(() => {
+    const rect = mergeButtonRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const width = Math.min(360, Math.max(260, window.innerWidth - 24));
+    const maxLeft = Math.max(12, window.innerWidth - width - 12);
+    const left = Math.min(maxLeft, Math.max(12, rect.right - width));
+    const below = rect.bottom + 8;
+    const maxTop = Math.max(12, window.innerHeight - 332);
+    const top = Math.min(maxTop, Math.max(12, below));
+    setMergePosition({ left, top });
+  }, []);
+
+  useEffect(() => {
+    if (!mergeOpen) return;
+    const close = () => setMergeOpen(false);
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMergeOpen(false);
+    };
+    const onLayout = () => updateMergePosition();
+    updateMergePosition();
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("resize", onLayout);
+    window.addEventListener("scroll", onLayout, true);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", onLayout);
+      window.removeEventListener("scroll", onLayout, true);
+    };
+  }, [mergeOpen, updateMergePosition]);
 
   return (
     <div className="identity-actions">
@@ -1594,32 +1642,49 @@ function AppIdentityActions({
       <button
         className="mini-icon-button"
         disabled={mergeTargets.length === 0}
-        onClick={() => {
-          const targetName = window.prompt(
-            "Merge this app into which remembered app?",
-            mergeTargets[0]?.display_name ?? "",
-          );
-          if (!targetName?.trim()) return;
-          const target = mergeTargets.find(
-            (app) =>
-              app.display_name.toLowerCase() === targetName.trim().toLowerCase() ||
-              matcherLabel(app.matcher).toLowerCase() === targetName.trim().toLowerCase(),
-          );
-          if (!target) {
-            window.alert("No remembered app matched that name.");
-            return;
-          }
-          void run(
-            "merge_app_identity",
-            { source: matcher, target: target.matcher },
-            "App identities merged",
-          );
+        ref={mergeButtonRef}
+        onClick={(event) => {
+          event.stopPropagation();
+          setMergeOpen((open) => {
+            if (open) return false;
+            updateMergePosition();
+            return true;
+          });
         }}
         title="Merge into remembered app"
         type="button"
       >
         <GitBranch size={14} />
       </button>
+      {mergeOpen && mergePosition && createPortal(
+        <div
+          className="identity-merge-popover"
+          onClick={(event) => event.stopPropagation()}
+          style={{ left: mergePosition.left, top: mergePosition.top }}
+        >
+          <strong>Merge Into</strong>
+          <div className="identity-merge-list">
+            {mergeTargets.map((target) => (
+              <button
+                key={routeKey(target.matcher)}
+                onClick={() => {
+                  setMergeOpen(false);
+                  void run(
+                    "merge_app_identity",
+                    { source: matcher, target: target.matcher },
+                    "App identities merged",
+                  ).catch(() => undefined);
+                }}
+                type="button"
+              >
+                <span>{target.displayName}</span>
+                <small>{target.meta}</small>
+              </button>
+            ))}
+          </div>
+        </div>,
+        document.body,
+      )}
       <button
         className="mini-icon-button"
         onClick={() => void run("reset_app_identity", { matcher }, "App identity reset").catch(() => undefined)}
@@ -1673,10 +1738,10 @@ function EffectsView({
     });
   }, [state.config.channels]);
 
-  const updateEffects = (effects: EffectInstance[], message?: string) => {
+  const updateEffects = (effects: EffectInstance[], message?: string, preferredInstanceId?: string) => {
     if (!selectedChannel) return;
     const channelId = selectedChannel.id;
-    const optimisticEffects = structuredClone(effects);
+    const optimisticEffects = normalizeSourceEffects(effects, preferredInstanceId);
     const writeGeneration = (effectWriteGeneration.current[channelId] ?? 0) + 1;
     effectWriteGeneration.current[channelId] = writeGeneration;
     setEffectError(null);
@@ -1724,6 +1789,18 @@ function EffectsView({
   };
   const addEffect = (effect: EffectDefinition) => {
     if (!selectedChannel) return;
+    const existing = selectedEffects.find((item) => item.effect_id === effect.id);
+    if (existing && isSingleInstanceEffect(effect.id)) {
+      if (!existing.bypassed) return;
+      updateEffects(
+        selectedEffects.map((item) =>
+          item.instance_id === existing.instance_id ? { ...item, bypassed: false } : item,
+        ),
+        "Effect enabled",
+        existing.instance_id,
+      );
+      return;
+    }
     const instance: EffectInstance = {
       instance_id: crypto.randomUUID(),
       effect_id: effect.id,
@@ -1731,7 +1808,7 @@ function EffectsView({
       bypassed: false,
       params: Object.fromEntries(effect.params.map((param) => [param.id, param.default])),
     };
-    updateEffects([...selectedEffects, instance], "Effect added");
+    updateEffects([...selectedEffects, instance], "Effect added", instance.instance_id);
   };
   const applyPreset = (instanceId: string, values: Record<string, number>) => {
     if (!selectedChannel) return;
@@ -1760,6 +1837,7 @@ function EffectsView({
         effect.instance_id === instanceId ? { ...effect, bypassed } : effect,
       ),
       bypassed ? "Effect bypassed" : "Effect enabled",
+      bypassed ? undefined : instanceId,
     );
   };
   const moveEffect = (index: number, direction: -1 | 1) => {
@@ -1788,16 +1866,28 @@ function EffectsView({
   };
   const pasteEffect = () => {
     if (!selectedChannel || !effectClipboard) return;
+    const pastedEffect = {
+      ...structuredClone(effectClipboard),
+      instance_id: crypto.randomUUID(),
+      name: effectClipboard.name ? `${effectClipboard.name} Copy` : null,
+    };
+    const existing = selectedEffects.find((effect) => effect.effect_id === pastedEffect.effect_id);
+    if (existing && isSingleInstanceEffect(pastedEffect.effect_id)) {
+      updateEffects(
+        selectedEffects.map((effect) =>
+          effect.instance_id === existing.instance_id
+            ? { ...pastedEffect, instance_id: existing.instance_id }
+            : effect,
+        ),
+        "Effect replaced",
+        existing.instance_id,
+      );
+      return;
+    }
     updateEffects(
-      [
-        ...selectedEffects,
-        {
-          ...structuredClone(effectClipboard),
-          instance_id: crypto.randomUUID(),
-          name: effectClipboard.name ? `${effectClipboard.name} Copy` : null,
-        },
-      ],
+      [...selectedEffects, pastedEffect],
       "Effect pasted",
+      pastedEffect.instance_id,
     );
   };
   const deleteEffect = (instanceId: string) => {
@@ -1822,7 +1912,7 @@ function EffectsView({
               onClick={() => setSelectedChannelId(channel.id)}
               type="button"
             >
-              <span>{channel.name}</span>
+              <span>{channelDisplayName(channel)}</span>
               <small>
                 {isHardwareChannel(channel)
                   ? channelInputLabel(channel, microphoneInputs)
@@ -1834,7 +1924,7 @@ function EffectsView({
       </div>
       <div className="panel">
         <div className="panel-header">
-          <h2>{selectedChannel?.name ?? "Effects"}</h2>
+          <h2>{selectedChannel ? channelDisplayName(selectedChannel) : "Effects"}</h2>
           <div className="panel-actions">
             <button
               className="secondary-button"
@@ -1889,7 +1979,7 @@ function EffectsView({
                 ).catch(() => undefined)
               }
               options={[
-                { value: "", label: "Auto hardware input" },
+                { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto hardware input") },
                 ...microphoneInputs.map((input) => ({
                   value: input.id,
                   label: input.description,
@@ -1897,29 +1987,8 @@ function EffectsView({
               ]}
               value={selectedChannel.source_device ?? ""}
             />
-            <label className="field-label" htmlFor="effects-input-mode">
-              Input mode
-            </label>
-            <AppSelect
-              ariaLabel="Input mode"
-              id="effects-input-mode"
-              onChange={(value) =>
-                void run(
-                  "set_channel_input_mode",
-                  {
-                    channelId: selectedChannel.id,
-                    inputMode: value,
-                    input_mode: value,
-                  },
-                  "Input mode updated",
-                ).catch(() => undefined)
-              }
-              options={inputModeOptions.map((mode) => ({
-                value: mode.id,
-                label: mode.label,
-              }))}
-              value={selectedChannel.input_mode}
-            />
+            <div className="field-label">Input mode</div>
+            <div className="static-field">Mono</div>
           </div>
         )}
         <div className="effect-chain">
@@ -1954,18 +2023,43 @@ function EffectsView({
         <div className="catalog-grid">
           {state.catalog.effects.map((effect) => {
             const availability = state.graph.effect_availability.find((item) => item.effect_id === effect.id);
+            const isEnabled = selectedEffects.some((item) => item.effect_id === effect.id && !item.bypassed);
+            const isPresent = selectedEffects.some((item) => item.effect_id === effect.id);
+            const isUnavailable = availability?.available === false;
+            const className = [
+              "catalog-item",
+              isEnabled ? "enabled" : "",
+              isPresent && !isEnabled ? "bypassed" : "",
+            ]
+              .filter(Boolean)
+              .join(" ");
             return (
               <button
-                className="catalog-item"
+                className={className}
                 disabled={!selectedChannel}
                 key={effect.id}
                 onClick={() => {
                   addEffect(effect);
                 }}
+                title={
+                  isEnabled
+                    ? "Enabled on this source"
+                    : isUnavailable
+                      ? availability.detail
+                      : isPresent
+                        ? "Bypassed on this source"
+                        : "Add to this source"
+                }
                 type="button"
               >
                 <span>{effect.name}</span>
-                {availability?.available ? <Check size={15} /> : <CircleAlert size={15} />}
+                {isUnavailable ? (
+                  <CircleAlert size={15} />
+                ) : isEnabled ? (
+                  <Check size={15} />
+                ) : (
+                  <CirclePlus size={15} />
+                )}
               </button>
             );
           })}
@@ -2327,7 +2421,7 @@ function DiagnosticsView({
   const [graphReport, setGraphReport] = useState<GraphDebugReport | null>(null);
   const diagnostics = report?.diagnostics ?? state.diagnostics;
   return (
-    <section className="two-column">
+    <section className="two-column diagnostics-view">
       <div className="panel">
         <div className="panel-header">
           <h2>Checks</h2>
@@ -2429,10 +2523,15 @@ function LatencySummary({ state }: { state: AppStateSnapshot }) {
   const heavyFx = state.config.channels.flatMap((channel) =>
     channel.effects
       .filter((effect) => !effect.bypassed && ["deepfilternet", "rnnoise", "convolver"].includes(effect.effect_id))
-      .map((effect) => `${channel.name}: ${effect.effect_id}`),
+      .map((effect) => `${channelDisplayName(channel)}: ${effect.effect_id}`),
   );
   const activeMixRoutes = state.config.channels.length * state.config.mixes.length;
-  const estimatedMicPath = heavyFx.length > 0 ? "30 ms+" : "20-30 ms";
+  const baseLatency = state.config.settings.low_latency_mic_monitoring ? 12 : 25;
+  const hardwareInput = state.config.channels.find(isHardwareChannel);
+  const hardwareFx = hardwareInput?.effects.some((effect) => !effect.bypassed) ?? false;
+  const micHops = hardwareFx ? 4 : 3;
+  const estimatedMicPath = `${baseLatency * micHops} ms+`;
+  const streamDelay = state.config.settings.stream_sync_delay_msec;
 
   return (
     <div className="latency-card command-report">
@@ -2446,9 +2545,14 @@ function LatencySummary({ state }: { state: AppStateSnapshot }) {
         </div>
       </div>
       <div className="command-stats">
-        <Stat icon={Gauge} label="Loopbacks" value="10 ms" />
+        <Stat icon={Gauge} label="Mic hop" value={`${baseLatency} ms`} />
         <Stat icon={Mic} label="Mic path" value={estimatedMicPath} />
-        <Stat icon={GitBranch} label="Routes" value={String(activeMixRoutes)} />
+        <Stat icon={GitBranch} label="Stream sync" value={`${streamDelay} ms`} />
+      </div>
+      <div className="command-stats">
+        <Stat icon={Radio} label="Monitor sync" value={`${state.config.settings.monitor_sync_delay_msec} ms`} />
+        <Stat icon={Cable} label="Routes" value={String(activeMixRoutes)} />
+        <Stat icon={Activity} label="Mode" value={state.config.settings.low_latency_mic_monitoring ? "Low" : "Stable"} />
       </div>
       {heavyFx.length > 0 && (
         <div className="latency-note">
@@ -2598,9 +2702,19 @@ function EffectAvailabilitySummary({ state }: { state: AppStateSnapshot }) {
 function SettingsView({
   state,
   run,
+  updateBusy,
+  updateInfo,
+  onCheckUpdates,
+  onInstallUpdate,
+  onOpenReleases,
 }: {
   state: AppStateSnapshot;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  updateBusy: boolean;
+  updateInfo: UpdateInfo | null;
+  onCheckUpdates: () => void;
+  onInstallUpdate: () => void;
+  onOpenReleases: () => void;
 }) {
   const updateSettings = (settings: MixerSettings) =>
     run("set_settings", { settings }, "Settings updated");
@@ -2634,7 +2748,7 @@ function SettingsView({
           value={state.config.settings.monitor_follows_default_output}
         />
         <Toggle
-          label="Lock default input"
+          label="Control default microphone"
           onChange={(value) =>
             updateSettings({ ...state.config.settings, lock_default_input: value })
           }
@@ -2654,6 +2768,111 @@ function SettingsView({
           }
           value={state.config.settings.auto_check_updates}
         />
+        <Toggle
+          label="Auto-install AppImage updates"
+          onChange={(value) =>
+            updateSettings({ ...state.config.settings, auto_install_updates: value })
+          }
+          value={state.config.settings.auto_install_updates}
+        />
+        <div className="settings-control">
+          <span>Release channel</span>
+          <AppSelect
+            ariaLabel="Release channel"
+            onChange={(value) =>
+              void updateSettings({
+                ...state.config.settings,
+                release_channel: value === "beta" ? "beta" : "stable",
+              })
+            }
+            options={[
+              { value: "stable", label: "Stable" },
+              { value: "beta", label: "Pre-release" },
+            ]}
+            value={state.config.settings.release_channel}
+          />
+        </div>
+      </div>
+      <div className="settings-section">
+        <div className="panel-header compact">
+          <h2>Updates</h2>
+          <Download size={18} />
+        </div>
+        <div className="update-card">
+          <div>
+            <strong>{updateInfo?.message ?? "Update status has not been checked"}</strong>
+            <span>
+              {updateInfo
+                ? `${updateInfo.channel} · current ${updateInfo.current_version}${updateInfo.version ? ` · latest ${updateInfo.version}` : ""}`
+                : "Signed AppImage updates, plus deb/rpm/AUR package releases"}
+            </span>
+          </div>
+          <div className="panel-actions">
+            <button className="secondary-button" disabled={updateBusy} onClick={onCheckUpdates} type="button">
+              <RefreshCw size={16} />
+              Check
+            </button>
+            <button
+              className="secondary-button"
+              disabled={updateBusy || !updateInfo?.available || !updateInfo.install_supported}
+              onClick={onInstallUpdate}
+              title={
+                updateInfo?.install_supported === false
+                  ? "Install through your package manager or use the AppImage"
+                  : "Download, verify, install, and restart"
+              }
+              type="button"
+            >
+              <Download size={16} />
+              Install
+            </button>
+            <button className="secondary-button" onClick={onOpenReleases} type="button">
+              <ExternalLink size={16} />
+              Releases
+            </button>
+          </div>
+        </div>
+      </div>
+      <div className="settings-section">
+        <div className="panel-header compact">
+          <h2>Sync</h2>
+          <Gauge size={18} />
+        </div>
+        <div className="settings-grid">
+          <Toggle
+            label="Low-latency mic monitoring"
+            onChange={(value) =>
+              updateSettings({ ...state.config.settings, low_latency_mic_monitoring: value })
+            }
+            value={state.config.settings.low_latency_mic_monitoring}
+          />
+          <VolumeFader
+            label="Stream source delay"
+            max={250}
+            min={0}
+            unit="ms"
+            value={state.config.settings.stream_sync_delay_msec}
+            onChange={(value) =>
+              updateSettings({
+                ...state.config.settings,
+                stream_sync_delay_msec: Math.round(value),
+              })
+            }
+          />
+          <VolumeFader
+            label="Monitor source delay"
+            max={250}
+            min={0}
+            unit="ms"
+            value={state.config.settings.monitor_sync_delay_msec}
+            onChange={(value) =>
+              updateSettings({
+                ...state.config.settings,
+                monitor_sync_delay_msec: Math.round(value),
+              })
+            }
+          />
+        </div>
       </div>
       <div className="system-grid">
         <Stat icon={Cpu} label="Engine" value={state.engine.audio_graph_running ? "Running" : "Stopped"} />
@@ -2773,12 +2992,6 @@ function primaryBusMixes(mixes: Mix[]): Mix[] {
   return primary.length === 2 ? primary : mixes.slice(0, 2);
 }
 
-function mixTabLabel(mix: Mix): string {
-  if (mix.id === "monitor") return "Monitor Mix";
-  if (mix.id === "stream") return "Stream Mix";
-  return mix.name;
-}
-
 function compactMixLabel(mix: Mix): string {
   if (mix.id === "monitor") return "MON";
   if (mix.id === "stream") return "STR";
@@ -2886,6 +3099,29 @@ function routeKey(matcher: AppMatcher): string {
   return entries.map(([kind, value]) => `${kind}:${value}`).join("|");
 }
 
+function normalizedMatcherValue(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function matchersOverlap(left: AppMatcher, right: AppMatcher): boolean {
+  if (routeKey(left) === routeKey(right)) return true;
+  const rightEntries = new Map(
+    matcherEntries(right).map(([kind, value]) => [kind, normalizedMatcherValue(value)]),
+  );
+  return matcherEntries(left).some(([kind, value]) => {
+    const rightValue = rightEntries.get(kind);
+    return Boolean(rightValue && rightValue === normalizedMatcherValue(value));
+  });
+}
+
+function activeMatchersForState(state: AppStateSnapshot): AppMatcher[] {
+  return state.graph.app_streams.map((stream) => matcherForStream(stream));
+}
+
+function matcherIsActive(matcher: AppMatcher, activeMatchers: AppMatcher[]): boolean {
+  return activeMatchers.some((activeMatcher) => matchersOverlap(activeMatcher, matcher));
+}
+
 function volumePresetForMatcher(
   presets: AppVolumePreset[] | undefined,
   matcher: AppMatcher,
@@ -2894,10 +3130,60 @@ function volumePresetForMatcher(
   return presets?.find((preset) => routeKey(preset.matcher) === key);
 }
 
+function mergeTargetsForState(state: AppStateSnapshot, source: AppMatcher): MergeTarget[] {
+  const sourceKey = routeKey(source);
+  const targets = new Map<string, MergeTarget>();
+
+  for (const stream of state.graph.app_streams) {
+    const matcher = matcherForStream(stream);
+    const key = routeKey(matcher);
+    if (key === sourceKey || !isMergeableAppTarget(stream.display_name, matcher)) continue;
+    targets.set(key, {
+      matcher,
+      displayName: stream.display_name || matcherLabel(matcher),
+      meta: "Active app",
+    });
+  }
+
+  for (const entry of offlineRoutingEntries(state)) {
+    const key = routeKey(entry.matcher);
+    if (key === sourceKey || targets.has(key) || !isMergeableAppTarget(entry.displayName, entry.matcher)) {
+      continue;
+    }
+    targets.set(key, {
+      matcher: entry.matcher,
+      displayName: entry.displayName,
+      meta: entry.meta || "Offline app",
+    });
+  }
+
+  return [...targets.values()].sort((left, right) => left.displayName.localeCompare(right.displayName));
+}
+
+function isMergeableAppTarget(displayName: string, matcher: AppMatcher): boolean {
+  if (routeKey(matcher) === "empty") return false;
+  const haystack = [displayName, ...matcherEntries(matcher).map(([, value]) => value)]
+    .join("\n")
+    .toLowerCase();
+  const blocked = [
+    "wavelinux",
+    "pipewire",
+    "wireplumber",
+    "libcanberra",
+    "pw-play",
+    "pw-cat",
+    "paplay",
+    "wavelinux-route-test",
+  ];
+  return !blocked.some((needle) => haystack.includes(needle));
+}
+
 function offlineRoutingEntries(state: AppStateSnapshot): OfflineRoutingEntry[] {
   const entries = new Map<string, OfflineRoutingEntry>();
+  const activeMatchers = activeMatchersForState(state);
   for (const app of state.config.app_history ?? []) {
     if (app.forgotten) continue;
+    if (matcherIsActive(app.matcher, activeMatchers)) continue;
     const key = routeKey(app.matcher);
     entries.set(key, {
       matcher: app.matcher,
@@ -2909,6 +3195,7 @@ function offlineRoutingEntries(state: AppStateSnapshot): OfflineRoutingEntry[] {
   }
 
   for (const route of state.config.app_routes) {
+    if (matcherIsActive(route.matcher, activeMatchers)) continue;
     const key = routeKey(route.matcher);
     const existing = entries.get(key);
     entries.set(key, {
@@ -2990,6 +3277,17 @@ function isHardwareChannel(channel: Pick<Channel, "kind">): boolean {
   return channel.kind === "microphone" || channel.kind === "generic";
 }
 
+function channelDisplayName(channel: Pick<Channel, "id" | "kind" | "name">): string {
+  if (
+    channel.id === "hardware_in" &&
+    isHardwareChannel(channel) &&
+    ["hardware in", "hardware input", "input"].includes(channel.name.trim().toLowerCase())
+  ) {
+    return "Input";
+  }
+  return channel.name;
+}
+
 function isWaveLinuxManagedDevice(
   device: Pick<AppStateSnapshot["graph"]["inputs"][number], "id" | "name" | "is_virtual">,
 ): boolean {
@@ -3007,11 +3305,20 @@ function isMicrophoneSource(device: AppStateSnapshot["graph"]["inputs"][number])
   const name = device.name.toLowerCase();
   const description = device.description.toLowerCase();
   return (
+    device.is_available !== false &&
     !isWaveLinuxManagedDevice(device) &&
     !name.endsWith(".monitor") &&
     !description.startsWith("monitor of ") &&
     !description.includes(" monitor")
   );
+}
+
+function autoMicrophoneLabel(
+  inputs: AppStateSnapshot["graph"]["inputs"],
+  fallback: string,
+): string {
+  const input = inputs[0];
+  return input ? `Auto: ${input.description}` : fallback;
 }
 
 function sortedMicrophoneInputs(
@@ -3153,6 +3460,53 @@ function meterLevelMapsEqual(left: Record<string, number>, right: Record<string,
 
 function channelBusMeterId(channelId: string, mixId: string): string {
   return `channel:${channelId}:mix:${mixId}`;
+}
+
+function channelRawMeterId(channelId: string): string {
+  return `channel:${channelId}:raw`;
+}
+
+function channelBusVuLevel(
+  channel: Channel,
+  mix: Mix,
+  bus: MixBus,
+  levelFor: (nodeId: string) => number,
+): number {
+  const busLevel = levelFor(channelBusMeterId(channel.id, mix.id));
+  if (busLevel > 0) return busLevel;
+  if (bus.muted || bus.volume <= 0) return 0;
+  const channelLevel = Math.max(levelFor(channel.id), levelFor(channelRawMeterId(channel.id)));
+  return Math.max(0, Math.min(1, channelLevel * bus.volume));
+}
+
+function normalizeSourceEffects(effects: EffectInstance[], preferredInstanceId?: string): EffectInstance[] {
+  const singleInstanceIndexes = new Map<string, number[]>();
+  for (const [index, effect] of effects.entries()) {
+    if (!isSingleInstanceEffect(effect.effect_id)) continue;
+    const indexes = singleInstanceIndexes.get(effect.effect_id) ?? [];
+    indexes.push(index);
+    singleInstanceIndexes.set(effect.effect_id, indexes);
+  }
+
+  if (singleInstanceIndexes.size === 0) {
+    return structuredClone(effects);
+  }
+
+  const keepIndexes = new Set<number>();
+  for (const indexes of singleInstanceIndexes.values()) {
+    const preferred = indexes.find((index) => effects[index]?.instance_id === preferredInstanceId);
+    const active = [...indexes].reverse().find((index) => effects[index] && !effects[index].bypassed);
+    const keepIndex = preferred ?? active ?? indexes.at(-1);
+    if (keepIndex !== undefined) keepIndexes.add(keepIndex);
+  }
+
+  return effects
+    .filter((effect, index) => !isSingleInstanceEffect(effect.effect_id) || keepIndexes.has(index))
+    .map((effect) => structuredClone(effect));
+}
+
+function isSingleInstanceEffect(effectId: string): boolean {
+  return singleInstanceEffectIds.has(effectId);
 }
 
 function effectChainsEqual(left: EffectInstance[], right: EffectInstance[]): boolean {

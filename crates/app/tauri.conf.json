@@ -41,8 +41,34 @@
     "longDescription": "WaveLinux is a Rust and PipeWire creator audio mixer for Linux.",
     "linux": {
       "deb": {
-        "depends": ["pipewire", "wireplumber", "pipewire-pulse", "libwebkit2gtk-4.1-0"]
+        "depends": [
+          "pipewire",
+          "wireplumber",
+          "pipewire-pulse",
+          "pulseaudio-utils",
+          "libwebkit2gtk-4.1-0",
+          "libayatana-appindicator3-1"
+        ],
+        "recommends": ["swh-plugins", "librnnoise-ladspa"]
+      },
+      "rpm": {
+        "depends": [
+          "pipewire",
+          "wireplumber",
+          "pipewire-pulseaudio",
+          "pulseaudio-utils",
+          "webkit2gtk4.1"
+        ],
+        "recommends": ["ladspa-swh-plugins", "lsp-plugins-ladspa", "rnnoise"]
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc2QjhFQjM3NzFDRkY2MwpSV1JqL3h4M3M0NXJCMXJDbm5GQ3F2ajdPdVRzanBIREJQYzdHL2FTVG44cFFTVm5XWlZQeVBqawo=",
+      "endpoints": [
+        "https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json"
+      ]
     }
   }
 }

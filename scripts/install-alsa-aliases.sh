@@ -68,7 +68,7 @@ emit_aliases() {
   else
     emit_pcm "wavelinux_mix_monitor" "wavelinux_mix_monitor_source" "WaveLinux Monitor Mix"
     emit_pcm "wavelinux_mix_stream" "wavelinux_mix_stream_source" "WaveLinux Stream Mix"
-    emit_pcm "wavelinux_channel_hardware_in" "wavelinux_channel_hardware_in.monitor" "WaveLinux Hardware In Channel"
+    emit_pcm "wavelinux_channel_hardware_in" "wavelinux_channel_hardware_in.monitor" "WaveLinux Input Channel"
     emit_pcm "wavelinux_channel_music" "wavelinux_channel_music.monitor" "WaveLinux Music Channel"
   fi
 

@@ -5,7 +5,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-pub const CONFIG_VERSION: u32 = 4;
+pub const CONFIG_VERSION: u32 = 6;
 pub const BACKUP_VERSION: u32 = 1;
 pub const MAX_MIXES: usize = 5;
 pub const MAX_SOFTWARE_CHANNELS: usize = 8;
@@ -77,6 +77,12 @@ pub struct MixerSettings {
     pub monitor_follows_default_output: bool,
     pub lock_default_input: bool,
     pub lock_default_output: bool,
+    #[serde(default)]
+    pub low_latency_mic_monitoring: bool,
+    #[serde(default)]
+    pub stream_sync_delay_msec: u16,
+    #[serde(default)]
+    pub monitor_sync_delay_msec: u16,
     pub auto_check_updates: bool,
     pub auto_install_updates: bool,
     pub release_channel: ReleaseChannel,
@@ -92,6 +98,9 @@ impl Default for MixerSettings {
             monitor_follows_default_output: true,
             lock_default_input: false,
             lock_default_output: false,
+            low_latency_mic_monitoring: false,
+            stream_sync_delay_msec: 0,
+            monitor_sync_delay_msec: 0,
             auto_check_updates: true,
             auto_install_updates: false,
             release_channel: ReleaseChannel::Stable,
@@ -130,7 +139,7 @@ impl Default for MixerConfig {
         ];
 
         let mut channels = vec![
-            Channel::new_fixed("hardware_in", "Hardware In", ChannelKind::Generic),
+            Channel::new_fixed("hardware_in", "Input", ChannelKind::Generic),
             Channel::new_fixed("system", "System", ChannelKind::System),
             Channel::new_fixed("game", "Game", ChannelKind::Application),
             Channel::new_fixed("chat", "Chat", ChannelKind::Application),
@@ -142,7 +151,6 @@ impl Default for MixerConfig {
         for channel in &mut channels {
             channel.ensure_mix_buses(&mixes);
         }
-        mute_hardware_monitor_bus(&mut channels);
 
         Self {
             version: CONFIG_VERSION,
@@ -238,7 +246,12 @@ impl MixerConfig {
             self.settings.lock_default_output = false;
         }
         self.settings.keep_running_in_tray = true;
+        self.settings.stream_sync_delay_msec =
+            clamp_sync_delay_msec(self.settings.stream_sync_delay_msec);
+        self.settings.monitor_sync_delay_msec =
+            clamp_sync_delay_msec(self.settings.monitor_sync_delay_msec);
         self.migrate_legacy_mic_channel();
+        self.normalize_hardware_input_name();
         self.ensure_system_channel();
         for mix in &mut self.mixes {
             mix.ensure_virtual_node_names();
@@ -247,13 +260,16 @@ impl MixerConfig {
         for channel in &mut self.channels {
             channel.ensure_virtual_node_name();
             channel.source_device = clean_optional_device_id(channel.source_device.take());
+            if channel.kind.uses_hardware_slot() {
+                channel.input_mode = ChannelInputMode::SumMono;
+            }
             channel.ensure_mix_buses(&self.mixes);
             for bus in channel.mix_buses.values_mut() {
                 bus.volume = clamp_unit(bus.volume);
             }
         }
-        if previous_version < 4 {
-            mute_hardware_monitor_bus(&mut self.channels);
+        if previous_version < 5 {
+            unmute_hardware_monitor_bus(&mut self.channels);
         }
         let catalog = EffectCatalog::default();
         for channel in &mut self.channels {
@@ -391,13 +407,28 @@ impl MixerConfig {
 
         let old_id = channel.id.clone();
         channel.id = "hardware_in".into();
-        channel.name = "Hardware In".into();
+        channel.name = "Input".into();
         channel.kind = ChannelKind::Generic;
         channel.virtual_sink_name = "wavelinux_channel_hardware_in".into();
 
         for route in &mut self.app_routes {
             if route.channel_id == old_id {
                 route.channel_id = channel.id.clone();
+            }
+        }
+    }
+
+    fn normalize_hardware_input_name(&mut self) {
+        for channel in &mut self.channels {
+            if channel.id != "hardware_in" {
+                continue;
+            }
+            let name = channel.name.trim();
+            if name.is_empty()
+                || name.eq_ignore_ascii_case("hardware in")
+                || name.eq_ignore_ascii_case("hardware input")
+            {
+                channel.name = "Input".into();
             }
         }
     }
@@ -583,13 +614,17 @@ impl MixerConfig {
     pub fn set_settings(&mut self, settings: MixerSettings) -> MixerSettings {
         self.settings = settings;
         self.settings.keep_running_in_tray = true;
+        self.settings.stream_sync_delay_msec =
+            clamp_sync_delay_msec(self.settings.stream_sync_delay_msec);
+        self.settings.monitor_sync_delay_msec =
+            clamp_sync_delay_msec(self.settings.monitor_sync_delay_msec);
         self.settings.clone()
     }
 
     pub fn set_channel_input_mode(
         &mut self,
         channel_id: impl AsRef<str>,
-        input_mode: ChannelInputMode,
+        _input_mode: ChannelInputMode,
     ) -> Result<Channel, ModelError> {
         let channel = self.channel_mut(channel_id.as_ref())?;
         if !channel.kind.uses_hardware_slot() {
@@ -598,7 +633,7 @@ impl MixerConfig {
                 channel.name
             )));
         }
-        channel.input_mode = input_mode;
+        channel.input_mode = ChannelInputMode::SumMono;
         Ok(channel.clone())
     }
 
@@ -1079,6 +1114,12 @@ impl MixerConfig {
             .find(|effect| effect.instance_id == instance_id)
             .ok_or_else(|| ModelError::EffectNotFound(instance_id.into()))?;
         effect.bypassed = bypassed;
+        if !bypassed {
+            channel.effects = keep_one_single_instance_effect_per_channel(
+                std::mem::take(&mut channel.effects),
+                Some(instance_id),
+            );
+        }
         Ok(channel.clone())
     }
 
@@ -1290,13 +1331,18 @@ pub struct Channel {
 impl Channel {
     pub fn new_fixed(id: &str, name: &str, kind: ChannelKind) -> Self {
         let safe = safe_node_id(id);
+        let input_mode = if kind.uses_hardware_slot() {
+            ChannelInputMode::SumMono
+        } else {
+            ChannelInputMode::Stereo
+        };
         Self {
             id: id.into(),
             name: name.into(),
             kind,
             virtual_sink_name: format!("wavelinux_channel_{safe}"),
             source_device: None,
-            input_mode: ChannelInputMode::Stereo,
+            input_mode,
             linked: false,
             mix_buses: BTreeMap::new(),
             app_matchers: Vec::new(),
@@ -1658,7 +1704,7 @@ impl Default for EffectCatalog {
                         "Reduction Limit",
                         0.0,
                         100.0,
-                        100.0,
+                        24.0,
                         " dB",
                     ),
                     param(
@@ -1749,7 +1795,9 @@ impl Default for EffectCatalog {
                 "gate",
                 "Noise Gate",
                 "Attenuate quiet room tone",
-                PluginHint::PipeWireBuiltin,
+                PluginHint::Ladspa {
+                    library_names: vec!["gate_1410.so".into()],
+                },
                 vec![
                     param("threshold_db", "Threshold", -80.0, 0.0, -40.0, " dB"),
                     param("attack_ms", "Attack", 0.1, 100.0, 2.5, " ms"),
@@ -1975,6 +2023,8 @@ pub struct DeviceInfo {
     pub index: Option<String>,
     pub name: String,
     pub description: String,
+    #[serde(default = "default_true")]
+    pub is_available: bool,
     pub is_default: bool,
     pub is_virtual: bool,
 }
@@ -2102,6 +2152,10 @@ pub fn percent_to_unit(percent: f32) -> f32 {
 
 pub fn unit_to_percent(value: f32) -> u8 {
     (clamp_unit(value) * 100.0).round() as u8
+}
+
+pub fn clamp_sync_delay_msec(value: u16) -> u16 {
+    value.min(250)
 }
 
 pub fn safe_node_id(value: &str) -> String {
@@ -2340,7 +2394,62 @@ fn normalize_effect_chain(
         effect.params = normalize_effect_params(effect.params, definition);
         normalized.push(effect);
     }
-    Ok(normalized)
+    Ok(keep_one_single_instance_effect_per_channel(
+        normalized, None,
+    ))
+}
+
+fn keep_one_single_instance_effect_per_channel(
+    effects: Vec<EffectInstance>,
+    preferred_instance_id: Option<&str>,
+) -> Vec<EffectInstance> {
+    let mut single_instance_indexes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, effect) in effects.iter().enumerate() {
+        if is_single_instance_effect(&effect.effect_id) {
+            single_instance_indexes
+                .entry(effect.effect_id.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    if single_instance_indexes.is_empty() {
+        return effects;
+    }
+
+    let mut keep_indexes = BTreeSet::new();
+    for indexes in single_instance_indexes.values() {
+        let preferred = preferred_instance_id.and_then(|instance_id| {
+            indexes
+                .iter()
+                .copied()
+                .find(|index| effects[*index].instance_id == instance_id)
+        });
+        let active = indexes
+            .iter()
+            .rev()
+            .copied()
+            .find(|index| !effects[*index].bypassed);
+        if let Some(index) = preferred.or(active).or_else(|| indexes.last().copied()) {
+            keep_indexes.insert(index);
+        }
+    }
+
+    effects
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, effect)| {
+            (!is_single_instance_effect(&effect.effect_id) || keep_indexes.contains(&index))
+                .then_some(effect)
+        })
+        .collect()
+}
+
+fn is_single_instance_effect(effect_id: &str) -> bool {
+    matches!(
+        effect_id,
+        "deepfilternet" | "rnnoise" | "highpass" | "eq" | "compressor" | "gate" | "limiter"
+    )
 }
 
 fn validate_effect_chain(
@@ -2498,7 +2607,7 @@ pub fn setup_templates() -> Vec<SetupTemplate> {
                 "Adds a MicrophoneFX virtual source",
                 "Routes mic, SFX, music, and chat into a call-safe mix",
                 "Keeps system/game audio mostly out of the microphone feed",
-                "Starts with speech cleanup effects on Hardware In",
+                "Starts with speech cleanup effects on Input",
             ],
         ),
         setup_template(
@@ -2507,7 +2616,7 @@ pub fn setup_templates() -> Vec<SetupTemplate> {
             "One-click virtual microphone mix for Discord with mic, music bed, SFX, and chat-safe levels.",
             &[
                 "Adds a Discord Mix virtual source",
-                "Routes Hardware In, SFX, and optional music into Discord",
+                "Routes Input, SFX, and optional music into Discord",
                 "Keeps system/game/browser audio muted from the mic feed",
                 "Uses speech cleanup and conservative limiter settings",
             ],
@@ -2583,7 +2692,7 @@ fn streaming_template_config() -> MixerConfig {
         vec![
             template_channel(
                 "hardware_in",
-                "Hardware In",
+                "Input",
                 ChannelKind::Generic,
                 voice_fx_chain(),
             ),
@@ -2596,7 +2705,7 @@ fn streaming_template_config() -> MixerConfig {
         ],
     );
 
-    set_template_bus(&mut config, "hardware_in", "monitor", 1.0, true);
+    set_template_bus(&mut config, "hardware_in", "monitor", 1.0, false);
     set_template_bus(&mut config, "hardware_in", "stream", 0.88, false);
     set_template_bus(&mut config, "system", "stream", 0.72, false);
     set_template_bus(&mut config, "game", "stream", 0.74, false);
@@ -2633,7 +2742,7 @@ fn microphonefx_template_config() -> MixerConfig {
         vec![
             template_channel(
                 "hardware_in",
-                "Hardware In",
+                "Input",
                 ChannelKind::Generic,
                 voice_fx_chain(),
             ),
@@ -2648,7 +2757,7 @@ fn microphonefx_template_config() -> MixerConfig {
     for channel_id in ["system", "chat", "browser"] {
         set_template_bus(&mut config, channel_id, "microphonefx", 0.0, true);
     }
-    set_template_bus(&mut config, "hardware_in", "monitor", 1.0, true);
+    set_template_bus(&mut config, "hardware_in", "monitor", 1.0, false);
     set_template_bus(&mut config, "hardware_in", "microphonefx", 0.9, false);
     set_template_bus(&mut config, "sfx", "microphonefx", 0.48, false);
     set_template_bus(&mut config, "music", "microphonefx", 0.24, false);
@@ -2675,7 +2784,7 @@ fn podcast_template_config() -> MixerConfig {
         vec![
             template_channel(
                 "hardware_in",
-                "Hardware In",
+                "Input",
                 ChannelKind::Generic,
                 voice_fx_chain(),
             ),
@@ -2692,7 +2801,7 @@ fn podcast_template_config() -> MixerConfig {
         ],
     );
 
-    set_template_bus(&mut config, "hardware_in", "monitor", 1.0, true);
+    set_template_bus(&mut config, "hardware_in", "monitor", 1.0, false);
     set_template_bus(&mut config, "hardware_in", "podcast", 0.9, false);
     set_template_bus(&mut config, "guest", "podcast", 0.82, false);
     set_template_bus(&mut config, "browser", "podcast", 0.64, false);
@@ -2728,7 +2837,7 @@ fn work_call_template_config() -> MixerConfig {
         vec![
             template_channel(
                 "hardware_in",
-                "Hardware In",
+                "Input",
                 ChannelKind::Generic,
                 voice_fx_chain(),
             ),
@@ -2739,7 +2848,7 @@ fn work_call_template_config() -> MixerConfig {
         ],
     );
 
-    set_template_bus(&mut config, "hardware_in", "monitor", 1.0, true);
+    set_template_bus(&mut config, "hardware_in", "monitor", 1.0, false);
     set_template_bus(&mut config, "hardware_in", "call_mix", 0.9, false);
     set_template_bus(&mut config, "chat", "call_mix", 0.0, true);
     set_template_bus(&mut config, "browser", "call_mix", 0.0, true);
@@ -2766,7 +2875,6 @@ fn template_config(mixes: Vec<Mix>, mut channels: Vec<Channel>) -> MixerConfig {
     for channel in &mut channels {
         channel.ensure_mix_buses(&mixes);
     }
-    mute_hardware_monitor_bus(&mut channels);
     MixerConfig {
         mixes,
         channels,
@@ -2774,14 +2882,14 @@ fn template_config(mixes: Vec<Mix>, mut channels: Vec<Channel>) -> MixerConfig {
     }
 }
 
-fn mute_hardware_monitor_bus(channels: &mut [Channel]) {
+fn unmute_hardware_monitor_bus(channels: &mut [Channel]) {
     for channel in channels
         .iter_mut()
         .filter(|channel| channel.kind.uses_hardware_slot())
     {
         if let Some(bus) = channel.mix_buses.get_mut("monitor") {
             bus.volume = 1.0;
-            bus.muted = true;
+            bus.muted = false;
         }
     }
 }
@@ -3001,8 +3109,9 @@ mod tests {
             config.channels[0].virtual_sink_name,
             "wavelinux_channel_hardware_in"
         );
+        assert_eq!(config.channels[0].name, "Input");
         assert_eq!(config.channels[0].mix_buses["monitor"].volume, 1.0);
-        assert!(config.channels[0].mix_buses["monitor"].muted);
+        assert!(!config.channels[0].mix_buses["monitor"].muted);
     }
 
     #[test]
@@ -3042,7 +3151,7 @@ mod tests {
             .iter()
             .find(|channel| channel.id == "hardware_in")
             .unwrap();
-        assert_eq!(hardware.name, "Hardware In");
+        assert_eq!(hardware.name, "Input");
         assert_eq!(hardware.kind, ChannelKind::Generic);
         assert_eq!(hardware.virtual_sink_name, "wavelinux_channel_hardware_in");
         assert_eq!(config.app_routes[0].channel_id, "hardware_in");
@@ -3084,7 +3193,7 @@ mod tests {
                     && channel
                         .mix_buses
                         .get("monitor")
-                        .is_some_and(|bus| bus.muted)
+                        .is_some_and(|bus| !bus.muted)
             }));
         assert!(config
             .app_routes
@@ -3465,7 +3574,7 @@ mod tests {
         let hardware_in = config
             .set_channel_input_mode("hardware_in", ChannelInputMode::MonoLeft)
             .unwrap();
-        assert_eq!(hardware_in.input_mode, ChannelInputMode::MonoLeft);
+        assert_eq!(hardware_in.input_mode, ChannelInputMode::SumMono);
         assert_eq!(ChannelInputMode::SumMono.channels(), 1);
         assert_eq!(ChannelInputMode::SumMono.channel_map(), "mono");
 
@@ -3473,6 +3582,14 @@ mod tests {
             .set_channel_input_mode("music", ChannelInputMode::MonoRight)
             .unwrap_err();
         assert!(matches!(err, ModelError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn hardware_input_modes_normalize_to_mono() {
+        let mut config = MixerConfig::default();
+        config.channels[0].input_mode = ChannelInputMode::Stereo;
+        let config = config.normalized().unwrap();
+        assert_eq!(config.channels[0].input_mode, ChannelInputMode::SumMono);
     }
 
     #[test]
@@ -3523,7 +3640,7 @@ mod tests {
                 .find(|channel| channel.id == "hardware_in")
                 .unwrap()
                 .input_mode,
-            ChannelInputMode::MonoRight
+            ChannelInputMode::SumMono
         );
         backup.validate().unwrap();
 
@@ -3640,6 +3757,67 @@ mod tests {
         assert_eq!(effects[0].effect_id, "gate");
         assert_eq!(effects[0].params.get("threshold_db"), Some(&-80.0));
         assert_eq!(effects[0].params.get("release_ms"), Some(&200.0));
+    }
+
+    #[test]
+    fn duplicate_realtime_noise_suppressors_keep_last_active_instance() {
+        let mut config = MixerConfig::default();
+        let mut first = EffectInstance::new("deepfilternet");
+        first.instance_id = "deepfilter-default".into();
+        first.params.insert("attenuation_limit_db".into(), 100.0);
+        let mut second = EffectInstance::new("deepfilternet");
+        second.instance_id = "deepfilter-natural".into();
+        second.params.insert("attenuation_limit_db".into(), 12.0);
+
+        let channel = config
+            .set_effect_chain("hardware_in", vec![first, second])
+            .unwrap();
+        let effects = &channel.effects;
+
+        assert_eq!(effects.len(), 1);
+        assert!(!effects[0].bypassed);
+        assert_eq!(effects[0].instance_id, "deepfilter-natural");
+        assert_eq!(effects[0].params.get("attenuation_limit_db"), Some(&12.0));
+    }
+
+    #[test]
+    fn duplicate_standard_effects_keep_last_active_instance() {
+        let mut config = MixerConfig::default();
+        let mut first = EffectInstance::new("eq");
+        first.instance_id = "eq-old".into();
+        first.params.insert("mid_gain_db".into(), -3.0);
+        let mut second = EffectInstance::new("eq");
+        second.instance_id = "eq-new".into();
+        second.params.insert("mid_gain_db".into(), 2.0);
+
+        let channel = config
+            .set_effect_chain("hardware_in", vec![first, second])
+            .unwrap();
+        let effects = &channel.effects;
+
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].instance_id, "eq-new");
+        assert_eq!(effects[0].params.get("mid_gain_db"), Some(&2.0));
+    }
+
+    #[test]
+    fn enabling_duplicate_realtime_noise_suppressor_removes_other_instances() {
+        let mut config = MixerConfig::default();
+        let mut first = EffectInstance::new("deepfilternet");
+        first.instance_id = "deepfilter-default".into();
+        first.bypassed = true;
+        let mut second = EffectInstance::new("deepfilternet");
+        second.instance_id = "deepfilter-natural".into();
+        config.channels[0].effects = vec![first, second];
+
+        let channel = config
+            .bypass_effect("hardware_in", "deepfilter-default", false)
+            .unwrap();
+        let effects = &channel.effects;
+
+        assert_eq!(effects.len(), 1);
+        assert!(!effects[0].bypassed);
+        assert_eq!(effects[0].instance_id, "deepfilter-default");
     }
 
     #[test]

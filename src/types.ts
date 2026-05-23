@@ -21,6 +21,9 @@ export interface MixerSettings {
   monitor_follows_default_output: boolean;
   lock_default_input: boolean;
   lock_default_output: boolean;
+  low_latency_mic_monitoring: boolean;
+  stream_sync_delay_msec: number;
+  monitor_sync_delay_msec: number;
   auto_check_updates: boolean;
   auto_install_updates: boolean;
   release_channel: "stable" | "beta";
@@ -133,6 +136,7 @@ export interface DeviceInfo {
   index?: string | null;
   name: string;
   description: string;
+  is_available: boolean;
   is_default: boolean;
   is_virtual: boolean;
 }
@@ -291,7 +295,12 @@ export interface SourceOutputRoute {
   role?: string | null;
   channel_id?: string | null;
   mix_id?: string | null;
+  source_id?: string | null;
+  source_name?: string | null;
   target_object?: string | null;
+  application_name?: string | null;
+  node_name?: string | null;
+  media_name?: string | null;
 }
 
 export interface StaleProcess {
@@ -320,4 +329,24 @@ export interface GraphDebugReport {
   diagnostics: Diagnostic[];
   debug_log_path: string;
   recent_log_lines: string[];
+}
+
+export interface UpdateInfo {
+  available: boolean;
+  install_supported: boolean;
+  current_version: string;
+  version?: string | null;
+  date?: string | null;
+  body?: string | null;
+  url?: string | null;
+  release_url: string;
+  channel: "stable" | "beta" | string;
+  endpoint: string;
+  message: string;
+}
+
+export interface UpdateInstallResult {
+  installed: boolean;
+  version?: string | null;
+  message: string;
 }

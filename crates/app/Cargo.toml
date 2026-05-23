@@ -10,11 +10,15 @@ authors.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = ["image-png", "tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
+time.workspace = true
+url = "2"
 wavelinux-engine = { path = "../engine" }
 wavelinux-model = { path = "../model" }

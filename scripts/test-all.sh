@@ -8,6 +8,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 node node_modules/.bin/tsc --noEmit
 node node_modules/.bin/vite build
+bash scripts/check-dependencies.sh
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 printf 'pcm.keep { type pulse }\n' > "$tmp_dir/asoundrc"

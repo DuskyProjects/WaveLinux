@@ -1,0 +1,62 @@
+# Maintainer: WaveLinux contributors <https://github.com/DuskyProjects/WaveLinux>
+pkgname=wavelinux
+pkgver=4.0.0
+pkgrel=1
+pkgdesc="Rust and PipeWire creator audio mixer for Linux"
+arch=('x86_64')
+url="https://github.com/DuskyProjects/WaveLinux"
+license=('GPL-3.0-only')
+depends=(
+  'pipewire'
+  'pipewire-pulse'
+  'wireplumber'
+  'libpulse'
+  'webkit2gtk-4.1'
+  'gtk3'
+  'libayatana-appindicator'
+)
+makedepends=(
+  'git'
+  'nodejs'
+  'yarn'
+  'rust'
+  'pkgconf'
+  'libpipewire'
+  'librsvg'
+  'patchelf'
+)
+optdepends=(
+  'swh-plugins: LADSPA compressor, gate, and limiter support'
+  'noise-suppression-for-voice: RNNoise LADSPA noise suppression'
+  'deepfilternet: DeepFilterNet noise suppression when packaged with LADSPA support'
+)
+source=("$pkgname-$pkgver.tar.gz::https://github.com/DuskyProjects/WaveLinux/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "WaveLinux-$pkgver"
+  yarn install --frozen-lockfile
+  node node_modules/.bin/tsc --noEmit
+  node node_modules/.bin/vite build
+  cargo build --release -p wavelinux-app
+}
+
+package() {
+  cd "WaveLinux-$pkgver"
+  install -Dm755 target/release/wavelinux-app "$pkgdir/usr/bin/wavelinux"
+  install -Dm644 crates/app/icons/icon.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/wavelinux.png"
+  install -Dm644 crates/app/icons/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/wavelinux.svg"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/wavelinux.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=WaveLinux
+Comment=Linux creator audio mixer
+Exec=wavelinux
+Icon=wavelinux
+Terminal=false
+Categories=Audio;AudioVideo;Mixer;
+StartupWMClass=io.github.duskyprojects.WaveLinux
+DESKTOP
+}

@@ -1,12 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use serde::Serialize;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_updater::UpdaterExt;
+use time::format_description::well_known::Rfc3339;
 use wavelinux_engine::{EngineError, GraphDebugReport, SoundCheckReport, WaveLinuxEngine};
 use wavelinux_model::{
     AppMatcher, AppRoute, AppStateSnapshot, AppVolumePreset, Channel, ChannelInputMode,
@@ -16,6 +24,40 @@ use wavelinux_model::{
 
 struct EngineState {
     engine: Arc<WaveLinuxEngine>,
+}
+
+struct ProcessLock {
+    _file: File,
+}
+
+const RELEASES_URL: &str = "https://github.com/DuskyProjects/WaveLinux/releases";
+const STABLE_UPDATE_ENDPOINT: &str =
+    "https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json";
+const BETA_UPDATE_ENDPOINT: &str =
+    "https://github.com/DuskyProjects/WaveLinux/releases/download/prerelease/latest.json";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct UpdateInfo {
+    available: bool,
+    install_supported: bool,
+    current_version: String,
+    version: Option<String>,
+    date: Option<String>,
+    body: Option<String>,
+    url: Option<String>,
+    release_url: String,
+    channel: String,
+    endpoint: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct UpdateInstallResult {
+    installed: bool,
+    version: Option<String>,
+    message: String,
 }
 
 #[tauri::command]
@@ -421,8 +463,176 @@ fn apply_setup_template(
     tauri_result(engine.engine.apply_setup_template(template_id))
 }
 
+#[tauri::command]
+async fn check_for_updates(
+    app: AppHandle,
+    engine: State<'_, EngineState>,
+) -> Result<UpdateInfo, String> {
+    let settings = engine
+        .engine
+        .get_state()
+        .map_err(|err| err.to_string())?
+        .config
+        .settings;
+    let endpoint = update_endpoint(&settings);
+    let endpoint_url = endpoint
+        .parse::<url::Url>()
+        .map_err(|err| err.to_string())?;
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![endpoint_url])
+        .map_err(|err| err.to_string())?
+        .build()
+        .map_err(|err| err.to_string())?;
+    let channel = release_channel_name(&settings).to_string();
+    let install_supported = is_appimage_install();
+    let update = match updater.check().await {
+        Ok(update) => update,
+        Err(err) if is_missing_update_metadata_error(&err.to_string()) => {
+            return Ok(UpdateInfo {
+                available: false,
+                install_supported,
+                current_version: env!("CARGO_PKG_VERSION").to_string(),
+                version: None,
+                date: None,
+                body: None,
+                url: None,
+                release_url: RELEASES_URL.to_string(),
+                channel,
+                endpoint,
+                message: "No signed update metadata has been published for this channel yet".into(),
+            });
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    Ok(match update {
+        Some(update) => {
+            let date = update.date.and_then(|date| date.format(&Rfc3339).ok());
+            let version = update.version.clone();
+            UpdateInfo {
+                available: true,
+                install_supported,
+                current_version: update.current_version,
+                version: Some(version.clone()),
+                date,
+                body: update.body,
+                url: Some(update.download_url.to_string()),
+                release_url: RELEASES_URL.to_string(),
+                channel,
+                endpoint,
+                message: if install_supported {
+                    format!("WaveLinux {version} is available")
+                } else {
+                    format!(
+                        "WaveLinux {version} is available; update through your package manager or install the AppImage"
+                    )
+                },
+            }
+        }
+        None => UpdateInfo {
+            available: false,
+            install_supported,
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            version: None,
+            date: None,
+            body: None,
+            url: None,
+            release_url: RELEASES_URL.to_string(),
+            channel,
+            endpoint,
+            message: "WaveLinux is up to date".into(),
+        },
+    })
+}
+
+#[tauri::command]
+async fn install_update(
+    app: AppHandle,
+    engine: State<'_, EngineState>,
+) -> Result<UpdateInstallResult, String> {
+    if !is_appimage_install() {
+        return Err(
+            "Self-update is available for AppImage installs. Use deb, rpm, or AUR updates through your package manager."
+                .into(),
+        );
+    }
+
+    let settings = engine
+        .engine
+        .get_state()
+        .map_err(|err| err.to_string())?
+        .config
+        .settings;
+    let endpoint = update_endpoint(&settings);
+    let endpoint_url = endpoint
+        .parse::<url::Url>()
+        .map_err(|err| err.to_string())?;
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![endpoint_url])
+        .map_err(|err| err.to_string())?
+        .build()
+        .map_err(|err| err.to_string())?;
+
+    let update = match updater.check().await {
+        Ok(update) => update,
+        Err(err) if is_missing_update_metadata_error(&err.to_string()) => None,
+        Err(err) => return Err(err.to_string()),
+    };
+
+    let Some(update) = update else {
+        return Ok(UpdateInstallResult {
+            installed: false,
+            version: None,
+            message: "No signed update metadata has been published for this channel yet".into(),
+        });
+    };
+
+    let _ = engine.engine.cleanup_audio_graph();
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|err| err.to_string())?;
+    app.restart()
+}
+
+#[tauri::command]
+fn open_release_page(app: AppHandle) -> Result<(), String> {
+    app.opener()
+        .open_url(RELEASES_URL, None::<String>)
+        .map_err(|err| err.to_string())
+}
+
 fn tauri_result<T>(result: Result<T, EngineError>) -> Result<T, String> {
     result.map_err(|err| err.to_string())
+}
+
+fn update_endpoint(settings: &MixerSettings) -> String {
+    match release_channel_name(settings) {
+        "beta" => std::env::var("WAVELINUX_BETA_UPDATE_ENDPOINT")
+            .or_else(|_| std::env::var("WAVELINUX_UPDATE_ENDPOINT"))
+            .unwrap_or_else(|_| BETA_UPDATE_ENDPOINT.into()),
+        _ => std::env::var("WAVELINUX_STABLE_UPDATE_ENDPOINT")
+            .or_else(|_| std::env::var("WAVELINUX_UPDATE_ENDPOINT"))
+            .unwrap_or_else(|_| STABLE_UPDATE_ENDPOINT.into()),
+    }
+}
+
+fn release_channel_name(settings: &MixerSettings) -> &'static str {
+    match settings.release_channel {
+        wavelinux_model::ReleaseChannel::Beta => "beta",
+        wavelinux_model::ReleaseChannel::Stable => "stable",
+    }
+}
+
+fn is_appimage_install() -> bool {
+    std::env::var_os("APPIMAGE").is_some()
+}
+
+fn is_missing_update_metadata_error(message: &str) -> bool {
+    message.contains("Could not fetch a valid release JSON")
+        || message.contains("ReleaseNotFound")
+        || message.contains("status code 404")
 }
 
 fn shutdown_audio_graph(engine: &WaveLinuxEngine, shutdown_started: &AtomicBool) {
@@ -448,6 +658,31 @@ fn show_main_window(app: &AppHandle) {
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+}
+
+fn acquire_process_lock() -> std::io::Result<Option<ProcessLock>> {
+    let lock_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let lock_path = lock_dir.join("wavelinux-4.lock");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+
+    file.set_len(0)?;
+    writeln!(file, "{}", std::process::id())?;
+    Ok(Some(ProcessLock { _file: file }))
 }
 
 fn build_tray(
@@ -491,15 +726,8 @@ fn build_tray(
 }
 
 fn main() {
-    let engine = WaveLinuxEngine::from_xdg().expect("failed to start WaveLinux engine");
-    let background = engine.spawn_background();
-    let tray_engine = Arc::clone(&engine);
-    let run_engine = Arc::clone(&engine);
     let shutdown_started = Arc::new(AtomicBool::new(false));
     let allow_exit = Arc::new(AtomicBool::new(false));
-    let tray_shutdown = Arc::clone(&shutdown_started);
-    let run_shutdown = Arc::clone(&shutdown_started);
-    let tray_allow_exit = Arc::clone(&allow_exit);
     let run_allow_exit = Arc::clone(&allow_exit);
 
     let app = tauri::Builder::default()
@@ -508,9 +736,7 @@ fn main() {
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(EngineState {
-            engine: Arc::clone(&engine),
-        })
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_state,
             observe_state,
@@ -565,16 +791,10 @@ fn main() {
             list_scenes,
             list_setup_templates,
             apply_setup_template,
+            check_for_updates,
+            install_update,
+            open_release_page,
         ])
-        .setup(move |app| {
-            build_tray(
-                app.handle(),
-                Arc::clone(&tray_engine),
-                Arc::clone(&tray_shutdown),
-                Arc::clone(&tray_allow_exit),
-            )?;
-            Ok(())
-        })
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -583,6 +803,28 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("error while building WaveLinux");
+
+    let Some(_process_lock) =
+        acquire_process_lock().expect("failed to acquire WaveLinux process lock")
+    else {
+        eprintln!("WaveLinux is already running; refusing to start a duplicate audio engine");
+        return;
+    };
+
+    let engine = WaveLinuxEngine::from_xdg().expect("failed to start WaveLinux engine");
+    let background = engine.spawn_background();
+    let run_engine = Arc::clone(&engine);
+    let run_shutdown = Arc::clone(&shutdown_started);
+    app.manage(EngineState {
+        engine: Arc::clone(&engine),
+    });
+    build_tray(
+        app.handle(),
+        Arc::clone(&engine),
+        Arc::clone(&shutdown_started),
+        Arc::clone(&allow_exit),
+    )
+    .expect("failed to build WaveLinux tray");
 
     app.run(move |_app, event| match event {
         tauri::RunEvent::ExitRequested { api, .. } if !run_allow_exit.load(Ordering::SeqCst) => {
