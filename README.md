@@ -23,6 +23,12 @@ adds safe audio-only hardware profiles, Bluetooth headset protection, searchable
 profile assignment, lower-lag mixer controls, better metering, and release
 packaging updates without changing the mixer-first workflow.
 
+4.1.1 adds a focused XM4 stability profile update: the Sony WH-1000XM4 profile
+now prefers AAC/SBC-XQ/SBC before LDAC, raises the Bluetooth latency floor to
+120 ms, and treats high-bitrate LDAC as something to avoid unless the link is
+excellent. It also publishes signed hardware profile assets with GitHub
+releases so profile fixes can land without waiting for a larger feature build.
+
 Highlights:
 
 - Hardware profiles are now individual JSON device files under `profiles/v1`
@@ -122,7 +128,7 @@ yarn install:local
 The local installer places the AppImage and launcher here:
 
 ```bash
-~/.local/share/wavelinux/WaveLinux_4.1.0_amd64.AppImage
+~/.local/share/wavelinux/WaveLinux_4.1.1_amd64.AppImage
 ~/.local/bin/wavelinux
 ```
 
@@ -311,10 +317,10 @@ Generate updater metadata:
 
 ```bash
 python3 scripts/build-updater-manifest.py \
-  --artifact target/release/bundle/appimage/WaveLinux_4.1.0_amd64.AppImage.tar.gz \
-  --version 4.1.0 \
+  --artifact target/release/bundle/appimage/WaveLinux_4.1.1_amd64.AppImage.tar.gz \
+  --version 4.1.1 \
   --repo DuskyProjects/WaveLinux \
-  --tag v4.1.0 \
+  --tag v4.1.1 \
   --output target/release/bundle/latest.json
 ```
 

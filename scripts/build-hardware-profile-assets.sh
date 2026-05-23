@@ -12,7 +12,24 @@ install -d "$OUT_DIR"
 cp "$SOURCE_DIR/index.json" "$OUT_DIR/hardware-profiles-v1-index.json"
 cp "$SOURCE_DIR"/devices/*.json "$OUT_DIR/"
 
-if [[ -n "$MINISIGN_KEY" ]]; then
+if [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" || -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ]]; then
+  if [[ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]]; then
+    echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD is required to sign hardware profiles with the Tauri key" >&2
+    exit 1
+  fi
+  signing_args=(--password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD")
+  if [[ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ]]; then
+    signing_env=(env -u TAURI_SIGNING_PRIVATE_KEY)
+    signing_args+=(--private-key-path "$TAURI_SIGNING_PRIVATE_KEY_PATH")
+  else
+    signing_env=(env -u TAURI_SIGNING_PRIVATE_KEY_PATH)
+    signing_args+=(--private-key "$TAURI_SIGNING_PRIVATE_KEY")
+  fi
+  for asset in "$OUT_DIR"/*.json; do
+    "${signing_env[@]}" "$ROOT_DIR/node_modules/.bin/tauri" signer sign "${signing_args[@]}" "$asset" >/dev/null
+    echo "Signed $asset"
+  done
+elif [[ -n "$MINISIGN_KEY" ]]; then
   if ! command -v minisign >/dev/null 2>&1; then
     echo "minisign is required when WAVELINUX_PROFILE_MINISIGN_KEY is set" >&2
     exit 1

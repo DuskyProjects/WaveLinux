@@ -859,7 +859,7 @@
     {
       "id": "sony.wh-1000xm4",
       "name": "Sony WH-1000XM4",
-      "revision": 3,
+      "revision": 4,
       "asset": "sony-wh-1000xm4.json",
       "matches": [
         {

@@ -1231,9 +1231,14 @@ mod tests {
 
         assert_eq!(
             profile.codec_policy.preferred_a2dp_codecs,
-            ["aac", "sbc_xq", "ldac", "sbc"]
+            ["aac", "sbc_xq", "sbc", "ldac"]
         );
-        assert_eq!(profile.codec_policy.ldac_quality.as_deref(), Some("auto"));
+        assert_eq!(profile.codec_policy.ldac_quality.as_deref(), Some("sq"));
+        assert!(profile
+            .codec_policy
+            .avoid_codecs
+            .iter()
+            .any(|codec| codec == "ldac_hq"));
     }
 
     #[test]
