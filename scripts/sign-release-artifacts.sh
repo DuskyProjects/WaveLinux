@@ -29,6 +29,6 @@ for artifact in "${artifacts[@]}"; do
   "$ROOT_DIR/node_modules/.bin/tauri" signer sign \
     --private-key-path "$KEY_PATH" \
     --password "$(cat "$PASSWORD_PATH")" \
-    "$artifact" > "$artifact.sig"
+    "$artifact" >/dev/null
   echo "Signed $artifact"
 done
