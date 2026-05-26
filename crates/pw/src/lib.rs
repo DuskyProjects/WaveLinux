@@ -577,7 +577,9 @@ fn channel_input_meter_source_name(
     if channel.kind.uses_hardware_slot() {
         if channel_has_active_effects(channel) {
             let processed = effect_chain_source_name(channel);
-            return available_sources.contains(&processed).then_some(processed);
+            if available_sources.contains(&processed) {
+                return Some(processed);
+            }
         }
 
         if let Some(source) = channel
@@ -3343,7 +3345,7 @@ mod tests {
     }
 
     #[test]
-    fn hardware_input_meters_wait_for_fx_source_when_effects_are_active() {
+    fn hardware_input_meters_use_raw_source_until_fx_source_is_available() {
         let mut config = MixerConfig::default();
         let hardware = config
             .channels
@@ -3363,9 +3365,12 @@ mod tests {
             target.node_id == channel_raw_meter_id("hardware_in")
                 && target.source_name == "alsa_input.real"
         }));
-        assert!(!targets.iter().any(|target| {
-            target.node_id == "hardware_in"
-                || target.node_id == channel_bus_meter_id("hardware_in", "stream")
+        assert!(targets.iter().any(|target| {
+            target.node_id == "hardware_in" && target.source_name == "alsa_input.real"
+        }));
+        assert!(targets.iter().any(|target| {
+            target.node_id == channel_bus_meter_id("hardware_in", "stream")
+                && target.source_name == "alsa_input.real"
         }));
     }
 

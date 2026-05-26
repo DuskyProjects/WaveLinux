@@ -3540,6 +3540,29 @@ impl WaveLinuxEngine {
         }
     }
 
+    fn refresh_meter_targets_from_live_graph(&self, area: &str) {
+        let result = (|| -> Result<(), EngineError> {
+            let config = self.effective_config_for_audio_graph(&self.read_config()?.clone());
+            let graph = self
+                .pw
+                .snapshot_for_config_with_effect_availability(None, Vec::new());
+            let audio_graph_running =
+                graph_has_wavelinux_nodes(&graph) && !self.stop.load(Ordering::SeqCst);
+            let meters = self.refresh_meter_supervisor(&config, &graph, audio_graph_running)?;
+            let mut runtime = self.write_runtime()?;
+            if runtime.status.audio_graph_running {
+                runtime.graph.meters = meters;
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            self.log_engine_event(
+                area,
+                format!("meter target refresh after effect sync failed: {err}"),
+            );
+        }
+    }
+
     fn stop_meter_supervisor(&self) {
         if let Ok(mut supervisor) = self.meter_supervisor.lock() {
             let stopped = supervisor.handles.len();
@@ -3828,7 +3851,10 @@ impl WaveLinuxEngine {
                         ),
                     );
                     match engine.sync_effect_channels(&channel_ids) {
-                        Ok(outputs) => engine.log_command_executions("effects.sync", &outputs),
+                        Ok(outputs) => {
+                            engine.log_command_executions("effects.sync", &outputs);
+                            engine.refresh_meter_targets_from_live_graph("effects.sync");
+                        }
                         Err(err) => {
                             engine.log_engine_event("effects.sync", format!("sync failed: {err}"));
                         }
