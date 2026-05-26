@@ -19,9 +19,11 @@ pub const INPUT_ROUTE_REVISION: &str = "2";
 pub const EFFECT_ROUTE_REVISION: &str = "1";
 pub const CHANNEL_MIX_ROUTE_REVISION: &str = "1";
 pub const MIX_MONITOR_ROUTE_REVISION: &str = "1";
+// Emergency defaults for isolated route helpers. Normal graph planning is
+// profile-sourced through route_settings_for_config().
 pub const STABLE_LOOPBACK_LATENCY_MSEC: u16 = 35;
 pub const LOW_LATENCY_LOOPBACK_MSEC: u16 = 20;
-pub const BLUETOOTH_MONITOR_LOOPBACK_MSEC: u16 = 80;
+pub const BLUETOOTH_MONITOR_LOOPBACK_MSEC: u16 = 120;
 pub const METERS_ENV: &str = "WAVELINUX_ENABLE_METERS";
 pub const METERS_DISABLE_ENV: &str = "WAVELINUX_DISABLE_METERS";
 pub const PW_RECORD_METERS_ENV: &str = "WAVELINUX_ENABLE_PW_RECORD_METERS";
@@ -693,6 +695,7 @@ pub struct PlannedGraph {
 pub fn plan_ensure_graph(config: &MixerConfig) -> PlannedGraph {
     let mut commands = Vec::new();
     let mut managed_nodes = Vec::new();
+    let route_settings = route_settings_for_config(config);
 
     for mix in &config.mixes {
         managed_nodes.push(mix.virtual_sink_name.clone());
@@ -707,22 +710,22 @@ pub fn plan_ensure_graph(config: &MixerConfig) -> PlannedGraph {
             commands.extend(plan_route_input_to_channel(
                 channel,
                 source,
-                &config.settings,
+                &route_settings,
             ));
         }
         if channel_has_active_effects(channel) {
-            commands.extend(plan_route_channel_to_effect(channel, &config.settings));
+            commands.extend(plan_route_channel_to_effect(channel, &route_settings));
         }
         for mix in &config.mixes {
             if channel.mix_buses.contains_key(&mix.id) {
-                commands.extend(plan_route_channel_to_mix(channel, mix, &config.settings));
+                commands.extend(plan_route_channel_to_mix(channel, mix, &route_settings));
             }
         }
     }
 
     for mix in &config.mixes {
         if let Some(output) = &mix.monitor_output {
-            commands.extend(plan_route_mix_to_output(mix, output, &config.settings));
+            commands.extend(plan_route_mix_to_output(mix, output, &route_settings));
         }
     }
 
@@ -730,6 +733,20 @@ pub fn plan_ensure_graph(config: &MixerConfig) -> PlannedGraph {
         commands,
         managed_nodes,
     }
+}
+
+fn route_settings_for_config(config: &MixerConfig) -> MixerSettings {
+    let mut settings = config.settings.clone();
+    if settings.runtime_latency_policy.is_none() {
+        settings.runtime_latency_policy = Some(
+            config
+                .device_policy
+                .fallback_hardware_profile
+                .latency_policy
+                .clone(),
+        );
+    }
+    settings
 }
 
 pub fn plan_ensure_mix(mix: &Mix) -> Vec<CommandSpec> {
@@ -989,7 +1006,8 @@ pub fn mix_monitor_latency_msec_for_sink(
 fn stable_loopback_latency_msec(settings: &MixerSettings) -> u16 {
     settings
         .runtime_latency_policy
-        .stable_msec
+        .as_ref()
+        .and_then(|policy| policy.stable_msec)
         .unwrap_or(STABLE_LOOPBACK_LATENCY_MSEC)
         .clamp(5, 500)
 }
@@ -997,7 +1015,8 @@ fn stable_loopback_latency_msec(settings: &MixerSettings) -> u16 {
 fn low_latency_loopback_msec(settings: &MixerSettings) -> u16 {
     settings
         .runtime_latency_policy
-        .low_latency_msec
+        .as_ref()
+        .and_then(|policy| policy.low_latency_msec)
         .unwrap_or(LOW_LATENCY_LOOPBACK_MSEC)
         .clamp(5, 500)
 }
@@ -1005,7 +1024,8 @@ fn low_latency_loopback_msec(settings: &MixerSettings) -> u16 {
 fn bluetooth_monitor_loopback_msec(settings: &MixerSettings) -> u16 {
     settings
         .runtime_latency_policy
-        .bluetooth_floor_msec
+        .as_ref()
+        .and_then(|policy| policy.bluetooth_floor_msec)
         .unwrap_or(BLUETOOTH_MONITOR_LOOPBACK_MSEC)
         .clamp(50, 500)
 }
@@ -3728,11 +3748,11 @@ mod tests {
             .next()
             .unwrap();
 
-        assert!(command.args.contains(&"latency_msec=80".into()));
+        assert!(command.args.contains(&"latency_msec=120".into()));
         assert!(command
             .args
             .iter()
-            .any(|arg| arg.contains("wavelinux.route_revision=1-latency-80")));
+            .any(|arg| arg.contains("wavelinux.route_revision=1-latency-120")));
 
         settings.low_latency_mic_monitoring = false;
         settings.optimization_mode = OptimizationMode::Safe;
@@ -3748,11 +3768,11 @@ mod tests {
             low_latency_mic_monitoring: true,
             ..MixerSettings::default()
         };
-        settings.runtime_latency_policy = wavelinux_model::LatencyPolicy {
+        settings.runtime_latency_policy = Some(wavelinux_model::LatencyPolicy {
             stable_msec: Some(60),
             low_latency_msec: Some(35),
             bluetooth_floor_msec: Some(120),
-        };
+        });
         let channel = Channel::new_fixed("hardware_in", "Input", ChannelKind::Generic);
         let music = Channel::new_fixed("music", "Music", ChannelKind::Application);
         let monitor = Mix::new_fixed("monitor", "Monitor");
@@ -3775,6 +3795,53 @@ mod tests {
             ),
             120
         );
+    }
+
+    #[test]
+    fn planned_graph_uses_generic_fallback_profile_when_no_runtime_profile_is_set() {
+        let mut config = MixerConfig::default();
+        config.settings.low_latency_mic_monitoring = true;
+        config
+            .device_policy
+            .fallback_hardware_profile
+            .latency_policy = wavelinux_model::LatencyPolicy {
+            stable_msec: Some(80),
+            low_latency_msec: Some(45),
+            bluetooth_floor_msec: Some(160),
+        };
+        config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap()
+            .source_device = Some("alsa_input.realtek".into());
+        config
+            .set_mix_monitor_output("monitor", Some("bluez_output.AC_80_0A_72_BD_10.1".into()))
+            .unwrap();
+
+        let plan = plan_ensure_graph(&config);
+
+        assert!(plan.commands.iter().any(|command| {
+            command.args.contains(&"latency_msec=45".into())
+                && command
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains("wavelinux.role=input_to_channel"))
+        }));
+        assert!(plan.commands.iter().any(|command| {
+            command.args.contains(&"latency_msec=80".into())
+                && command.args.iter().any(|arg| {
+                    arg.contains("wavelinux.role=channel_to_mix")
+                        && arg.contains("wavelinux.channel_id=music")
+                })
+        }));
+        assert!(plan.commands.iter().any(|command| {
+            command.args.contains(&"latency_msec=160".into())
+                && command
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains("wavelinux.role=mix_monitor"))
+        }));
     }
 
     #[test]

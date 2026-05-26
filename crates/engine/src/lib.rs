@@ -4261,8 +4261,9 @@ fn effective_config_with_profiled_devices(
     let auto_output = preferred_monitor_output(outputs, active_sink.or(default_sink));
     let mut effective =
         effective_config_with_auto_devices(config, auto_input, auto_output, bluetooth_cards);
-    effective.settings.runtime_latency_policy =
-        active_latency_policy_for_config(&effective, inputs, outputs);
+    effective.settings.runtime_latency_policy = Some(active_latency_policy_for_config(
+        &effective, inputs, outputs,
+    ));
     effective
 }
 
@@ -4908,6 +4909,7 @@ fn settings_affect_audio_graph(previous: &MixerSettings, next: &MixerSettings) -
         || previous.stream_sync_delay_msec != next.stream_sync_delay_msec
         || previous.monitor_sync_delay_msec != next.monitor_sync_delay_msec
         || previous.optimization_mode != next.optimization_mode
+        || previous.runtime_latency_policy != next.runtime_latency_policy
 }
 
 fn module_is_stale_for_config(module: &ManagedModule, config: &MixerConfig) -> bool {
@@ -6954,21 +6956,14 @@ mod tests {
         );
         let plan = plan_ensure_graph(&effective);
 
-        assert_eq!(
-            effective.settings.runtime_latency_policy.stable_msec,
-            Some(60)
-        );
-        assert_eq!(
-            effective.settings.runtime_latency_policy.low_latency_msec,
-            Some(35)
-        );
-        assert_eq!(
-            effective
-                .settings
-                .runtime_latency_policy
-                .bluetooth_floor_msec,
-            Some(120)
-        );
+        let runtime_latency = effective
+            .settings
+            .runtime_latency_policy
+            .as_ref()
+            .expect("profile latency policy should be resolved for graph planning");
+        assert_eq!(runtime_latency.stable_msec, Some(60));
+        assert_eq!(runtime_latency.low_latency_msec, Some(35));
+        assert_eq!(runtime_latency.bluetooth_floor_msec, Some(120));
         assert!(plan.commands.iter().any(|command| {
             command.args.contains(&"latency_msec=35".into())
                 && command

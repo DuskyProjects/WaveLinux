@@ -88,8 +88,8 @@ pub struct MixerSettings {
     pub release_channel: ReleaseChannel,
     #[serde(default)]
     pub optimization_mode: OptimizationMode,
-    #[serde(default = "default_runtime_latency_policy", skip_serializing)]
-    pub runtime_latency_policy: LatencyPolicy,
+    #[serde(default, skip_serializing)]
+    pub runtime_latency_policy: Option<LatencyPolicy>,
 }
 
 impl Default for MixerSettings {
@@ -109,7 +109,7 @@ impl Default for MixerSettings {
             auto_install_updates: false,
             release_channel: ReleaseChannel::Stable,
             optimization_mode: OptimizationMode::Performance,
-            runtime_latency_policy: default_runtime_latency_policy(),
+            runtime_latency_policy: None,
         }
     }
 }
@@ -2474,14 +2474,6 @@ fn default_fallback_hardware_profile_id() -> String {
 
 fn default_fallback_hardware_profile_name() -> &'static str {
     "Default Generic Audio"
-}
-
-fn default_runtime_latency_policy() -> LatencyPolicy {
-    LatencyPolicy {
-        stable_msec: Some(35),
-        low_latency_msec: Some(20),
-        bluetooth_floor_msec: Some(80),
-    }
 }
 
 fn normalize_latency_policy(policy: &mut LatencyPolicy) {
