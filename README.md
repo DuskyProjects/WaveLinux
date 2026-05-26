@@ -29,6 +29,12 @@ now prefers AAC/SBC-XQ/SBC before LDAC, raises the Bluetooth latency floor to
 excellent. It also publishes signed hardware profile assets with GitHub
 releases so profile fixes can land without waiting for a larger feature build.
 
+4.1.2 is a stability and profile-authority fix release. It removes the
+refresh-loop stalls caused by large `pactl` output, keeps faders and toggles
+responsive under drag spam, makes the hardware input VU visually swap from raw
+mic to post-FX `wavelinux-mic`, and lets active hardware profiles decide route
+latency floors before any generic fallback is used.
+
 Highlights:
 
 - Hardware profiles are now individual JSON device files under `profiles/v1`
@@ -128,7 +134,7 @@ yarn install:local
 The local installer places the AppImage and launcher here:
 
 ```bash
-~/.local/share/wavelinux/WaveLinux_4.1.1_amd64.AppImage
+~/.local/share/wavelinux/WaveLinux_4.1.2_amd64.AppImage
 ~/.local/bin/wavelinux
 ```
 
@@ -317,10 +323,10 @@ Generate updater metadata:
 
 ```bash
 python3 scripts/build-updater-manifest.py \
-  --artifact target/release/bundle/appimage/WaveLinux_4.1.1_amd64.AppImage.tar.gz \
-  --version 4.1.1 \
+  --artifact target/release/bundle/appimage/WaveLinux_4.1.2_amd64.AppImage.tar.gz \
+  --version 4.1.2 \
   --repo DuskyProjects/WaveLinux \
-  --tag v4.1.1 \
+  --tag v4.1.2 \
   --output target/release/bundle/latest.json
 ```
 
