@@ -43,6 +43,23 @@ Use `examples/local-usb-microphone.json` as a starting point. Prefer exact `vend
   `sbc_xq`.
 - `confidence`: `low`, `medium`, or `high`.
 
+## Bluetooth Latency Floors
+
+Bluetooth profiles should preserve the best stable A2DP codec before falling
+back to lower-quality codecs. Do not use SBC as the first crackle fix when AAC,
+SBC-XQ, or LDAC is available; raise the codec latency floor first.
+
+Use these stability-first floors unless a device-specific trace proves a lower
+value is reliable:
+
+- `aac`: 320 ms
+- `sbc_xq`: 360 ms
+- `sbc`: 280 ms
+- `ldac`: 500 ms
+
+LDAC is quality-first, not latency-first. Profiles should avoid maximum-bitrate
+LDAC modes on unstable links and should keep HFP/HSP out of music playback.
+
 ## Guardrails
 
 WaveLinux ignores profiles that contain executable fields such as `command`, `exec`, `shell`, `script`, or `hook`.

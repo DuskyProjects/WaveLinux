@@ -1614,6 +1614,19 @@ impl FallbackHardwareProfile {
         self.name = clean_app_display_name(&self.name)
             .unwrap_or_else(|| default_fallback_hardware_profile_name().to_string());
         normalize_latency_policy(&mut self.latency_policy);
+        if self.id == default_fallback_hardware_profile_id()
+            && self.name == default_fallback_hardware_profile_name()
+            && matches!(
+                self.latency_policy,
+                LatencyPolicy {
+                    stable_msec: Some(35),
+                    low_latency_msec: Some(20),
+                    bluetooth_floor_msec: Some(120 | 180),
+                }
+            )
+        {
+            self.latency_policy = FallbackHardwareProfile::default().latency_policy;
+        }
         normalize_routing_policy(&mut self.routing_policy);
         if self.bluetooth_mic_policy != BluetoothMicPolicy::NeverIfHfp {
             self.bluetooth_mic_policy = BluetoothMicPolicy::NeverIfHfp;
@@ -1628,9 +1641,9 @@ impl Default for FallbackHardwareProfile {
             id: default_fallback_hardware_profile_id(),
             name: default_fallback_hardware_profile_name().into(),
             latency_policy: LatencyPolicy {
-                stable_msec: Some(35),
-                low_latency_msec: Some(20),
-                bluetooth_floor_msec: Some(180),
+                stable_msec: Some(80),
+                low_latency_msec: Some(60),
+                bluetooth_floor_msec: Some(240),
             },
             routing_policy: RoutingPolicy {
                 input_priority: Some(35),
@@ -3381,6 +3394,45 @@ mod tests {
             .iter()
             .any(|channel| channel.id == "system" && channel.kind == ChannelKind::System));
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_default_fallback_profile_migrates_to_safe_latency() {
+        let raw = r#"
+        {
+          "device_policy": {
+            "fallback_hardware_profile": {
+              "id": "default.generic-audio",
+              "name": "Default Generic Audio",
+              "latency_policy": {
+                "stable_msec": 35,
+                "low_latency_msec": 20,
+                "bluetooth_floor_msec": 120
+              },
+              "routing_policy": {
+                "input_priority": 35,
+                "output_priority": 30,
+                "allow_auto_select_input": true,
+                "allow_auto_select_output": true,
+                "prefer_non_bluetooth_input": true
+              },
+              "bluetooth_mic_policy": "never_if_hfp",
+              "confidence": "low"
+            }
+          }
+        }
+        "#;
+
+        let config: MixerConfig = serde_json::from_str(raw).unwrap();
+        let config = config.normalized().unwrap();
+
+        assert_eq!(
+            config
+                .device_policy
+                .fallback_hardware_profile
+                .latency_policy,
+            FallbackHardwareProfile::default().latency_policy
+        );
     }
 
     #[test]

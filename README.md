@@ -41,6 +41,9 @@ during OBS, webcam, browser, and effects load. For Bluetooth headsets such as
 the Sony WH-1000XM4, it restores the preferred stable A2DP profile instead of
 leaving an already-A2DP LDAC session active when AAC is the safer profile
 choice, with larger profile-defined buffers available for LDAC and SBC-XQ.
+It also persists the real monitor output selected while following the system
+default, so a disconnected Bluetooth headset cannot stay saved as the preferred
+output and cause silence on the next restart.
 
 Highlights:
 
@@ -62,6 +65,9 @@ Highlights:
   commands run.
 - Hardware input meters now show the real selected microphone before effects,
   then the microphone-only post-FX signal when effects are active.
+- If an old effect-chain helper exits after restart, WaveLinux now repairs the
+  stale route instead of leaving app routing stuck on a missing `wavelinux-mic`
+  source.
 - Channel Stream/Monitor meters now follow the effective channel-send and
   destination mix/master level, so source strip VUs and mix VUs agree.
 - The effects microphone export is named `wavelinux-mic` / `WaveLinux-mic` so

@@ -19,16 +19,25 @@ hardware profile line.
   VU state stay aligned.
 - Made Bluetooth reconnect routing wait for the selected A2DP sink before
   moving monitor output, preventing silence while the sink is still appearing.
+- Persisted the real monitor output chosen while following the system default,
+  so a disconnected Bluetooth headset is not saved and reused as the preferred
+  output on the next restart.
 - Treated disappearing app streams during route moves as benign stale state.
 - Fixed hardware input VU behavior so it displays the raw selected microphone
   until the FX source appears, then visually swaps to the post-FX
   `wavelinux-mic` source without changing routing.
+- Repaired restart races where an old effect-chain process could disappear
+  after the new app reused the graph, leaving routes pointed at a missing
+  `wavelinux-mic` source and app routing stuck on "graph not ready".
 - Applied active hardware profile latency floors to audio routes. Realtek
   ALC3254 speaker routing now uses the profile's safer low/stable latency
   floors instead of the old global 20 ms path.
 - Made route latency profile-sourced: assigned or auto-matched hardware
   profiles decide first, and the editable generic fallback profile decides when
   no specific profile exists.
+- Fixed the AUR staging helper so it includes `wavelinux.install`, allowing the
+  generated `.SRCINFO` to reflect the 4.1.2 package and install-time profile
+  prewarm hook.
 
 ## Notes
 

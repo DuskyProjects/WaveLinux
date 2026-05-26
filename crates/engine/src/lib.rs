@@ -1095,25 +1095,30 @@ impl WaveLinuxEngine {
             }
         }
         record_refresh_phase(&mut refresh_phases, &mut phase_started, "bluetooth");
+        let auto_device_repair_needed = auto_device_repair_needed_for_profiled_devices(
+            &config,
+            ProfiledDeviceRepairView {
+                inputs: &graph.inputs,
+                outputs: &graph.outputs,
+                bluetooth_cards: &bluetooth_cards,
+                default_source: default_source.as_deref(),
+                default_sink: default_sink.as_deref(),
+                active_sink: active_sink.as_deref(),
+                managed_modules: &managed_modules,
+            },
+        );
+        let active_effect_route_repair_needed =
+            active_effect_routes_need_repair(&audio_config, &graph, &managed_modules);
         if audio_graph_running
             && !self.stop.load(Ordering::SeqCst)
-            && auto_device_repair_needed_for_profiled_devices(
-                &config,
-                ProfiledDeviceRepairView {
-                    inputs: &graph.inputs,
-                    outputs: &graph.outputs,
-                    bluetooth_cards: &bluetooth_cards,
-                    default_source: default_source.as_deref(),
-                    default_sink: default_sink.as_deref(),
-                    active_sink: active_sink.as_deref(),
-                    managed_modules: &managed_modules,
-                },
-            )
+            && (auto_device_repair_needed || active_effect_route_repair_needed)
         {
-            self.log_engine_event(
-                "hotplug.device",
-                "auto hardware device changed while graph was running; repairing audio routes",
-            );
+            let reason = if active_effect_route_repair_needed && !auto_device_repair_needed {
+                "active effect route changed while graph was running; repairing audio routes"
+            } else {
+                "auto hardware device changed while graph was running; repairing audio routes"
+            };
+            self.log_engine_event("hotplug.device", reason);
             let _audio_commands = self.lock_audio_commands()?;
             if !self.stop.load(Ordering::SeqCst) {
                 let report = self.repair_audio_graph_unlocked()?;
@@ -1138,6 +1143,7 @@ impl WaveLinuxEngine {
         }
         record_refresh_phase(&mut refresh_phases, &mut phase_started, "repair");
         if audio_graph_running && !self.stop.load(Ordering::SeqCst) {
+            self.persist_followed_monitor_output_selection(&config, &audio_config)?;
             let graph_ready_for_apps =
                 app_routing_graph_ready(&audio_config, &graph, &managed_modules);
             let rescued_streams = self.move_unready_routed_streams_to_default(
@@ -3313,6 +3319,62 @@ impl WaveLinuxEngine {
         write_json(&self.paths.config_file(), &config)
     }
 
+    fn persist_followed_monitor_output_selection(
+        &self,
+        saved_config: &MixerConfig,
+        effective_config: &MixerConfig,
+    ) -> Result<(), EngineError> {
+        if !saved_config.settings.monitor_follows_default_output {
+            return Ok(());
+        }
+        let Some(output) = effective_config
+            .mixes
+            .iter()
+            .find(|mix| mix.id == "monitor")
+            .and_then(|mix| mix.monitor_output.clone())
+            .filter(|output| is_restorable_device(output))
+        else {
+            return Ok(());
+        };
+        let saved_output = saved_config
+            .mixes
+            .iter()
+            .find(|mix| mix.id == "monitor")
+            .and_then(|mix| mix.monitor_output.as_deref());
+        if saved_output == Some(output.as_str())
+            && saved_config.device_policy.preferred_output.as_deref() == Some(output.as_str())
+        {
+            return Ok(());
+        }
+
+        let mut changed = false;
+        {
+            let mut config = self.write_config()?;
+            if let Some(mix) = config.mixes.iter_mut().find(|mix| mix.id == "monitor") {
+                if mix.monitor_output.as_deref() != Some(output.as_str()) {
+                    mix.monitor_output = Some(output.clone());
+                    changed = true;
+                }
+            }
+            if config.device_policy.preferred_output.as_deref() != Some(output.as_str()) {
+                config.device_policy.preferred_output = Some(output.clone());
+                changed = true;
+            }
+            if config.device_policy.active_output_fallback {
+                config.device_policy.active_output_fallback = false;
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist_config()?;
+            self.log_engine_event(
+                "hotplug.output",
+                format!("persisted followed monitor output: {output}"),
+            );
+        }
+        Ok(())
+    }
+
     fn read_config(&self) -> Result<std::sync::RwLockReadGuard<'_, MixerConfig>, EngineError> {
         self.config.read().map_err(|_| EngineError::LockPoisoned)
     }
@@ -4845,6 +4907,38 @@ fn app_routing_graph_ready(
     })
 }
 
+fn active_effect_routes_need_repair(
+    config: &MixerConfig,
+    graph: &RuntimeGraph,
+    managed_modules: &[ManagedModule],
+) -> bool {
+    let output_names = graph
+        .outputs
+        .iter()
+        .map(|output| output.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let input_names = graph
+        .inputs
+        .iter()
+        .map(|input| input.name.as_str())
+        .collect::<BTreeSet<_>>();
+
+    config
+        .channels
+        .iter()
+        .filter(|channel| channel_has_active_effects(channel))
+        .any(|channel| {
+            !channel_route_ready(
+                channel,
+                &config.mixes,
+                &config.settings,
+                &output_names,
+                &input_names,
+                managed_modules,
+            )
+        })
+}
+
 fn stream_route_ready(
     config: &MixerConfig,
     graph: &RuntimeGraph,
@@ -5999,7 +6093,7 @@ mod tests {
 
         assert_eq!(default_profile.source, "default");
         assert_eq!(default_profile.name, "Default Generic Audio");
-        assert_eq!(default_profile.latency_policy.stable_msec, Some(35));
+        assert_eq!(default_profile.latency_policy.stable_msec, Some(80));
         assert_eq!(default_profile.routing_policy.output_priority, Some(30));
     }
 
@@ -6468,6 +6562,11 @@ mod tests {
             &missing_fx_graph,
             &modules
         ));
+        assert!(active_effect_routes_need_repair(
+            &config,
+            &missing_fx_graph,
+            &modules
+        ));
 
         let mut raw_fallback_modules = modules.clone();
         for module in raw_fallback_modules.iter_mut().filter(|module| {
@@ -6477,6 +6576,11 @@ mod tests {
             module.source_name = Some("wavelinux_channel_music.monitor".into());
         }
         assert!(app_routing_graph_ready(
+            &config,
+            &missing_fx_graph,
+            &raw_fallback_modules
+        ));
+        assert!(!active_effect_routes_need_repair(
             &config,
             &missing_fx_graph,
             &raw_fallback_modules
@@ -7124,6 +7228,47 @@ mod tests {
     }
 
     #[test]
+    fn followed_monitor_output_persists_auto_selected_real_output() {
+        let engine = test_engine();
+        let mut saved = MixerConfig::default();
+        saved
+            .set_mix_monitor_output("monitor", Some("bluez_output.dead".into()))
+            .unwrap();
+        saved.settings.monitor_follows_default_output = true;
+        saved.device_policy.preferred_output = Some("bluez_output.dead".into());
+        saved.device_policy.active_output_fallback = true;
+
+        {
+            let mut config = engine.write_config().unwrap();
+            *config = saved.clone();
+        }
+        engine.persist_config().unwrap();
+
+        let mut effective = saved.clone();
+        effective
+            .set_mix_monitor_output("monitor", Some("alsa_output.speaker".into()))
+            .unwrap();
+        effective.device_policy.preferred_output = Some("alsa_output.speaker".into());
+        effective.device_policy.active_output_fallback = false;
+
+        engine
+            .persist_followed_monitor_output_selection(&saved, &effective)
+            .unwrap();
+
+        let config = engine.read_config().unwrap();
+        let monitor = config.mixes.iter().find(|mix| mix.id == "monitor").unwrap();
+        assert_eq!(
+            monitor.monitor_output.as_deref(),
+            Some("alsa_output.speaker")
+        );
+        assert_eq!(
+            config.device_policy.preferred_output.as_deref(),
+            Some("alsa_output.speaker")
+        );
+        assert!(!config.device_policy.active_output_fallback);
+    }
+
+    #[test]
     fn profiled_devices_raise_runtime_route_latency_floor() {
         let mut config = MixerConfig::default();
         config.settings.low_latency_mic_monitoring = true;
@@ -7160,7 +7305,7 @@ mod tests {
             .expect("profile latency policy should be resolved for graph planning");
         assert_eq!(runtime_latency.stable_msec, Some(60));
         assert_eq!(runtime_latency.low_latency_msec, Some(35));
-        assert_eq!(runtime_latency.bluetooth_floor_msec, Some(180));
+        assert_eq!(runtime_latency.bluetooth_floor_msec, Some(240));
         assert!(plan.commands.iter().any(|command| {
             command.args.contains(&"latency_msec=35".into())
                 && command

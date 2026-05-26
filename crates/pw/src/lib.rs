@@ -22,9 +22,9 @@ pub const CHANNEL_MIX_ROUTE_REVISION: &str = "1";
 pub const MIX_MONITOR_ROUTE_REVISION: &str = "1";
 // Emergency defaults for isolated route helpers. Normal graph planning is
 // profile-sourced through route_settings_for_config().
-pub const STABLE_LOOPBACK_LATENCY_MSEC: u16 = 35;
-pub const LOW_LATENCY_LOOPBACK_MSEC: u16 = 20;
-pub const BLUETOOTH_MONITOR_LOOPBACK_MSEC: u16 = 120;
+pub const STABLE_LOOPBACK_LATENCY_MSEC: u16 = 80;
+pub const LOW_LATENCY_LOOPBACK_MSEC: u16 = 60;
+pub const BLUETOOTH_MONITOR_LOOPBACK_MSEC: u16 = 240;
 pub const METERS_ENV: &str = "WAVELINUX_ENABLE_METERS";
 pub const METERS_DISABLE_ENV: &str = "WAVELINUX_DISABLE_METERS";
 pub const PW_RECORD_METERS_ENV: &str = "WAVELINUX_ENABLE_PW_RECORD_METERS";
@@ -3793,7 +3793,7 @@ mod tests {
         assert!(spec
             .args
             .iter()
-            .any(|arg| arg.contains("wavelinux.route_revision=2-latency-20")));
+            .any(|arg| arg.contains("wavelinux.route_revision=2-latency-60")));
     }
 
     #[test]
@@ -3864,7 +3864,7 @@ mod tests {
         assert!(spec
             .args
             .iter()
-            .any(|arg| arg.contains("wavelinux.route_revision=1-latency-20")));
+            .any(|arg| arg.contains("wavelinux.route_revision=1-latency-60")));
     }
 
     #[test]
@@ -3892,15 +3892,15 @@ mod tests {
 
         assert!(route("hardware_in", "stream")
             .args
-            .contains(&"latency_msec=20".into()));
+            .contains(&"latency_msec=60".into()));
         assert!(route("music", "stream")
             .args
-            .contains(&"latency_msec=115".into()));
+            .contains(&"latency_msec=160".into()));
         assert!(route("music", "monitor")
             .args
-            .contains(&"latency_msec=65".into()));
+            .contains(&"latency_msec=110".into()));
         assert!(plan.commands.iter().any(|command| {
-            command.args.contains(&"latency_msec=20".into())
+            command.args.contains(&"latency_msec=60".into())
                 && command
                     .args
                     .iter()
@@ -3920,11 +3920,11 @@ mod tests {
             .next()
             .unwrap();
 
-        assert!(command.args.contains(&"latency_msec=120".into()));
+        assert!(command.args.contains(&"latency_msec=240".into()));
         assert!(command
             .args
             .iter()
-            .any(|arg| arg.contains("wavelinux.route_revision=1-latency-120")));
+            .any(|arg| arg.contains("wavelinux.route_revision=1-latency-240")));
 
         settings.low_latency_mic_monitoring = false;
         settings.optimization_mode = OptimizationMode::Safe;
@@ -3943,7 +3943,7 @@ mod tests {
         settings.runtime_latency_policy = Some(wavelinux_model::LatencyPolicy {
             stable_msec: Some(60),
             low_latency_msec: Some(35),
-            bluetooth_floor_msec: Some(120),
+            bluetooth_floor_msec: Some(240),
         });
         let channel = Channel::new_fixed("hardware_in", "Input", ChannelKind::Generic);
         let music = Channel::new_fixed("music", "Music", ChannelKind::Application);
@@ -3965,7 +3965,7 @@ mod tests {
                 "bluez_output.AC_80_0A_72_BD_10.1",
                 &settings
             ),
-            120
+            240
         );
     }
 

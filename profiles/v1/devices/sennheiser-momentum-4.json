@@ -1,7 +1,7 @@
 {
   "id": "sennheiser.momentum-4",
   "name": "Sennheiser Momentum 4 Wireless",
-  "revision": 2,
+  "revision": 3,
   "matches": [
     {
       "bus": "bluetooth",
@@ -22,8 +22,8 @@
     "sample_rates_hz": [48000]
   },
   "latency_policy": {
-    "stable_msec": 120,
-    "bluetooth_floor_msec": 160
+    "stable_msec": 160,
+    "bluetooth_floor_msec": 240
   },
   "routing_policy": {
     "output_priority": 66,
@@ -36,11 +36,11 @@
     "preferred_a2dp_codecs": ["aptx_adaptive", "aptx_hd", "aac", "sbc_xq", "sbc"],
     "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"],
     "latency_floor_msec": {
-      "aptx_adaptive": 180,
-      "aptx_hd": 200,
-      "aac": 180,
-      "sbc_xq": 200,
-      "sbc": 180
+      "aptx_adaptive": 260,
+      "aptx_hd": 360,
+      "aac": 320,
+      "sbc_xq": 360,
+      "sbc": 280
     }
   },
   "confidence": "medium",

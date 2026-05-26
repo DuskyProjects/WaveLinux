@@ -1325,18 +1325,22 @@ mod tests {
             profile.codec_policy.preferred_a2dp_codecs,
             ["aac", "sbc_xq", "sbc", "ldac"]
         );
-        assert_eq!(profile.latency_policy.bluetooth_floor_msec, Some(160));
+        assert_eq!(profile.latency_policy.bluetooth_floor_msec, Some(240));
         assert_eq!(
             profile.codec_policy.latency_floor_msec.get("aac"),
-            Some(&180)
+            Some(&320)
         );
         assert_eq!(
             profile.codec_policy.latency_floor_msec.get("sbc_xq"),
-            Some(&200)
+            Some(&360)
+        );
+        assert_eq!(
+            profile.codec_policy.latency_floor_msec.get("sbc"),
+            Some(&280)
         );
         assert_eq!(
             profile.codec_policy.latency_floor_msec.get("ldac"),
-            Some(&240)
+            Some(&500)
         );
         assert_eq!(profile.codec_policy.ldac_quality.as_deref(), Some("sq"));
         assert!(profile
@@ -1369,9 +1373,10 @@ mod tests {
                 .and_then(|policy| policy.bluetooth_floor_msec)
         };
 
-        assert_eq!(latency_for_codec("aac"), Some(180));
-        assert_eq!(latency_for_codec("sbc_xq"), Some(200));
-        assert_eq!(latency_for_codec("ldac"), Some(240));
+        assert_eq!(latency_for_codec("aac"), Some(320));
+        assert_eq!(latency_for_codec("sbc_xq"), Some(360));
+        assert_eq!(latency_for_codec("sbc"), Some(280));
+        assert_eq!(latency_for_codec("ldac"), Some(500));
     }
 
     #[test]
@@ -1386,12 +1391,12 @@ mod tests {
             .filter(|entry| entry.profile.capabilities.bluetooth_a2dp)
         {
             assert!(
-                entry.profile.latency_policy.bluetooth_floor_msec >= Some(160),
+                entry.profile.latency_policy.bluetooth_floor_msec >= Some(240),
                 "{} should keep a conservative Bluetooth floor",
                 entry.profile.id
             );
             for codec in &entry.profile.codec_policy.preferred_a2dp_codecs {
-                if matches!(codec.as_str(), "aac" | "ldac" | "sbc_xq") {
+                if matches!(codec.as_str(), "aac" | "ldac" | "sbc_xq" | "sbc") {
                     assert!(
                         entry
                             .profile
@@ -1991,7 +1996,7 @@ mod tests {
 
     #[test]
     fn base64_wrapped_tauri_minisign_signature_verifies() {
-        let signature = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSai94eDNzNDVyQnp6enF5M3lOMGYzK3ZZRkNZTUlRbkZuTEF4TFlCWmZTRm56bzIvOXBmTkdzZ2lhcm8yQW8vaWF3UEczOXhMQ2w3QngxNXdNUUY4Wk1VVk81ZEpaS1EwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5ODI5MTIzCWZpbGU6aW5kZXguanNvbgo5NGVOOEpCRTcyTWxPK3Y4ZW9ROFhRU2twbmMyZk1wTW9tMXNHK1BVZXRKcktxVWk5Ukh6L2NrVDlJVXNXYlRhdUl2VWpQR1dvMXRFUlFYejBCTWdCUT09Cg==";
+        let signature = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSai94eDNzNDVyQnhlTmYweXdWVTRFQm5lWktmemZ4b2xMemdzekMzalpLSERHUVhBZ3VGU3ZCa3J2MVlMYW1CVzJMbCtPZHhjZVc3UmxkdEJldWkrcTRqWkpwT2kwZHd3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5ODMwMTMwCWZpbGU6aW5kZXguanNvbgpnQnJBQXprRkZ1WlluMS9TUzJxdno1eGZ1WW94SGU4VldmQ1ZKY3BKbTE5bVJYMXQ5UUljejdVWUE1dnV1M2NNd3BkZHVMNlFZWVkrUTg4b2JwaGhBdz09Cg==";
 
         assert!(verify_profile_signature(
             include_bytes!("../../../profiles/v1/index.json"),

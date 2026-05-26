@@ -1,7 +1,7 @@
 {
   "id": "sony.wh-1000xm5",
   "name": "Sony WH-1000XM5",
-  "revision": 2,
+  "revision": 3,
   "matches": [
     {
       "bus": "bluetooth",
@@ -23,8 +23,8 @@
     "sample_rates_hz": [48000]
   },
   "latency_policy": {
-    "stable_msec": 120,
-    "bluetooth_floor_msec": 160
+    "stable_msec": 160,
+    "bluetooth_floor_msec": 240
   },
   "routing_policy": {
     "output_priority": 70,
@@ -37,10 +37,10 @@
     "preferred_a2dp_codecs": ["ldac", "aac", "sbc_xq", "sbc"],
     "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"],
     "latency_floor_msec": {
-      "ldac": 240,
-      "aac": 180,
-      "sbc_xq": 200,
-      "sbc": 180
+      "ldac": 500,
+      "aac": 320,
+      "sbc_xq": 360,
+      "sbc": 280
     },
     "ldac_quality": "auto"
   },
@@ -48,7 +48,8 @@
   "quirks": [
     "Microphone capture uses HFP/HSP on normal Bluetooth stacks; keep playback on A2DP and prefer another microphone.",
     "Avoid forcing LDAC maximum bitrate on unstable links.",
-    "LDAC needs a larger PipeWire loopback floor than AAC/SBC-XQ when the desktop is under load."
+    "LDAC needs a larger PipeWire loopback floor than AAC/SBC-XQ when the desktop is under load.",
+    "Use profile latency to preserve codec quality instead of falling back below AAC for ordinary crackle recovery."
   ],
   "source_notes": [
     "Sony WH-1000XM5 specifications list SBC, AAC, and LDAC formats plus A2DP, AVRCP, HFP, and HSP profiles."

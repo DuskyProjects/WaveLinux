@@ -822,9 +822,9 @@ function defaultDemoFallbackProfile(): FallbackHardwareProfile {
     id: "default.generic-audio",
     name: "Default Generic Audio",
     latency_policy: {
-      stable_msec: 35,
-      low_latency_msec: 20,
-      bluetooth_floor_msec: 120,
+      stable_msec: 80,
+      low_latency_msec: 60,
+      bluetooth_floor_msec: 240,
     },
     routing_policy: {
       input_priority: 35,
@@ -839,9 +839,9 @@ function defaultDemoFallbackProfile(): FallbackHardwareProfile {
 }
 
 const safeLatencyPolicy = {
-  stable_msec: 35,
-  low_latency_msec: 20,
-  bluetooth_floor_msec: 120,
+  stable_msec: 80,
+  low_latency_msec: 60,
+  bluetooth_floor_msec: 240,
 };
 
 let demoHardwareProfiles = [
