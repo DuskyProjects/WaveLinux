@@ -120,6 +120,11 @@ type OfflineRoutingEntry = {
   volumePreset?: AppVolumePreset;
 };
 
+type LatestNumberQueue = {
+  inFlight: boolean;
+  latest: number | null;
+};
+
 type MergeTarget = {
   matcher: AppMatcher;
   displayName: string;
@@ -147,6 +152,12 @@ export default function App() {
   const refreshTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const refreshInFlight = useRef(false);
   const refreshQueued = useRef(false);
+  const mixVolumeQueues = useRef<Record<string, LatestNumberQueue>>({});
+  const channelVolumeQueues = useRef<Record<string, LatestNumberQueue>>({});
+  const settingsQueue = useRef<{ inFlight: boolean; latest: MixerSettings | null }>({
+    inFlight: false,
+    latest: null,
+  });
 
   const applySnapshot = useCallback((next: AppStateSnapshot) => {
     setState(next);
@@ -310,32 +321,82 @@ export default function App() {
     });
   }, []);
 
+  const flushMixVolumeQueue = useCallback(
+    (mixId: string) => {
+      const queue = mixVolumeQueues.current[mixId];
+      if (!queue || queue.inFlight || queue.latest === null) return;
+      const volume = queue.latest;
+      queue.latest = null;
+      queue.inFlight = true;
+      void invoke<Mix>("set_mix_volume", { mixId, volume })
+        .then((mix) => {
+          if (queue.latest === null) {
+            patchMixVolume(mix.id, mix.volume);
+          }
+        })
+        .catch((error) => {
+          setToast(String(error));
+          void refresh().catch(() => undefined);
+        })
+        .finally(() => {
+          queue.inFlight = false;
+          if (queue.latest !== null) {
+            flushMixVolumeQueue(mixId);
+          }
+        });
+    },
+    [patchMixVolume, refresh],
+  );
+
   const setMixVolumeFast = useCallback(
     async (mixId: string, volume: number) => {
       patchMixVolume(mixId, volume);
-      try {
-        const mix = await invoke<Mix>("set_mix_volume", { mixId, volume });
-        patchMixVolume(mix.id, mix.volume);
-      } catch (error) {
-        setToast(String(error));
-        await refresh().catch(() => undefined);
-      }
+      const queue = mixVolumeQueues.current[mixId] ?? { inFlight: false, latest: null };
+      mixVolumeQueues.current[mixId] = queue;
+      queue.latest = volume;
+      flushMixVolumeQueue(mixId);
     },
-    [patchMixVolume, refresh],
+    [flushMixVolumeQueue, patchMixVolume],
+  );
+
+  const flushChannelVolumeQueue = useCallback(
+    (channelId: string, mixId: string) => {
+      const key = `${channelId}\u0000${mixId}`;
+      const queue = channelVolumeQueues.current[key];
+      if (!queue || queue.inFlight || queue.latest === null) return;
+      const volume = queue.latest;
+      queue.latest = null;
+      queue.inFlight = true;
+      void invoke<MixBus>("set_channel_volume", { channelId, mixId, volume })
+        .then((bus) => {
+          if (queue.latest === null) {
+            patchChannelBusVolume(channelId, mixId, bus.volume);
+          }
+        })
+        .catch((error) => {
+          setToast(String(error));
+          void refresh().catch(() => undefined);
+        })
+        .finally(() => {
+          queue.inFlight = false;
+          if (queue.latest !== null) {
+            flushChannelVolumeQueue(channelId, mixId);
+          }
+        });
+    },
+    [patchChannelBusVolume, refresh],
   );
 
   const setChannelBusVolumeFast = useCallback(
     async (channelId: string, mixId: string, volume: number) => {
       patchChannelBusVolume(channelId, mixId, volume);
-      try {
-        const bus = await invoke<MixBus>("set_channel_volume", { channelId, mixId, volume });
-        patchChannelBusVolume(channelId, mixId, bus.volume);
-      } catch (error) {
-        setToast(String(error));
-        await refresh().catch(() => undefined);
-      }
+      const key = `${channelId}\u0000${mixId}`;
+      const queue = channelVolumeQueues.current[key] ?? { inFlight: false, latest: null };
+      channelVolumeQueues.current[key] = queue;
+      queue.latest = volume;
+      flushChannelVolumeQueue(channelId, mixId);
     },
-    [patchChannelBusVolume, refresh],
+    [flushChannelVolumeQueue, patchChannelBusVolume],
   );
 
   const setMixMuteFast = useCallback(
@@ -431,20 +492,39 @@ export default function App() {
     [patchMix, patchSettingsFromPartial, refresh, scheduleRefresh],
   );
 
+  const flushSettingsQueue = useCallback(() => {
+    const queue = settingsQueue.current;
+    if (queue.inFlight || queue.latest === null) return;
+    const settings = queue.latest;
+    queue.latest = null;
+    queue.inFlight = true;
+    void invoke<MixerSettings>("set_settings", { settings })
+      .then((next) => {
+        if (queue.latest === null) {
+          patchSettings(next);
+          scheduleRefresh();
+          setToast("Settings updated");
+        }
+      })
+      .catch((error) => {
+        setToast(String(error));
+        void refresh().catch(() => undefined);
+      })
+      .finally(() => {
+        queue.inFlight = false;
+        if (queue.latest !== null) {
+          flushSettingsQueue();
+        }
+      });
+  }, [patchSettings, refresh, scheduleRefresh]);
+
   const setSettingsFast = useCallback(
     async (settings: MixerSettings) => {
       patchSettings(settings);
-      try {
-        const next = await invoke<MixerSettings>("set_settings", { settings });
-        patchSettings(next);
-        scheduleRefresh();
-        setToast("Settings updated");
-      } catch (error) {
-        setToast(String(error));
-        await refresh().catch(() => undefined);
-      }
+      settingsQueue.current.latest = settings;
+      flushSettingsQueue();
     },
-    [patchSettings, refresh, scheduleRefresh],
+    [flushSettingsQueue, patchSettings],
   );
 
   const setAppStreamMuteFast = useCallback(

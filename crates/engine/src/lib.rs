@@ -39,7 +39,7 @@ use wavelinux_pw::{
     plan_set_source_mute, plan_set_source_volume, plan_set_stream_mute, plan_set_stream_volume,
     plan_unload_modules, probe_effect_availability, render_filter_chain, BluetoothAudioCard,
     CommandDomain, CommandOutput, CommandSpec, ManagedModule, MeterTarget, PlannedGraph, PwClient,
-    PwError, SinkInputRoute, SourceOutputRoute, StaleProcess,
+    PwError, SinkInputRoute, SnapshotCommandTiming, SourceOutputRoute, StaleProcess,
 };
 
 mod hardware_profiles;
@@ -288,6 +288,29 @@ fn record_refresh_phase(
 ) {
     phases.push((phase, phase_started.elapsed().as_millis()));
     *phase_started = Instant::now();
+}
+
+fn format_snapshot_command_timings(timings: &[SnapshotCommandTiming]) -> String {
+    let mut selected = timings
+        .iter()
+        .filter(|timing| timing.elapsed_ms >= 25 || !timing.succeeded)
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        selected = timings.iter().collect();
+    }
+
+    selected
+        .into_iter()
+        .map(|timing| {
+            format!(
+                "{}:{}ms:{}",
+                timing.label,
+                timing.elapsed_ms,
+                if timing.succeeded { "ok" } else { "err" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[derive(Debug)]
@@ -908,6 +931,8 @@ impl WaveLinuxEngine {
         {
             let _ = engine.repair_audio_graph();
         }
+        #[cfg(not(test))]
+        engine.schedule_hardware_profile_prewarm();
         Ok(engine)
     }
 
@@ -932,6 +957,27 @@ impl WaveLinuxEngine {
             &self.pw,
             &self.read_config()?.device_policy,
         )
+    }
+
+    #[cfg(not(test))]
+    fn schedule_hardware_profile_prewarm(self: &Arc<Self>) {
+        let engine = Arc::clone(self);
+        thread::spawn(move || match engine.prewarm_hardware_profiles() {
+            Ok(report) => engine.log_engine_event(
+                "hardware.profile.prewarm",
+                format!(
+                    "startup devices={} matched={} fetched={} diagnostics={}",
+                    report.devices,
+                    report.matched,
+                    report.fetched,
+                    report.diagnostics.len()
+                ),
+            ),
+            Err(err) => engine.log_engine_event(
+                "hardware.profile.prewarm",
+                format!("startup prewarm failed: {err}"),
+            ),
+        });
     }
 
     pub fn get_state(&self) -> Result<AppStateSnapshot, EngineError> {
@@ -974,7 +1020,8 @@ impl WaveLinuxEngine {
         let mut phase_started = Instant::now();
         let mut refresh_phases = Vec::new();
         let config = self.read_config()?.clone();
-        let mut graph = self.snapshot_for_config(Some(&config))?;
+        let (mut graph, mut snapshot_command_timings) =
+            self.snapshot_for_config_timed(Some(&config))?;
         record_refresh_phase(&mut refresh_phases, &mut phase_started, "snapshot");
         let mut bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
         let mut default_source = self.pw.default_source().ok().flatten();
@@ -1006,7 +1053,9 @@ impl WaveLinuxEngine {
                 .any(|output| !output.skipped && output.error.is_none())
             {
                 thread::sleep(Duration::from_millis(250));
-                graph = self.snapshot_for_config(Some(&config))?;
+                let (next_graph, timings) = self.snapshot_for_config_timed(Some(&config))?;
+                graph = next_graph;
+                snapshot_command_timings.extend(timings);
                 bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
                 default_source = self.pw.default_source().ok().flatten();
                 default_sink = self.pw.default_sink().ok().flatten();
@@ -1047,7 +1096,9 @@ impl WaveLinuxEngine {
             if !self.stop.load(Ordering::SeqCst) {
                 let report = self.repair_audio_graph_unlocked()?;
                 self.log_command_executions("hotplug.device", &report.outputs);
-                graph = self.snapshot_for_config(Some(&config))?;
+                let (next_graph, timings) = self.snapshot_for_config_timed(Some(&config))?;
+                graph = next_graph;
+                snapshot_command_timings.extend(timings);
                 bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
                 default_sink = self.pw.default_sink().ok().flatten();
                 active_sink = self.pw.active_playback_sink().ok().flatten();
@@ -1095,7 +1146,9 @@ impl WaveLinuxEngine {
                 false
             };
             if rescued_streams || routed_streams || updated_volumes || moved_capture_streams {
-                graph = self.snapshot_for_config(Some(&config))?;
+                let (next_graph, timings) = self.snapshot_for_config_timed(Some(&config))?;
+                graph = next_graph;
+                snapshot_command_timings.extend(timings);
                 audio_graph_running = graph_has_wavelinux_nodes(&graph);
             }
         }
@@ -1136,10 +1189,11 @@ impl WaveLinuxEngine {
                 .map(|(phase, elapsed_ms)| format!("{phase}={elapsed_ms}ms"))
                 .collect::<Vec<_>>()
                 .join(" ");
+            let snapshot_commands = format_snapshot_command_timings(&snapshot_command_timings);
             self.log_engine_event(
                 "runtime.refresh",
                 format!(
-                    "slow_refresh_ms={} inputs={} outputs={} streams={} meters={} graph_running={} phases={}",
+                    "slow_refresh_ms={} inputs={} outputs={} streams={} meters={} graph_running={} phases={} snapshot_commands={}",
                     elapsed.as_millis(),
                     runtime.graph.inputs.len(),
                     runtime.graph.outputs.len(),
@@ -1147,6 +1201,7 @@ impl WaveLinuxEngine {
                     runtime.graph.meters.len(),
                     runtime.status.audio_graph_running,
                     phases,
+                    snapshot_commands,
                 ),
             );
         }
@@ -1175,9 +1230,9 @@ impl WaveLinuxEngine {
         }
         let config = self.effective_config_for_audio_graph(&self.read_config()?.clone());
         let monitor_preroute_outputs = self.preload_monitor_output_routes_for_config(&config)?;
-        let preserve_stale_monitor_routes = monitor_preroute_outputs
-            .iter()
-            .any(|output| output.error.is_some());
+        let preserve_stale_monitor_routes = monitor_preroute_outputs.iter().any(|output| {
+            output.error.is_some() || output.stderr.contains("preserving existing monitor route")
+        });
         self.log_command_executions("repair.preroute", &monitor_preroute_outputs);
         outputs.extend(monitor_preroute_outputs);
         let cleanup_outputs =
@@ -1476,6 +1531,7 @@ impl WaveLinuxEngine {
             let output =
                 command_execution(self.pw.execute(plan_pw_set_mix_volume(&mix, mix.volume)));
             self.log_command_executions("level.mix", &[output]);
+            self.refresh_meter_targets_after_level_change();
         }
         Ok(mix)
     }
@@ -1494,6 +1550,7 @@ impl WaveLinuxEngine {
             let _audio_commands = self.lock_audio_commands()?;
             let output = command_execution(self.pw.execute(plan_pw_set_mix_mute(&mix, mix.muted)));
             self.log_command_executions("level.mix", &[output]);
+            self.refresh_meter_targets_after_level_change();
         }
         Ok(mix)
     }
@@ -1827,6 +1884,7 @@ impl WaveLinuxEngine {
             ));
         }
         self.log_command_executions("level.channel", &outputs);
+        self.refresh_meter_targets_after_level_change();
         Ok(bus)
     }
 
@@ -1854,6 +1912,7 @@ impl WaveLinuxEngine {
         let _audio_commands = self.lock_audio_commands()?;
         let outputs = self.execute_channel_bus_mute_unlocked(&channel_id, &mix_id, bus.muted);
         self.log_command_executions("level.channel", &outputs);
+        self.refresh_meter_targets_after_level_change();
         Ok(bus)
     }
 
@@ -1930,7 +1989,8 @@ impl WaveLinuxEngine {
         }
 
         let _audio_commands = self.lock_audio_commands()?;
-        Ok(command_execution(self.pw.execute(command)))
+        let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
+        Ok(ignore_stale_stream_command(output, &stream_id))
     }
 
     pub fn move_app_stream_to_default(
@@ -1943,7 +2003,8 @@ impl WaveLinuxEngine {
         }
 
         let _audio_commands = self.lock_audio_commands()?;
-        Ok(command_execution(self.pw.execute(command)))
+        let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
+        Ok(ignore_stale_stream_command(output, &stream_id))
     }
 
     pub fn set_app_stream_volume(
@@ -1957,7 +2018,8 @@ impl WaveLinuxEngine {
         }
 
         let _audio_commands = self.lock_audio_commands()?;
-        Ok(command_execution(self.pw.execute(command)))
+        let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
+        Ok(ignore_stale_stream_command(output, &stream_id))
     }
 
     pub fn set_app_stream_mute(
@@ -1971,7 +2033,8 @@ impl WaveLinuxEngine {
         }
 
         let _audio_commands = self.lock_audio_commands()?;
-        Ok(command_execution(self.pw.execute(command)))
+        let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
+        Ok(ignore_stale_stream_command(output, &stream_id))
     }
 
     pub fn set_effect_chain(
@@ -2248,8 +2311,16 @@ impl WaveLinuxEngine {
         );
         let _audio_commands = self.lock_audio_commands()?;
         for (stream_id, channel) in routes {
-            let output =
-                command_execution(self.pw.execute(plan_move_app_stream(&stream_id, &channel)));
+            let command = plan_move_app_stream(&stream_id, &channel);
+            let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
+            let output = ignore_stale_stream_command(output, &stream_id);
+            if output.skipped && output.stderr.contains("disappeared") {
+                self.log_engine_event(
+                    "route.streams",
+                    format!("stream {stream_id} disappeared before configured routing; ignoring stale state"),
+                );
+                continue;
+            }
             self.log_command_executions("route.streams", &[output]);
         }
         Ok(true)
@@ -2413,8 +2484,16 @@ impl WaveLinuxEngine {
         );
         let _audio_commands = self.lock_audio_commands()?;
         for stream_id in stream_ids {
-            let output =
-                command_execution(self.pw.execute(plan_move_app_stream_to_default(&stream_id)));
+            let command = plan_move_app_stream_to_default(&stream_id);
+            let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
+            let output = ignore_stale_stream_command(output, &stream_id);
+            if output.skipped && output.stderr.contains("disappeared") {
+                self.log_engine_event(
+                    "route.streams",
+                    format!("stream {stream_id} disappeared before fallback routing; ignoring stale state"),
+                );
+                continue;
+            }
             self.log_command_executions("route.streams", &[output]);
         }
         Ok(true)
@@ -2451,8 +2530,18 @@ impl WaveLinuxEngine {
         );
         let _audio_commands = self.lock_audio_commands()?;
         for (stream_id, volume) in updates {
-            let output =
-                command_execution(self.pw.execute(plan_set_stream_volume(&stream_id, volume)));
+            let command = plan_set_stream_volume(&stream_id, volume);
+            let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
+            let output = ignore_stale_stream_command(output, &stream_id);
+            if output.skipped && output.stderr.contains("disappeared") {
+                self.log_engine_event(
+                    "route.volumes",
+                    format!(
+                        "stream {stream_id} disappeared before volume preset; ignoring stale state"
+                    ),
+                );
+                continue;
+            }
             self.log_command_executions("route.volumes", &[output]);
         }
         Ok(true)
@@ -2849,6 +2938,17 @@ impl WaveLinuxEngine {
                     ),
                 });
             }
+            if self.effect_chain_log_mentions_clipping(channel) {
+                diagnostics.push(Diagnostic {
+                    code: format!("effects.clipping.{}", channel.id),
+                    severity: DiagnosticSeverity::Warning,
+                    message: format!("{} FX input is clipping", channel.name),
+                    action: Some(
+                        "Lower the hardware mic gain slightly or keep a limiter at the end of the voice chain"
+                            .into(),
+                    ),
+                });
+            }
 
             for effect in channel.effects.iter().filter(|effect| !effect.bypassed) {
                 let Some(effect_availability) = availability.get(effect.effect_id.as_str()) else {
@@ -2882,6 +2982,12 @@ impl WaveLinuxEngine {
                 let log = log.to_ascii_lowercase();
                 log.contains("underrun detected") || log.contains("processing too slow")
             })
+            .unwrap_or(false)
+    }
+
+    fn effect_chain_log_mentions_clipping(&self, channel: &Channel) -> bool {
+        fs::read_to_string(self.effect_chain_log_path(channel))
+            .map(|log| log.to_ascii_lowercase().contains("clipping detected"))
             .unwrap_or(false)
     }
 
@@ -3040,32 +3146,62 @@ impl WaveLinuxEngine {
         config: &MixerConfig,
     ) -> Result<Vec<CommandExecution>, EngineError> {
         let plan = plan_ensure_graph(config);
-        let existing_graph = self
+        let mut existing_graph = self
             .pw
             .snapshot_for_config_with_effect_availability(None, Vec::new());
-        let managed_modules = self.pw.managed_modules().unwrap_or_default();
-        let source_outputs = self.pw.source_output_routes().unwrap_or_default();
-        let commands = plan
+        let monitor_commands = plan
             .commands
             .into_iter()
             .filter(command_is_mix_monitor_route)
-            .filter(|command| monitor_route_endpoints_available(command, &existing_graph))
-            .filter(|command| {
-                !repair_command_is_satisfied(
-                    command,
+            .collect::<Vec<_>>();
+        if monitor_commands.iter().any(|command| {
+            command_targets_bluetooth_sink(command)
+                && !monitor_route_endpoints_available(command, &existing_graph)
+        }) {
+            for _ in 0..6 {
+                thread::sleep(Duration::from_millis(200));
+                existing_graph = self
+                    .pw
+                    .snapshot_for_config_with_effect_availability(None, Vec::new());
+                if monitor_commands.iter().all(|command| {
+                    !command_targets_bluetooth_sink(command)
+                        || monitor_route_endpoints_available(command, &existing_graph)
+                }) {
+                    break;
+                }
+            }
+        }
+        let managed_modules = self.pw.managed_modules().unwrap_or_default();
+        let source_outputs = self.pw.source_output_routes().unwrap_or_default();
+        let mut skipped = Vec::new();
+        let commands = monitor_commands
+            .into_iter()
+            .filter_map(|command| {
+                if !monitor_route_endpoints_available(&command, &existing_graph) {
+                    skipped.push(skipped_command_with_stderr(
+                        command,
+                        "monitor output is not visible yet; preserving existing monitor route",
+                    ));
+                    return None;
+                }
+                (!repair_command_is_satisfied(
+                    &command,
                     &existing_graph,
                     &source_outputs,
                     &managed_modules,
-                )
+                ))
+                .then_some(command)
             })
             .collect::<Vec<_>>();
 
-        Ok(self
-            .pw
-            .execute_all(commands)
-            .into_iter()
-            .map(command_execution)
-            .collect())
+        let mut outputs = skipped;
+        outputs.extend(
+            self.pw
+                .execute_all(commands)
+                .into_iter()
+                .map(command_execution),
+        );
+        Ok(outputs)
     }
 
     fn apply_start_at_login(&self, enabled: bool) -> Result<(), EngineError> {
@@ -3147,9 +3283,17 @@ impl WaveLinuxEngine {
         &self,
         config: Option<&MixerConfig>,
     ) -> Result<RuntimeGraph, EngineError> {
-        let mut graph = self
-            .pw
-            .snapshot_for_config_with_effect_availability(config, self.effect_availability()?);
+        Ok(self.snapshot_for_config_timed(config)?.0)
+    }
+
+    fn snapshot_for_config_timed(
+        &self,
+        config: Option<&MixerConfig>,
+    ) -> Result<(RuntimeGraph, Vec<SnapshotCommandTiming>), EngineError> {
+        let (mut graph, timings) = self.pw.snapshot_for_config_with_effect_availability_timed(
+            config,
+            self.effect_availability()?,
+        );
         let profile_policy = match config {
             Some(config) => config.device_policy.clone(),
             None => self.read_config()?.device_policy.clone(),
@@ -3164,7 +3308,7 @@ impl WaveLinuxEngine {
         if let Ok(catalog) = self.hardware_profiles() {
             apply_profile_policy_to_graph(&mut graph, &catalog, &profile_policy);
         }
-        Ok(graph)
+        Ok((graph, timings))
     }
 
     fn host_diagnostics(&self) -> Result<Vec<Diagnostic>, EngineError> {
@@ -3369,6 +3513,31 @@ impl WaveLinuxEngine {
             runtime.graph.meters.clear();
         }
         Ok(())
+    }
+
+    fn refresh_meter_targets_after_level_change(&self) {
+        let result = (|| -> Result<(), EngineError> {
+            let config = self.read_config()?.clone();
+            let (graph, audio_graph_running) = {
+                let runtime = self.read_runtime()?;
+                (
+                    runtime.graph.clone(),
+                    runtime.status.audio_graph_running && !self.stop.load(Ordering::SeqCst),
+                )
+            };
+            let meters = self.refresh_meter_supervisor(&config, &graph, audio_graph_running)?;
+            let mut runtime = self.write_runtime()?;
+            if runtime.status.audio_graph_running {
+                runtime.graph.meters = meters;
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            self.log_engine_event(
+                "meters.supervisor",
+                format!("level-change meter target refresh failed: {err}"),
+            );
+        }
     }
 
     fn stop_meter_supervisor(&self) {
@@ -4289,11 +4458,59 @@ fn command_execution(result: Result<CommandOutput, PwError>) -> CommandExecution
     }
 }
 
+fn command_execution_with_spec(
+    command: CommandSpec,
+    result: Result<CommandOutput, PwError>,
+) -> CommandExecution {
+    match result {
+        Ok(output) => CommandExecution {
+            command: output.command,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            skipped: output.skipped,
+            error: None,
+        },
+        Err(err) => CommandExecution {
+            command,
+            stdout: String::new(),
+            stderr: String::new(),
+            skipped: false,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn ignore_stale_stream_command(mut output: CommandExecution, stream_id: &str) -> CommandExecution {
+    if output.error.as_deref().is_some_and(is_stale_stream_error) {
+        output.stderr = format!("stream {stream_id} disappeared before the command could apply");
+        output.skipped = true;
+        output.error = None;
+    }
+    output
+}
+
+fn is_stale_stream_error(error: &str) -> bool {
+    error.contains("No such entity") || error.contains("No such process")
+}
+
 fn skipped_command(command: CommandSpec) -> CommandExecution {
     CommandExecution {
         command,
         stdout: String::new(),
         stderr: String::new(),
+        skipped: true,
+        error: None,
+    }
+}
+
+fn skipped_command_with_stderr(
+    command: CommandSpec,
+    stderr: impl Into<String>,
+) -> CommandExecution {
+    CommandExecution {
+        command,
+        stdout: String::new(),
+        stderr: stderr.into(),
         skipped: true,
         error: None,
     }
@@ -4929,6 +5146,16 @@ fn monitor_route_endpoints_available(command: &CommandSpec, graph: &RuntimeGraph
     });
 
     source_available && sink_available
+}
+
+fn command_targets_bluetooth_sink(command: &CommandSpec) -> bool {
+    command_arg_value(&command.args, "sink=")
+        .map(|sink| {
+            sink.trim()
+                .to_ascii_lowercase()
+                .starts_with("bluez_output.")
+        })
+        .unwrap_or(false)
 }
 
 fn command_arg_value<'a>(args: &'a [String], prefix: &str) -> Option<&'a str> {

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -106,6 +107,13 @@ pub struct MeterTarget {
     pub muted: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotCommandTiming {
+    pub label: String,
+    pub elapsed_ms: u128,
+    pub succeeded: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct PwClient {
     dry_run: bool,
@@ -159,22 +167,35 @@ impl PwClient {
         config: Option<&MixerConfig>,
         effect_availability: Vec<EffectAvailability>,
     ) -> RuntimeGraph {
-        let inputs = self.list_sources().unwrap_or_default();
-        let outputs = self.list_sinks().unwrap_or_default();
+        self.snapshot_for_config_with_effect_availability_timed(config, effect_availability)
+            .0
+    }
+
+    pub fn snapshot_for_config_with_effect_availability_timed(
+        &self,
+        config: Option<&MixerConfig>,
+        effect_availability: Vec<EffectAvailability>,
+    ) -> (RuntimeGraph, Vec<SnapshotCommandTiming>) {
+        let mut timings = Vec::new();
+        let inputs = self.list_sources_timed(&mut timings).unwrap_or_default();
+        let outputs = self.list_sinks_timed(&mut timings).unwrap_or_default();
         let sink_names_by_index = outputs
             .iter()
             .filter_map(|sink| Some((sink.index.clone()?, sink.name.clone())))
             .collect();
         let app_streams = self
-            .list_sink_inputs_with_routes(config, &sink_names_by_index)
+            .list_sink_inputs_with_routes_timed(config, &sink_names_by_index, &mut timings)
             .unwrap_or_default();
-        RuntimeGraph {
-            inputs,
-            outputs,
-            app_streams,
-            meters: Vec::new(),
-            effect_availability,
-        }
+        (
+            RuntimeGraph {
+                inputs,
+                outputs,
+                app_streams,
+                meters: Vec::new(),
+                effect_availability,
+            },
+            timings,
+        )
     }
 
     pub fn diagnostics(&self) -> Vec<Diagnostic> {
@@ -331,6 +352,18 @@ impl PwClient {
         Ok(parse_devices_json(&json, "Source"))
     }
 
+    fn list_sources_timed(
+        &self,
+        timings: &mut Vec<SnapshotCommandTiming>,
+    ) -> Result<Vec<DeviceInfo>, PwError> {
+        let json = self.pactl_json_timed(
+            ["list", "sources"],
+            "pactl --format=json list sources",
+            timings,
+        )?;
+        Ok(parse_devices_json(&json, "Source"))
+    }
+
     pub fn list_inputs(&self) -> Result<Vec<DeviceInfo>, PwError> {
         self.list_sources()
     }
@@ -340,17 +373,37 @@ impl PwClient {
         Ok(parse_devices_json(&json, "Sink"))
     }
 
+    fn list_sinks_timed(
+        &self,
+        timings: &mut Vec<SnapshotCommandTiming>,
+    ) -> Result<Vec<DeviceInfo>, PwError> {
+        let json =
+            self.pactl_json_timed(["list", "sinks"], "pactl --format=json list sinks", timings)?;
+        Ok(parse_devices_json(&json, "Sink"))
+    }
+
     pub fn list_outputs(&self) -> Result<Vec<DeviceInfo>, PwError> {
         self.list_sinks()
     }
 
-    fn list_sink_inputs_with_routes(
+    fn list_sink_inputs_with_routes_timed(
         &self,
         config: Option<&MixerConfig>,
         sink_names_by_index: &BTreeMap<String, String>,
+        timings: &mut Vec<SnapshotCommandTiming>,
     ) -> Result<Vec<AppStream>, PwError> {
-        let json = self.pactl_json(["list", "sink-inputs"])?;
-        let clients_json = self.pactl_json(["list", "clients"]).unwrap_or_default();
+        let json = self.pactl_json_timed(
+            ["list", "sink-inputs"],
+            "pactl --format=json list sink-inputs",
+            timings,
+        )?;
+        let clients_json = self
+            .pactl_json_timed(
+                ["list", "clients"],
+                "pactl --format=json list clients",
+                timings,
+            )
+            .unwrap_or_default();
         let client_properties = parse_client_properties_json(&clients_json);
         Ok(parse_sink_inputs_json_with_client_properties(
             &json,
@@ -384,6 +437,26 @@ impl PwClient {
             });
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn pactl_json_timed<I, S>(
+        &self,
+        args: I,
+        label: &str,
+        timings: &mut Vec<SnapshotCommandTiming>,
+    ) -> Result<String, PwError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let started = Instant::now();
+        let result = self.pactl_json(args);
+        timings.push(SnapshotCommandTiming {
+            label: label.into(),
+            elapsed_ms: started.elapsed().as_millis(),
+            succeeded: result.is_ok(),
+        });
+        result
     }
 
     fn pactl_text<I, S>(&self, args: I) -> Result<String, PwError>
@@ -3016,20 +3089,35 @@ fn command_output_with_timeout(
                 PwError::Io(err.to_string())
             }
         })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| PwError::Io("failed to capture command stdout".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| PwError::Io("failed to capture command stderr".into()))?;
+    let stdout_reader = spawn_pipe_reader(stdout);
+    let stderr_reader = spawn_pipe_reader(stderr);
     let started = Instant::now();
     loop {
-        if child
+        if let Some(status) = child
             .try_wait()
             .map_err(|err| PwError::Io(err.to_string()))?
-            .is_some()
         {
-            return child
-                .wait_with_output()
-                .map_err(|err| PwError::Io(err.to_string()));
+            let stdout = join_pipe_reader(stdout_reader)?;
+            let stderr = join_pipe_reader(stderr_reader)?;
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = join_pipe_reader(stdout_reader);
+            let _ = join_pipe_reader(stderr_reader);
             return Err(PwError::CommandTimedOut {
                 program: program.into(),
                 args: args.to_vec(),
@@ -3038,6 +3126,24 @@ fn command_output_with_timeout(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn spawn_pipe_reader<R>(mut reader: R) -> thread::JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_pipe_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, PwError> {
+    handle
+        .join()
+        .map_err(|_| PwError::Io("command pipe reader panicked".into()))?
+        .map_err(|err| PwError::Io(err.to_string()))
 }
 
 fn command_exists(program: &str) -> bool {
@@ -3146,6 +3252,16 @@ mod tests {
         assert!(!meter_sampling_enabled_from_env(Some("false"), None, true));
         assert!(!meter_sampling_enabled_from_env(Some("1"), Some("1"), true));
         assert!(meter_sampling_enabled_from_env(Some("1"), Some("0"), true));
+    }
+
+    #[test]
+    fn command_output_with_timeout_drains_large_stdout_while_waiting() {
+        let args = vec!["-c".into(), "yes 0123456789abcdef | head -c 200000".into()];
+
+        let output = command_output_with_timeout("sh", &args, Duration::from_secs(2)).unwrap();
+
+        assert!(output.status.success());
+        assert!(output.stdout.len() >= 200_000);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 #[cfg(test)]
 use include_dir::{include_dir, Dir};
 use minisign_verify::{PublicKey, Signature};
@@ -104,7 +105,7 @@ pub fn sync_remote_profiles_for_devices(
     catalog: &HardwareProfileCatalog,
 ) -> RemoteProfileSyncReport {
     let mut report = RemoteProfileSyncReport::default();
-    if !remote_profile_sync_needed(devices, policy, catalog) {
+    if !remote_profile_downloads_enabled() {
         return report;
     }
     let missing_assigned_profile_ids = missing_assigned_profile_ids(policy, catalog);
@@ -112,20 +113,24 @@ pub fn sync_remote_profiles_for_devices(
         .iter()
         .filter(|device| should_lookup_remote_profile(device, catalog))
         .collect::<Vec<_>>();
-    if missing_devices.is_empty() && missing_assigned_profile_ids.is_empty() {
-        return report;
-    }
+    let needs_profile_assets =
+        !missing_devices.is_empty() || !missing_assigned_profile_ids.is_empty();
 
     let index = match load_or_download_remote_index(paths) {
         Ok(index) => index,
         Err(reason) => {
-            report.diagnostics.push(remote_profile_diagnostic(
-                DiagnosticSeverity::Warning,
-                reason,
-            ));
+            if needs_profile_assets {
+                report.diagnostics.push(remote_profile_diagnostic(
+                    DiagnosticSeverity::Warning,
+                    reason,
+                ));
+            }
             return report;
         }
     };
+    if !needs_profile_assets {
+        return report;
+    }
 
     let mut wanted_assets = BTreeSet::new();
     for profile_id in &missing_assigned_profile_ids {
@@ -485,12 +490,29 @@ fn verify_profile_signature(data: &[u8], signature_text: &str) -> Result<(), Str
     let public_key = PublicKey::from_base64(PROFILE_PUBLIC_KEY_BASE64).map_err(|err| {
         format!("Ignored remote hardware profile because the public key was invalid: {err}")
     })?;
-    let signature = Signature::decode(signature_text).map_err(|err| {
-        format!("Ignored remote hardware profile with invalid signature data: {err}")
-    })?;
+    let signature = decode_profile_signature(signature_text)?;
     public_key.verify(data, &signature, false).map_err(|err| {
         format!("Ignored remote hardware profile because signature verification failed: {err}")
     })
+}
+
+fn decode_profile_signature(signature_text: &str) -> Result<Signature, String> {
+    match Signature::decode(signature_text) {
+        Ok(signature) => Ok(signature),
+        Err(raw_err) => {
+            let decoded = BASE64_STANDARD.decode(signature_text.trim()).map_err(|_| {
+                format!("Ignored remote hardware profile with invalid signature data: {raw_err}")
+            })?;
+            let decoded_text = std::str::from_utf8(&decoded).map_err(|err| {
+                format!(
+                    "Ignored remote hardware profile with non-UTF-8 wrapped signature data: {err}"
+                )
+            })?;
+            Signature::decode(decoded_text).map_err(|err| {
+                format!("Ignored remote hardware profile with invalid signature data: {err}")
+            })
+        }
+    }
 }
 
 fn remote_signature_path(path: &Path) -> Option<PathBuf> {
@@ -526,11 +548,24 @@ fn load_or_download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileInd
     }
     let failure_path = remote_index_failure_path(paths);
     if cache_file_is_fresh(&failure_path, PROFILE_INDEX_FAILURE_TTL) {
-        return read_verified_remote_index(&index_path, &signature_path).map_err(|cache_err| {
-            format!(
-                "Hardware profile index download is in backoff after a recent failure; cached index unavailable: {cache_err}"
-            )
-        });
+        if let Ok(index) = read_verified_remote_index(&index_path, &signature_path) {
+            return Ok(index);
+        }
+        let recent_failure = fs::read_to_string(&failure_path).unwrap_or_default();
+        let cache_missing = !index_path.is_file() || !signature_path.is_file();
+        let retry_stale_failure_without_cache = cache_missing
+            && (recent_failure.contains("404")
+                || recent_failure.contains("invalid signature data")
+                || recent_failure.contains("signature verification failed"));
+        if retry_stale_failure_without_cache {
+            let _ = fs::remove_file(&failure_path);
+        } else {
+            return read_verified_remote_index(&index_path, &signature_path).map_err(|cache_err| {
+                format!(
+                    "Hardware profile index download is in backoff after a recent failure; cached index unavailable: {cache_err}"
+                )
+            });
+        }
     }
 
     let download_result = download_remote_index(paths);
@@ -1822,5 +1857,16 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("invalid signature")));
+    }
+
+    #[test]
+    fn base64_wrapped_tauri_minisign_signature_verifies() {
+        let signature = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSai94eDNzNDVyQnl2d3BKZ0gvQWhlVjUvUnM4bC8vYU9RQzdQcEVrT0EzYnBvd3ZLWGV0bW9vU0NXSFZxYXVDamtmTlhUUlZPT0NLcXhDVm9hc0FYaXI1S0trWUpFaFFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5NTYwOTE2CWZpbGU6aGFyZHdhcmUtcHJvZmlsZXMtdjEtaW5kZXguanNvbgphRXhJNkJmNkxTRmlIcHQ2NXg0d0I3Q08xOGI4c0IxN0xVb09jd3RQbTdmdjkrdmY3bnAyRmJJTHhHZGNLdkxvU01KQnhidmtlR1hUS3g5cHpRdTlBdz09Cg==";
+
+        assert!(verify_profile_signature(
+            include_bytes!("../../../profiles/v1/index.json"),
+            signature,
+        )
+        .is_ok());
     }
 }

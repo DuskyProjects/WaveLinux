@@ -15,6 +15,7 @@ authors = ["WaveLinux contributors"]
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
 directories = "6"
 include_dir = "0.7"
 serde = { version = "1", features = ["derive"] }

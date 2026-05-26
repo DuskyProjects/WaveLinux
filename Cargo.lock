@@ -5116,6 +5116,7 @@ dependencies = [
 name = "wavelinux-engine"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "directories",
  "include_dir",
  "minisign-verify",
