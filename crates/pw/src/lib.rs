@@ -17,6 +17,7 @@ use wavelinux_model::{
 
 pub const INPUT_ROUTE_REVISION: &str = "2";
 pub const EFFECT_ROUTE_REVISION: &str = "1";
+pub const EFFECT_CONFIG_REVISION: &str = "2";
 pub const CHANNEL_MIX_ROUTE_REVISION: &str = "1";
 pub const MIX_MONITOR_ROUTE_REVISION: &str = "1";
 // Emergency defaults for isolated route helpers. Normal graph planning is
@@ -499,6 +500,26 @@ pub fn meter_targets_for_config(
     config: &MixerConfig,
     available_sources: &BTreeSet<String>,
 ) -> Vec<MeterTarget> {
+    meter_targets_for_config_inner(config, available_sources, &BTreeMap::new())
+}
+
+pub fn meter_targets_for_config_with_devices(
+    config: &MixerConfig,
+    available_sources: &[DeviceInfo],
+) -> Vec<MeterTarget> {
+    let available_source_names = available_sources
+        .iter()
+        .map(|source| source.name.clone())
+        .collect::<BTreeSet<_>>();
+    let effect_sources = effect_meter_sources_by_channel(available_sources);
+    meter_targets_for_config_inner(config, &available_source_names, &effect_sources)
+}
+
+fn meter_targets_for_config_inner(
+    config: &MixerConfig,
+    available_sources: &BTreeSet<String>,
+    effect_sources: &BTreeMap<String, String>,
+) -> Vec<MeterTarget> {
     let mut targets = Vec::new();
     let mixes_by_id = config
         .mixes
@@ -539,9 +560,12 @@ pub fn meter_targets_for_config(
                 muted: false,
             });
         }
-        let Some(channel_source_name) =
-            channel_input_meter_source_name(channel, available_sources, &raw_source_name)
-        else {
+        let Some(channel_source_name) = channel_input_meter_source_name(
+            channel,
+            available_sources,
+            effect_sources,
+            &raw_source_name,
+        ) else {
             continue;
         };
         targets.push(MeterTarget {
@@ -551,9 +575,12 @@ pub fn meter_targets_for_config(
             muted: false,
         });
 
-        let Some(bus_source_name) =
-            channel_bus_meter_source_name(channel, available_sources, &raw_source_name)
-        else {
+        let Some(bus_source_name) = channel_bus_meter_source_name(
+            channel,
+            available_sources,
+            effect_sources,
+            &raw_source_name,
+        ) else {
             continue;
         };
         for (mix_id, bus) in &channel.mix_buses {
@@ -571,9 +598,25 @@ pub fn meter_targets_for_config(
     targets
 }
 
+fn effect_meter_sources_by_channel(available_sources: &[DeviceInfo]) -> BTreeMap<String, String> {
+    available_sources
+        .iter()
+        .filter_map(|source| {
+            let role = source.pipewire_properties.get("wavelinux.role")?;
+            if role != "effect_output" {
+                return None;
+            }
+            let channel_id = source.pipewire_properties.get("wavelinux.channel_id")?;
+            (!channel_id.trim().is_empty() && !source.name.trim().is_empty())
+                .then(|| (channel_id.clone(), source.name.clone()))
+        })
+        .collect()
+}
+
 fn channel_input_meter_source_name(
     channel: &Channel,
     available_sources: &BTreeSet<String>,
+    effect_sources: &BTreeMap<String, String>,
     raw_source_name: &str,
 ) -> Option<String> {
     if channel.kind.uses_hardware_slot() {
@@ -581,6 +624,12 @@ fn channel_input_meter_source_name(
             let processed = effect_chain_source_name(channel);
             if available_sources.contains(&processed) {
                 return Some(processed);
+            }
+            if let Some(source) = effect_sources
+                .get(&channel.id)
+                .filter(|source| available_sources.contains(*source))
+            {
+                return Some(source.clone());
             }
         }
 
@@ -601,6 +650,14 @@ fn channel_input_meter_source_name(
     if available_sources.contains(&processed) {
         return Some(processed);
     }
+    if channel_has_active_effects(channel) {
+        if let Some(source) = effect_sources
+            .get(&channel.id)
+            .filter(|source| available_sources.contains(*source))
+        {
+            return Some(source.clone());
+        }
+    }
 
     if available_sources.contains(raw_source_name) {
         return Some(raw_source_name.to_string());
@@ -612,15 +669,29 @@ fn channel_input_meter_source_name(
 fn channel_bus_meter_source_name(
     channel: &Channel,
     available_sources: &BTreeSet<String>,
+    effect_sources: &BTreeMap<String, String>,
     raw_source_name: &str,
 ) -> Option<String> {
     if channel.kind.uses_hardware_slot() {
-        return channel_input_meter_source_name(channel, available_sources, raw_source_name);
+        return channel_input_meter_source_name(
+            channel,
+            available_sources,
+            effect_sources,
+            raw_source_name,
+        );
     }
 
     let preferred = channel_mix_source_name(channel);
     if available_sources.contains(&preferred) {
         return Some(preferred);
+    }
+    if channel_has_active_effects(channel) {
+        if let Some(source) = effect_sources
+            .get(&channel.id)
+            .filter(|source| available_sources.contains(*source))
+        {
+            return Some(source.clone());
+        }
     }
 
     available_sources
@@ -1222,7 +1293,7 @@ pub fn plan_set_card_profile(card_name: &str, profile_name: &str) -> CommandSpec
 pub fn plan_bluetooth_a2dp_profiles(cards: &[BluetoothAudioCard]) -> Vec<CommandSpec> {
     cards
         .iter()
-        .filter(|card| !card.a2dp_active())
+        .filter(|card| !card.preferred_a2dp_active())
         .filter_map(|card| {
             card.preferred_a2dp_profile
                 .as_deref()
@@ -1449,6 +1520,9 @@ pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String
     rendered.push_str("\"\n");
     rendered.push_str("      wavelinux.managed = \"1\"\n");
     rendered.push_str("      wavelinux.role = \"effect_chain\"\n");
+    rendered.push_str("      wavelinux.effect_config_revision = \"");
+    rendered.push_str(EFFECT_CONFIG_REVISION);
+    rendered.push_str("\"\n");
     rendered.push_str("      wavelinux.channel_id = \"");
     rendered.push_str(&escape_pw(&channel.id));
     rendered.push_str("\"\n");
@@ -1496,14 +1570,15 @@ pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String
     rendered.push_str(" Input\"\n");
     rendered.push_str("        media.class = Audio/Sink\n");
     rendered.push_str("        node.virtual = true\n");
-    rendered.push_str("        priority.session = -1000\n");
-    rendered.push_str("        priority.driver = -1000\n");
     rendered.push_str("        audio.rate = 48000\n");
     rendered.push_str("        audio.channels = 2\n");
     rendered.push_str("        audio.position = [ FL FR ]\n");
     rendered.push_str("        node.always-process = true\n");
     rendered.push_str("        wavelinux.managed = \"1\"\n");
     rendered.push_str("        wavelinux.role = \"effect_input\"\n");
+    rendered.push_str("        wavelinux.effect_config_revision = \"");
+    rendered.push_str(EFFECT_CONFIG_REVISION);
+    rendered.push_str("\"\n");
     rendered.push_str("        wavelinux.channel_id = \"");
     rendered.push_str(&escape_pw(&channel.id));
     rendered.push_str("\"\n");
@@ -1526,14 +1601,15 @@ pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String
     rendered.push_str("\"\n");
     rendered.push_str("        media.class = Audio/Source\n");
     rendered.push_str("        node.virtual = true\n");
-    rendered.push_str("        priority.session = -1000\n");
-    rendered.push_str("        priority.driver = -1000\n");
     rendered.push_str("        audio.rate = 48000\n");
     rendered.push_str("        audio.channels = 2\n");
     rendered.push_str("        audio.position = [ FL FR ]\n");
     rendered.push_str("        node.always-process = true\n");
     rendered.push_str("        wavelinux.managed = \"1\"\n");
     rendered.push_str("        wavelinux.role = \"effect_output\"\n");
+    rendered.push_str("        wavelinux.effect_config_revision = \"");
+    rendered.push_str(EFFECT_CONFIG_REVISION);
+    rendered.push_str("\"\n");
     rendered.push_str("        wavelinux.channel_id = \"");
     rendered.push_str(&escape_pw(&channel.id));
     rendered.push_str("\"\n");
@@ -1744,6 +1820,12 @@ impl BluetoothAudioCard {
         self.active_profile
             .as_deref()
             .is_some_and(is_a2dp_profile_name)
+    }
+
+    pub fn preferred_a2dp_active(&self) -> bool {
+        self.preferred_a2dp_profile
+            .as_deref()
+            .is_some_and(|preferred| self.active_profile.as_deref() == Some(preferred))
     }
 }
 
@@ -3450,6 +3532,44 @@ mod tests {
     }
 
     #[test]
+    fn hardware_input_meters_follow_effect_source_by_pipewire_metadata() {
+        let mut config = MixerConfig::default();
+        let hardware = config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        hardware.source_device = Some("alsa_input.real".into());
+        hardware.effects = vec![EffectInstance::new("limiter")];
+        let sources = vec![
+            test_source("alsa_input.real", BTreeMap::new()),
+            test_source("wavelinux_channel_hardware_in.monitor", BTreeMap::new()),
+            test_source(
+                "output.wavelinux.fx.randomized.source",
+                BTreeMap::from([
+                    ("wavelinux.role".into(), "effect_output".into()),
+                    ("wavelinux.channel_id".into(), "hardware_in".into()),
+                ]),
+            ),
+        ];
+
+        let targets = meter_targets_for_config_with_devices(&config, &sources);
+
+        assert!(targets.iter().any(|target| {
+            target.node_id == "hardware_in"
+                && target.source_name == "output.wavelinux.fx.randomized.source"
+        }));
+        assert!(targets.iter().any(|target| {
+            target.node_id == channel_raw_meter_id("hardware_in")
+                && target.source_name == "alsa_input.real"
+        }));
+        assert!(targets.iter().any(|target| {
+            target.node_id == channel_bus_meter_id("hardware_in", "stream")
+                && target.source_name == "output.wavelinux.fx.randomized.source"
+        }));
+    }
+
+    #[test]
     fn app_channel_and_bus_meters_follow_effect_source_when_available() {
         let mut config = MixerConfig::default();
         let music = config
@@ -3492,6 +3612,34 @@ mod tests {
         assert_eq!(spec.program, "pactl");
         assert_eq!(spec.args[0], "move-sink-input");
         assert_eq!(spec.args[2], "@DEFAULT_SINK@");
+    }
+
+    fn test_source(name: &str, pipewire_properties: BTreeMap<String, String>) -> DeviceInfo {
+        DeviceInfo {
+            id: name.into(),
+            index: None,
+            name: name.into(),
+            description: name.into(),
+            is_available: true,
+            is_default: false,
+            is_virtual: name.contains("wavelinux"),
+            bus: None,
+            vendor_id: None,
+            product_id: None,
+            alsa_card: None,
+            alsa_device: None,
+            driver: None,
+            bluetooth_modalias: None,
+            active_profile: None,
+            active_codec: None,
+            pipewire_properties,
+            matched_profile_id: None,
+            matched_profile_source: None,
+            profile_confidence: None,
+            active_latency_policy: None,
+            active_routing_policy: None,
+            active_bluetooth_mic_policy: None,
+        }
     }
 
     #[test]
@@ -3588,16 +3736,40 @@ mod tests {
     }
 
     #[test]
-    fn bluetooth_cards_already_on_a2dp_do_not_plan_profile_changes() {
+    fn bluetooth_cards_already_on_preferred_a2dp_do_not_plan_profile_changes() {
         let cards = vec![BluetoothAudioCard {
             name: "bluez_card.AC_80_0A_72_BD_10".into(),
             device_key: "AC_80_0A_72_BD_10".into(),
-            active_profile: Some("a2dp-sink-sbc".into()),
-            preferred_a2dp_profile: Some("a2dp-sink".into()),
+            active_profile: Some("a2dp-sink-aac".into()),
+            preferred_a2dp_profile: Some("a2dp-sink-aac".into()),
         }];
 
         assert!(cards[0].a2dp_active());
+        assert!(cards[0].preferred_a2dp_active());
         assert!(plan_bluetooth_a2dp_profiles(&cards).is_empty());
+    }
+
+    #[test]
+    fn bluetooth_cards_switch_from_ldac_a2dp_to_preferred_stable_a2dp() {
+        let cards = vec![BluetoothAudioCard {
+            name: "bluez_card.AC_80_0A_72_BD_10".into(),
+            device_key: "AC_80_0A_72_BD_10".into(),
+            active_profile: Some("a2dp-sink".into()),
+            preferred_a2dp_profile: Some("a2dp-sink-aac".into()),
+        }];
+
+        assert!(cards[0].a2dp_active());
+        assert!(!cards[0].preferred_a2dp_active());
+        let commands = plan_bluetooth_a2dp_profiles(&cards);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].args,
+            [
+                "set-card-profile",
+                "bluez_card.AC_80_0A_72_BD_10",
+                "a2dp-sink-aac"
+            ]
+        );
     }
 
     #[test]
@@ -4341,6 +4513,9 @@ mod tests {
         assert!(rendered.contains("node.name = \"wavelinux-mic\""));
         assert!(rendered.contains("device.description = \"WaveLinux-mic\""));
         assert!(rendered.contains("node.description = \"WaveLinux-mic\""));
+        assert!(rendered.contains("wavelinux.effect_config_revision = \"2\""));
+        assert!(!rendered.contains("priority.session"));
+        assert!(!rendered.contains("priority.driver"));
     }
 
     #[test]

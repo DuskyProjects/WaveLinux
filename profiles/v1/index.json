@@ -4,7 +4,7 @@
     {
       "id": "apple.airpods-pro",
       "name": "Apple AirPods Pro",
-      "revision": 1,
+      "revision": 2,
       "asset": "apple-airpods-pro.json",
       "matches": [
         {
@@ -156,7 +156,7 @@
     {
       "id": "bose.quietcomfort-ultra",
       "name": "Bose QuietComfort Ultra Headphones",
-      "revision": 1,
+      "revision": 2,
       "asset": "bose-quietcomfort-ultra.json",
       "matches": [
         {
@@ -686,7 +686,7 @@
     {
       "id": "realtek.alc3254-hda",
       "name": "Realtek ALC3254 HDA Audio Codec",
-      "revision": 2,
+      "revision": 4,
       "asset": "realtek-alc3254-hda.json",
       "matches": [
         {
@@ -797,7 +797,7 @@
     {
       "id": "sennheiser.momentum-4",
       "name": "Sennheiser Momentum 4 Wireless",
-      "revision": 1,
+      "revision": 2,
       "asset": "sennheiser-momentum-4.json",
       "matches": [
         {
@@ -859,7 +859,7 @@
     {
       "id": "sony.wh-1000xm4",
       "name": "Sony WH-1000XM4",
-      "revision": 4,
+      "revision": 6,
       "asset": "sony-wh-1000xm4.json",
       "matches": [
         {
@@ -883,7 +883,7 @@
     {
       "id": "sony.wh-1000xm5",
       "name": "Sony WH-1000XM5",
-      "revision": 1,
+      "revision": 2,
       "asset": "sony-wh-1000xm5.json",
       "matches": [
         {
@@ -928,7 +928,7 @@
     {
       "id": "steelseries.arctis-nova-pro-wireless-bluetooth",
       "name": "SteelSeries Arctis Nova Pro Wireless Bluetooth",
-      "revision": 1,
+      "revision": 2,
       "asset": "steelseries-arctis-nova-pro-wireless-bluetooth.json",
       "matches": [
         {

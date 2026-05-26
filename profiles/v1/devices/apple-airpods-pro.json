@@ -1,7 +1,7 @@
 {
   "id": "apple.airpods-pro",
   "name": "Apple AirPods Pro",
-  "revision": 1,
+  "revision": 2,
   "matches": [
     {
       "bus": "bluetooth",
@@ -23,8 +23,8 @@
     "sample_rates_hz": [48000]
   },
   "latency_policy": {
-    "stable_msec": 90,
-    "bluetooth_floor_msec": 90
+    "stable_msec": 120,
+    "bluetooth_floor_msec": 160
   },
   "routing_policy": {
     "output_priority": 62,
@@ -35,11 +35,17 @@
   "bluetooth_mic_policy": "never_if_hfp",
   "codec_policy": {
     "preferred_a2dp_codecs": ["aac", "sbc_xq", "sbc"],
-    "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"]
+    "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"],
+    "latency_floor_msec": {
+      "aac": 180,
+      "sbc_xq": 200,
+      "sbc": 180
+    }
   },
   "confidence": "medium",
   "quirks": [
-    "On Linux, using the headset microphone should be treated as call-mode fallback, not an optimized music playback state."
+    "On Linux, using the headset microphone should be treated as call-mode fallback, not an optimized music playback state.",
+    "AAC remains the preferred stable A2DP codec, with explicit profile latency floors for AAC and SBC-XQ to prevent underruns under desktop load."
   ],
   "source_notes": [
     "Seeded from common AirPods Linux behavior and Bluetooth A2DP/HFP profile limits."

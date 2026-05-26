@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::mem;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,27 +21,29 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 use wavelinux_model::{
-    setup_templates, AppMatcher, AppRoute, AppStateSnapshot, AppStream, AppVolumePreset, Channel,
-    ChannelInputMode, ChannelKind, ConfigBackup, DeviceInfo, Diagnostic, DiagnosticSeverity,
-    EffectAvailability, EffectCatalog, EffectInstance, EngineStatus, FallbackHardwareProfile,
-    HardwareProfile, HardwareProfileUiState, KnownApp, LatencyPolicy, LevelMeter, Mix, MixerConfig,
-    MixerSettings, ModelError, RoutingPolicy, RuntimeGraph, Scene, SetupTemplate,
+    safe_node_id, setup_templates, AppMatcher, AppRoute, AppStateSnapshot, AppStream,
+    AppVolumePreset, Channel, ChannelInputMode, ChannelKind, ConfigBackup, DeviceInfo, Diagnostic,
+    DiagnosticSeverity, EffectAvailability, EffectCatalog, EffectInstance, EngineStatus,
+    FallbackHardwareProfile, HardwareProfile, HardwareProfileUiState, KnownApp, LatencyPolicy,
+    LevelMeter, Mix, MixerConfig, MixerSettings, ModelError, RoutingPolicy, RuntimeGraph, Scene,
+    SetupTemplate,
 };
 use wavelinux_pw::{
     channel_has_active_effects, channel_mix_route_revision, channel_mix_source_name,
     effect_chain_input_name, effect_chain_source_name, effect_route_revision, input_route_revision,
-    meter_sampling_enabled, meter_targets_for_config, mix_monitor_route_revision_for_sink,
-    plan_bluetooth_a2dp_profiles, plan_ensure_graph, plan_kill_stale_processes,
-    plan_move_app_stream, plan_move_app_stream_to_default, plan_move_capture_stream_to_source,
-    plan_route_channel_to_effect, plan_route_channel_to_mix, plan_set_channel_bus_mute,
-    plan_set_channel_bus_source_output_mute, plan_set_channel_bus_source_output_volume,
-    plan_set_channel_bus_volume, plan_set_default_sink, plan_set_default_source,
-    plan_set_managed_sink_mute, plan_set_managed_sink_volume,
+    meter_sampling_enabled, meter_targets_for_config_with_devices,
+    mix_monitor_route_revision_for_sink, plan_bluetooth_a2dp_profiles, plan_ensure_graph,
+    plan_kill_stale_processes, plan_move_app_stream, plan_move_app_stream_to_default,
+    plan_move_capture_stream_to_source, plan_route_channel_to_effect, plan_route_channel_to_mix,
+    plan_set_channel_bus_mute, plan_set_channel_bus_source_output_mute,
+    plan_set_channel_bus_source_output_volume, plan_set_channel_bus_volume, plan_set_default_sink,
+    plan_set_default_source, plan_set_managed_sink_mute, plan_set_managed_sink_volume,
     plan_set_mix_mute as plan_pw_set_mix_mute, plan_set_mix_volume as plan_pw_set_mix_volume,
     plan_set_source_mute, plan_set_source_volume, plan_set_stream_mute, plan_set_stream_volume,
     plan_unload_modules, probe_effect_availability, render_filter_chain, BluetoothAudioCard,
     CommandDomain, CommandOutput, CommandSpec, ManagedModule, MeterTarget, PlannedGraph, PwClient,
     PwError, SinkInputRoute, SnapshotCommandTiming, SourceOutputRoute, StaleProcess,
+    EFFECT_CONFIG_REVISION,
 };
 
 mod hardware_profiles;
@@ -915,7 +919,22 @@ impl WaveLinuxEngine {
                 ),
             );
         }
-        let startup_cleanup = engine.cleanup_startup_audio_graph()?;
+        let restore_on_launch = engine
+            .read_config()
+            .map(|config| config.settings.restore_audio_graph_on_launch)
+            .unwrap_or(false);
+        let startup_graph_reusable = engine.options.auto_repair_on_start
+            && restore_on_launch
+            && engine.startup_audio_graph_reusable().unwrap_or(false);
+        let startup_cleanup = if startup_graph_reusable {
+            engine.log_engine_event(
+                "startup.cleanup",
+                "existing WaveLinux audio graph is current; skipping startup rebuild",
+            );
+            Vec::new()
+        } else {
+            engine.cleanup_startup_audio_graph()?
+        };
         if !startup_cleanup.is_empty() {
             engine.log_command_executions("startup.cleanup", &startup_cleanup);
         }
@@ -923,13 +942,16 @@ impl WaveLinuxEngine {
         if !startup_source_levels.is_empty() {
             engine.log_command_executions("startup.source-levels", &startup_source_levels);
         }
-        if engine.options.auto_repair_on_start
-            && engine
-                .read_config()
-                .map(|config| config.settings.restore_audio_graph_on_launch)
-                .unwrap_or(false)
-        {
-            let _ = engine.repair_audio_graph();
+        if engine.options.auto_repair_on_start && restore_on_launch {
+            if startup_graph_reusable {
+                engine.log_engine_event(
+                    "repair.startup",
+                    "existing audio graph matched current profiles and routes; skipped startup repair",
+                );
+                let _ = engine.refresh_runtime();
+            } else {
+                let _ = engine.repair_audio_graph();
+            }
         }
         #[cfg(not(test))]
         engine.schedule_hardware_profile_prewarm();
@@ -2203,6 +2225,55 @@ impl WaveLinuxEngine {
         Ok(outputs)
     }
 
+    fn startup_audio_graph_reusable(&self) -> Result<bool, EngineError> {
+        let config = self.read_config()?.clone();
+        let (graph, _) = self.snapshot_for_config_timed(Some(&config))?;
+        if !graph_has_wavelinux_nodes(&graph) {
+            return Ok(false);
+        }
+
+        let bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
+        let default_source = self.pw.default_source().ok().flatten();
+        let default_sink = self.pw.default_sink().ok().flatten();
+        let active_sink = self.pw.active_playback_sink().ok().flatten();
+        let managed_modules = self.pw.managed_modules().unwrap_or_default();
+        let effective_config = effective_config_with_profiled_devices(
+            &config,
+            &graph.inputs,
+            &graph.outputs,
+            &bluetooth_cards,
+            default_sink.as_deref(),
+            active_sink.as_deref(),
+        );
+
+        if auto_device_repair_needed_for_profiled_devices(
+            &config,
+            ProfiledDeviceRepairView {
+                inputs: &graph.inputs,
+                outputs: &graph.outputs,
+                bluetooth_cards: &bluetooth_cards,
+                default_source: default_source.as_deref(),
+                default_sink: default_sink.as_deref(),
+                active_sink: active_sink.as_deref(),
+                managed_modules: &managed_modules,
+            },
+        ) {
+            return Ok(false);
+        }
+
+        let graph_has_blocking_diagnostic = graph_diagnostics(&effective_config, &graph)
+            .iter()
+            .any(|diagnostic| {
+                matches!(diagnostic.severity, DiagnosticSeverity::Error)
+                    || diagnostic.code.starts_with("graph.effect_")
+            });
+        if graph_has_blocking_diagnostic {
+            return Ok(false);
+        }
+
+        Ok(route_diagnostics(&effective_config, &graph, &managed_modules).is_empty())
+    }
+
     fn cleanup_startup_audio_graph(&self) -> Result<Vec<CommandExecution>, EngineError> {
         let graph = self
             .pw
@@ -2829,26 +2900,34 @@ impl WaveLinuxEngine {
                 .open(&log_path);
             let stderr = OpenOptions::new().create(true).append(true).open(&log_path);
             match (stdout, stderr) {
-                (Ok(stdout), Ok(stderr)) => Command::new("pipewire")
-                    .arg("-c")
-                    .arg(&path)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::from(stdout))
-                    .stderr(Stdio::from(stderr))
-                    .spawn()
-                    .map(|_| CommandOutput {
-                        command: command.clone(),
-                        stdout: String::new(),
-                        stderr: log_path.display().to_string(),
-                        skipped: false,
-                    })
-                    .map_err(|err| {
-                        if err.kind() == std::io::ErrorKind::NotFound {
-                            PwError::CommandNotFound("pipewire".into())
-                        } else {
-                            PwError::Io(err.to_string())
-                        }
-                    }),
+                (Ok(stdout), Ok(stderr)) => {
+                    let mut child = Command::new("pipewire");
+                    child
+                        .arg("-c")
+                        .arg(&path)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::from(stdout))
+                        .stderr(Stdio::from(stderr));
+                    #[cfg(unix)]
+                    {
+                        child.process_group(0);
+                    }
+                    child
+                        .spawn()
+                        .map(|_| CommandOutput {
+                            command: command.clone(),
+                            stdout: String::new(),
+                            stderr: log_path.display().to_string(),
+                            skipped: false,
+                        })
+                        .map_err(|err| {
+                            if err.kind() == std::io::ErrorKind::NotFound {
+                                PwError::CommandNotFound("pipewire".into())
+                            } else {
+                                PwError::Io(err.to_string())
+                            }
+                        })
+                }
                 (Err(err), _) | (_, Err(err)) => Err(PwError::Io(err.to_string())),
             }
         };
@@ -3462,12 +3541,7 @@ impl WaveLinuxEngine {
         audio_graph_running: bool,
     ) -> Result<Vec<LevelMeter>, EngineError> {
         let targets = if audio_graph_running {
-            let available_sources = graph
-                .inputs
-                .iter()
-                .map(|source| source.name.clone())
-                .collect::<BTreeSet<_>>();
-            meter_targets_for_config(config, &available_sources)
+            meter_targets_for_config_with_devices(config, &graph.inputs)
         } else {
             Vec::new()
         };
@@ -4379,7 +4453,7 @@ fn auto_device_repair_needed_for_profiled_devices(
     let auto_output =
         preferred_monitor_output(view.outputs, view.active_sink.or(view.default_sink));
     auto_device_repair_needed(
-        config,
+        &effective_config,
         auto_input.as_deref(),
         auto_output.as_deref(),
         view.default_source,
@@ -4414,12 +4488,16 @@ fn auto_input_repair_needed(
     config
         .channels
         .iter()
-        .filter(|channel| channel.kind.uses_hardware_slot() && channel.source_device.is_none())
+        .filter(|channel| channel.kind.uses_hardware_slot())
         .any(|channel| {
+            let expected_source = channel.source_device.as_deref().unwrap_or(auto_input);
+            if expected_source != auto_input {
+                return false;
+            }
             !managed_modules.iter().any(|module| {
                 module.role.as_deref() == Some("input_to_channel")
                     && module.channel_id.as_deref() == Some(channel.id.as_str())
-                    && module.source_name.as_deref() == Some(auto_input)
+                    && module.source_name.as_deref() == Some(expected_source)
                     && module.sink_name.as_deref() == Some(channel.virtual_sink_name.as_str())
                     && module.route_revision.as_deref()
                         == Some(input_route_revision(&config.settings, channel).as_str())
@@ -4689,6 +4767,13 @@ fn graph_has_wavelinux_nodes(graph: &RuntimeGraph) -> bool {
                         .to_ascii_lowercase()
                         .contains("wavelinux"))
         })
+}
+
+fn effect_node_has_current_config_revision(device: &DeviceInfo) -> bool {
+    device
+        .pipewire_properties
+        .get("wavelinux.effect_config_revision")
+        .is_some_and(|revision| revision == EFFECT_CONFIG_REVISION)
 }
 
 fn app_routing_graph_ready(
@@ -5041,6 +5126,45 @@ fn module_is_stale_for_config(module: &ManagedModule, config: &MixerConfig) -> b
                     Some(&mix.virtual_sink_name),
                 )
         }
+        Some("effect_chain") => module.channel_id.as_deref().is_none_or(|channel_id| {
+            config
+                .channels
+                .iter()
+                .find(|channel| channel.id == channel_id)
+                .is_none_or(|channel| {
+                    if !channel_has_active_effects(channel) {
+                        return true;
+                    }
+                    let expected = format!("wavelinux_fx_{}_chain", safe_node_id(&channel.id));
+                    module.node_name.as_deref() != Some(expected.as_str())
+                })
+        }),
+        Some("effect_input") => module.channel_id.as_deref().is_none_or(|channel_id| {
+            config
+                .channels
+                .iter()
+                .find(|channel| channel.id == channel_id)
+                .is_none_or(|channel| {
+                    if !channel_has_active_effects(channel) {
+                        return true;
+                    }
+                    let expected = effect_chain_input_name(channel);
+                    module.node_name.as_deref() != Some(expected.as_str())
+                })
+        }),
+        Some("effect_output") => module.channel_id.as_deref().is_none_or(|channel_id| {
+            config
+                .channels
+                .iter()
+                .find(|channel| channel.id == channel_id)
+                .is_none_or(|channel| {
+                    if !channel_has_active_effects(channel) {
+                        return true;
+                    }
+                    let expected = effect_chain_source_name(channel);
+                    module.node_name.as_deref() != Some(expected.as_str())
+                })
+        }),
         Some(_) => true,
         None => module
             .node_name
@@ -5572,31 +5696,58 @@ fn graph_diagnostics(config: &MixerConfig, graph: &RuntimeGraph) -> Vec<Diagnost
                 action: Some("Run Repair to recreate the virtual channel sink".into()),
             });
         }
-        if channel_has_active_effects(channel)
-            && !graph
+        if channel_has_active_effects(channel) {
+            let effect_source_name = effect_chain_source_name(channel);
+            let effect_source = graph
                 .inputs
                 .iter()
-                .any(|input| input.name == effect_chain_source_name(channel))
-        {
-            diagnostics.push(Diagnostic {
-                code: format!("graph.effect_source.{}", channel.id),
-                severity: DiagnosticSeverity::Warning,
-                message: format!("{} FX output is not visible yet", channel.name),
-                action: Some("Run Repair to restart the channel effect chain".into()),
-            });
-        }
-        if channel_has_active_effects(channel)
-            && !graph
+                .find(|input| input.name == effect_source_name);
+            if let Some(effect_source) = effect_source {
+                if !effect_node_has_current_config_revision(effect_source) {
+                    diagnostics.push(Diagnostic {
+                        code: format!("graph.effect_source_revision.{}", channel.id),
+                        severity: DiagnosticSeverity::Warning,
+                        message: format!(
+                            "{} FX output was created by an older WaveLinux effect config",
+                            channel.name
+                        ),
+                        action: Some("Run Repair to restart the channel effect chain".into()),
+                    });
+                }
+            } else {
+                diagnostics.push(Diagnostic {
+                    code: format!("graph.effect_source.{}", channel.id),
+                    severity: DiagnosticSeverity::Warning,
+                    message: format!("{} FX output is not visible yet", channel.name),
+                    action: Some("Run Repair to restart the channel effect chain".into()),
+                });
+            }
+
+            let effect_input_name = effect_chain_input_name(channel);
+            let effect_input = graph
                 .outputs
                 .iter()
-                .any(|output| output.name == effect_chain_input_name(channel))
-        {
-            diagnostics.push(Diagnostic {
-                code: format!("graph.effect_input.{}", channel.id),
-                severity: DiagnosticSeverity::Warning,
-                message: format!("{} FX input is not visible yet", channel.name),
-                action: Some("Run Repair to restart the channel effect chain".into()),
-            });
+                .find(|output| output.name == effect_input_name);
+            if let Some(effect_input) = effect_input {
+                if !effect_node_has_current_config_revision(effect_input) {
+                    diagnostics.push(Diagnostic {
+                        code: format!("graph.effect_input_revision.{}", channel.id),
+                        severity: DiagnosticSeverity::Warning,
+                        message: format!(
+                            "{} FX input was created by an older WaveLinux effect config",
+                            channel.name
+                        ),
+                        action: Some("Run Repair to restart the channel effect chain".into()),
+                    });
+                }
+            } else {
+                diagnostics.push(Diagnostic {
+                    code: format!("graph.effect_input.{}", channel.id),
+                    severity: DiagnosticSeverity::Warning,
+                    message: format!("{} FX input is not visible yet", channel.name),
+                    action: Some("Run Repair to restart the channel effect chain".into()),
+                });
+            }
         }
     }
 
@@ -6667,6 +6818,52 @@ mod tests {
     }
 
     #[test]
+    fn stale_cleanup_keeps_current_effect_chain_nodes() {
+        let mut config = MixerConfig::default();
+        let channel = config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        channel.effects = vec![EffectInstance::new("limiter")];
+
+        let effect_input = ManagedModule {
+            module_id: "effect-input".into(),
+            role: Some("effect_input".into()),
+            channel_id: Some("hardware_in".into()),
+            mix_id: None,
+            route_revision: None,
+            node_name: Some(effect_chain_input_name(channel)),
+            source_name: None,
+            sink_name: None,
+        };
+        let effect_output = ManagedModule {
+            module_id: "effect-output".into(),
+            role: Some("effect_output".into()),
+            channel_id: Some("hardware_in".into()),
+            mix_id: None,
+            route_revision: None,
+            node_name: Some(effect_chain_source_name(channel)),
+            source_name: None,
+            sink_name: None,
+        };
+        let stale_effect_output = ManagedModule {
+            module_id: "stale-effect-output".into(),
+            role: Some("effect_output".into()),
+            channel_id: Some("music".into()),
+            mix_id: None,
+            route_revision: None,
+            node_name: Some(effect_chain_source_name(channel)),
+            source_name: None,
+            sink_name: None,
+        };
+
+        assert!(!module_is_stale_for_config(&effect_input, &config));
+        assert!(!module_is_stale_for_config(&effect_output, &config));
+        assert!(module_is_stale_for_config(&stale_effect_output, &config));
+    }
+
+    #[test]
     fn repair_requires_loopback_endpoint_match() {
         let config = MixerConfig::default();
         let command = plan_ensure_graph(&config)
@@ -6963,7 +7160,7 @@ mod tests {
             .expect("profile latency policy should be resolved for graph planning");
         assert_eq!(runtime_latency.stable_msec, Some(60));
         assert_eq!(runtime_latency.low_latency_msec, Some(35));
-        assert_eq!(runtime_latency.bluetooth_floor_msec, Some(120));
+        assert_eq!(runtime_latency.bluetooth_floor_msec, Some(180));
         assert!(plan.commands.iter().any(|command| {
             command.args.contains(&"latency_msec=35".into())
                 && command
@@ -6999,6 +7196,53 @@ mod tests {
                 default_sink: None,
                 active_sink: Some("alsa_output.realtek"),
                 managed_modules: &[stale_low_latency_route],
+            }
+        ));
+
+        let hardware_channel = effective
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        let monitor_mix = effective
+            .mixes
+            .iter()
+            .find(|mix| mix.id == "monitor")
+            .unwrap();
+        let current_input_route = ManagedModule {
+            module_id: "2".into(),
+            role: Some("input_to_channel".into()),
+            channel_id: Some("hardware_in".into()),
+            mix_id: None,
+            route_revision: Some(input_route_revision(&effective.settings, hardware_channel)),
+            node_name: None,
+            source_name: Some("alsa_input.realtek".into()),
+            sink_name: Some(hardware_channel.virtual_sink_name.clone()),
+        };
+        let current_profile_latency_route = ManagedModule {
+            module_id: "3".into(),
+            role: Some("mix_monitor".into()),
+            channel_id: None,
+            mix_id: Some("monitor".into()),
+            route_revision: Some(mix_monitor_route_revision_for_sink(
+                &effective.settings,
+                monitor_mix,
+                "alsa_output.realtek",
+            )),
+            node_name: None,
+            source_name: Some("wavelinux_mix_monitor.monitor".into()),
+            sink_name: Some("alsa_output.realtek".into()),
+        };
+        assert!(!auto_device_repair_needed_for_profiled_devices(
+            &config,
+            ProfiledDeviceRepairView {
+                inputs: &inputs,
+                outputs: &outputs,
+                bluetooth_cards: &[],
+                default_source: None,
+                default_sink: None,
+                active_sink: Some("alsa_output.realtek"),
+                managed_modules: &[current_input_route, current_profile_latency_route],
             }
         ));
     }

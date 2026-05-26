@@ -1630,7 +1630,7 @@ impl Default for FallbackHardwareProfile {
             latency_policy: LatencyPolicy {
                 stable_msec: Some(35),
                 low_latency_msec: Some(20),
-                bluetooth_floor_msec: Some(120),
+                bluetooth_floor_msec: Some(180),
             },
             routing_policy: RoutingPolicy {
                 input_priority: Some(35),
@@ -2256,6 +2256,8 @@ pub struct CodecPolicy {
     pub preferred_a2dp_codecs: Vec<String>,
     #[serde(default)]
     pub avoid_codecs: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub latency_floor_msec: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ldac_quality: Option<String>,
 }

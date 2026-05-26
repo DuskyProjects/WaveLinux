@@ -1,7 +1,7 @@
 {
   "id": "steelseries.arctis-nova-pro-wireless-bluetooth",
   "name": "SteelSeries Arctis Nova Pro Wireless Bluetooth",
-  "revision": 1,
+  "revision": 2,
   "matches": [
     {
       "bus": "bluetooth",
@@ -22,8 +22,8 @@
     "sample_rates_hz": [48000]
   },
   "latency_policy": {
-    "stable_msec": 90,
-    "bluetooth_floor_msec": 90
+    "stable_msec": 120,
+    "bluetooth_floor_msec": 160
   },
   "routing_policy": {
     "output_priority": 60,
@@ -34,11 +34,16 @@
   "bluetooth_mic_policy": "never_if_hfp",
   "codec_policy": {
     "preferred_a2dp_codecs": ["sbc_xq", "sbc"],
-    "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"]
+    "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"],
+    "latency_floor_msec": {
+      "sbc_xq": 200,
+      "sbc": 180
+    }
   },
   "confidence": "medium",
   "quirks": [
-    "Prefer the headset's dedicated USB/base-station path for game chat when available; Bluetooth mic use is compatibility fallback only."
+    "Prefer the headset's dedicated USB/base-station path for game chat when available; Bluetooth mic use is compatibility fallback only.",
+    "SBC-XQ is kept as the preferred Bluetooth playback path when available, with a safer profile latency floor instead of falling back to HFP/HSP."
   ],
   "source_notes": [
     "Linux user reports for Bluetooth gaming headsets commonly describe the A2DP playback versus HFP microphone tradeoff."

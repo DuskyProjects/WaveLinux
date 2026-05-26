@@ -38,7 +38,9 @@ Use `examples/local-usb-microphone.json` as a starting point. Prefer exact `vend
 - `latency_policy`: conservative and low-latency loopback choices in milliseconds.
 - `routing_policy`: auto-selection priorities and whether the device should be considered for input/output.
 - `bluetooth_mic_policy`: Bluetooth microphone safety policy. Use `never_if_hfp` for normal Bluetooth headsets.
-- `codec_policy`: preferred and avoided codecs for Bluetooth devices.
+- `codec_policy`: preferred/avoided Bluetooth codecs plus optional
+  `latency_floor_msec` values keyed by codec, such as `aac`, `ldac`, and
+  `sbc_xq`.
 - `confidence`: `low`, `medium`, or `high`.
 
 ## Guardrails

@@ -1,7 +1,7 @@
 {
   "id": "sony.wh-1000xm4",
   "name": "Sony WH-1000XM4",
-  "revision": 4,
+  "revision": 6,
   "matches": [
     {
       "bus": "bluetooth",
@@ -24,7 +24,7 @@
   },
   "latency_policy": {
     "stable_msec": 120,
-    "bluetooth_floor_msec": 120
+    "bluetooth_floor_msec": 160
   },
   "routing_policy": {
     "output_priority": 70,
@@ -36,13 +36,21 @@
   "codec_policy": {
     "preferred_a2dp_codecs": ["aac", "sbc_xq", "sbc", "ldac"],
     "avoid_codecs": ["ldac_hq", "ldac_990", "hsp", "hfp", "cvsd", "msbc"],
+    "latency_floor_msec": {
+      "aac": 180,
+      "ldac": 240,
+      "sbc_xq": 200,
+      "sbc": 180
+    },
     "ldac_quality": "sq"
   },
   "confidence": "high",
   "quirks": [
     "Bluetooth microphone capture forces headset mode on normal XM4 Bluetooth stacks and lowers playback quality.",
     "For latency and stability, prefer AAC or SBC-XQ A2DP before LDAC. LDAC should be limited to stable/standard quality and high-bitrate LDAC should be avoided unless link quality is excellent.",
-    "If playback crackles on LDAC auto, switch the card profile to AAC first, then SBC-XQ if AAC is still unstable."
+    "If playback crackles on LDAC auto, switch the card profile to AAC first, then SBC-XQ if AAC is still unstable.",
+    "When multiple A2DP profiles are exposed, WaveLinux should restore the preferred stable A2DP profile instead of leaving the headset on LDAC merely because LDAC is also A2DP.",
+    "Codec-specific latency floors keep AAC as the preferred automatic profile while giving LDAC, AAC, and SBC-XQ enough Bluetooth buffer to avoid clicking on PipeWire/BlueZ stacks that expose each codec as a separate A2DP card profile."
   ],
   "source_notes": [
     "Sony documents WH-1000XM4 A2DP playback codecs as SBC, AAC, and LDAC, with HFP/HSP as separate headset profiles.",

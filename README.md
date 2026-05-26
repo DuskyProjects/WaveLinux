@@ -24,16 +24,23 @@ profile assignment, lower-lag mixer controls, better metering, and release
 packaging updates without changing the mixer-first workflow.
 
 4.1.1 adds a focused XM4 stability profile update: the Sony WH-1000XM4 profile
-now prefers AAC/SBC-XQ/SBC before LDAC, raises the Bluetooth latency floor to
-120 ms, and treats high-bitrate LDAC as something to avoid unless the link is
-excellent. It also publishes signed hardware profile assets with GitHub
-releases so profile fixes can land without waiting for a larger feature build.
+now keeps AAC as the preferred stable A2DP codec, adds safer codec-specific
+Bluetooth latency floors for AAC, SBC-XQ, and LDAC, and treats high-bitrate LDAC
+as something to avoid unless the link is excellent. It also publishes signed
+hardware profile assets with GitHub releases so profile fixes can land without
+waiting for a larger feature build.
 
 4.1.2 is a stability and profile-authority fix release. It removes the
 refresh-loop stalls caused by large `pactl` output, keeps faders and toggles
 responsive under drag spam, makes the hardware input VU visually swap from raw
 mic to post-FX `wavelinux-mic`, and lets active hardware profiles decide route
-latency floors before any generic fallback is used.
+latency floors before any generic fallback is used. It also reuses a current
+WaveLinux audio graph on normal restarts instead of rebuilding it, and raises
+the Realtek ALC3254 profile latency floor to reduce laptop speaker crackle
+during OBS, webcam, browser, and effects load. For Bluetooth headsets such as
+the Sony WH-1000XM4, it restores the preferred stable A2DP profile instead of
+leaving an already-A2DP LDAC session active when AAC is the safer profile
+choice, with larger profile-defined buffers available for LDAC and SBC-XQ.
 
 Highlights:
 
@@ -61,6 +68,17 @@ Highlights:
   Discord, OBS, and browser capture menus are easier to understand.
 - Startup repair resets real non-Bluetooth microphone sources to 100% and
   unmuted, while ignoring WaveLinux virtual/monitor sources.
+- Startup skips cleanup and repair when the existing graph already matches the
+  current profiles, routes, and effect-chain revision.
+- The Realtek ALC3254 profile now uses more conservative profile-sourced
+  latency floors for stressed SOF/HDA laptop speaker paths.
+- Bluetooth A2DP protection now corrects codec/profile drift inside A2DP, so
+  XM4-style headsets can be moved from crackly LDAC to the preferred AAC profile
+  without falling back to HFP/HSP, while profile data provides separate safe
+  latency floors for AAC, LDAC, and SBC-XQ.
+- Common Bluetooth headset profiles now carry conservative A2DP latency floors
+  per codec, and the editable generic fallback profile uses a safer Bluetooth
+  floor for unknown devices.
 - Release, local-native, AUR, and profile asset scripts were updated for the
   new profile system and 4.1 packaging.
 

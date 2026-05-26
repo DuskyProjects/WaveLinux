@@ -288,7 +288,7 @@ fn apply_profile_to_device(device: &mut DeviceInfo, profile: &HardwareProfile, s
     device.matched_profile_id = Some(profile.id.clone());
     device.matched_profile_source = Some(source);
     device.profile_confidence = Some(profile.confidence);
-    device.active_latency_policy = Some(profile.latency_policy.clone());
+    device.active_latency_policy = Some(active_latency_policy_for_profile(device, profile));
     device.active_routing_policy = Some(profile.routing_policy.clone());
     device.active_bluetooth_mic_policy = Some(effective_bluetooth_mic_policy(device, profile));
 }
@@ -312,6 +312,63 @@ fn hardware_profile_summary(profile: &HardwareProfile, source: &str) -> Hardware
         routing_policy: profile.routing_policy.clone(),
         bluetooth_mic_policy: profile.bluetooth_mic_policy,
     }
+}
+
+fn active_latency_policy_for_profile(
+    device: &DeviceInfo,
+    profile: &HardwareProfile,
+) -> wavelinux_model::LatencyPolicy {
+    let mut latency_policy = profile.latency_policy.clone();
+    let Some(codec_floor) = codec_latency_floor_for_device(device, profile) else {
+        return latency_policy;
+    };
+    latency_policy.bluetooth_floor_msec = Some(
+        latency_policy
+            .bluetooth_floor_msec
+            .unwrap_or(0)
+            .max(codec_floor.clamp(50, 500)),
+    );
+    latency_policy
+}
+
+fn codec_latency_floor_for_device(device: &DeviceInfo, profile: &HardwareProfile) -> Option<u16> {
+    if profile.codec_policy.latency_floor_msec.is_empty() {
+        return None;
+    }
+    [
+        device.active_codec.as_deref(),
+        device.active_profile.as_deref(),
+        Some(device.name.as_str()),
+        Some(device.description.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(codec_key_from_text)
+    .find_map(|codec| {
+        profile
+            .codec_policy
+            .latency_floor_msec
+            .iter()
+            .find(|(key, _)| codec_key_from_text(key).as_deref() == Some(codec.as_str()))
+            .map(|(_, floor)| *floor)
+    })
+}
+
+fn codec_key_from_text(text: &str) -> Option<String> {
+    let normalized = text.trim().replace(['-', ' '], "_").to_ascii_lowercase();
+    if normalized.contains("sbc_xq") {
+        return Some("sbc_xq".into());
+    }
+    if normalized.contains("ldac") {
+        return Some("ldac".into());
+    }
+    if normalized.contains("aac") {
+        return Some("aac".into());
+    }
+    if normalized.contains("sbc") {
+        return Some("sbc".into());
+    }
+    None
 }
 
 fn fallback_hardware_profile_summary(profile: &FallbackHardwareProfile) -> HardwareProfileSummary {
@@ -1268,12 +1325,85 @@ mod tests {
             profile.codec_policy.preferred_a2dp_codecs,
             ["aac", "sbc_xq", "sbc", "ldac"]
         );
+        assert_eq!(profile.latency_policy.bluetooth_floor_msec, Some(160));
+        assert_eq!(
+            profile.codec_policy.latency_floor_msec.get("aac"),
+            Some(&180)
+        );
+        assert_eq!(
+            profile.codec_policy.latency_floor_msec.get("sbc_xq"),
+            Some(&200)
+        );
+        assert_eq!(
+            profile.codec_policy.latency_floor_msec.get("ldac"),
+            Some(&240)
+        );
         assert_eq!(profile.codec_policy.ldac_quality.as_deref(), Some("sq"));
         assert!(profile
             .codec_policy
             .avoid_codecs
             .iter()
             .any(|codec| codec == "ldac_hq"));
+    }
+
+    #[test]
+    fn shipped_xm4_profile_applies_codec_specific_latency_floor() {
+        let root = tempdir().unwrap();
+        let paths = EnginePaths::for_tests(root.path());
+        let catalog = load_hardware_profile_catalog(&paths);
+        let latency_for_codec = |codec: &str| {
+            let mut dev = device(
+                "bluez_output.AC_80_0A_72_BD_10.1",
+                "WH-1000XM4",
+                DeviceBus::Bluetooth,
+            );
+            dev.active_profile = Some(format!("a2dp-sink-{codec}"));
+            dev.active_codec = Some(codec.into());
+            let mut devices = vec![dev];
+
+            apply_profiles_to_devices(&mut devices, &catalog);
+
+            devices[0]
+                .active_latency_policy
+                .as_ref()
+                .and_then(|policy| policy.bluetooth_floor_msec)
+        };
+
+        assert_eq!(latency_for_codec("aac"), Some(180));
+        assert_eq!(latency_for_codec("sbc_xq"), Some(200));
+        assert_eq!(latency_for_codec("ldac"), Some(240));
+    }
+
+    #[test]
+    fn shipped_bluetooth_profiles_define_safe_codec_latency_floors() {
+        let root = tempdir().unwrap();
+        let paths = EnginePaths::for_tests(root.path());
+        let catalog = load_hardware_profile_catalog(&paths);
+
+        for entry in catalog
+            .profiles
+            .iter()
+            .filter(|entry| entry.profile.capabilities.bluetooth_a2dp)
+        {
+            assert!(
+                entry.profile.latency_policy.bluetooth_floor_msec >= Some(160),
+                "{} should keep a conservative Bluetooth floor",
+                entry.profile.id
+            );
+            for codec in &entry.profile.codec_policy.preferred_a2dp_codecs {
+                if matches!(codec.as_str(), "aac" | "ldac" | "sbc_xq") {
+                    assert!(
+                        entry
+                            .profile
+                            .codec_policy
+                            .latency_floor_msec
+                            .contains_key(codec),
+                        "{} should define a safe latency floor for {codec}",
+                        entry.profile.id
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1861,7 +1991,7 @@ mod tests {
 
     #[test]
     fn base64_wrapped_tauri_minisign_signature_verifies() {
-        let signature = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSai94eDNzNDVyQnl2d3BKZ0gvQWhlVjUvUnM4bC8vYU9RQzdQcEVrT0EzYnBvd3ZLWGV0bW9vU0NXSFZxYXVDamtmTlhUUlZPT0NLcXhDVm9hc0FYaXI1S0trWUpFaFFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5NTYwOTE2CWZpbGU6aGFyZHdhcmUtcHJvZmlsZXMtdjEtaW5kZXguanNvbgphRXhJNkJmNkxTRmlIcHQ2NXg0d0I3Q08xOGI4c0IxN0xVb09jd3RQbTdmdjkrdmY3bnAyRmJJTHhHZGNLdkxvU01KQnhidmtlR1hUS3g5cHpRdTlBdz09Cg==";
+        let signature = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSai94eDNzNDVyQnp6enF5M3lOMGYzK3ZZRkNZTUlRbkZuTEF4TFlCWmZTRm56bzIvOXBmTkdzZ2lhcm8yQW8vaWF3UEczOXhMQ2w3QngxNXdNUUY4Wk1VVk81ZEpaS1EwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5ODI5MTIzCWZpbGU6aW5kZXguanNvbgo5NGVOOEpCRTcyTWxPK3Y4ZW9ROFhRU2twbmMyZk1wTW9tMXNHK1BVZXRKcktxVWk5Ukh6L2NrVDlJVXNXYlRhdUl2VWpQR1dvMXRFUlFYejBCTWdCUT09Cg==";
 
         assert!(verify_profile_signature(
             include_bytes!("../../../profiles/v1/index.json"),

@@ -1,7 +1,7 @@
 {
   "id": "sennheiser.momentum-4",
   "name": "Sennheiser Momentum 4 Wireless",
-  "revision": 1,
+  "revision": 2,
   "matches": [
     {
       "bus": "bluetooth",
@@ -22,8 +22,8 @@
     "sample_rates_hz": [48000]
   },
   "latency_policy": {
-    "stable_msec": 85,
-    "bluetooth_floor_msec": 85
+    "stable_msec": 120,
+    "bluetooth_floor_msec": 160
   },
   "routing_policy": {
     "output_priority": 66,
@@ -34,11 +34,19 @@
   "bluetooth_mic_policy": "never_if_hfp",
   "codec_policy": {
     "preferred_a2dp_codecs": ["aptx_adaptive", "aptx_hd", "aac", "sbc_xq", "sbc"],
-    "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"]
+    "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"],
+    "latency_floor_msec": {
+      "aptx_adaptive": 180,
+      "aptx_hd": 200,
+      "aac": 180,
+      "sbc_xq": 200,
+      "sbc": 180
+    }
   },
   "confidence": "medium",
   "quirks": [
-    "Headset microphone use should remain call-mode fallback because normal Bluetooth A2DP is playback-only."
+    "Headset microphone use should remain call-mode fallback because normal Bluetooth A2DP is playback-only.",
+    "Advanced A2DP codecs get explicit profile latency floors so quality codecs are buffered instead of being replaced by headset mode."
   ],
   "source_notes": [
     "Seeded from common Momentum 4 codec support discussions and Bluetooth A2DP/HFP profile limits."

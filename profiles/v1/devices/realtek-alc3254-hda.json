@@ -1,7 +1,7 @@
 {
   "id": "realtek.alc3254-hda",
   "name": "Realtek ALC3254 HDA Audio Codec",
-  "revision": 2,
+  "revision": 4,
   "matches": [
     {
       "node_name_contains": ["__Speaker__sink"],
@@ -32,8 +32,8 @@
     "sample_rates_hz": [48000]
   },
   "latency_policy": {
-    "stable_msec": 60,
-    "low_latency_msec": 35
+    "stable_msec": 120,
+    "low_latency_msec": 80
   },
   "routing_policy": {
     "input_priority": 58,
@@ -51,13 +51,13 @@
     "Match only analog speaker, headphone, headset, and microphone endpoints. HDMI/DisplayPort endpoints on the same SOF/HDA card must use HDMI-specific or generic sink profiles.",
     "Headset, headphones, and digital microphone ports should only be selected when PipeWire marks the port available.",
     "Some hosts expose a deep-buffer playback device; keep low-latency monitoring on the normal HiFi path.",
-    "SOF/HDA laptop speaker paths can resync or crackle under very small loopback buffers; prefer conservative latency over forced ultra-low-latency routing.",
+    "SOF/HDA laptop speaker paths can resync or crackle under small loopback buffers, especially while OBS, webcams, browsers, and effects are active; prefer conservative profile latency over forced ultra-low-latency routing.",
     "Do not write modprobe, SOF, UCM, or kernel-parameter overrides from this profile."
   ],
   "source_notes": [
     "Profile identity is the Realtek ALC3254 codec reported by PipeWire/ALSA as alsa.mixer_name, not a specific laptop model.",
     "Observed tuning source: local Alienware m16 R1 exposes Realtek ALC3254 behind Intel 8086:7a50 Raptor Lake HDA with snd_soc_skl_hda_dsp, cfg-dmics:2, and 48 kHz s32le/s24-32le paths.",
-    "Local PipeWire speaker path reports api.alsa.period-size=1024, api.alsa.period-num=8, api.alsa.headroom=24, node.max-latency=4096/48000, and spa.alsa resync events when stressed.",
+    "Local PipeWire speaker path reports api.alsa.period-size=1024, api.alsa.period-num=8, api.alsa.headroom=24, node.max-latency=4096/48000, and spa.alsa resync events when stressed. Revision 4 raises automatic WaveLinux route latency to reduce speaker crackle during ordinary desktop load.",
     "Dell Alienware m16 R1 specifications confirm this implementation has stereo speakers and digital-array microphones, but those platform details are not required for matching."
   ],
   "maintainer": "WaveLinux"

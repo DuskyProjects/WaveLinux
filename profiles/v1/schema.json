@@ -128,6 +128,14 @@
           "type": "array",
           "items": { "type": "string" }
         },
+        "latency_floor_msec": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 50,
+            "maximum": 500
+          }
+        },
         "ldac_quality": { "enum": ["auto", "hq", "sq", "mq"] }
       }
     }
