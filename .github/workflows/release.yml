@@ -13,7 +13,7 @@ jobs:
   linux-bundles:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -88,7 +88,7 @@ jobs:
           cp target/hardware-profiles/v1/*.json* target/release/upload/
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wavelinux-linux-bundles
           path: target/release/upload/*
