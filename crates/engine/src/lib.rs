@@ -4259,8 +4259,87 @@ fn effective_config_with_profiled_devices(
 ) -> MixerConfig {
     let auto_input = best_hardware_input(inputs, bluetooth_cards);
     let auto_output = preferred_monitor_output(outputs, active_sink.or(default_sink));
+    let mut effective =
+        effective_config_with_auto_devices(config, auto_input, auto_output, bluetooth_cards);
+    effective.settings.runtime_latency_policy =
+        active_latency_policy_for_config(&effective, inputs, outputs);
+    effective
+}
 
-    effective_config_with_auto_devices(config, auto_input, auto_output, bluetooth_cards)
+fn active_latency_policy_for_config(
+    config: &MixerConfig,
+    inputs: &[DeviceInfo],
+    outputs: &[DeviceInfo],
+) -> LatencyPolicy {
+    let fallback = &config
+        .device_policy
+        .fallback_hardware_profile
+        .latency_policy;
+    let mut combined = LatencyPolicy::default();
+    let mut saw_policy = false;
+
+    for channel in config
+        .channels
+        .iter()
+        .filter(|channel| channel.kind.uses_hardware_slot())
+    {
+        if let Some(policy) = channel
+            .source_device
+            .as_deref()
+            .and_then(|source| inputs.iter().find(|input| input.id == source))
+            .and_then(|device| device.active_latency_policy.as_ref())
+        {
+            merge_latency_policy_floor(&mut combined, policy);
+            saw_policy = true;
+        }
+    }
+
+    for mix in &config.mixes {
+        if let Some(policy) = mix
+            .monitor_output
+            .as_deref()
+            .and_then(|output| outputs.iter().find(|device| device.id == output))
+            .and_then(|device| device.active_latency_policy.as_ref())
+        {
+            merge_latency_policy_floor(&mut combined, policy);
+            saw_policy = true;
+        }
+    }
+
+    if !saw_policy {
+        return fallback.clone();
+    }
+
+    fill_latency_policy_defaults(&mut combined, fallback);
+    combined
+}
+
+fn merge_latency_policy_floor(target: &mut LatencyPolicy, policy: &LatencyPolicy) {
+    target.stable_msec = max_optional_u16(target.stable_msec, policy.stable_msec);
+    target.low_latency_msec = max_optional_u16(target.low_latency_msec, policy.low_latency_msec);
+    target.bluetooth_floor_msec =
+        max_optional_u16(target.bluetooth_floor_msec, policy.bluetooth_floor_msec);
+}
+
+fn max_optional_u16(left: Option<u16>, right: Option<u16>) -> Option<u16> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn fill_latency_policy_defaults(policy: &mut LatencyPolicy, fallback: &LatencyPolicy) {
+    if policy.stable_msec.is_none() {
+        policy.stable_msec = fallback.stable_msec;
+    }
+    if policy.low_latency_msec.is_none() {
+        policy.low_latency_msec = fallback.low_latency_msec;
+    }
+    if policy.bluetooth_floor_msec.is_none() {
+        policy.bluetooth_floor_msec = fallback.bluetooth_floor_msec;
+    }
 }
 
 struct ProfiledDeviceRepairView<'a> {
@@ -4278,6 +4357,21 @@ fn auto_device_repair_needed_for_profiled_devices(
     view: ProfiledDeviceRepairView<'_>,
 ) -> bool {
     if !plan_bluetooth_a2dp_profiles(view.bluetooth_cards).is_empty() {
+        return true;
+    }
+    let effective_config = effective_config_with_profiled_devices(
+        config,
+        view.inputs,
+        view.outputs,
+        view.bluetooth_cards,
+        view.default_sink,
+        view.active_sink,
+    );
+    if view
+        .managed_modules
+        .iter()
+        .any(|module| module_is_stale_for_config(module, &effective_config))
+    {
         return true;
     }
     let auto_input = best_hardware_input(view.inputs, view.bluetooth_cards);
@@ -6828,6 +6922,90 @@ mod tests {
             effective.device_policy.preferred_output.as_deref(),
             Some("bluez_output.sony")
         );
+    }
+
+    #[test]
+    fn profiled_devices_raise_runtime_route_latency_floor() {
+        let mut config = MixerConfig::default();
+        config.settings.low_latency_mic_monitoring = true;
+        let realtek_policy = LatencyPolicy {
+            stable_msec: Some(60),
+            low_latency_msec: Some(35),
+            bluetooth_floor_msec: None,
+        };
+        let mut input = device(
+            "alsa_input.realtek",
+            "Realtek ALC3254 Digital Microphone",
+            false,
+        );
+        input.active_latency_policy = Some(realtek_policy.clone());
+        let mut output = device("alsa_output.realtek", "Realtek ALC3254 Speaker", false);
+        output.active_latency_policy = Some(realtek_policy);
+        let inputs = vec![input];
+        let outputs = vec![output];
+
+        let effective = effective_config_with_profiled_devices(
+            &config,
+            &inputs,
+            &outputs,
+            &[],
+            None,
+            Some("alsa_output.realtek"),
+        );
+        let plan = plan_ensure_graph(&effective);
+
+        assert_eq!(
+            effective.settings.runtime_latency_policy.stable_msec,
+            Some(60)
+        );
+        assert_eq!(
+            effective.settings.runtime_latency_policy.low_latency_msec,
+            Some(35)
+        );
+        assert_eq!(
+            effective
+                .settings
+                .runtime_latency_policy
+                .bluetooth_floor_msec,
+            Some(120)
+        );
+        assert!(plan.commands.iter().any(|command| {
+            command.args.contains(&"latency_msec=35".into())
+                && command
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains("wavelinux.role=mix_monitor"))
+        }));
+        assert!(plan.commands.iter().any(|command| {
+            command.args.contains(&"latency_msec=60".into())
+                && command.args.iter().any(|arg| {
+                    arg.contains("wavelinux.role=channel_to_mix")
+                        && arg.contains("wavelinux.channel_id=music")
+                })
+        }));
+
+        let stale_low_latency_route = ManagedModule {
+            module_id: "1".into(),
+            role: Some("mix_monitor".into()),
+            channel_id: None,
+            mix_id: Some("monitor".into()),
+            route_revision: Some("1-latency-20".into()),
+            node_name: None,
+            source_name: Some("wavelinux_mix_monitor.monitor".into()),
+            sink_name: Some("alsa_output.realtek".into()),
+        };
+        assert!(auto_device_repair_needed_for_profiled_devices(
+            &config,
+            ProfiledDeviceRepairView {
+                inputs: &inputs,
+                outputs: &outputs,
+                bluetooth_cards: &[],
+                default_source: None,
+                default_sink: None,
+                active_sink: Some("alsa_output.realtek"),
+                managed_modules: &[stale_low_latency_route],
+            }
+        ));
     }
 
     #[test]

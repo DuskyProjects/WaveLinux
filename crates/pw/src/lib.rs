@@ -938,9 +938,9 @@ pub fn hardware_route_latency_msec(channel: &Channel, settings: &MixerSettings) 
         && (settings.low_latency_mic_monitoring
             || settings.optimization_mode == OptimizationMode::Performance)
     {
-        LOW_LATENCY_LOOPBACK_MSEC
+        low_latency_loopback_msec(settings)
     } else {
-        STABLE_LOOPBACK_LATENCY_MSEC
+        stable_loopback_latency_msec(settings)
     }
 }
 
@@ -948,7 +948,7 @@ pub fn channel_mix_latency_msec(channel: &Channel, mix: &Mix, settings: &MixerSe
     let base = if channel.kind.uses_hardware_slot() {
         hardware_route_latency_msec(channel, settings)
     } else {
-        STABLE_LOOPBACK_LATENCY_MSEC
+        stable_loopback_latency_msec(settings)
     };
     let extra = if channel.kind.uses_hardware_slot() {
         0
@@ -967,9 +967,9 @@ pub fn mix_monitor_latency_msec(mix: &Mix, settings: &MixerSettings) -> u16 {
         && (settings.low_latency_mic_monitoring
             || settings.optimization_mode == OptimizationMode::Performance)
     {
-        LOW_LATENCY_LOOPBACK_MSEC
+        low_latency_loopback_msec(settings)
     } else {
-        STABLE_LOOPBACK_LATENCY_MSEC
+        stable_loopback_latency_msec(settings)
     }
 }
 
@@ -980,10 +980,34 @@ pub fn mix_monitor_latency_msec_for_sink(
 ) -> u16 {
     let base = mix_monitor_latency_msec(mix, settings);
     if is_bluetooth_output_name(sink_name) {
-        base.max(BLUETOOTH_MONITOR_LOOPBACK_MSEC)
+        base.max(bluetooth_monitor_loopback_msec(settings))
     } else {
         base
     }
+}
+
+fn stable_loopback_latency_msec(settings: &MixerSettings) -> u16 {
+    settings
+        .runtime_latency_policy
+        .stable_msec
+        .unwrap_or(STABLE_LOOPBACK_LATENCY_MSEC)
+        .clamp(5, 500)
+}
+
+fn low_latency_loopback_msec(settings: &MixerSettings) -> u16 {
+    settings
+        .runtime_latency_policy
+        .low_latency_msec
+        .unwrap_or(LOW_LATENCY_LOOPBACK_MSEC)
+        .clamp(5, 500)
+}
+
+fn bluetooth_monitor_loopback_msec(settings: &MixerSettings) -> u16 {
+    settings
+        .runtime_latency_policy
+        .bluetooth_floor_msec
+        .unwrap_or(BLUETOOTH_MONITOR_LOOPBACK_MSEC)
+        .clamp(50, 500)
 }
 
 pub fn input_route_revision(settings: &MixerSettings, channel: &Channel) -> String {
@@ -3715,6 +3739,41 @@ mod tests {
         assert_eq!(
             mix_monitor_latency_msec_for_sink(&mix, "alsa_output.usb", &settings),
             STABLE_LOOPBACK_LATENCY_MSEC
+        );
+    }
+
+    #[test]
+    fn runtime_latency_policy_controls_profiled_route_floors() {
+        let mut settings = MixerSettings {
+            low_latency_mic_monitoring: true,
+            ..MixerSettings::default()
+        };
+        settings.runtime_latency_policy = wavelinux_model::LatencyPolicy {
+            stable_msec: Some(60),
+            low_latency_msec: Some(35),
+            bluetooth_floor_msec: Some(120),
+        };
+        let channel = Channel::new_fixed("hardware_in", "Input", ChannelKind::Generic);
+        let music = Channel::new_fixed("music", "Music", ChannelKind::Application);
+        let monitor = Mix::new_fixed("monitor", "Monitor");
+
+        assert_eq!(hardware_route_latency_msec(&channel, &settings), 35);
+        assert_eq!(channel_mix_latency_msec(&music, &monitor, &settings), 60);
+        assert_eq!(
+            mix_monitor_latency_msec_for_sink(
+                &monitor,
+                "alsa_output.pci.realtek.HiFi__Speaker__sink",
+                &settings
+            ),
+            35
+        );
+        assert_eq!(
+            mix_monitor_latency_msec_for_sink(
+                &monitor,
+                "bluez_output.AC_80_0A_72_BD_10.1",
+                &settings
+            ),
+            120
         );
     }
 
