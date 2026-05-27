@@ -49,13 +49,15 @@ Bluetooth profiles should preserve the best stable A2DP codec before falling
 back to lower-quality codecs. Do not use SBC as the first crackle fix when AAC,
 SBC-XQ, or LDAC is available; raise the codec latency floor first.
 
-Use these stability-first floors unless a device-specific trace proves a lower
-value is reliable:
+Use these stability-first floors unless a device-specific trace proves another
+value is reliable. Keep floors below PipeWire's common 48 kHz/1024-quantum,
+16-buffer link ceiling so extra buffering does not cause `out of buffers`
+dropouts:
 
-- `aac`: 320 ms
-- `sbc_xq`: 360 ms
-- `sbc`: 280 ms
-- `ldac`: 500 ms
+- `aac`: 280 ms
+- `sbc_xq`: 300 ms
+- `sbc`: 240 ms
+- `ldac`: 300 ms
 
 LDAC is quality-first, not latency-first. Profiles should avoid maximum-bitrate
 LDAC modes on unstable links and should keep HFP/HSP out of music playback.

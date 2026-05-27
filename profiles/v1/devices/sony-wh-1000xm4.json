@@ -1,7 +1,7 @@
 {
   "id": "sony.wh-1000xm4",
   "name": "Sony WH-1000XM4",
-  "revision": 7,
+  "revision": 8,
   "matches": [
     {
       "bus": "bluetooth",
@@ -37,10 +37,10 @@
     "preferred_a2dp_codecs": ["aac", "sbc_xq", "sbc", "ldac"],
     "avoid_codecs": ["ldac_hq", "ldac_990", "hsp", "hfp", "cvsd", "msbc"],
     "latency_floor_msec": {
-      "aac": 320,
-      "ldac": 500,
-      "sbc_xq": 360,
-      "sbc": 280
+      "aac": 280,
+      "ldac": 300,
+      "sbc_xq": 300,
+      "sbc": 240
     },
     "ldac_quality": "sq"
   },
@@ -51,7 +51,7 @@
     "If playback crackles on LDAC auto, switch the card profile to AAC first; do not drop below AAC automatically unless AAC is unavailable.",
     "When multiple A2DP profiles are exposed, WaveLinux should restore the preferred stable A2DP profile instead of leaving the headset on LDAC merely because LDAC is also A2DP.",
     "Codec-specific latency floors keep AAC as the preferred automatic profile while giving AAC, SBC-XQ, SBC, and LDAC enough Bluetooth buffer to avoid clicking, skips, and BlueZ transport churn on PipeWire stacks that expose each codec as a separate A2DP card profile.",
-    "Local testing showed AAC at 180 ms could still crackle or drop out under desktop load, so revision 7 treats 320 ms as the AAC stability floor and reserves LDAC for quality-first links with a much larger buffer."
+    "Local testing showed AAC at 180 ms could still crackle or drop out under desktop load, while 320 ms could exhaust PipeWire's default 16-buffer link budget on 48 kHz/1024-quantum graphs. Revision 8 keeps AAC buffered at 280 ms and caps higher-bitrate codec floors at 300 ms to avoid mini dropouts without falling below AAC."
   ],
   "source_notes": [
     "Sony documents WH-1000XM4 A2DP playback codecs as SBC, AAC, and LDAC, with HFP/HSP as separate headset profiles.",

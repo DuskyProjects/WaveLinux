@@ -1328,19 +1328,19 @@ mod tests {
         assert_eq!(profile.latency_policy.bluetooth_floor_msec, Some(240));
         assert_eq!(
             profile.codec_policy.latency_floor_msec.get("aac"),
-            Some(&320)
-        );
-        assert_eq!(
-            profile.codec_policy.latency_floor_msec.get("sbc_xq"),
-            Some(&360)
-        );
-        assert_eq!(
-            profile.codec_policy.latency_floor_msec.get("sbc"),
             Some(&280)
         );
         assert_eq!(
+            profile.codec_policy.latency_floor_msec.get("sbc_xq"),
+            Some(&300)
+        );
+        assert_eq!(
+            profile.codec_policy.latency_floor_msec.get("sbc"),
+            Some(&240)
+        );
+        assert_eq!(
             profile.codec_policy.latency_floor_msec.get("ldac"),
-            Some(&500)
+            Some(&300)
         );
         assert_eq!(profile.codec_policy.ldac_quality.as_deref(), Some("sq"));
         assert!(profile
@@ -1373,10 +1373,10 @@ mod tests {
                 .and_then(|policy| policy.bluetooth_floor_msec)
         };
 
-        assert_eq!(latency_for_codec("aac"), Some(320));
-        assert_eq!(latency_for_codec("sbc_xq"), Some(360));
-        assert_eq!(latency_for_codec("sbc"), Some(280));
-        assert_eq!(latency_for_codec("ldac"), Some(500));
+        assert_eq!(latency_for_codec("aac"), Some(280));
+        assert_eq!(latency_for_codec("sbc_xq"), Some(300));
+        assert_eq!(latency_for_codec("sbc"), Some(240));
+        assert_eq!(latency_for_codec("ldac"), Some(300));
     }
 
     #[test]
@@ -1404,6 +1404,11 @@ mod tests {
                             .latency_floor_msec
                             .contains_key(codec),
                         "{} should define a safe latency floor for {codec}",
+                        entry.profile.id
+                    );
+                    assert!(
+                        entry.profile.codec_policy.latency_floor_msec[codec] <= 300,
+                        "{} {codec} floor should stay under PipeWire's common 16-buffer link budget",
                         entry.profile.id
                     );
                 }
@@ -1996,7 +2001,7 @@ mod tests {
 
     #[test]
     fn base64_wrapped_tauri_minisign_signature_verifies() {
-        let signature = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSai94eDNzNDVyQnhlTmYweXdWVTRFQm5lWktmemZ4b2xMemdzekMzalpLSERHUVhBZ3VGU3ZCa3J2MVlMYW1CVzJMbCtPZHhjZVc3UmxkdEJldWkrcTRqWkpwT2kwZHd3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5ODMwMTMwCWZpbGU6aW5kZXguanNvbgpnQnJBQXprRkZ1WlluMS9TUzJxdno1eGZ1WW94SGU4VldmQ1ZKY3BKbTE5bVJYMXQ5UUljejdVWUE1dnV1M2NNd3BkZHVMNlFZWVkrUTg4b2JwaGhBdz09Cg==";
+        let signature = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSai94eDNzNDVyQjVtMmJVSzBmK2FtMEszSHNidkJua1FGNHo2QitrQlgyMlZkMFBGeVlOKzVlWldoR1BKK3dKT0g5LzFPUk1LaVhJRkdHUTV5YmR3eFNvVDB4ZVh6WHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5ODg2OTA0CWZpbGU6aGFyZHdhcmUtcHJvZmlsZXMtdjEtaW5kZXguanNvbgpVTEtVdllVNGh4Y05GUFJSTXNHNWhBdml4SjFrRTdNK3hwaTFUcDVOcHdsOXo4RmZGWENQUlhCY1g5QWRsRWJtcUZWNXVad2x5Z2FPNitMV0txd2lEQT09Cg==";
 
         assert!(verify_profile_signature(
             include_bytes!("../../../profiles/v1/index.json"),

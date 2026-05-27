@@ -1055,6 +1055,7 @@ impl WaveLinuxEngine {
             &graph.inputs,
             &graph.outputs,
             &bluetooth_cards,
+            default_source.as_deref(),
             default_sink.as_deref(),
             active_sink.as_deref(),
         );
@@ -1088,6 +1089,7 @@ impl WaveLinuxEngine {
                     &graph.inputs,
                     &graph.outputs,
                     &bluetooth_cards,
+                    default_source.as_deref(),
                     default_sink.as_deref(),
                     active_sink.as_deref(),
                 );
@@ -1121,12 +1123,17 @@ impl WaveLinuxEngine {
             self.log_engine_event("hotplug.device", reason);
             let _audio_commands = self.lock_audio_commands()?;
             if !self.stop.load(Ordering::SeqCst) {
-                let report = self.repair_audio_graph_unlocked()?;
-                self.log_command_executions("hotplug.device", &report.outputs);
+                let outputs = if auto_device_repair_needed && !active_effect_route_repair_needed {
+                    self.repair_auto_device_routes_unlocked()?
+                } else {
+                    self.repair_audio_graph_unlocked()?.outputs
+                };
+                self.log_command_executions("hotplug.device", &outputs);
                 let (next_graph, timings) = self.snapshot_for_config_timed(Some(&config))?;
                 graph = next_graph;
                 snapshot_command_timings.extend(timings);
                 bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
+                default_source = self.pw.default_source().ok().flatten();
                 default_sink = self.pw.default_sink().ok().flatten();
                 active_sink = self.pw.active_playback_sink().ok().flatten();
                 managed_modules = self.pw.managed_modules().unwrap_or_default();
@@ -1135,6 +1142,7 @@ impl WaveLinuxEngine {
                     &graph.inputs,
                     &graph.outputs,
                     &bluetooth_cards,
+                    default_source.as_deref(),
                     default_sink.as_deref(),
                     active_sink.as_deref(),
                 );
@@ -1421,6 +1429,72 @@ impl WaveLinuxEngine {
             planned,
             outputs,
         })
+    }
+
+    fn repair_auto_device_routes_unlocked(&self) -> Result<Vec<CommandExecution>, EngineError> {
+        let started = Instant::now();
+        let config = self.effective_config_for_audio_graph(&self.read_config()?.clone());
+        let monitor_preroute_outputs = self.preload_monitor_output_routes_for_config(&config)?;
+        let preserve_stale_monitor_routes = monitor_preroute_outputs.iter().any(|output| {
+            output.error.is_some() || output.stderr.contains("preserving existing monitor route")
+        });
+        let mut outputs = monitor_preroute_outputs;
+        outputs.extend(self.cleanup_stale_auto_device_modules_for_config(
+            &config,
+            preserve_stale_monitor_routes,
+        )?);
+
+        let mut planned = plan_ensure_graph(&config);
+        let planned_count = planned.commands.len();
+        let existing_graph = self
+            .pw
+            .snapshot_for_config_with_effect_availability(None, Vec::new());
+        let managed_modules = self.pw.managed_modules().unwrap_or_default();
+        let source_outputs = self.pw.source_output_routes().unwrap_or_default();
+        planned.commands.retain(|command| {
+            command_is_auto_device_route(command)
+                && !repair_command_is_satisfied(
+                    command,
+                    &existing_graph,
+                    &source_outputs,
+                    &managed_modules,
+                )
+        });
+        self.log_engine_event(
+            "repair.auto-device",
+            format!(
+                "planned={} retained={} managed_modules={} source_outputs={} inputs={} outputs={}",
+                planned_count,
+                planned.commands.len(),
+                managed_modules.len(),
+                source_outputs.len(),
+                existing_graph.inputs.len(),
+                existing_graph.outputs.len(),
+            ),
+        );
+        outputs.extend(
+            self.pw
+                .execute_all(planned.commands)
+                .into_iter()
+                .map(command_execution),
+        );
+        outputs.extend(self.apply_default_device_locks(&config)?);
+        let source_outputs = self.pw.source_output_routes().unwrap_or_default();
+        outputs.extend(self.execute_capture_stream_moves_unlocked(&config, &source_outputs)?);
+        self.log_engine_event(
+            "repair.auto-device",
+            format!(
+                "outputs={} failed={} skipped={} elapsed_ms={}",
+                outputs.len(),
+                outputs
+                    .iter()
+                    .filter(|output| output.error.is_some())
+                    .count(),
+                outputs.iter().filter(|output| output.skipped).count(),
+                started.elapsed().as_millis(),
+            ),
+        );
+        Ok(outputs)
     }
 
     pub fn run_diagnostics(&self) -> Result<SoundCheckReport, EngineError> {
@@ -2248,6 +2322,7 @@ impl WaveLinuxEngine {
             &graph.inputs,
             &graph.outputs,
             &bluetooth_cards,
+            default_source.as_deref(),
             default_sink.as_deref(),
             active_sink.as_deref(),
         );
@@ -2795,11 +2870,13 @@ impl WaveLinuxEngine {
         let outputs = self.profiled_outputs().unwrap_or_default();
         let default_sink = self.pw.default_sink().ok().flatten();
         let active_sink = self.pw.active_playback_sink().ok().flatten();
+        let default_source = self.pw.default_source().ok().flatten();
         effective_config_with_profiled_devices(
             config,
             &inputs,
             &outputs,
             &bluetooth_cards,
+            default_source.as_deref(),
             default_sink.as_deref(),
             active_sink.as_deref(),
         )
@@ -3224,6 +3301,27 @@ impl WaveLinuxEngine {
             module_dedupe_key_for_config(module, config).is_some_and(|key| !seen.insert(key))
         })?);
         Ok(outputs)
+    }
+
+    fn cleanup_stale_auto_device_modules_for_config(
+        &self,
+        config: &MixerConfig,
+        preserve_stale_monitor_routes: bool,
+    ) -> Result<Vec<CommandExecution>, EngineError> {
+        let mut seen = BTreeSet::new();
+        self.cleanup_modules(|module| {
+            if !module_is_auto_device_route(module) {
+                return false;
+            }
+            if preserve_stale_monitor_routes && module.role.as_deref() == Some("mix_monitor") {
+                return false;
+            }
+            if module_is_stale_for_config(module, config) {
+                return true;
+            }
+
+            module_dedupe_key_for_config(module, config).is_some_and(|key| !seen.insert(key))
+        })
     }
 
     fn preload_monitor_output_routes_for_config(
@@ -4169,22 +4267,28 @@ impl DefaultDevices {
 
 fn effective_config_with_auto_devices(
     config: &MixerConfig,
+    inputs: &[DeviceInfo],
+    outputs: &[DeviceInfo],
     auto_input: Option<String>,
     auto_output: Option<String>,
     bluetooth_cards: &[BluetoothAudioCard],
 ) -> MixerConfig {
     let mut effective = config.clone();
+    effective.device_policy.active_input_fallback = false;
+    effective.device_policy.active_output_fallback = false;
 
     for channel in effective
         .channels
         .iter_mut()
         .filter(|channel| channel.kind.uses_hardware_slot())
     {
-        if channel
-            .source_device
-            .as_deref()
-            .is_some_and(|source| bluetooth_input_would_force_hfp(source, bluetooth_cards))
-        {
+        let Some(source) = channel.source_device.as_deref() else {
+            continue;
+        };
+        let bluetooth_blocked = bluetooth_input_would_force_hfp(source, bluetooth_cards);
+        let unavailable = selected_input_is_unavailable(inputs, source, bluetooth_cards);
+        if bluetooth_blocked || unavailable {
+            effective.device_policy.restorable_input = Some(source.to_owned());
             channel.source_device = None;
             effective.device_policy.active_input_fallback = true;
         }
@@ -4208,9 +4312,60 @@ fn effective_config_with_auto_devices(
                 effective.device_policy.preferred_output = Some(auto_output);
             }
         }
+    } else if let Some(auto_output) = auto_output {
+        if let Some(mix) = effective.mixes.iter_mut().find(|mix| mix.id == "monitor") {
+            if mix
+                .monitor_output
+                .as_deref()
+                .is_some_and(|output| selected_output_is_unavailable(outputs, output))
+            {
+                effective.device_policy.restorable_output = mix.monitor_output.clone();
+                mix.monitor_output = Some(auto_output.clone());
+                effective.device_policy.preferred_output = Some(auto_output);
+                effective.device_policy.active_output_fallback = true;
+            }
+        }
     }
 
     effective
+}
+
+fn selected_input_is_unavailable(
+    inputs: &[DeviceInfo],
+    source: &str,
+    bluetooth_cards: &[BluetoothAudioCard],
+) -> bool {
+    !inputs.is_empty()
+        && !inputs
+            .iter()
+            .any(|input| input_device_can_route_source(input, source, bluetooth_cards))
+}
+
+fn input_device_can_route_source(
+    input: &DeviceInfo,
+    source: &str,
+    bluetooth_cards: &[BluetoothAudioCard],
+) -> bool {
+    audio_endpoint_names_match(&input.id, source)
+        && input.is_available
+        && !input.is_virtual
+        && is_restorable_device(&input.id)
+        && !looks_like_monitor_source(input)
+        && !bluetooth_input_would_force_hfp(&input.id, bluetooth_cards)
+}
+
+fn selected_output_is_unavailable(outputs: &[DeviceInfo], output: &str) -> bool {
+    !outputs.is_empty()
+        && !outputs
+            .iter()
+            .any(|device| output_device_can_route_sink(device, output))
+}
+
+fn output_device_can_route_sink(device: &DeviceInfo, output: &str) -> bool {
+    audio_endpoint_names_match(&device.id, output)
+        && device.is_available
+        && !device.is_virtual
+        && is_restorable_device(&device.id)
 }
 
 fn best_hardware_input(
@@ -4219,19 +4374,40 @@ fn best_hardware_input(
 ) -> Option<String> {
     inputs
         .iter()
-        .filter(|input| {
-            !input.is_virtual
-                && input.is_available
-                && is_restorable_device(&input.id)
-                && !looks_like_monitor_source(input)
-                && !bluetooth_input_would_force_hfp(&input.id, bluetooth_cards)
-                && input
-                    .active_routing_policy
-                    .as_ref()
-                    .is_none_or(|policy| policy.allow_auto_select_input)
-        })
+        .filter(|input| input_device_can_auto_select(input, bluetooth_cards))
         .max_by_key(|input| (hardware_input_priority(input), input.is_default))
         .map(|input| input.id.clone())
+}
+
+fn preferred_hardware_input(
+    inputs: &[DeviceInfo],
+    default_source: Option<&str>,
+    bluetooth_cards: &[BluetoothAudioCard],
+) -> Option<String> {
+    if let Some(default_input) = default_source.and_then(|source| {
+        inputs.iter().find(|input| {
+            audio_endpoint_names_match(&input.id, source)
+                && input_device_can_auto_select(input, bluetooth_cards)
+        })
+    }) {
+        return Some(default_input.id.clone());
+    }
+    best_hardware_input(inputs, bluetooth_cards)
+}
+
+fn input_device_can_auto_select(
+    input: &DeviceInfo,
+    bluetooth_cards: &[BluetoothAudioCard],
+) -> bool {
+    !input.is_virtual
+        && input.is_available
+        && is_restorable_device(&input.id)
+        && !looks_like_monitor_source(input)
+        && !bluetooth_input_would_force_hfp(&input.id, bluetooth_cards)
+        && input
+            .active_routing_policy
+            .as_ref()
+            .is_none_or(|policy| policy.allow_auto_select_input)
 }
 
 fn startup_microphone_level_reset_commands(
@@ -4274,16 +4450,24 @@ fn best_monitor_output(outputs: &[DeviceInfo]) -> Option<String> {
         .map(|output| output.id.clone())
 }
 
-fn preferred_monitor_output(outputs: &[DeviceInfo], default_sink: Option<&str>) -> Option<String> {
-    if let Some(default_sink) = default_sink.filter(|sink| {
-        outputs.iter().any(|output| {
-            output.id == *sink
-                && output.is_available
-                && !output.is_virtual
-                && is_restorable_device(&output.id)
-        })
+fn preferred_monitor_output(
+    outputs: &[DeviceInfo],
+    default_sink: Option<&str>,
+    active_sink: Option<&str>,
+) -> Option<String> {
+    if let Some(default_output) = default_sink.and_then(|sink| {
+        outputs
+            .iter()
+            .find(|output| output_device_can_route_sink(output, sink))
     }) {
-        return Some(default_sink.to_owned());
+        return Some(default_output.id.clone());
+    }
+    if let Some(active_output) = active_sink.and_then(|sink| {
+        outputs
+            .iter()
+            .find(|output| output_device_can_route_sink(output, sink))
+    }) {
+        return Some(active_output.id.clone());
     }
     best_monitor_output(outputs)
 }
@@ -4390,13 +4574,20 @@ fn effective_config_with_profiled_devices(
     inputs: &[DeviceInfo],
     outputs: &[DeviceInfo],
     bluetooth_cards: &[BluetoothAudioCard],
+    default_source: Option<&str>,
     default_sink: Option<&str>,
     active_sink: Option<&str>,
 ) -> MixerConfig {
-    let auto_input = best_hardware_input(inputs, bluetooth_cards);
-    let auto_output = preferred_monitor_output(outputs, active_sink.or(default_sink));
-    let mut effective =
-        effective_config_with_auto_devices(config, auto_input, auto_output, bluetooth_cards);
+    let auto_input = preferred_hardware_input(inputs, default_source, bluetooth_cards);
+    let auto_output = preferred_monitor_output(outputs, default_sink, active_sink);
+    let mut effective = effective_config_with_auto_devices(
+        config,
+        inputs,
+        outputs,
+        auto_input,
+        auto_output,
+        bluetooth_cards,
+    );
     effective.settings.runtime_latency_policy = Some(active_latency_policy_for_config(
         &effective, inputs, outputs,
     ));
@@ -4501,19 +4692,20 @@ fn auto_device_repair_needed_for_profiled_devices(
         view.inputs,
         view.outputs,
         view.bluetooth_cards,
+        view.default_source,
         view.default_sink,
         view.active_sink,
     );
     if view
         .managed_modules
         .iter()
-        .any(|module| module_is_stale_for_config(module, &effective_config))
+        .any(|module| auto_device_module_is_stale_for_config(module, &effective_config))
     {
         return true;
     }
-    let auto_input = best_hardware_input(view.inputs, view.bluetooth_cards);
-    let auto_output =
-        preferred_monitor_output(view.outputs, view.active_sink.or(view.default_sink));
+    let auto_input =
+        preferred_hardware_input(view.inputs, view.default_source, view.bluetooth_cards);
+    let auto_output = preferred_monitor_output(view.outputs, view.default_sink, view.active_sink);
     auto_device_repair_needed(
         &effective_config,
         auto_input.as_deref(),
@@ -4521,6 +4713,17 @@ fn auto_device_repair_needed_for_profiled_devices(
         view.default_source,
         view.default_sink,
         view.managed_modules,
+    )
+}
+
+fn auto_device_module_is_stale_for_config(module: &ManagedModule, config: &MixerConfig) -> bool {
+    module_is_auto_device_route(module) && module_is_stale_for_config(module, config)
+}
+
+fn module_is_auto_device_route(module: &ManagedModule) -> bool {
+    matches!(
+        module.role.as_deref(),
+        Some("input_to_channel") | Some("mix_monitor")
     )
 }
 
@@ -4572,7 +4775,9 @@ fn auto_output_repair_needed(
     auto_output: Option<&str>,
     managed_modules: &[ManagedModule],
 ) -> bool {
-    if !config.settings.monitor_follows_default_output {
+    if !config.settings.monitor_follows_default_output
+        && !config.device_policy.active_output_fallback
+    {
         return false;
     }
     let Some(auto_output) = auto_output.filter(|device| is_restorable_device(device)) else {
@@ -5444,6 +5649,15 @@ fn command_is_mix_monitor_route(command: &CommandSpec) -> bool {
         && command_arg_value(&command.args, "source_output_properties=")
             .and_then(|properties| property_value_from_arg(properties, "wavelinux.role="))
             == Some("mix_monitor")
+}
+
+fn command_is_auto_device_route(command: &CommandSpec) -> bool {
+    command.program == "pactl"
+        && command.args.first().map(String::as_str) == Some("load-module")
+        && command.args.get(1).map(String::as_str) == Some("module-loopback")
+        && command_arg_value(&command.args, "source_output_properties=")
+            .and_then(|properties| property_value_from_arg(properties, "wavelinux.role="))
+            .is_some_and(|role| matches!(role, "input_to_channel" | "mix_monitor"))
 }
 
 fn command_routes_active_effect_channel(
@@ -7210,6 +7424,8 @@ mod tests {
 
         let effective = effective_config_with_auto_devices(
             &config,
+            &[],
+            &[],
             None,
             Some("bluez_output.sony".into()),
             &[],
@@ -7293,6 +7509,7 @@ mod tests {
             &inputs,
             &outputs,
             &[],
+            None,
             None,
             Some("alsa_output.realtek"),
         );
@@ -7433,6 +7650,63 @@ mod tests {
     }
 
     #[test]
+    fn auto_device_repair_ignores_non_device_route_staleness() {
+        let config = MixerConfig::default();
+        let outputs = vec![device("alsa_output.speaker", "Built-in Speaker", true)];
+        let effective = effective_config_with_profiled_devices(
+            &config,
+            &[],
+            &outputs,
+            &[],
+            None,
+            Some("alsa_output.speaker"),
+            Some("alsa_output.speaker"),
+        );
+        let monitor_mix = effective
+            .mixes
+            .iter()
+            .find(|mix| mix.id == "monitor")
+            .unwrap();
+        let current_monitor_route = ManagedModule {
+            module_id: "monitor".into(),
+            role: Some("mix_monitor".into()),
+            channel_id: None,
+            mix_id: Some("monitor".into()),
+            route_revision: Some(mix_monitor_route_revision_for_sink(
+                &effective.settings,
+                monitor_mix,
+                "alsa_output.speaker",
+            )),
+            node_name: None,
+            source_name: Some("wavelinux_mix_monitor.monitor".into()),
+            sink_name: Some("alsa_output.speaker".into()),
+        };
+        let stale_music_route = ManagedModule {
+            module_id: "music-monitor".into(),
+            role: Some("channel_to_mix".into()),
+            channel_id: Some("music".into()),
+            mix_id: Some("monitor".into()),
+            route_revision: Some("1-latency-1".into()),
+            node_name: None,
+            source_name: Some("wavelinux_channel_music.monitor".into()),
+            sink_name: Some("wavelinux_mix_monitor".into()),
+        };
+
+        assert!(!auto_device_repair_needed_for_profiled_devices(
+            &config,
+            ProfiledDeviceRepairView {
+                inputs: &[],
+                outputs: &outputs,
+                bluetooth_cards: &[],
+                default_source: None,
+                default_sink: Some("alsa_output.speaker"),
+                active_sink: Some("alsa_output.speaker"),
+                managed_modules: &[current_monitor_route, stale_music_route],
+            }
+        ));
+    }
+
+    #[test]
     fn auto_output_prefers_bluetooth_then_usb_then_jack_then_speaker() {
         let outputs = vec![
             device("alsa_output.speaker", "Built-in Speakers", false),
@@ -7458,13 +7732,193 @@ mod tests {
             Some("alsa_output.speaker")
         );
         assert_eq!(
-            preferred_monitor_output(&outputs, Some("alsa_output.pci_headphones")).as_deref(),
+            preferred_monitor_output(&outputs, Some("alsa_output.pci_headphones"), None).as_deref(),
             Some("alsa_output.pci_headphones")
         );
         assert_eq!(
-            preferred_monitor_output(&outputs, Some("wavelinux_channel_system")).as_deref(),
+            preferred_monitor_output(&outputs, Some("wavelinux_channel_system"), None).as_deref(),
             Some("bluez_output.sony")
         );
+        assert_eq!(
+            preferred_monitor_output(
+                &outputs,
+                Some("alsa_output.speaker"),
+                Some("bluez_output.sony")
+            )
+            .as_deref(),
+            Some("alsa_output.speaker")
+        );
+        let rotated_bluetooth = [device(
+            "bluez_output.AC_80_0A_72_BD_10.a2dp-sink",
+            "WH-1000XM4 Bluetooth",
+            false,
+        )];
+        assert_eq!(
+            preferred_monitor_output(
+                &rotated_bluetooth,
+                Some("bluez_output.AC:80:0A:72:BD:10.headset-head-unit"),
+                None,
+            )
+            .as_deref(),
+            Some("bluez_output.AC_80_0A_72_BD_10.a2dp-sink")
+        );
+    }
+
+    #[test]
+    fn stale_saved_input_falls_back_to_best_available_hardware() {
+        let mut config = MixerConfig::default();
+        let hardware = config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        hardware.source_device = Some("alsa_input.dead".into());
+        config.device_policy.preferred_input = Some("alsa_input.dead".into());
+        let inputs = vec![
+            device("alsa_input.pci_mic", "Built-in Microphone", true),
+            device("alsa_input.usb_interface", "USB Audio Interface", false),
+        ];
+
+        let effective =
+            effective_config_with_profiled_devices(&config, &inputs, &[], &[], None, None, None);
+        let hardware = effective
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+
+        assert_eq!(
+            hardware.source_device.as_deref(),
+            Some("alsa_input.usb_interface")
+        );
+        assert_eq!(
+            effective.device_policy.restorable_input.as_deref(),
+            Some("alsa_input.dead")
+        );
+        assert!(effective.device_policy.active_input_fallback);
+        assert!(auto_device_repair_needed_for_profiled_devices(
+            &config,
+            ProfiledDeviceRepairView {
+                inputs: &inputs,
+                outputs: &[],
+                bluetooth_cards: &[],
+                default_source: None,
+                default_sink: None,
+                active_sink: None,
+                managed_modules: &[],
+            }
+        ));
+    }
+
+    #[test]
+    fn available_manual_input_is_preserved_over_auto_candidate() {
+        let mut config = MixerConfig::default();
+        let hardware = config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        hardware.source_device = Some("alsa_input.pci_mic".into());
+        let inputs = vec![
+            device("alsa_input.pci_mic", "Built-in Microphone", true),
+            device("alsa_input.usb_interface", "USB Audio Interface", false),
+        ];
+
+        let effective =
+            effective_config_with_profiled_devices(&config, &inputs, &[], &[], None, None, None);
+        let hardware = effective
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+
+        assert_eq!(
+            hardware.source_device.as_deref(),
+            Some("alsa_input.pci_mic")
+        );
+        assert!(!effective.device_policy.active_input_fallback);
+    }
+
+    #[test]
+    fn stale_saved_manual_output_falls_back_to_default_sink() {
+        let mut config = MixerConfig::default();
+        config.settings.monitor_follows_default_output = false;
+        config
+            .set_mix_monitor_output("monitor", Some("bluez_output.dead".into()))
+            .unwrap();
+        config.device_policy.preferred_output = Some("bluez_output.dead".into());
+        let outputs = vec![device("alsa_output.speaker", "Built-in Speakers", true)];
+
+        let effective = effective_config_with_profiled_devices(
+            &config,
+            &[],
+            &outputs,
+            &[],
+            None,
+            Some("alsa_output.speaker"),
+            None,
+        );
+        let monitor = effective
+            .mixes
+            .iter()
+            .find(|mix| mix.id == "monitor")
+            .unwrap();
+
+        assert_eq!(
+            monitor.monitor_output.as_deref(),
+            Some("alsa_output.speaker")
+        );
+        assert_eq!(
+            effective.device_policy.restorable_output.as_deref(),
+            Some("bluez_output.dead")
+        );
+        assert!(effective.device_policy.active_output_fallback);
+        assert!(auto_device_repair_needed_for_profiled_devices(
+            &config,
+            ProfiledDeviceRepairView {
+                inputs: &[],
+                outputs: &outputs,
+                bluetooth_cards: &[],
+                default_source: None,
+                default_sink: Some("alsa_output.speaker"),
+                active_sink: None,
+                managed_modules: &[],
+            }
+        ));
+    }
+
+    #[test]
+    fn available_manual_output_is_preserved_over_auto_candidate() {
+        let mut config = MixerConfig::default();
+        config.settings.monitor_follows_default_output = false;
+        config
+            .set_mix_monitor_output("monitor", Some("alsa_output.speaker".into()))
+            .unwrap();
+        let outputs = vec![
+            device("alsa_output.speaker", "Built-in Speakers", true),
+            device("bluez_output.sony", "WH-1000XM4 Bluetooth", false),
+        ];
+
+        let effective = effective_config_with_profiled_devices(
+            &config,
+            &[],
+            &outputs,
+            &[],
+            None,
+            Some("bluez_output.sony"),
+            None,
+        );
+        let monitor = effective
+            .mixes
+            .iter()
+            .find(|mix| mix.id == "monitor")
+            .unwrap();
+
+        assert_eq!(
+            monitor.monitor_output.as_deref(),
+            Some("alsa_output.speaker")
+        );
+        assert!(!effective.device_policy.active_output_fallback);
     }
 
     #[test]
@@ -7618,6 +8072,64 @@ mod tests {
     }
 
     #[test]
+    fn auto_input_prefers_system_default_microphone_when_safe() {
+        let config = MixerConfig::default();
+        let inputs = vec![
+            device("alsa_input.pci_mic", "Built-in Microphone", true),
+            device("alsa_input.usb_interface", "USB Audio Interface", false),
+        ];
+
+        let effective = effective_config_with_profiled_devices(
+            &config,
+            &inputs,
+            &[],
+            &[],
+            Some("alsa_input.pci_mic"),
+            None,
+            None,
+        );
+        let hardware = effective
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+
+        assert_eq!(
+            hardware.source_device.as_deref(),
+            Some("alsa_input.pci_mic")
+        );
+    }
+
+    #[test]
+    fn auto_input_ignores_wavelinux_default_source_and_uses_hardware_ranking() {
+        let config = MixerConfig::default();
+        let inputs = vec![
+            device("alsa_input.pci_mic", "Built-in Microphone", true),
+            device("alsa_input.usb_interface", "USB Audio Interface", false),
+        ];
+
+        let effective = effective_config_with_profiled_devices(
+            &config,
+            &inputs,
+            &[],
+            &[],
+            Some("wavelinux_mix_stream_source"),
+            None,
+            None,
+        );
+        let hardware = effective
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+
+        assert_eq!(
+            hardware.source_device.as_deref(),
+            Some("alsa_input.usb_interface")
+        );
+    }
+
+    #[test]
     fn bluetooth_headset_input_is_not_auto_selected_when_a2dp_is_available() {
         let cards = vec![BluetoothAudioCard {
             name: "bluez_card.AC_80_0A_72_BD_10".into(),
@@ -7744,7 +8256,7 @@ mod tests {
             active_profile: Some("headset-head-unit".into()),
             preferred_a2dp_profile: Some("a2dp-sink".into()),
         }];
-        let effective = effective_config_with_auto_devices(&config, None, None, &cards);
+        let effective = effective_config_with_auto_devices(&config, &[], &[], None, None, &cards);
         let hardware = effective
             .channels
             .iter()

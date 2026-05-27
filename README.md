@@ -43,7 +43,12 @@ leaving an already-A2DP LDAC session active when AAC is the safer profile
 choice, with larger profile-defined buffers available for LDAC and SBC-XQ.
 It also persists the real monitor output selected while following the system
 default, so a disconnected Bluetooth headset cannot stay saved as the preferred
-output and cause silence on the next restart.
+output and cause silence on the next restart. Follow-up 4.1.2 profile tuning
+keeps XM4 AAC at a lower safe 280 ms floor and caps LDAC/SBC-XQ at 300 ms so
+Bluetooth buffering stays below PipeWire's common 16-buffer link budget instead
+of trading crackle for mini dropouts. Auto-device repair is also scoped to input
+and monitor-output routes so Bluetooth reconnects or profile changes do not
+restart unrelated effects and channel paths.
 
 Highlights:
 
@@ -68,6 +73,11 @@ Highlights:
 - If an old effect-chain helper exits after restart, WaveLinux now repairs the
   stale route instead of leaving app routing stuck on a missing `wavelinux-mic`
   source.
+- Bluetooth profile floors now target the lowest stable profile-defined buffer
+  range observed locally, rather than falling back below AAC or pushing latency
+  high enough to exhaust PipeWire buffers.
+- Auto hardware repair now updates only real device routes, keeping effect
+  chains and app/channel routes alive during output reconnects.
 - Channel Stream/Monitor meters now follow the effective channel-send and
   destination mix/master level, so source strip VUs and mix VUs agree.
 - The effects microphone export is named `wavelinux-mic` / `WaveLinux-mic` so
