@@ -15,13 +15,12 @@ use wavelinux_model::{
     MixerConfig, MixerSettings, OptimizationMode, PluginHint, RuntimeGraph, SAMPLE_RATE_HZ,
 };
 
-pub const INPUT_ROUTE_REVISION: &str = "2";
-pub const EFFECT_ROUTE_REVISION: &str = "1";
+pub const INPUT_ROUTE_REVISION: &str = "3";
+pub const EFFECT_ROUTE_REVISION: &str = "2";
 pub const EFFECT_CONFIG_REVISION: &str = "2";
-pub const CHANNEL_MIX_ROUTE_REVISION: &str = "1";
-pub const MIX_MONITOR_ROUTE_REVISION: &str = "1";
-// Emergency defaults for isolated route helpers. Normal graph planning is
-// profile-sourced through route_settings_for_config().
+pub const CHANNEL_MIX_ROUTE_REVISION: &str = "2";
+pub const MIX_MONITOR_ROUTE_REVISION: &str = "2";
+// Fallback latencies for direct route helpers; profiles drive normal graph plans.
 pub const STABLE_LOOPBACK_LATENCY_MSEC: u16 = 80;
 pub const LOW_LATENCY_LOOPBACK_MSEC: u16 = 60;
 pub const BLUETOOTH_MONITOR_LOOPBACK_MSEC: u16 = 240;
@@ -903,6 +902,7 @@ pub fn plan_route_channel_to_mix(
             format!("source={source_name}"),
             format!("sink={}", mix.virtual_sink_name),
             latency_arg(latency_msec),
+            "adjust_time=0".into(),
             "channels=2".into(),
             "channel_map=front-left,front-right".into(),
             format!(
@@ -965,6 +965,7 @@ pub fn plan_route_channel_to_effect(
             format!("source={raw_source}"),
             format!("sink={}", effect_chain_input_name(channel)),
             latency_arg(latency_msec),
+            "adjust_time=0".into(),
             "channels=2".into(),
             "channel_map=front-left,front-right".into(),
             format!(
@@ -998,6 +999,7 @@ pub fn plan_route_input_to_channel(
             format!("source={source_name}"),
             format!("sink={}", channel.virtual_sink_name),
             latency_arg(latency_msec),
+            "adjust_time=0".into(),
             format!("channels={channels}"),
             format!("channel_map={channel_map}"),
             "remix=yes".into(),
@@ -1168,6 +1170,7 @@ pub fn plan_route_mix_to_output(
             format!("source={}.monitor", mix.virtual_sink_name),
             format!("sink={sink_name}"),
             latency_arg(latency_msec),
+            "adjust_time=0".into(),
             "channels=2".into(),
             "channel_map=front-left,front-right".into(),
             format!(
@@ -3785,6 +3788,7 @@ mod tests {
         assert!(spec.args.contains(&"sink=wavelinux_channel_mic".into()));
         assert!(spec.args.contains(&"channels=1".into()));
         assert!(spec.args.contains(&"channel_map=mono".into()));
+        assert!(spec.args.contains(&"adjust_time=0".into()));
         assert!(spec.args.contains(&"remix=yes".into()));
         assert!(spec
             .args
@@ -3793,7 +3797,7 @@ mod tests {
         assert!(spec
             .args
             .iter()
-            .any(|arg| arg.contains("wavelinux.route_revision=2-latency-60")));
+            .any(|arg| arg.contains("wavelinux.route_revision=3-latency-60")));
     }
 
     #[test]
@@ -3857,6 +3861,7 @@ mod tests {
         assert!(spec
             .args
             .contains(&"sink=wavelinux_fx_hardware_in_input".into()));
+        assert!(spec.args.contains(&"adjust_time=0".into()));
         assert!(spec
             .args
             .iter()
@@ -3864,7 +3869,7 @@ mod tests {
         assert!(spec
             .args
             .iter()
-            .any(|arg| arg.contains("wavelinux.route_revision=1-latency-60")));
+            .any(|arg| arg.contains("wavelinux.route_revision=2-latency-60")));
     }
 
     #[test]
@@ -3921,10 +3926,11 @@ mod tests {
             .unwrap();
 
         assert!(command.args.contains(&"latency_msec=240".into()));
+        assert!(command.args.contains(&"adjust_time=0".into()));
         assert!(command
             .args
             .iter()
-            .any(|arg| arg.contains("wavelinux.route_revision=1-latency-240")));
+            .any(|arg| arg.contains("wavelinux.route_revision=2-latency-240")));
 
         settings.low_latency_mic_monitoring = false;
         settings.optimization_mode = OptimizationMode::Safe;

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Source this before launching WaveLinux. It only changes the environment for
-# the WaveLinux child process; it does not edit files, services, or user config.
+# Sanitize only the WaveLinux child-process environment.
 
 if [[ -z "${BASH_VERSION:-}" ]]; then
   echo "sanitize-runtime-env.sh requires bash" >&2

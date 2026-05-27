@@ -1,4 +1,4 @@
-# WaveLinux 4.1 Test Suites
+# WaveLinux Test Suites
 
 WaveLinux keeps all default tests dry-run and safe for CI. They must not create,
 move, or unload live PipeWire nodes unless a test is explicitly marked ignored.
@@ -20,7 +20,7 @@ WAVELINUX_RUN_LIVE_TESTS=1 bash scripts/test-all.sh
 
 - `wavelinux-model`: config migration and normalization, scene/backup
   serialization, app identity pin/merge/reset, wrapper app matching, device
-  policy, effect catalog ranges, and WaveLinux 3.1-style presets.
+  policy, effect catalog ranges, and legacy preset compatibility.
 - `wavelinux-pw`: PipeWire/PulseAudio command planning, managed module parsing,
   app stream identity enrichment, source-output and sink-input route hydration,
   effect-chain rendering, plugin detection, and cleanup planning.

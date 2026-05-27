@@ -1,11 +1,10 @@
-# WaveLinux 4.1
+# WaveLinux
 <!-- Keep this screenshot in the README as the permanent project preview. -->
 <img width="1895" height="1108" alt="image" src="https://github.com/user-attachments/assets/22b52de8-d97d-4664-9772-c1c358122144" />
 
-WaveLinux 4.1 is a Linux-first creator audio mixer built with Rust, Tauri,
-React, TypeScript, and PipeWire. It is a fresh application that carries the
-WaveLinux name forward while replacing the old Python implementation with a
-new native desktop stack.
+WaveLinux is a Linux-first creator audio mixer built with Rust, Tauri, React,
+TypeScript, and PipeWire. It is a native desktop app for software mixing,
+hardware-aware routing, and creator audio workflows.
 
 The goal is Wave Link-style software mixing for Linux: virtual source faders,
 separate Monitor and Stream mixes, app routing, microphone processing, scenes,
@@ -16,43 +15,9 @@ features, Stream Deck integration, proprietary marketplace effects, and
 hardware Clipguard behavior are intentionally out of scope for WaveLinux.
 Standard Linux audio hardware is the target.
 
-## WaveLinux 4.1 Release Notes
+## Highlights
 
-WaveLinux 4.1 is the background optimization and hardware profile release. It
-adds safe audio-only hardware profiles, Bluetooth headset protection, searchable
-profile assignment, lower-lag mixer controls, better metering, and release
-packaging updates without changing the mixer-first workflow.
-
-4.1.1 adds a focused XM4 stability profile update: the Sony WH-1000XM4 profile
-now keeps AAC as the preferred stable A2DP codec, adds safer codec-specific
-Bluetooth latency floors for AAC, SBC-XQ, and LDAC, and treats high-bitrate LDAC
-as something to avoid unless the link is excellent. It also publishes signed
-hardware profile assets with GitHub releases so profile fixes can land without
-waiting for a larger feature build.
-
-4.1.2 is a stability and profile-authority fix release. It removes the
-refresh-loop stalls caused by large `pactl` output, keeps faders and toggles
-responsive under drag spam, makes the hardware input VU visually swap from raw
-mic to post-FX `wavelinux-mic`, and lets active hardware profiles decide route
-latency floors before any generic fallback is used. It also reuses a current
-WaveLinux audio graph on normal restarts instead of rebuilding it, and raises
-the Realtek ALC3254 profile latency floor to reduce laptop speaker crackle
-during OBS, webcam, browser, and effects load. For Bluetooth headsets such as
-the Sony WH-1000XM4, it restores the preferred stable A2DP profile instead of
-leaving an already-A2DP LDAC session active when AAC is the safer profile
-choice, with larger profile-defined buffers available for LDAC and SBC-XQ.
-It also persists the real monitor output selected while following the system
-default, so a disconnected Bluetooth headset cannot stay saved as the preferred
-output and cause silence on the next restart. Follow-up 4.1.2 profile tuning
-keeps XM4 AAC at a lower safe 280 ms floor and caps LDAC/SBC-XQ at 300 ms so
-Bluetooth buffering stays below PipeWire's common 16-buffer link budget instead
-of trading crackle for mini dropouts. Auto-device repair is also scoped to input
-and monitor-output routes so Bluetooth reconnects or profile changes do not
-restart unrelated effects and channel paths.
-
-Highlights:
-
-- Hardware profiles are now individual JSON device files under `profiles/v1`
+- Hardware profiles are individual JSON device files under `profiles/v1`
   with schema docs, examples, local overrides, signed remote bundle support,
   install-time hardware prewarm, and an editable safe generic fallback profile.
 - Profiles stay audio-only and cannot execute commands, write host config, or
@@ -61,24 +26,24 @@ Highlights:
   refused as an optimization when they would destroy playback quality, and
   capture is routed to DJI, USB, internal, or other non-Bluetooth microphones
   when available.
-- The Settings page now contains Profiles and Health tabs, while the main mixer
+- The Settings page contains Profiles and Health tabs, while the main mixer
   navigation stays focused on mixing, routing, effects, scenes, and settings.
 - Profile and route selectors are searchable, anchored to their controls, and
   sized for readable hardware/profile names.
 - Mixer commands use optimistic UI updates and coalesced backend refreshes so
   faders, toggles, and low-latency settings no longer freeze the app while audio
   commands run.
-- Hardware input meters now show the real selected microphone before effects,
+- Hardware input meters show the real selected microphone before effects,
   then the microphone-only post-FX signal when effects are active.
-- If an old effect-chain helper exits after restart, WaveLinux now repairs the
+- If an effect-chain helper exits after restart, WaveLinux repairs the
   stale route instead of leaving app routing stuck on a missing `wavelinux-mic`
   source.
-- Bluetooth profile floors now target the lowest stable profile-defined buffer
+- Bluetooth profile floors target the lowest stable profile-defined buffer
   range observed locally, rather than falling back below AAC or pushing latency
   high enough to exhaust PipeWire buffers.
-- Auto hardware repair now updates only real device routes, keeping effect
+- Auto hardware repair updates only real device routes, keeping effect
   chains and app/channel routes alive during output reconnects.
-- Channel Stream/Monitor meters now follow the effective channel-send and
+- Channel Stream/Monitor meters follow the effective channel-send and
   destination mix/master level, so source strip VUs and mix VUs agree.
 - The effects microphone export is named `wavelinux-mic` / `WaveLinux-mic` so
   Discord, OBS, and browser capture menus are easier to understand.
@@ -86,17 +51,11 @@ Highlights:
   unmuted, while ignoring WaveLinux virtual/monitor sources.
 - Startup skips cleanup and repair when the existing graph already matches the
   current profiles, routes, and effect-chain revision.
-- The Realtek ALC3254 profile now uses more conservative profile-sourced
-  latency floors for stressed SOF/HDA laptop speaker paths.
-- Bluetooth A2DP protection now corrects codec/profile drift inside A2DP, so
-  XM4-style headsets can be moved from crackly LDAC to the preferred AAC profile
-  without falling back to HFP/HSP, while profile data provides separate safe
-  latency floors for AAC, LDAC, and SBC-XQ.
-- Common Bluetooth headset profiles now carry conservative A2DP latency floors
-  per codec, and the editable generic fallback profile uses a safer Bluetooth
-  floor for unknown devices.
-- Release, local-native, AUR, and profile asset scripts were updated for the
-  new profile system and 4.1 packaging.
+- Common Bluetooth headset profiles carry conservative A2DP latency floors per
+  codec, and the editable generic fallback profile uses a safer Bluetooth floor
+  for unknown devices.
+
+Release history lives in `RELEASE_NOTES.md`.
 
 ## Features
 
@@ -124,7 +83,7 @@ Highlights:
 
 ## Supported Platforms
 
-WaveLinux 4.1 targets PipeWire-based Linux desktops.
+WaveLinux targets PipeWire-based Linux desktops.
 
 Required host services and tools:
 
@@ -168,7 +127,7 @@ yarn install:local
 The local installer places the AppImage and launcher here:
 
 ```bash
-~/.local/share/wavelinux/WaveLinux_4.1.2_amd64.AppImage
+~/.local/share/wavelinux/WaveLinux_*_amd64.AppImage
 ~/.local/bin/wavelinux
 ```
 
@@ -356,11 +315,12 @@ yarn desktop:release
 Generate updater metadata:
 
 ```bash
+VERSION="$(node -p "require('./package.json').version")"
 python3 scripts/build-updater-manifest.py \
-  --artifact target/release/bundle/appimage/WaveLinux_4.1.2_amd64.AppImage.tar.gz \
-  --version 4.1.2 \
+  --artifact "target/release/bundle/appimage/WaveLinux_${VERSION}_amd64.AppImage.tar.gz" \
+  --version "$VERSION" \
   --repo DuskyProjects/WaveLinux \
-  --tag v4.1.2 \
+  --tag "v$VERSION" \
   --output target/release/bundle/latest.json
 ```
 
@@ -391,4 +351,4 @@ Required GitHub Actions secrets:
 
 ## License
 
-WaveLinux 4.1 is licensed under GPL-3.0-only.
+WaveLinux is licensed under GPL-3.0-only.

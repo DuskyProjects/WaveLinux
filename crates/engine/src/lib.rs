@@ -70,8 +70,10 @@ const EFFECT_GRAPH_SYNC_DEBOUNCE: Duration = Duration::from_millis(180);
 const GRAPH_REPAIR_DEBOUNCE: Duration = Duration::from_millis(160);
 const AUDIO_COMMAND_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
 const CAPTURE_MOVE_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+const APP_STREAM_MOVE_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const CLEANUP_MODULE_PASSES: usize = 6;
 const CLEANUP_MODULE_SETTLE: Duration = Duration::from_millis(120);
+const BLUETOOTH_MONITOR_ROUTE_SETTLE: Duration = Duration::from_millis(650);
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -257,6 +259,7 @@ struct RuntimeCache {
     graph: RuntimeGraph,
     diagnostics: Vec<Diagnostic>,
     status: EngineStatus,
+    bluetooth_monitor_routes: BTreeMap<String, BluetoothMonitorRouteSignature>,
 }
 
 impl RuntimeCache {
@@ -264,6 +267,7 @@ impl RuntimeCache {
         Self {
             graph: RuntimeGraph::default(),
             diagnostics: Vec::new(),
+            bluetooth_monitor_routes: BTreeMap::new(),
             status: EngineStatus {
                 dry_run,
                 healthy: true,
@@ -277,6 +281,14 @@ impl RuntimeCache {
             },
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BluetoothMonitorRouteSignature {
+    output: String,
+    serial: Option<String>,
+    profile: Option<String>,
+    codec: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -843,6 +855,7 @@ pub struct WaveLinuxEngine {
     remote_profile_sync: Arc<Mutex<RemoteProfileSyncState>>,
     audio_commands: Mutex<()>,
     capture_move_failures: Mutex<BTreeMap<String, Instant>>,
+    app_stream_move_failures: Mutex<BTreeMap<String, Instant>>,
     deferred_effect_sync: Mutex<DeferredEffectSync>,
     deferred_graph_repair: Mutex<DeferredGraphRepair>,
     stop: AtomicBool,
@@ -890,6 +903,7 @@ impl WaveLinuxEngine {
             remote_profile_sync: Arc::new(Mutex::new(RemoteProfileSyncState::default())),
             audio_commands: Mutex::new(()),
             capture_move_failures: Mutex::new(BTreeMap::new()),
+            app_stream_move_failures: Mutex::new(BTreeMap::new()),
             deferred_effect_sync: Mutex::new(DeferredEffectSync::default()),
             deferred_graph_repair: Mutex::new(DeferredGraphRepair::default()),
             paths,
@@ -1097,7 +1111,7 @@ impl WaveLinuxEngine {
             }
         }
         record_refresh_phase(&mut refresh_phases, &mut phase_started, "bluetooth");
-        let auto_device_repair_needed = auto_device_repair_needed_for_profiled_devices(
+        let auto_device_route_repair_needed = auto_device_route_repair_needed_for_profiled_devices(
             &config,
             ProfiledDeviceRepairView {
                 inputs: &graph.inputs,
@@ -1111,11 +1125,43 @@ impl WaveLinuxEngine {
         );
         let active_effect_route_repair_needed =
             active_effect_routes_need_repair(&audio_config, &graph, &managed_modules);
+        let default_device_lock_repair_needed = default_device_lock_repair_needed(
+            &audio_config,
+            default_source.as_deref(),
+            default_sink.as_deref(),
+        );
+        let auto_device_repair_needed =
+            auto_device_route_repair_needed || default_device_lock_repair_needed;
+        let bluetooth_monitor_route_refresh_needed = audio_graph_running
+            && self
+                .read_runtime()
+                .map(|runtime| {
+                    bluetooth_monitor_route_refresh_needed(
+                        &runtime,
+                        &audio_config,
+                        &graph.outputs,
+                        &managed_modules,
+                    )
+                })
+                .unwrap_or(false);
         if audio_graph_running
             && !self.stop.load(Ordering::SeqCst)
-            && (auto_device_repair_needed || active_effect_route_repair_needed)
+            && (auto_device_repair_needed
+                || active_effect_route_repair_needed
+                || bluetooth_monitor_route_refresh_needed)
         {
-            let reason = if active_effect_route_repair_needed && !auto_device_repair_needed {
+            let default_lock_only_repair = default_device_lock_repair_needed
+                && !auto_device_route_repair_needed
+                && !active_effect_route_repair_needed
+                && !bluetooth_monitor_route_refresh_needed;
+            let reason = if default_lock_only_repair {
+                "default audio device lock changed; restoring app-facing default only"
+            } else if bluetooth_monitor_route_refresh_needed
+                && !auto_device_repair_needed
+                && !active_effect_route_repair_needed
+            {
+                "Bluetooth monitor route changed or duplicated; rebuilding final output route"
+            } else if active_effect_route_repair_needed && !auto_device_repair_needed {
                 "active effect route changed while graph was running; repairing audio routes"
             } else {
                 "auto hardware device changed while graph was running; repairing audio routes"
@@ -1123,20 +1169,34 @@ impl WaveLinuxEngine {
             self.log_engine_event("hotplug.device", reason);
             let _audio_commands = self.lock_audio_commands()?;
             if !self.stop.load(Ordering::SeqCst) {
-                let outputs = if auto_device_repair_needed && !active_effect_route_repair_needed {
-                    self.repair_auto_device_routes_unlocked()?
-                } else {
-                    self.repair_audio_graph_unlocked()?.outputs
-                };
+                let mut outputs = Vec::new();
+                if default_lock_only_repair {
+                    outputs.extend(self.apply_default_device_locks(&audio_config)?);
+                } else if bluetooth_monitor_route_refresh_needed {
+                    outputs.extend(self.repair_bluetooth_monitor_routes_unlocked(&audio_config)?);
+                }
+                if active_effect_route_repair_needed {
+                    outputs.extend(self.repair_audio_graph_unlocked()?.outputs);
+                } else if !default_lock_only_repair
+                    && (auto_device_route_repair_needed || default_device_lock_repair_needed)
+                {
+                    outputs.extend(self.repair_auto_device_routes_unlocked()?);
+                }
                 self.log_command_executions("hotplug.device", &outputs);
-                let (next_graph, timings) = self.snapshot_for_config_timed(Some(&config))?;
-                graph = next_graph;
-                snapshot_command_timings.extend(timings);
-                bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
-                default_source = self.pw.default_source().ok().flatten();
-                default_sink = self.pw.default_sink().ok().flatten();
-                active_sink = self.pw.active_playback_sink().ok().flatten();
-                managed_modules = self.pw.managed_modules().unwrap_or_default();
+                if default_lock_only_repair {
+                    default_source = self.pw.default_source().ok().flatten();
+                    default_sink = self.pw.default_sink().ok().flatten();
+                    active_sink = self.pw.active_playback_sink().ok().flatten();
+                } else {
+                    let (next_graph, timings) = self.snapshot_for_config_timed(Some(&config))?;
+                    graph = next_graph;
+                    snapshot_command_timings.extend(timings);
+                    bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
+                    default_source = self.pw.default_source().ok().flatten();
+                    default_sink = self.pw.default_sink().ok().flatten();
+                    active_sink = self.pw.active_playback_sink().ok().flatten();
+                    managed_modules = self.pw.managed_modules().unwrap_or_default();
+                }
                 audio_config = effective_config_with_profiled_devices(
                     &config,
                     &graph.inputs,
@@ -1203,6 +1263,8 @@ impl WaveLinuxEngine {
         let mut runtime = self.write_runtime()?;
         runtime.graph = graph;
         runtime.diagnostics = diagnostics;
+        runtime.bluetooth_monitor_routes =
+            bluetooth_monitor_route_signatures(&audio_config, &runtime.graph.outputs);
         runtime.status.healthy = healthy;
         runtime.status.audio_graph_running = audio_graph_running;
         runtime.status.last_refresh_unix = OffsetDateTime::now_utc().unix_timestamp();
@@ -1493,6 +1555,104 @@ impl WaveLinuxEngine {
                 outputs.iter().filter(|output| output.skipped).count(),
                 started.elapsed().as_millis(),
             ),
+        );
+        Ok(outputs)
+    }
+
+    fn repair_bluetooth_monitor_routes_unlocked(
+        &self,
+        config: &MixerConfig,
+    ) -> Result<Vec<CommandExecution>, EngineError> {
+        let plan = plan_ensure_graph(config);
+        let monitor_commands = plan
+            .commands
+            .into_iter()
+            .filter(command_is_mix_monitor_route)
+            .filter(command_targets_bluetooth_sink)
+            .collect::<Vec<_>>();
+        if monitor_commands.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let desired_routes = monitor_commands
+            .iter()
+            .filter_map(|command| {
+                let properties = command_arg_value(&command.args, "source_output_properties=")?;
+                let mix_id = property_value_from_arg(properties, "wavelinux.mix_id=")?;
+                let sink = command_arg_value(&command.args, "sink=")?;
+                Some((mix_id.to_owned(), sink.to_owned()))
+            })
+            .collect::<Vec<_>>();
+
+        let mut outputs = self.cleanup_modules(|module| {
+            module.role.as_deref() == Some("mix_monitor")
+                && desired_routes.iter().any(|(mix_id, sink)| {
+                    module.mix_id.as_deref() == Some(mix_id.as_str())
+                        && module
+                            .sink_name
+                            .as_deref()
+                            .is_some_and(|actual| audio_endpoint_names_match(actual, sink))
+                })
+        })?;
+
+        if !outputs.is_empty() {
+            thread::sleep(CLEANUP_MODULE_SETTLE);
+        }
+
+        let mut graph = self
+            .pw
+            .snapshot_for_config_with_effect_availability(None, Vec::new());
+        if monitor_commands
+            .iter()
+            .any(|command| !monitor_route_endpoints_available(command, &graph))
+        {
+            for _ in 0..6 {
+                thread::sleep(Duration::from_millis(200));
+                graph = self
+                    .pw
+                    .snapshot_for_config_with_effect_availability(None, Vec::new());
+                if monitor_commands
+                    .iter()
+                    .all(|command| monitor_route_endpoints_available(command, &graph))
+                {
+                    break;
+                }
+            }
+        }
+
+        if monitor_commands
+            .iter()
+            .any(|command| monitor_route_endpoints_available(command, &graph))
+        {
+            self.log_engine_event(
+                "hotplug.output",
+                "Bluetooth monitor route reset; waiting for A2DP transport before reconnecting",
+            );
+            thread::sleep(BLUETOOTH_MONITOR_ROUTE_SETTLE);
+            graph = self
+                .pw
+                .snapshot_for_config_with_effect_availability(None, Vec::new());
+        }
+
+        let commands = monitor_commands
+            .into_iter()
+            .filter_map(|command| {
+                if monitor_route_endpoints_available(&command, &graph) {
+                    Some(command)
+                } else {
+                    outputs.push(skipped_command_with_stderr(
+                        command,
+                        "Bluetooth monitor output is not visible; keeping route disconnected",
+                    ));
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        outputs.extend(
+            self.pw
+                .execute_all(commands)
+                .into_iter()
+                .map(command_execution),
         );
         Ok(outputs)
     }
@@ -2327,7 +2487,7 @@ impl WaveLinuxEngine {
             active_sink.as_deref(),
         );
 
-        if auto_device_repair_needed_for_profiled_devices(
+        if auto_device_route_repair_needed_for_profiled_devices(
             &config,
             ProfiledDeviceRepairView {
                 inputs: &graph.inputs,
@@ -2441,6 +2601,9 @@ impl WaveLinuxEngine {
                 if stream.routed_channel_id.as_deref() == Some(channel.id.as_str()) {
                     return None;
                 }
+                if self.app_stream_move_recently_failed(&stream.id) {
+                    return None;
+                }
                 Some((stream.id.clone(), channel.clone()))
             })
             .collect::<Vec<_>>();
@@ -2473,6 +2636,7 @@ impl WaveLinuxEngine {
                 );
                 continue;
             }
+            self.remember_app_stream_move_result(&stream_id, &output)?;
             self.log_command_executions("route.streams", &[output]);
         }
         Ok(true)
@@ -2559,11 +2723,12 @@ impl WaveLinuxEngine {
                 commands.len()
             ),
         );
-        let outputs = self
-            .pw
-            .execute_all(commands)
+        let outputs = commands
             .into_iter()
-            .map(command_execution)
+            .map(|command| {
+                let result = self.pw.execute(command.clone());
+                command_execution_with_spec(command, result)
+            })
             .collect::<Vec<_>>();
         self.remember_failed_capture_moves(&outputs)?;
         Ok(outputs)
@@ -2608,6 +2773,32 @@ impl WaveLinuxEngine {
         Ok(())
     }
 
+    fn app_stream_move_recently_failed(&self, stream_id: &str) -> bool {
+        self.app_stream_move_failures
+            .lock()
+            .ok()
+            .and_then(|failures| failures.get(stream_id).copied())
+            .is_some_and(|failed_at| failed_at.elapsed() < APP_STREAM_MOVE_FAILURE_BACKOFF)
+    }
+
+    fn remember_app_stream_move_result(
+        &self,
+        stream_id: &str,
+        output: &CommandExecution,
+    ) -> Result<(), EngineError> {
+        let mut failures = self
+            .app_stream_move_failures
+            .lock()
+            .map_err(|_| EngineError::LockPoisoned)?;
+        failures.retain(|_, failed_at| failed_at.elapsed() < APP_STREAM_MOVE_FAILURE_BACKOFF);
+        if output.error.is_some() {
+            failures.insert(stream_id.to_string(), Instant::now());
+        } else {
+            failures.remove(stream_id);
+        }
+        Ok(())
+    }
+
     fn move_unready_routed_streams_to_default(
         &self,
         config: &MixerConfig,
@@ -2646,6 +2837,7 @@ impl WaveLinuxEngine {
                 );
                 continue;
             }
+            self.remember_app_stream_move_result(&stream_id, &output)?;
             self.log_command_executions("route.streams", &[output]);
         }
         Ok(true)
@@ -3354,8 +3546,29 @@ impl WaveLinuxEngine {
                 }
             }
         }
-        let managed_modules = self.pw.managed_modules().unwrap_or_default();
-        let source_outputs = self.pw.source_output_routes().unwrap_or_default();
+        let mut managed_modules = self.pw.managed_modules().unwrap_or_default();
+        let mut source_outputs = self.pw.source_output_routes().unwrap_or_default();
+        if monitor_commands.iter().any(|command| {
+            command_targets_bluetooth_sink(command)
+                && monitor_route_endpoints_available(command, &existing_graph)
+                && !repair_command_is_satisfied(
+                    command,
+                    &existing_graph,
+                    &source_outputs,
+                    &managed_modules,
+                )
+        }) {
+            self.log_engine_event(
+                "hotplug.output",
+                "Bluetooth monitor output is visible; waiting for A2DP transport to settle",
+            );
+            thread::sleep(BLUETOOTH_MONITOR_ROUTE_SETTLE);
+            existing_graph = self
+                .pw
+                .snapshot_for_config_with_effect_availability(None, Vec::new());
+            managed_modules = self.pw.managed_modules().unwrap_or_default();
+            source_outputs = self.pw.source_output_routes().unwrap_or_default();
+        }
         let mut skipped = Vec::new();
         let commands = monitor_commands
             .into_iter()
@@ -4680,7 +4893,7 @@ struct ProfiledDeviceRepairView<'a> {
     managed_modules: &'a [ManagedModule],
 }
 
-fn auto_device_repair_needed_for_profiled_devices(
+fn auto_device_route_repair_needed_for_profiled_devices(
     config: &MixerConfig,
     view: ProfiledDeviceRepairView<'_>,
 ) -> bool {
@@ -4706,14 +4919,74 @@ fn auto_device_repair_needed_for_profiled_devices(
     let auto_input =
         preferred_hardware_input(view.inputs, view.default_source, view.bluetooth_cards);
     let auto_output = preferred_monitor_output(view.outputs, view.default_sink, view.active_sink);
-    auto_device_repair_needed(
+    auto_device_route_repair_needed(
         &effective_config,
         auto_input.as_deref(),
         auto_output.as_deref(),
-        view.default_source,
-        view.default_sink,
         view.managed_modules,
     )
+}
+
+fn bluetooth_monitor_route_signatures(
+    config: &MixerConfig,
+    outputs: &[DeviceInfo],
+) -> BTreeMap<String, BluetoothMonitorRouteSignature> {
+    config
+        .mixes
+        .iter()
+        .filter_map(|mix| {
+            let output = mix
+                .monitor_output
+                .as_deref()
+                .filter(|output| output.starts_with("bluez_output."))?;
+            let device = outputs
+                .iter()
+                .find(|device| output_device_can_route_sink(device, output))?;
+            Some((
+                mix.id.clone(),
+                BluetoothMonitorRouteSignature {
+                    output: device.id.clone(),
+                    serial: device
+                        .pipewire_properties
+                        .get("object.serial")
+                        .cloned()
+                        .or_else(|| device.pipewire_properties.get("object.id").cloned()),
+                    profile: device.active_profile.clone(),
+                    codec: device.active_codec.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn bluetooth_monitor_route_refresh_needed(
+    runtime: &RuntimeCache,
+    config: &MixerConfig,
+    outputs: &[DeviceInfo],
+    managed_modules: &[ManagedModule],
+) -> bool {
+    let signatures = bluetooth_monitor_route_signatures(config, outputs);
+    signatures.iter().any(|(mix_id, signature)| {
+        let route_count = managed_modules
+            .iter()
+            .filter(|module| {
+                module.role.as_deref() == Some("mix_monitor")
+                    && module.mix_id.as_deref() == Some(mix_id.as_str())
+                    && module
+                        .sink_name
+                        .as_deref()
+                        .is_some_and(|sink| audio_endpoint_names_match(sink, &signature.output))
+            })
+            .count();
+        if route_count != 1 {
+            return true;
+        }
+
+        runtime
+            .bluetooth_monitor_routes
+            .get(mix_id)
+            .is_some_and(|previous| previous != signature)
+    })
 }
 
 fn auto_device_module_is_stale_for_config(module: &ManagedModule, config: &MixerConfig) -> bool {
@@ -4727,17 +5000,22 @@ fn module_is_auto_device_route(module: &ManagedModule) -> bool {
     )
 }
 
-fn auto_device_repair_needed(
+fn auto_device_route_repair_needed(
     config: &MixerConfig,
     auto_input: Option<&str>,
     auto_output: Option<&str>,
-    default_source: Option<&str>,
-    default_sink: Option<&str>,
     managed_modules: &[ManagedModule],
 ) -> bool {
     auto_input_repair_needed(config, auto_input, managed_modules)
         || auto_output_repair_needed(config, auto_output, managed_modules)
-        || default_input_lock_repair_needed(config, default_source)
+}
+
+fn default_device_lock_repair_needed(
+    config: &MixerConfig,
+    default_source: Option<&str>,
+    default_sink: Option<&str>,
+) -> bool {
+    default_input_lock_repair_needed(config, default_source)
         || default_output_lock_repair_needed(config, default_sink)
 }
 
@@ -7339,6 +7617,18 @@ mod tests {
     }
 
     #[test]
+    fn default_device_lock_drift_is_separate_from_route_repair() {
+        let mut config = MixerConfig::default();
+        config.settings.lock_default_input = true;
+        let route_repair = auto_device_route_repair_needed(&config, None, None, &[]);
+        let lock_repair =
+            default_device_lock_repair_needed(&config, Some("alsa_input.usb_mic"), None);
+
+        assert!(!route_repair);
+        assert!(lock_repair);
+    }
+
+    #[test]
     fn default_input_lock_moves_live_capture_streams_to_wavelinux_mic() {
         let mut config = MixerConfig::default();
         let route = SourceOutputRoute {
@@ -7548,7 +7838,7 @@ mod tests {
             source_name: Some("wavelinux_mix_monitor.monitor".into()),
             sink_name: Some("alsa_output.realtek".into()),
         };
-        assert!(auto_device_repair_needed_for_profiled_devices(
+        assert!(auto_device_route_repair_needed_for_profiled_devices(
             &config,
             ProfiledDeviceRepairView {
                 inputs: &inputs,
@@ -7595,7 +7885,7 @@ mod tests {
             source_name: Some("wavelinux_mix_monitor.monitor".into()),
             sink_name: Some("alsa_output.realtek".into()),
         };
-        assert!(!auto_device_repair_needed_for_profiled_devices(
+        assert!(!auto_device_route_repair_needed_for_profiled_devices(
             &config,
             ProfiledDeviceRepairView {
                 inputs: &inputs,
@@ -7650,6 +7940,113 @@ mod tests {
     }
 
     #[test]
+    fn bluetooth_monitor_route_refreshes_when_output_identity_changes() {
+        let mut config = MixerConfig::default();
+        config
+            .set_mix_monitor_output("monitor", Some("bluez_output.sony".into()))
+            .unwrap();
+        let mut output = device("bluez_output.sony", "WH-1000XM4", false);
+        output
+            .pipewire_properties
+            .insert("object.serial".into(), "new-serial".into());
+        output.active_profile = Some("a2dp-sink".into());
+        output.active_codec = Some("aac".into());
+        let monitor_mix = config.mixes.iter().find(|mix| mix.id == "monitor").unwrap();
+        let route = ManagedModule {
+            module_id: "1".into(),
+            role: Some("mix_monitor".into()),
+            channel_id: None,
+            mix_id: Some("monitor".into()),
+            route_revision: Some(mix_monitor_route_revision_for_sink(
+                &config.settings,
+                monitor_mix,
+                "bluez_output.sony",
+            )),
+            node_name: None,
+            source_name: Some("wavelinux_mix_monitor.monitor".into()),
+            sink_name: Some("bluez_output.sony".into()),
+        };
+        let runtime = RuntimeCache {
+            bluetooth_monitor_routes: BTreeMap::from([(
+                "monitor".into(),
+                BluetoothMonitorRouteSignature {
+                    output: "bluez_output.sony".into(),
+                    serial: Some("old-serial".into()),
+                    profile: Some("a2dp-sink".into()),
+                    codec: Some("aac".into()),
+                },
+            )]),
+            ..RuntimeCache::new(false)
+        };
+
+        assert!(bluetooth_monitor_route_refresh_needed(
+            &runtime,
+            &config,
+            &[output.clone()],
+            std::slice::from_ref(&route),
+        ));
+
+        let runtime = RuntimeCache {
+            bluetooth_monitor_routes: bluetooth_monitor_route_signatures(
+                &config,
+                std::slice::from_ref(&output),
+            ),
+            ..RuntimeCache::new(false)
+        };
+        assert!(!bluetooth_monitor_route_refresh_needed(
+            &runtime,
+            &config,
+            &[output],
+            &[route],
+        ));
+    }
+
+    #[test]
+    fn bluetooth_monitor_route_refreshes_duplicate_final_routes() {
+        let mut config = MixerConfig::default();
+        config
+            .set_mix_monitor_output("monitor", Some("bluez_output.sony".into()))
+            .unwrap();
+        let mut output = device("bluez_output.sony", "WH-1000XM4", false);
+        output
+            .pipewire_properties
+            .insert("object.serial".into(), "serial".into());
+        let runtime = RuntimeCache {
+            bluetooth_monitor_routes: bluetooth_monitor_route_signatures(
+                &config,
+                std::slice::from_ref(&output),
+            ),
+            ..RuntimeCache::new(false)
+        };
+        let monitor_mix = config.mixes.iter().find(|mix| mix.id == "monitor").unwrap();
+        let route = ManagedModule {
+            module_id: "1".into(),
+            role: Some("mix_monitor".into()),
+            channel_id: None,
+            mix_id: Some("monitor".into()),
+            route_revision: Some(mix_monitor_route_revision_for_sink(
+                &config.settings,
+                monitor_mix,
+                "bluez_output.sony",
+            )),
+            node_name: None,
+            source_name: Some("wavelinux_mix_monitor.monitor".into()),
+            sink_name: Some("bluez_output.sony".into()),
+        };
+        let duplicate = ManagedModule {
+            module_id: "2".into(),
+            ..route.clone()
+        };
+
+        assert!(bluetooth_monitor_route_refresh_needed(
+            &runtime,
+            &config,
+            &[output],
+            &[route, duplicate],
+        ));
+    }
+
+    #[test]
     fn auto_device_repair_ignores_non_device_route_staleness() {
         let config = MixerConfig::default();
         let outputs = vec![device("alsa_output.speaker", "Built-in Speaker", true)];
@@ -7692,7 +8089,7 @@ mod tests {
             sink_name: Some("wavelinux_mix_monitor".into()),
         };
 
-        assert!(!auto_device_repair_needed_for_profiled_devices(
+        assert!(!auto_device_route_repair_needed_for_profiled_devices(
             &config,
             ProfiledDeviceRepairView {
                 inputs: &[],
@@ -7796,7 +8193,7 @@ mod tests {
             Some("alsa_input.dead")
         );
         assert!(effective.device_policy.active_input_fallback);
-        assert!(auto_device_repair_needed_for_profiled_devices(
+        assert!(auto_device_route_repair_needed_for_profiled_devices(
             &config,
             ProfiledDeviceRepairView {
                 inputs: &inputs,
@@ -7873,7 +8270,7 @@ mod tests {
             Some("bluez_output.dead")
         );
         assert!(effective.device_policy.active_output_fallback);
-        assert!(auto_device_repair_needed_for_profiled_devices(
+        assert!(auto_device_route_repair_needed_for_profiled_devices(
             &config,
             ProfiledDeviceRepairView {
                 inputs: &[],
@@ -8201,6 +8598,84 @@ mod tests {
             &cards,
         )
         .is_empty());
+    }
+
+    #[test]
+    fn failed_capture_moves_are_backed_off_by_source_output_id() {
+        let engine = test_engine();
+        let failed_move = CommandExecution {
+            command: plan_move_capture_stream_to_source("77", "wavelinux_mix_stream_source"),
+            stdout: String::new(),
+            stderr: String::new(),
+            skipped: false,
+            error: Some("Failure: Invalid argument".into()),
+        };
+
+        engine
+            .remember_failed_capture_moves(&[failed_move])
+            .unwrap();
+        assert!(engine.capture_move_recently_failed("77"));
+
+        let route = SourceOutputRoute {
+            id: "77".into(),
+            module_id: None,
+            role: None,
+            channel_id: None,
+            mix_id: None,
+            source_id: Some("55".into()),
+            source_name: Some("alsa_input.usb_mic".into()),
+            target_object: None,
+            application_name: Some("Browser capture".into()),
+            node_name: Some("browser-capture".into()),
+            media_name: Some("CaptureStream".into()),
+        };
+
+        let outputs = engine
+            .execute_capture_stream_moves_unlocked_with_devices(
+                &MixerConfig::default(),
+                &[route],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn failed_app_stream_moves_are_backed_off_by_stream_id() {
+        let engine = test_engine();
+        let failed_move = CommandExecution {
+            command: plan_move_app_stream(
+                "320089",
+                engine
+                    .read_config()
+                    .unwrap()
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == "game")
+                    .unwrap(),
+            ),
+            stdout: String::new(),
+            stderr: String::new(),
+            skipped: false,
+            error: Some("Failure: Invalid argument".into()),
+        };
+
+        engine
+            .remember_app_stream_move_result("320089", &failed_move)
+            .unwrap();
+
+        assert!(engine.app_stream_move_recently_failed("320089"));
+
+        let ok_move = CommandExecution {
+            error: None,
+            ..failed_move
+        };
+        engine
+            .remember_app_stream_move_result("320089", &ok_move)
+            .unwrap();
+        assert!(!engine.app_stream_move_recently_failed("320089"));
     }
 
     #[test]

@@ -197,8 +197,7 @@ export default function App() {
     }, delayMs);
   }, [applySnapshot]);
 
-  // UI actions should not wait on a full state refresh. This helper invokes the
-  // backend command, then coalesces a lightweight refresh in the background.
+  // Run quick backend actions while coalescing the follow-up refresh.
   const run = useCallback(
     async <T,>(command: string, args?: Record<string, unknown>, message?: string): Promise<T> => {
       try {
@@ -2318,7 +2317,7 @@ function EffectsView({
           [channelId]: channel.effects,
         }));
         if (message) {
-          // Keep this local to EffectsView so effect edits never wait on a full state refresh.
+          // Keep effect edits local so they do not block on global refresh.
           setEffectError(null);
         }
       })
