@@ -1,0 +1,42 @@
+{
+  "id": "avermedia.live-gamer-portable-2-plus",
+  "name": "AVerMedia Live Gamer Portable 2 Plus Audio",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["live gamer portable"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["avermedia", "audio"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": false,
+    "duplex": false,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 60,
+    "low_latency_msec": 40
+  },
+  "routing_policy": {
+    "input_priority": 44,
+    "allow_auto_select_input": false,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Capture-card audio is content audio and may be frame-buffer delayed; do not auto-select it as the primary microphone."
+  ],
+  "source_notes": [
+    "Seeded from common AVerMedia USB capture-card audio behavior."
+  ],
+  "maintainer": "WaveLinux"
+}

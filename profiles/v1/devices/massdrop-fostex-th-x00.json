@@ -1,0 +1,42 @@
+{
+  "id": "massdrop-fostex.th-x00",
+  "name": "Massdrop x Fostex TH-X00",
+  "revision": 1,
+  "matches": [
+    {
+      "description_contains": ["th-x00"]
+    },
+    {
+      "description_contains": ["massdrop", "fostex"]
+    }
+  ],
+  "capabilities": {
+    "input": false,
+    "output": true,
+    "duplex": false
+  },
+  "latency_policy": {
+    "stable_msec": 18,
+    "low_latency_msec": 10
+  },
+  "routing_policy": {
+    "input_priority": 0,
+    "output_priority": 55,
+    "allow_auto_select_input": false,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {
+    "preferred_a2dp_codecs": [],
+    "avoid_codecs": []
+  },
+  "confidence": "medium",
+  "quirks": [
+    "Passive analog headphone; only applies when a user labels or attaches a real output path to this headphone."
+  ],
+  "source_notes": [
+    "TH-X00 has no USB/Bluetooth identity and should not auto-select generic analog outputs without an explicit alias or manual attachment."
+  ],
+  "maintainer": "WaveLinux"
+}

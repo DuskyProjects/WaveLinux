@@ -1,0 +1,62 @@
+{
+  "id": "sony.wh-1000xm4",
+  "name": "Sony WH-1000XM4",
+  "revision": 8,
+  "matches": [
+    {
+      "bus": "bluetooth",
+      "node_name_contains": ["bluez"],
+      "description_contains": ["wh-1000xm4"]
+    },
+    {
+      "bus": "bluetooth",
+      "bluetooth_modalias_contains": ["054c", "0d58"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "bluetooth_a2dp": true,
+    "bluetooth_hfp": true,
+    "duplex_a2dp": false,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 160,
+    "bluetooth_floor_msec": 240
+  },
+  "routing_policy": {
+    "output_priority": 70,
+    "allow_auto_select_input": false,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {
+    "preferred_a2dp_codecs": ["aac", "sbc_xq", "sbc", "ldac"],
+    "avoid_codecs": ["ldac_hq", "ldac_990", "hsp", "hfp", "cvsd", "msbc"],
+    "latency_floor_msec": {
+      "aac": 280,
+      "ldac": 300,
+      "sbc_xq": 300,
+      "sbc": 240
+    },
+    "ldac_quality": "sq"
+  },
+  "confidence": "high",
+  "quirks": [
+    "Bluetooth microphone capture forces headset mode on normal XM4 Bluetooth stacks and lowers playback quality.",
+    "For latency and stability, prefer AAC or SBC-XQ A2DP before LDAC. LDAC should be limited to stable/standard quality and high-bitrate LDAC should be avoided unless link quality is excellent.",
+    "If playback crackles on LDAC auto, switch the card profile to AAC first; do not drop below AAC automatically unless AAC is unavailable.",
+    "When multiple A2DP profiles are exposed, WaveLinux should restore the preferred stable A2DP profile instead of leaving the headset on LDAC merely because LDAC is also A2DP.",
+    "Codec-specific latency floors keep AAC as the preferred automatic profile while giving AAC, SBC-XQ, SBC, and LDAC enough Bluetooth buffer to avoid clicking, skips, and BlueZ transport churn on PipeWire stacks that expose each codec as a separate A2DP card profile.",
+    "Local testing showed AAC at 180 ms could still crackle or drop out under desktop load, while 320 ms could exhaust PipeWire's default 16-buffer link budget on 48 kHz/1024-quantum graphs. Revision 8 keeps AAC buffered at 280 ms and caps higher-bitrate codec floors at 300 ms to avoid mini dropouts without falling below AAC."
+  ],
+  "source_notes": [
+    "Sony documents WH-1000XM4 A2DP playback codecs as SBC, AAC, and LDAC, with HFP/HSP as separate headset profiles.",
+    "WirePlumber documents A2DP, BAP, HFP, and HSP roles, and enables all available A2DP codecs by default.",
+    "Linux Bluetooth headset discussions consistently describe HFP/HSP as the compatibility path for headset microphones, not full-quality music playback."
+  ],
+  "maintainer": "WaveLinux"
+}

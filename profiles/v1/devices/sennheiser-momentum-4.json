@@ -1,0 +1,55 @@
+{
+  "id": "sennheiser.momentum-4",
+  "name": "Sennheiser Momentum 4 Wireless",
+  "revision": 4,
+  "matches": [
+    {
+      "bus": "bluetooth",
+      "description_contains": ["momentum 4"]
+    },
+    {
+      "bus": "bluetooth",
+      "description_contains": ["sennheiser", "momentum"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "bluetooth_a2dp": true,
+    "bluetooth_hfp": true,
+    "duplex_a2dp": false,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 160,
+    "bluetooth_floor_msec": 240
+  },
+  "routing_policy": {
+    "output_priority": 66,
+    "allow_auto_select_input": false,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {
+    "preferred_a2dp_codecs": ["aptx_adaptive", "aptx_hd", "aac", "sbc_xq", "sbc"],
+    "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"],
+    "latency_floor_msec": {
+      "aptx_adaptive": 260,
+      "aptx_hd": 300,
+      "aac": 280,
+      "sbc_xq": 300,
+      "sbc": 240
+    }
+  },
+  "confidence": "medium",
+  "quirks": [
+    "Headset microphone use should remain call-mode fallback because normal Bluetooth A2DP is playback-only.",
+    "Advanced A2DP codecs get explicit profile latency floors so quality codecs are buffered instead of being replaced by headset mode, while staying below PipeWire's default 16-buffer link ceiling."
+  ],
+  "source_notes": [
+    "Seeded from common Momentum 4 codec support discussions and Bluetooth A2DP/HFP profile limits."
+  ],
+  "maintainer": "WaveLinux"
+}

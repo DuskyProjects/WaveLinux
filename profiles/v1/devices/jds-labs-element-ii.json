@@ -1,0 +1,48 @@
+{
+  "id": "jds-labs.element-ii",
+  "name": "JDS Labs Element II",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["jds", "element ii"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["jds labs", "element"]
+    },
+    {
+      "bus": "usb",
+      "node_name_contains": ["element_ii"]
+    }
+  ],
+  "capabilities": {
+    "input": false,
+    "output": true,
+    "duplex": false,
+    "usb_audio_class": true,
+    "sample_rates_hz": [44100, 48000, 88200, 96000, 176400, 192000, 384000]
+  },
+  "latency_policy": {
+    "stable_msec": 18,
+    "low_latency_msec": 8
+  },
+  "routing_policy": {
+    "output_priority": 78,
+    "allow_auto_select_input": false,
+    "allow_auto_select_output": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "high",
+  "quirks": [
+    "USB endpoint is playback-only for the computer; RCA analog input is not a capture source.",
+    "384 kHz PCM is capability metadata, not an automatic desktop target. Keep normal app graphs at 48 kHz unless the user intentionally runs a high-rate listening chain.",
+    "The low output impedance and high headphone power make it suitable for low-impedance headphones such as TH-X00, but analog gain remains a physical control."
+  ],
+  "source_notes": [
+    "JDS Labs documents Element II as an XMOS XU208 USB Audio Class 2 DAC supporting 16/24/32-bit PCM at 44.1, 48, 88.2, 96, 176.4, 192, and 384 kHz on Linux without extra drivers.",
+    "JDS Labs documents headphone output plus RCA preamp output, with RCA analog input bypassing the USB DAC path."
+  ],
+  "maintainer": "WaveLinux"
+}

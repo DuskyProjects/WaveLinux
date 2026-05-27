@@ -1,0 +1,51 @@
+{
+  "id": "dji.wireless-mic-rx",
+  "name": "DJI Wireless Mic Receiver (USB Audio Mode)",
+  "revision": 3,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["wireless microphone rx"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["dji", "wireless mic"]
+    },
+    {
+      "bus": "usb",
+      "node_name_contains": ["wireless_mic"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": false,
+    "duplex": false,
+    "usb_audio_class": true,
+    "channels": 2,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 25,
+    "low_latency_msec": 12
+  },
+  "routing_policy": {
+    "input_priority": 95,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "high",
+  "quirks": [
+    "Only applies when PipeWire or ALSA exposes an actual Wireless Microphone RX source.",
+    "Do not auto-select the receiver from USB VID/PID alone; the observed 2ca3:4011 descriptor is vendor-specific bulk transport, not a USB Audio Class microphone.",
+    "If a phone adapter or cable exposes the receiver as a standard source, treat it as the preferred non-Bluetooth microphone for keeping headphones on A2DP."
+  ],
+  "source_notes": [
+    "DJI support documents computer microphone use as Wireless Microphone RX.",
+    "DJI Mic documentation and reviews consistently describe 48 kHz digital audio capture for receiver-based computer/camera workflows.",
+    "Local lsusb descriptor for 2ca3:4011 reports class 255 vendor-specific with bulk endpoints, so WaveLinux requires an exposed audio source before treating it as capture."
+  ],
+  "maintainer": "WaveLinux"
+}

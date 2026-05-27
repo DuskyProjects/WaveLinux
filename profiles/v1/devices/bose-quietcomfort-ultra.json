@@ -1,0 +1,55 @@
+{
+  "id": "bose.quietcomfort-ultra",
+  "name": "Bose QuietComfort Ultra Headphones",
+  "revision": 4,
+  "matches": [
+    {
+      "bus": "bluetooth",
+      "description_contains": ["quietcomfort ultra"]
+    },
+    {
+      "bus": "bluetooth",
+      "description_contains": ["bose", "qc ultra"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "bluetooth_a2dp": true,
+    "bluetooth_hfp": true,
+    "duplex_a2dp": false,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 160,
+    "bluetooth_floor_msec": 240
+  },
+  "routing_policy": {
+    "output_priority": 66,
+    "allow_auto_select_input": false,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {
+    "preferred_a2dp_codecs": ["aptx_adaptive", "aac", "sbc_xq", "sbc"],
+    "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"],
+    "latency_floor_msec": {
+      "aptx_adaptive": 260,
+      "aac": 280,
+      "sbc_xq": 300,
+      "sbc": 240
+    }
+  },
+  "confidence": "medium",
+  "quirks": [
+    "Only use advanced codecs when both PipeWire and the headset report support; otherwise stay on stable AAC/SBC A2DP.",
+    "Do not use HFP/HSP as a music playback optimization.",
+    "Codec-specific latency floors keep A2DP quality intact while giving AAC, aptX Adaptive, and SBC-XQ enough buffer without exhausting PipeWire's default link buffer pool."
+  ],
+  "source_notes": [
+    "Bose QuietComfort Ultra materials discuss Bluetooth multipoint and Qualcomm aptX Adaptive support on compatible sources."
+  ],
+  "maintainer": "WaveLinux"
+}

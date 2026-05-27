@@ -1,0 +1,43 @@
+{
+  "id": "elgato.wave-xlr",
+  "name": "Elgato Wave XLR",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["wave xlr"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["elgato", "xlr"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000, 96000]
+  },
+  "latency_policy": {
+    "stable_msec": 25,
+    "low_latency_msec": 12
+  },
+  "routing_policy": {
+    "input_priority": 87,
+    "output_priority": 25,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Treat headphone output as monitor-capable, not as an automatic main speaker replacement."
+  ],
+  "source_notes": [
+    "Seeded from Elgato Wave-family USB capture behavior and 48/96 kHz Wave device specifications."
+  ],
+  "maintainer": "WaveLinux"
+}

@@ -1,0 +1,48 @@
+{
+  "id": "nvidia.ad106m-hda-hdmi",
+  "name": "NVIDIA AD106M HDA HDMI/DisplayPort Audio",
+  "revision": 3,
+  "matches": [
+    {
+      "bus": "pci",
+      "vendor_id": "10de",
+      "product_id": "22bd"
+    },
+    {
+      "bus": "pci",
+      "description_contains": ["ad106m", "high definition audio"]
+    },
+    {
+      "node_name_contains": ["hdmi"],
+      "description_contains": ["nvidia"]
+    }
+  ],
+  "capabilities": {
+    "input": false,
+    "output": true,
+    "duplex": false,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 25
+  },
+  "routing_policy": {
+    "output_priority": 10,
+    "allow_auto_select_input": false,
+    "allow_auto_select_output": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "high",
+  "quirks": [
+    "HDMI and DisplayPort endpoints are sink-only and unavailable unless an active display exposes audio.",
+    "Do not treat this device as capture hardware or a low-latency monitoring target.",
+    "Exact channel count and sample-rate support come from display ELD/SAD data, so keep automatic defaults conservative."
+  ],
+  "source_notes": [
+    "Local PCI inventory reports NVIDIA AD106M HDA Audio 10de:22bd.",
+    "NVIDIA's HDMI audio documentation describes GPU HDMI/DisplayPort audio as an HDA sound card whose usable formats depend on connected display ELD/SAD data.",
+    "Local ALSA/PipeWire exposes NVIDIA outputs as HDMI/DisplayPort sinks only."
+  ],
+  "maintainer": "WaveLinux"
+}

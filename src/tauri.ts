@@ -6,7 +6,10 @@ import type {
   ConfigBackup,
   EffectCatalog,
   EffectInstance,
+  FallbackHardwareProfile,
   GraphDebugReport,
+  HardwareProfileSummary,
+  HardwareProfileUiState,
   Mix,
   Scene,
   SetupTemplate,
@@ -49,6 +52,64 @@ export function initialSnapshot(): AppStateSnapshot | null {
 function demoMutation(command: string, args?: Record<string, unknown>): unknown {
   if (command === "list_setup_templates") {
     return structuredClone(demoSetupTemplates);
+  }
+
+  if (command === "list_hardware_profiles") {
+    return demoHardwareProfileState();
+  }
+
+  if (command === "set_device_hardware_profile") {
+    const deviceId = stringArg(args, "deviceId") || stringArg(args, "device_id");
+    const profileId = stringArg(args, "profileId") || stringArg(args, "profile_id");
+    if (deviceId) {
+      if (profileId) {
+        demoState.config.device_policy.hardware_profile_assignments[deviceId] = profileId;
+      } else {
+        delete demoState.config.device_policy.hardware_profile_assignments[deviceId];
+      }
+      applyDemoHardwareProfiles();
+    }
+    return demoHardwareProfileState();
+  }
+
+  if (command === "set_fallback_hardware_profile") {
+    const fallbackProfile =
+      (args?.fallbackProfile as FallbackHardwareProfile | undefined) ??
+      (args?.fallback_profile as FallbackHardwareProfile | undefined);
+    if (fallbackProfile) {
+      demoState.config.device_policy.fallback_hardware_profile = structuredClone(fallbackProfile);
+      applyDemoHardwareProfiles();
+    }
+    return demoHardwareProfileState();
+  }
+
+  if (command === "set_hardware_profile_policy") {
+    const profileId = stringArg(args, "profileId") || stringArg(args, "profile_id");
+    const name = stringArg(args, "name");
+    const latencyPolicy = (args?.latencyPolicy ?? args?.latency_policy) as HardwareProfileSummary["latency_policy"] | undefined;
+    const routingPolicy = (args?.routingPolicy ?? args?.routing_policy) as HardwareProfileSummary["routing_policy"] | undefined;
+    if (profileId === demoState.config.device_policy.fallback_hardware_profile.id) {
+      demoState.config.device_policy.fallback_hardware_profile = {
+        ...demoState.config.device_policy.fallback_hardware_profile,
+        name: name || demoState.config.device_policy.fallback_hardware_profile.name,
+        latency_policy: latencyPolicy ?? demoState.config.device_policy.fallback_hardware_profile.latency_policy,
+        routing_policy: routingPolicy ?? demoState.config.device_policy.fallback_hardware_profile.routing_policy,
+      };
+    } else {
+      demoHardwareProfiles = demoHardwareProfiles.map((profile) =>
+        profile.id === profileId
+          ? {
+              ...profile,
+              name: name || profile.name,
+              source: "local",
+              latency_policy: latencyPolicy ?? profile.latency_policy,
+              routing_policy: routingPolicy ?? profile.routing_policy,
+            }
+          : profile,
+      );
+    }
+    applyDemoHardwareProfiles();
+    return demoHardwareProfileState();
   }
 
   if (command === "apply_setup_template") {
@@ -305,7 +366,7 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return {
       available: false,
       install_supported: false,
-      current_version: "4.0.0",
+      current_version: "4.1.2",
       version: null,
       date: null,
       body: null,
@@ -756,6 +817,118 @@ function slug(value: string): string {
 
 const demoScenes: Scene[] = [];
 
+function defaultDemoFallbackProfile(): FallbackHardwareProfile {
+  return {
+    id: "default.generic-audio",
+    name: "Default Generic Audio",
+    latency_policy: {
+      stable_msec: 80,
+      low_latency_msec: 60,
+      bluetooth_floor_msec: 240,
+    },
+    routing_policy: {
+      input_priority: 35,
+      output_priority: 30,
+      allow_auto_select_input: true,
+      allow_auto_select_output: true,
+      prefer_non_bluetooth_input: true,
+    },
+    bluetooth_mic_policy: "never_if_hfp",
+    confidence: "low",
+  };
+}
+
+const safeLatencyPolicy = {
+  stable_msec: 80,
+  low_latency_msec: 60,
+  bluetooth_floor_msec: 240,
+};
+
+let demoHardwareProfiles = [
+  demoHardwareProfile("jds-labs.element-ii", "JDS Labs Element II", "local", "high", {
+    input_priority: 0,
+    output_priority: 78,
+    allow_auto_select_input: false,
+    allow_auto_select_output: true,
+    prefer_non_bluetooth_input: true,
+  }),
+  demoHardwareProfile("sony.wh-1000xm4", "Sony WH-1000XM4", "local", "high", {
+    input_priority: 10,
+    output_priority: 70,
+    allow_auto_select_input: false,
+    allow_auto_select_output: true,
+    prefer_non_bluetooth_input: true,
+  }),
+  demoHardwareProfile("dji.wireless-mic-rx", "DJI Wireless Mic Receiver", "local", "high", {
+    input_priority: 88,
+    output_priority: 0,
+    allow_auto_select_input: true,
+    allow_auto_select_output: false,
+    prefer_non_bluetooth_input: true,
+  }),
+] satisfies HardwareProfileSummary[];
+
+function demoHardwareProfileState(): HardwareProfileUiState {
+  return {
+    profiles: [demoHardwareProfileFromFallback(), ...structuredClone(demoHardwareProfiles)],
+    assignments: structuredClone(demoState.config.device_policy.hardware_profile_assignments),
+    fallback_profile: structuredClone(demoState.config.device_policy.fallback_hardware_profile),
+  };
+}
+
+function demoHardwareProfile(
+  id: string,
+  name: string,
+  source: string,
+  confidence: HardwareProfileSummary["confidence"],
+  routing_policy: HardwareProfileSummary["routing_policy"],
+): HardwareProfileSummary {
+  return {
+    id,
+    name,
+    source,
+    confidence,
+    latency_policy: structuredClone(safeLatencyPolicy),
+    routing_policy,
+    bluetooth_mic_policy: "never_if_hfp",
+  };
+}
+
+function demoHardwareProfileFromFallback(): HardwareProfileSummary {
+  const fallback = demoState.config.device_policy.fallback_hardware_profile;
+  return {
+    id: fallback.id,
+    name: fallback.name,
+    source: "default",
+    confidence: fallback.confidence,
+    latency_policy: structuredClone(fallback.latency_policy),
+    routing_policy: structuredClone(fallback.routing_policy),
+    bluetooth_mic_policy: fallback.bluetooth_mic_policy,
+  };
+}
+
+function applyDemoHardwareProfiles() {
+  for (const device of [...demoState.graph.inputs, ...demoState.graph.outputs]) {
+    const assignedProfileId = demoState.config.device_policy.hardware_profile_assignments[device.id];
+    const autoProfileId = device.id.includes("bluez")
+      ? "sony.wh-1000xm4"
+      : device.id.includes("usb_interface") || device.id.includes("usb")
+        ? "jds-labs.element-ii"
+        : "";
+    const profileId = assignedProfileId || autoProfileId || demoState.config.device_policy.fallback_hardware_profile.id;
+    const profile =
+      profileId === demoState.config.device_policy.fallback_hardware_profile.id
+        ? demoHardwareProfileFromFallback()
+        : demoHardwareProfiles.find((item) => item.id === profileId) ?? demoHardwareProfileFromFallback();
+    device.matched_profile_id = profile.id;
+    device.matched_profile_source = assignedProfileId ? `assigned:${profile.source}` : profile.source;
+    device.profile_confidence = profile.confidence;
+    device.active_latency_policy = structuredClone(profile.latency_policy);
+    device.active_routing_policy = structuredClone(profile.routing_policy);
+    device.active_bluetooth_mic_policy = profile.bluetooth_mic_policy;
+  }
+}
+
 const catalog: EffectCatalog = {
   preferred_order: [
     "deepfilternet",
@@ -1172,12 +1345,15 @@ function applyDemoSetupTemplate(templateId: string) {
     restorable_output: null,
     active_input_fallback: false,
     active_output_fallback: false,
+    hardware_profile_assignments: {},
+    fallback_hardware_profile: defaultDemoFallbackProfile(),
   };
+  applyDemoHardwareProfiles();
 }
 
 export const demoState: AppStateSnapshot = {
   config: {
-    version: 4,
+    version: 7,
     audio: {
       sample_rate_hz: 48000,
       bit_depth: 24,
@@ -1274,18 +1450,20 @@ export const demoState: AppStateSnapshot = {
       restorable_output: null,
       active_input_fallback: false,
       active_output_fallback: false,
+      hardware_profile_assignments: {},
+      fallback_hardware_profile: defaultDemoFallbackProfile(),
     },
   },
   graph: {
     inputs: [
-      { id: "alsa_input.usb_interface", name: "alsa_input.usb_interface", description: "USB Interface Line In", is_available: true, is_default: true, is_virtual: false },
-      { id: "alsa_input.capture_card", name: "alsa_input.capture_card", description: "HDMI Capture Card Audio", is_available: true, is_default: false, is_virtual: false },
-      { id: "bluez_input.headset", name: "bluez_input.headset", description: "Bluetooth Headset Mic", is_available: true, is_default: false, is_virtual: false },
-      { id: "alsa_output.usb.monitor", name: "alsa_output.usb.monitor", description: "USB Headphones Monitor", is_available: true, is_default: false, is_virtual: false },
+      { id: "alsa_input.usb_interface", name: "alsa_input.usb_interface", description: "USB Interface Line In", is_available: true, is_default: true, is_virtual: false, bus: "usb" },
+      { id: "alsa_input.capture_card", name: "alsa_input.capture_card", description: "HDMI Capture Card Audio", is_available: true, is_default: false, is_virtual: false, bus: "usb" },
+      { id: "bluez_input.headset", name: "bluez_input.headset", description: "Bluetooth Headset Mic", is_available: true, is_default: false, is_virtual: false, bus: "bluetooth" },
+      { id: "alsa_output.usb.monitor", name: "alsa_output.usb.monitor", description: "USB Headphones Monitor", is_available: true, is_default: false, is_virtual: false, bus: "usb" },
     ],
     outputs: [
-      { id: "alsa_output.usb", name: "alsa_output.usb", description: "USB Headphones", is_available: true, is_default: true, is_virtual: false },
-      { id: "bluez_output.headset", name: "bluez_output.headset", description: "Bluetooth Headset", is_available: true, is_default: false, is_virtual: false },
+      { id: "alsa_output.usb", name: "alsa_output.usb", description: "USB Headphones", is_available: true, is_default: true, is_virtual: false, bus: "usb" },
+      { id: "bluez_output.headset", name: "bluez_output.headset", description: "Bluetooth Headset", is_available: true, is_default: false, is_virtual: false, bus: "bluetooth" },
     ],
     app_streams: [
       { id: "42", app_id: "firefox", binary: "firefox", process_name: "firefox", window_class: "firefox", display_name: "Firefox", media_name: "YouTube", routed_channel_id: "browser", volume: 0.76, muted: false },
@@ -1315,3 +1493,5 @@ export const demoState: AppStateSnapshot = {
   },
   catalog,
 };
+
+applyDemoHardwareProfiles();

@@ -1,0 +1,43 @@
+{
+  "id": "tc-helicon.goxlr-mini",
+  "name": "TC Helicon GoXLR Mini",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["goxlr mini"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["tc helicon", "mini"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 30,
+    "low_latency_msec": 16
+  },
+  "routing_policy": {
+    "input_priority": 86,
+    "output_priority": 62,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Keep route preservation conservative because GoXLR Mini endpoints are often used as distinct app buses."
+  ],
+  "source_notes": [
+    "Seeded from common GoXLR Mini Linux creator-routing behavior."
+  ],
+  "maintainer": "WaveLinux"
+}

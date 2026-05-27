@@ -5,7 +5,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-pub const CONFIG_VERSION: u32 = 6;
+pub const CONFIG_VERSION: u32 = 7;
 pub const BACKUP_VERSION: u32 = 1;
 pub const MAX_MIXES: usize = 5;
 pub const MAX_SOFTWARE_CHANNELS: usize = 8;
@@ -86,6 +86,10 @@ pub struct MixerSettings {
     pub auto_check_updates: bool,
     pub auto_install_updates: bool,
     pub release_channel: ReleaseChannel,
+    #[serde(default)]
+    pub optimization_mode: OptimizationMode,
+    #[serde(default, skip_serializing)]
+    pub runtime_latency_policy: Option<LatencyPolicy>,
 }
 
 impl Default for MixerSettings {
@@ -104,6 +108,8 @@ impl Default for MixerSettings {
             auto_check_updates: true,
             auto_install_updates: false,
             release_channel: ReleaseChannel::Stable,
+            optimization_mode: OptimizationMode::Performance,
+            runtime_latency_policy: None,
         }
     }
 }
@@ -113,6 +119,15 @@ impl Default for MixerSettings {
 pub enum ReleaseChannel {
     Stable,
     Beta,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizationMode {
+    #[default]
+    Performance,
+    Safe,
+    Advisory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -370,6 +385,21 @@ impl MixerConfig {
             clean_optional_matcher(self.device_policy.restorable_input.take());
         self.device_policy.restorable_output =
             clean_optional_matcher(self.device_policy.restorable_output.take());
+        self.device_policy.hardware_profile_assignments = self
+            .device_policy
+            .hardware_profile_assignments
+            .iter()
+            .filter_map(|(device_id, profile_id)| {
+                let device_id = clean_optional_device_id(Some(device_id.clone()))?;
+                let profile_id = clean_optional_profile_id(Some(profile_id.clone()))?;
+                Some((device_id, profile_id))
+            })
+            .collect();
+        self.device_policy.fallback_hardware_profile = self
+            .device_policy
+            .fallback_hardware_profile
+            .clone()
+            .normalized();
     }
 
     fn normalize_app_volume_presets(&mut self) {
@@ -1560,6 +1590,72 @@ pub struct DevicePolicy {
     pub active_input_fallback: bool,
     #[serde(default)]
     pub active_output_fallback: bool,
+    #[serde(default)]
+    pub hardware_profile_assignments: BTreeMap<DeviceId, String>,
+    #[serde(default)]
+    pub fallback_hardware_profile: FallbackHardwareProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct FallbackHardwareProfile {
+    pub id: String,
+    pub name: String,
+    pub latency_policy: LatencyPolicy,
+    pub routing_policy: RoutingPolicy,
+    pub bluetooth_mic_policy: BluetoothMicPolicy,
+    pub confidence: ProfileConfidence,
+}
+
+impl FallbackHardwareProfile {
+    pub fn normalized(mut self) -> Self {
+        self.id = clean_optional_profile_id(Some(self.id))
+            .unwrap_or_else(default_fallback_hardware_profile_id);
+        self.name = clean_app_display_name(&self.name)
+            .unwrap_or_else(|| default_fallback_hardware_profile_name().to_string());
+        normalize_latency_policy(&mut self.latency_policy);
+        if self.id == default_fallback_hardware_profile_id()
+            && self.name == default_fallback_hardware_profile_name()
+            && matches!(
+                self.latency_policy,
+                LatencyPolicy {
+                    stable_msec: Some(35),
+                    low_latency_msec: Some(20),
+                    bluetooth_floor_msec: Some(120 | 180),
+                }
+            )
+        {
+            self.latency_policy = FallbackHardwareProfile::default().latency_policy;
+        }
+        normalize_routing_policy(&mut self.routing_policy);
+        if self.bluetooth_mic_policy != BluetoothMicPolicy::NeverIfHfp {
+            self.bluetooth_mic_policy = BluetoothMicPolicy::NeverIfHfp;
+        }
+        self
+    }
+}
+
+impl Default for FallbackHardwareProfile {
+    fn default() -> Self {
+        Self {
+            id: default_fallback_hardware_profile_id(),
+            name: default_fallback_hardware_profile_name().into(),
+            latency_policy: LatencyPolicy {
+                stable_msec: Some(80),
+                low_latency_msec: Some(60),
+                bluetooth_floor_msec: Some(240),
+            },
+            routing_policy: RoutingPolicy {
+                input_priority: Some(35),
+                output_priority: Some(30),
+                allow_auto_select_input: true,
+                allow_auto_select_output: true,
+                prefer_non_bluetooth_input: true,
+            },
+            bluetooth_mic_policy: BluetoothMicPolicy::NeverIfHfp,
+            confidence: ProfileConfidence::Low,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2017,6 +2113,178 @@ impl Default for EffectCatalog {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HardwareProfile {
+    pub id: String,
+    pub name: String,
+    pub revision: u32,
+    pub matches: Vec<HardwareProfileMatch>,
+    pub capabilities: DeviceCapabilities,
+    pub latency_policy: LatencyPolicy,
+    pub routing_policy: RoutingPolicy,
+    pub bluetooth_mic_policy: BluetoothMicPolicy,
+    pub codec_policy: CodecPolicy,
+    pub confidence: ProfileConfidence,
+    pub quirks: Vec<String>,
+    pub source_notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintainer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HardwareProfileSummary {
+    pub id: String,
+    pub name: String,
+    pub source: String,
+    pub confidence: ProfileConfidence,
+    pub latency_policy: LatencyPolicy,
+    pub routing_policy: RoutingPolicy,
+    pub bluetooth_mic_policy: BluetoothMicPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HardwareProfileUiState {
+    pub profiles: Vec<HardwareProfileSummary>,
+    pub assignments: BTreeMap<DeviceId, String>,
+    pub fallback_profile: FallbackHardwareProfile,
+}
+
+impl Default for HardwareProfile {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            revision: 1,
+            matches: Vec::new(),
+            capabilities: DeviceCapabilities::default(),
+            latency_policy: LatencyPolicy::default(),
+            routing_policy: RoutingPolicy::default(),
+            bluetooth_mic_policy: BluetoothMicPolicy::NeverIfHfp,
+            codec_policy: CodecPolicy::default(),
+            confidence: ProfileConfidence::Low,
+            quirks: Vec::new(),
+            source_notes: Vec::new(),
+            maintainer: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HardwareProfileMatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus: Option<DeviceBus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    #[serde(default)]
+    pub node_name_contains: Vec<String>,
+    #[serde(default)]
+    pub description_contains: Vec<String>,
+    #[serde(default)]
+    pub property_contains: Vec<String>,
+    #[serde(default)]
+    pub driver_contains: Vec<String>,
+    #[serde(default)]
+    pub bluetooth_modalias_contains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceBus {
+    Usb,
+    Bluetooth,
+    Pci,
+    Platform,
+    Virtual,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DeviceCapabilities {
+    pub input: bool,
+    pub output: bool,
+    pub duplex: bool,
+    pub bluetooth_a2dp: bool,
+    pub bluetooth_hfp: bool,
+    pub duplex_a2dp: bool,
+    pub usb_audio_class: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u8>,
+    #[serde(default)]
+    pub sample_rates_hz: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LatencyPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_msec: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_latency_msec: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bluetooth_floor_msec: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RoutingPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_priority: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_priority: Option<u8>,
+    pub allow_auto_select_input: bool,
+    pub allow_auto_select_output: bool,
+    pub prefer_non_bluetooth_input: bool,
+}
+
+impl Default for RoutingPolicy {
+    fn default() -> Self {
+        Self {
+            input_priority: None,
+            output_priority: None,
+            allow_auto_select_input: true,
+            allow_auto_select_output: true,
+            prefer_non_bluetooth_input: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum BluetoothMicPolicy {
+    #[default]
+    NeverIfHfp,
+    AllowExplicitCallMode,
+    AllowDuplexA2dpIfSupported,
+    AdvisoryOnly,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CodecPolicy {
+    #[serde(default)]
+    pub preferred_a2dp_codecs: Vec<String>,
+    #[serde(default)]
+    pub avoid_codecs: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub latency_floor_msec: BTreeMap<String, u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ldac_quality: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileConfidence {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeviceInfo {
     pub id: DeviceId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2027,6 +2295,38 @@ pub struct DeviceInfo {
     pub is_available: bool,
     pub is_default: bool,
     pub is_virtual: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus: Option<DeviceBus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alsa_card: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alsa_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bluetooth_modalias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_codec: Option<String>,
+    #[serde(default)]
+    pub pipewire_properties: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_profile_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_confidence: Option<ProfileConfidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_latency_policy: Option<LatencyPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_routing_policy: Option<RoutingPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_bluetooth_mic_policy: Option<BluetoothMicPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2183,6 +2483,27 @@ fn default_true() -> bool {
     true
 }
 
+fn default_fallback_hardware_profile_id() -> String {
+    "default.generic-audio".into()
+}
+
+fn default_fallback_hardware_profile_name() -> &'static str {
+    "Default Generic Audio"
+}
+
+fn normalize_latency_policy(policy: &mut LatencyPolicy) {
+    policy.stable_msec = policy.stable_msec.map(|value| value.clamp(5, 500));
+    policy.low_latency_msec = policy.low_latency_msec.map(|value| value.clamp(5, 500));
+    policy.bluetooth_floor_msec = policy
+        .bluetooth_floor_msec
+        .map(|value| value.clamp(50, 500));
+}
+
+fn normalize_routing_policy(policy: &mut RoutingPolicy) {
+    policy.input_priority = policy.input_priority.map(|value| value.min(100));
+    policy.output_priority = policy.output_priority.map(|value| value.min(100));
+}
+
 fn offset_index(index: usize, direction: i32, len: usize) -> usize {
     if len == 0 {
         return 0;
@@ -2207,6 +2528,10 @@ fn clean_optional_matcher(value: Option<String>) -> Option<String> {
 
 fn clean_optional_device_id(value: Option<String>) -> Option<String> {
     clean_optional_matcher(value).filter(|value| value != "@DEFAULT_SOURCE@")
+}
+
+fn clean_optional_profile_id(value: Option<String>) -> Option<String> {
+    clean_optional_matcher(value).map(|value| value.chars().take(128).collect())
 }
 
 fn clean_optional_label(value: Option<String>) -> Option<String> {
@@ -3069,6 +3394,45 @@ mod tests {
             .iter()
             .any(|channel| channel.id == "system" && channel.kind == ChannelKind::System));
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_default_fallback_profile_migrates_to_safe_latency() {
+        let raw = r#"
+        {
+          "device_policy": {
+            "fallback_hardware_profile": {
+              "id": "default.generic-audio",
+              "name": "Default Generic Audio",
+              "latency_policy": {
+                "stable_msec": 35,
+                "low_latency_msec": 20,
+                "bluetooth_floor_msec": 120
+              },
+              "routing_policy": {
+                "input_priority": 35,
+                "output_priority": 30,
+                "allow_auto_select_input": true,
+                "allow_auto_select_output": true,
+                "prefer_non_bluetooth_input": true
+              },
+              "bluetooth_mic_policy": "never_if_hfp",
+              "confidence": "low"
+            }
+          }
+        }
+        "#;
+
+        let config: MixerConfig = serde_json::from_str(raw).unwrap();
+        let config = config.normalized().unwrap();
+
+        assert_eq!(
+            config
+                .device_policy
+                .fallback_hardware_profile
+                .latency_policy,
+            FallbackHardwareProfile::default().latency_policy
+        );
     }
 
     #[test]

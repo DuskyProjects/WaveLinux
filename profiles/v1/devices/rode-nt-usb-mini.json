@@ -1,0 +1,43 @@
+{
+  "id": "rode.nt-usb-mini",
+  "name": "RODE NT-USB Mini",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["nt-usb mini"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["rode", "mini"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 25,
+    "low_latency_msec": 12
+  },
+  "routing_policy": {
+    "input_priority": 86,
+    "output_priority": 22,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "high",
+  "quirks": [
+    "48 kHz-only behavior is intentional; do not upshift the system graph to chase unsupported rates."
+  ],
+  "source_notes": [
+    "RODE NT-USB Mini specifications list a 48 kHz sample rate."
+  ],
+  "maintainer": "WaveLinux"
+}

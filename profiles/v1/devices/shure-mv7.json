@@ -1,0 +1,43 @@
+{
+  "id": "shure.mv7",
+  "name": "Shure MV7",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["shure", "mv7"]
+    },
+    {
+      "bus": "usb",
+      "node_name_contains": ["mv7"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [44100, 48000]
+  },
+  "latency_policy": {
+    "stable_msec": 25,
+    "low_latency_msec": 12
+  },
+  "routing_policy": {
+    "input_priority": 88,
+    "output_priority": 24,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "high",
+  "quirks": [
+    "USB mic headphone output should be available for monitoring but should not become the default system sink automatically."
+  ],
+  "source_notes": [
+    "Shure MV7 documentation lists USB operation with 44.1/48 kHz sample-rate modes."
+  ],
+  "maintainer": "WaveLinux"
+}

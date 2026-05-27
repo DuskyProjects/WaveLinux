@@ -1,0 +1,43 @@
+{
+  "id": "samson.q2u",
+  "name": "Samson Q2U",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["samson", "q2u"]
+    },
+    {
+      "bus": "usb",
+      "node_name_contains": ["q2u"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [44100, 48000]
+  },
+  "latency_policy": {
+    "stable_msec": 28,
+    "low_latency_msec": 14
+  },
+  "routing_policy": {
+    "input_priority": 80,
+    "output_priority": 20,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Keep as a capture-first USB microphone profile; do not auto-route desktop playback to its monitor output."
+  ],
+  "source_notes": [
+    "Seeded from common Samson Q2U USB/XLR microphone behavior."
+  ],
+  "maintainer": "WaveLinux"
+}

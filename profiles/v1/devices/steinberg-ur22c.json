@@ -1,0 +1,44 @@
+{
+  "id": "steinberg.ur22c",
+  "name": "Steinberg UR22C",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["ur22c"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["steinberg", "ur22"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "channels": 2,
+    "sample_rates_hz": [44100, 48000, 88200, 96000, 176400, 192000]
+  },
+  "latency_policy": {
+    "stable_msec": 22,
+    "low_latency_msec": 10
+  },
+  "routing_policy": {
+    "input_priority": 82,
+    "output_priority": 62,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Class-compliant mode should stay conservative until the device is observed stable after hotplug."
+  ],
+  "source_notes": [
+    "Seeded from common UR-C USB-C interface capabilities and published high-rate support."
+  ],
+  "maintainer": "WaveLinux"
+}

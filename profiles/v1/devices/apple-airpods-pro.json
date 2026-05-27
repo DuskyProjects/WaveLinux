@@ -1,0 +1,54 @@
+{
+  "id": "apple.airpods-pro",
+  "name": "Apple AirPods Pro",
+  "revision": 4,
+  "matches": [
+    {
+      "bus": "bluetooth",
+      "node_name_contains": ["bluez"],
+      "description_contains": ["airpods pro"]
+    },
+    {
+      "bus": "bluetooth",
+      "description_contains": ["airpods"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "bluetooth_a2dp": true,
+    "bluetooth_hfp": true,
+    "duplex_a2dp": false,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 160,
+    "bluetooth_floor_msec": 240
+  },
+  "routing_policy": {
+    "output_priority": 62,
+    "allow_auto_select_input": false,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {
+    "preferred_a2dp_codecs": ["aac", "sbc_xq", "sbc"],
+    "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"],
+    "latency_floor_msec": {
+      "aac": 280,
+      "sbc_xq": 300,
+      "sbc": 240
+    }
+  },
+  "confidence": "medium",
+  "quirks": [
+    "On Linux, using the headset microphone should be treated as call-mode fallback, not an optimized music playback state.",
+    "AAC remains the preferred stable A2DP codec, with explicit profile latency floors for AAC and SBC-XQ that stay within PipeWire's default 16-buffer link budget."
+  ],
+  "source_notes": [
+    "Seeded from common AirPods Linux behavior and Bluetooth A2DP/HFP profile limits."
+  ],
+  "maintainer": "WaveLinux"
+}

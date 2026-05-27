@@ -1,0 +1,43 @@
+{
+  "id": "tc-helicon.goxlr",
+  "name": "TC Helicon GoXLR",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["goxlr"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["tc helicon", "xlr"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 30,
+    "low_latency_msec": 16
+  },
+  "routing_policy": {
+    "input_priority": 86,
+    "output_priority": 62,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "GoXLR-style devices expose several named virtual endpoints; avoid collapsing music/chat/system routes into one default path."
+  ],
+  "source_notes": [
+    "Seeded from common GoXLR Linux creator-routing behavior."
+  ],
+  "maintainer": "WaveLinux"
+}

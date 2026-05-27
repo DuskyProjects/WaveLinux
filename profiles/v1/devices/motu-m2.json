@@ -1,0 +1,43 @@
+{
+  "id": "motu.m2",
+  "name": "MOTU M2",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["motu", "m2"]
+    },
+    {
+      "bus": "usb",
+      "node_name_contains": ["motu", "m2"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [44100, 48000, 88200, 96000, 176400, 192000]
+  },
+  "latency_policy": {
+    "stable_msec": 22,
+    "low_latency_msec": 10
+  },
+  "routing_policy": {
+    "input_priority": 86,
+    "output_priority": 66,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Community Linux reports are generally positive, but some hosts need a conservative buffer after reconnect or suspend."
+  ],
+  "source_notes": [
+    "MOTU M-series material and retailer specs list USB Audio Class operation and sample rates through 192 kHz."
+  ],
+  "maintainer": "WaveLinux"
+}

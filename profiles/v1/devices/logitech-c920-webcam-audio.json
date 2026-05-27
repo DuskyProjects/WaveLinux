@@ -1,0 +1,43 @@
+{
+  "id": "logitech.c920-webcam-audio",
+  "name": "Logitech C920 Webcam Audio",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "vendor_id": "046d",
+      "description_contains": ["c920"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["logitech", "hd pro webcam"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": false,
+    "duplex": false,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000, 44100]
+  },
+  "latency_policy": {
+    "stable_msec": 35,
+    "low_latency_msec": 20
+  },
+  "routing_policy": {
+    "input_priority": 55,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Acceptable fallback microphone to preserve Bluetooth A2DP, but dedicated USB mics and interfaces rank higher."
+  ],
+  "source_notes": [
+    "Seeded from common Logitech C920 UVC/UAC webcam behavior."
+  ],
+  "maintainer": "WaveLinux"
+}

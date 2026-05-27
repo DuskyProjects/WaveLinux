@@ -1,0 +1,1077 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "apple.airpods-pro",
+      "name": "Apple AirPods Pro",
+      "revision": 4,
+      "asset": "apple-airpods-pro.json",
+      "matches": [
+        {
+          "bus": "bluetooth",
+          "node_name_contains": [
+            "bluez"
+          ],
+          "description_contains": [
+            "airpods pro"
+          ]
+        },
+        {
+          "bus": "bluetooth",
+          "description_contains": [
+            "airpods"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "audient.id4-mkii",
+      "name": "Audient iD4 MKII",
+      "revision": 1,
+      "asset": "audient-id4-mkii.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "audient",
+            "id4"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "audient",
+            "id4"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "audio-technica.at2020usb-x",
+      "name": "Audio-Technica AT2020USB-X",
+      "revision": 1,
+      "asset": "audio-technica-at2020usb-x.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "at2020usb"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "audio-technica",
+            "2020"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "avermedia.live-gamer-portable-2-plus",
+      "name": "AVerMedia Live Gamer Portable 2 Plus Audio",
+      "revision": 1,
+      "asset": "avermedia-live-gamer-portable-2-plus.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "live gamer portable"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "avermedia",
+            "audio"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "behringer.umc202hd",
+      "name": "Behringer U-Phoria UMC202HD",
+      "revision": 1,
+      "asset": "behringer-umc202hd.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "umc202hd"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "u-phoria",
+            "202"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "blue.snowball",
+      "name": "Blue Snowball USB Microphone",
+      "revision": 1,
+      "asset": "blue-snowball.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "blue",
+            "snowball"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "snowball",
+            "microphone"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "blue.yeti",
+      "name": "Blue Yeti USB Microphone",
+      "revision": 1,
+      "asset": "blue-yeti.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "blue",
+            "yeti"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "yeti",
+            "microphone"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bose.quietcomfort-ultra",
+      "name": "Bose QuietComfort Ultra Headphones",
+      "revision": 4,
+      "asset": "bose-quietcomfort-ultra.json",
+      "matches": [
+        {
+          "bus": "bluetooth",
+          "description_contains": [
+            "quietcomfort ultra"
+          ]
+        },
+        {
+          "bus": "bluetooth",
+          "description_contains": [
+            "bose",
+            "qc ultra"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "corsair.virtuoso-usb",
+      "name": "Corsair Virtuoso USB/Wireless Dongle",
+      "revision": 1,
+      "asset": "corsair-virtuoso-usb.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "corsair",
+            "virtuoso"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "virtuoso"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dji.wireless-mic-rx",
+      "name": "DJI Wireless Mic Receiver (USB Audio Mode)",
+      "revision": 3,
+      "asset": "dji-wireless-mic-rx.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "wireless microphone rx"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "dji",
+            "wireless mic"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "wireless_mic"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "elgato.cam-link-4k",
+      "name": "Elgato Cam Link 4K Audio",
+      "revision": 1,
+      "asset": "elgato-cam-link-4k.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "cam link",
+            "audio"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "elgato",
+            "cam link"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "elgato.hd60-x",
+      "name": "Elgato HD60 X Audio",
+      "revision": 1,
+      "asset": "elgato-hd60-x.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "hd60 x"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "elgato",
+            "hd60"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "elgato.wave-3",
+      "name": "Elgato Wave:3",
+      "revision": 1,
+      "asset": "elgato-wave-3.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "wave:3"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "elgato",
+            "wave"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "elgato.wave-xlr",
+      "name": "Elgato Wave XLR",
+      "revision": 1,
+      "asset": "elgato-wave-xlr.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "wave xlr"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "elgato",
+            "xlr"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "focusrite.scarlett-2i2-3rd-gen",
+      "name": "Focusrite Scarlett 2i2 3rd Gen",
+      "revision": 1,
+      "asset": "focusrite-scarlett-2i2-3rd-gen.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "scarlett",
+            "2i2"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "scarlett",
+            "2i2"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "focusrite.scarlett-2i2-4th-gen",
+      "name": "Focusrite Scarlett 2i2 4th Gen",
+      "revision": 1,
+      "asset": "focusrite-scarlett-2i2-4th-gen.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "scarlett",
+            "2i2",
+            "4th"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "scarlett 2i2"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "focusrite.scarlett-4i4-3rd-gen",
+      "name": "Focusrite Scarlett 4i4 3rd Gen",
+      "revision": 1,
+      "asset": "focusrite-scarlett-4i4-3rd-gen.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "scarlett",
+            "4i4"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "scarlett",
+            "4i4"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "focusrite.scarlett-solo-3rd-gen",
+      "name": "Focusrite Scarlett Solo 3rd Gen",
+      "revision": 1,
+      "asset": "focusrite-scarlett-solo-3rd-gen.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "scarlett",
+            "solo"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "scarlett",
+            "solo"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "focusrite.vocaster-two",
+      "name": "Focusrite Vocaster Two",
+      "revision": 1,
+      "asset": "focusrite-vocaster-two.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "vocaster",
+            "two"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "vocaster"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "hyperx.cloud-ii-usb",
+      "name": "HyperX Cloud II USB",
+      "revision": 1,
+      "asset": "hyperx-cloud-ii-usb.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "hyperx",
+            "cloud ii"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "cloud ii",
+            "usb"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "hyperx.quadcast",
+      "name": "HyperX QuadCast",
+      "revision": 1,
+      "asset": "hyperx-quadcast.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "hyperx",
+            "quadcast"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "quadcast"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "jds-labs.element-ii",
+      "name": "JDS Labs Element II",
+      "revision": 1,
+      "asset": "jds-labs-element-ii.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "jds",
+            "element ii"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "jds labs",
+            "element"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "element_ii"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "logitech.brio-webcam-audio",
+      "name": "Logitech Brio Webcam Audio",
+      "revision": 1,
+      "asset": "logitech-brio-webcam-audio.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "vendor_id": "046d",
+          "description_contains": [
+            "brio"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "logitech",
+            "brio"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "logitech.c920-webcam-audio",
+      "name": "Logitech C920 Webcam Audio",
+      "revision": 1,
+      "asset": "logitech-c920-webcam-audio.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "vendor_id": "046d",
+          "description_contains": [
+            "c920"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "logitech",
+            "hd pro webcam"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "logitech.g-pro-x-usb-headset",
+      "name": "Logitech G PRO X USB Headset",
+      "revision": 1,
+      "asset": "logitech-g-pro-x-usb-headset.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "logitech",
+            "pro x",
+            "headset"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "g pro x",
+            "headset"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "pro x",
+            "blue voice"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "logitech.usb-webcam-audio",
+      "name": "Logitech USB Webcam Audio",
+      "revision": 2,
+      "asset": "logitech-usb-webcam-audio.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "vendor_id": "046d",
+          "description_contains": [
+            "logitech",
+            "webcam"
+          ]
+        },
+        {
+          "bus": "usb",
+          "vendor_id": "046d",
+          "description_contains": [
+            "logitech",
+            "microphone"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "webcam",
+            "microphone"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "massdrop-fostex.th-x00",
+      "name": "Massdrop x Fostex TH-X00",
+      "revision": 1,
+      "asset": "massdrop-fostex-th-x00.json",
+      "matches": [
+        {
+          "description_contains": [
+            "th-x00"
+          ]
+        },
+        {
+          "description_contains": [
+            "massdrop",
+            "fostex"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "motu.m2",
+      "name": "MOTU M2",
+      "revision": 1,
+      "asset": "motu-m2.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "motu",
+            "m2"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "motu",
+            "m2"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nvidia.ad106m-hda-hdmi",
+      "name": "NVIDIA AD106M HDA HDMI/DisplayPort Audio",
+      "revision": 3,
+      "asset": "nvidia-ad106m-hda-hdmi.json",
+      "matches": [
+        {
+          "bus": "pci",
+          "vendor_id": "10de",
+          "product_id": "22bd"
+        },
+        {
+          "bus": "pci",
+          "description_contains": [
+            "ad106m",
+            "high definition audio"
+          ]
+        },
+        {
+          "node_name_contains": [
+            "hdmi"
+          ],
+          "description_contains": [
+            "nvidia"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "presonus.audiobox-usb96",
+      "name": "PreSonus AudioBox USB 96",
+      "revision": 1,
+      "asset": "presonus-audiobox-usb96.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "audiobox",
+            "usb 96"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "audiobox",
+            "usb96"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "realtek.alc3254-hda",
+      "name": "Realtek ALC3254 HDA Audio Codec",
+      "revision": 5,
+      "asset": "realtek-alc3254-hda.json",
+      "matches": [
+        {
+          "node_name_contains": [
+            "__Speaker__sink"
+          ],
+          "property_contains": [
+            "alsa.mixer_name=Realtek ALC3254"
+          ]
+        },
+        {
+          "node_name_contains": [
+            "__Headphones__sink"
+          ],
+          "property_contains": [
+            "alsa.mixer_name=Realtek ALC3254"
+          ]
+        },
+        {
+          "node_name_contains": [
+            "__Headset__source"
+          ],
+          "property_contains": [
+            "alsa.mixer_name=Realtek ALC3254"
+          ]
+        },
+        {
+          "node_name_contains": [
+            "__Mic1__source"
+          ],
+          "property_contains": [
+            "alsa.mixer_name=Realtek ALC3254"
+          ]
+        },
+        {
+          "node_name_contains": [
+            "__Mic2__source"
+          ],
+          "property_contains": [
+            "alsa.mixer_name=Realtek ALC3254"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rode.nt-usb-mini",
+      "name": "RODE NT-USB Mini",
+      "revision": 1,
+      "asset": "rode-nt-usb-mini.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "nt-usb mini"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "rode",
+            "mini"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rode.nt-usb-plus",
+      "name": "RODE NT-USB+",
+      "revision": 1,
+      "asset": "rode-nt-usb-plus.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "nt-usb+"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "rode",
+            "nt-usb"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "samson.q2u",
+      "name": "Samson Q2U",
+      "revision": 1,
+      "asset": "samson-q2u.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "samson",
+            "q2u"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "q2u"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sennheiser.momentum-4",
+      "name": "Sennheiser Momentum 4 Wireless",
+      "revision": 4,
+      "asset": "sennheiser-momentum-4.json",
+      "matches": [
+        {
+          "bus": "bluetooth",
+          "description_contains": [
+            "momentum 4"
+          ]
+        },
+        {
+          "bus": "bluetooth",
+          "description_contains": [
+            "sennheiser",
+            "momentum"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "shure.mv7",
+      "name": "Shure MV7",
+      "revision": 1,
+      "asset": "shure-mv7.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "shure",
+            "mv7"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "mv7"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "solid-state-logic.ssl2",
+      "name": "Solid State Logic SSL 2",
+      "revision": 1,
+      "asset": "solid-state-logic-ssl2.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "ssl 2"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "solid state logic"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sony.wh-1000xm4",
+      "name": "Sony WH-1000XM4",
+      "revision": 8,
+      "asset": "sony-wh-1000xm4.json",
+      "matches": [
+        {
+          "bus": "bluetooth",
+          "node_name_contains": [
+            "bluez"
+          ],
+          "description_contains": [
+            "wh-1000xm4"
+          ]
+        },
+        {
+          "bus": "bluetooth",
+          "bluetooth_modalias_contains": [
+            "054c",
+            "0d58"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sony.wh-1000xm5",
+      "name": "Sony WH-1000XM5",
+      "revision": 4,
+      "asset": "sony-wh-1000xm5.json",
+      "matches": [
+        {
+          "bus": "bluetooth",
+          "node_name_contains": [
+            "bluez"
+          ],
+          "description_contains": [
+            "wh-1000xm5"
+          ]
+        },
+        {
+          "bus": "bluetooth",
+          "description_contains": [
+            "1000xm5"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "steelseries.arctis-7-usb",
+      "name": "SteelSeries Arctis 7 USB/Wireless Dongle",
+      "revision": 1,
+      "asset": "steelseries-arctis-7-usb.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "steelseries",
+            "arctis 7"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "arctis",
+            "chat"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "steelseries.arctis-nova-pro-wireless-bluetooth",
+      "name": "SteelSeries Arctis Nova Pro Wireless Bluetooth",
+      "revision": 4,
+      "asset": "steelseries-arctis-nova-pro-wireless-bluetooth.json",
+      "matches": [
+        {
+          "bus": "bluetooth",
+          "description_contains": [
+            "arctis nova pro"
+          ]
+        },
+        {
+          "bus": "bluetooth",
+          "description_contains": [
+            "steelseries",
+            "nova"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "steinberg.ur22c",
+      "name": "Steinberg UR22C",
+      "revision": 1,
+      "asset": "steinberg-ur22c.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "ur22c"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "steinberg",
+            "ur22"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tascam.us-2x2hr",
+      "name": "Tascam US-2x2HR",
+      "revision": 1,
+      "asset": "tascam-us-2x2hr.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "us-2x2hr"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "tascam",
+            "2x2"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tc-helicon.goxlr-mini",
+      "name": "TC Helicon GoXLR Mini",
+      "revision": 1,
+      "asset": "tc-helicon-goxlr-mini.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "goxlr mini"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "tc helicon",
+            "mini"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tc-helicon.goxlr",
+      "name": "TC Helicon GoXLR",
+      "revision": 1,
+      "asset": "tc-helicon-goxlr.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "goxlr"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "tc helicon",
+            "xlr"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "universal-audio.volt-2",
+      "name": "Universal Audio Volt 2",
+      "revision": 1,
+      "asset": "universal-audio-volt-2.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "volt",
+            "2"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "universal audio",
+            "volt"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "yamaha.ag03",
+      "name": "Yamaha AG03",
+      "revision": 1,
+      "asset": "yamaha-ag03.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "description_contains": [
+            "ag03"
+          ]
+        },
+        {
+          "bus": "usb",
+          "description_contains": [
+            "yamaha",
+            "ag"
+          ]
+        }
+      ]
+    }
+  ]
+}

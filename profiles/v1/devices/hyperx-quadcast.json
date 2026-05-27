@@ -1,0 +1,43 @@
+{
+  "id": "hyperx.quadcast",
+  "name": "HyperX QuadCast",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["hyperx", "quadcast"]
+    },
+    {
+      "bus": "usb",
+      "node_name_contains": ["quadcast"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 28,
+    "low_latency_msec": 14
+  },
+  "routing_policy": {
+    "input_priority": 82,
+    "output_priority": 22,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "USB mic monitor output should not become the main system output automatically."
+  ],
+  "source_notes": [
+    "Seeded from common HyperX QuadCast USB microphone behavior in creator setups."
+  ],
+  "maintainer": "WaveLinux"
+}

@@ -1,4 +1,4 @@
-# WaveLinux 4.0 Test Suites
+# WaveLinux 4.1 Test Suites
 
 WaveLinux keeps all default tests dry-run and safe for CI. They must not create,
 move, or unload live PipeWire nodes unless a test is explicitly marked ignored.

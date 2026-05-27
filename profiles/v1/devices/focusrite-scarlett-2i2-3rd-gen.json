@@ -1,0 +1,45 @@
+{
+  "id": "focusrite.scarlett-2i2-3rd-gen",
+  "name": "Focusrite Scarlett 2i2 3rd Gen",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["scarlett", "2i2"]
+    },
+    {
+      "bus": "usb",
+      "node_name_contains": ["scarlett", "2i2"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "channels": 2,
+    "sample_rates_hz": [44100, 48000, 88200, 96000, 176400, 192000]
+  },
+  "latency_policy": {
+    "stable_msec": 20,
+    "low_latency_msec": 8
+  },
+  "routing_policy": {
+    "input_priority": 84,
+    "output_priority": 64,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "high",
+  "quirks": [
+    "Use conservative latency until the interface is observed stable on the current USB controller.",
+    "Prefer 48 kHz for general desktop audio; do not force 192 kHz system-wide."
+  ],
+  "source_notes": [
+    "Focusrite Scarlett 2i2 3rd Gen specifications list 44.1, 48, 88.2, 96, 176.4, and 192 kHz sample rates."
+  ],
+  "maintainer": "WaveLinux"
+}

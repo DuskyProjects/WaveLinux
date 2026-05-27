@@ -1,0 +1,42 @@
+{
+  "id": "elgato.hd60-x",
+  "name": "Elgato HD60 X Audio",
+  "revision": 1,
+  "matches": [
+    {
+      "bus": "usb",
+      "description_contains": ["hd60 x"]
+    },
+    {
+      "bus": "usb",
+      "description_contains": ["elgato", "hd60"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": false,
+    "duplex": false,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 55,
+    "low_latency_msec": 35
+  },
+  "routing_policy": {
+    "input_priority": 45,
+    "allow_auto_select_input": false,
+    "allow_auto_select_output": false,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Treat HDMI capture audio as a content source, not as a low-latency voice microphone."
+  ],
+  "source_notes": [
+    "Seeded as a common HDMI/USB capture-card audio endpoint profile."
+  ],
+  "maintainer": "WaveLinux"
+}

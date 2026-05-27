@@ -1,0 +1,58 @@
+{
+  "id": "sony.wh-1000xm5",
+  "name": "Sony WH-1000XM5",
+  "revision": 4,
+  "matches": [
+    {
+      "bus": "bluetooth",
+      "node_name_contains": ["bluez"],
+      "description_contains": ["wh-1000xm5"]
+    },
+    {
+      "bus": "bluetooth",
+      "description_contains": ["1000xm5"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "bluetooth_a2dp": true,
+    "bluetooth_hfp": true,
+    "duplex_a2dp": false,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 160,
+    "bluetooth_floor_msec": 240
+  },
+  "routing_policy": {
+    "output_priority": 70,
+    "allow_auto_select_input": false,
+    "allow_auto_select_output": true,
+    "prefer_non_bluetooth_input": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {
+    "preferred_a2dp_codecs": ["ldac", "aac", "sbc_xq", "sbc"],
+    "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"],
+    "latency_floor_msec": {
+      "ldac": 300,
+      "aac": 280,
+      "sbc_xq": 300,
+      "sbc": 240
+    },
+    "ldac_quality": "auto"
+  },
+  "confidence": "high",
+  "quirks": [
+    "Microphone capture uses HFP/HSP on normal Bluetooth stacks; keep playback on A2DP and prefer another microphone.",
+    "Avoid forcing LDAC maximum bitrate on unstable links.",
+    "LDAC needs a larger PipeWire loopback floor than SBC, but the profile caps it below the default 16-buffer link ceiling to avoid mini dropouts.",
+    "Use profile latency to preserve codec quality instead of falling back below AAC for ordinary crackle recovery."
+  ],
+  "source_notes": [
+    "Sony WH-1000XM5 specifications list SBC, AAC, and LDAC formats plus A2DP, AVRCP, HFP, and HSP profiles."
+  ],
+  "maintainer": "WaveLinux"
+}
