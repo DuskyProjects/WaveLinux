@@ -151,6 +151,8 @@ const SOURCE_ICON_OPTIONS: IconOption[] = [
 const SELECT_VISIBLE_OPTION_LIMIT = 80;
 const ELGATO_POLL_MS = 1500;
 const STREAMER_DEVICE_POLL_MS = 1500;
+const LIVE_METER_POLL_MS = 16;
+const IDLE_METER_POLL_MS = 250;
 const UI_METER_ATTACK_SECONDS = 0.018;
 const UI_METER_RELEASE_SECONDS = 0.34;
 const UI_METER_FLOOR = 0.003;
@@ -1167,13 +1169,18 @@ function MixerView({
     let stopped = false;
     let timer = 0;
     const tick = () => {
+      if (!documentHasActiveFocus()) {
+        setLiveMeters([]);
+        timer = window.setTimeout(tick, IDLE_METER_POLL_MS);
+        return;
+      }
       invoke<LevelMeter[]>("observe_meters")
         .then((meters) => {
           if (!stopped) setLiveMeters(meters);
         })
         .catch(() => undefined)
         .finally(() => {
-          if (!stopped) timer = window.setTimeout(tick, 16);
+          if (!stopped) timer = window.setTimeout(tick, LIVE_METER_POLL_MS);
         });
     };
 
@@ -1410,13 +1417,18 @@ function WaveLinkMixerView({
     let stopped = false;
     let timer = 0;
     const tick = () => {
+      if (!documentHasActiveFocus()) {
+        setLiveMeters([]);
+        timer = window.setTimeout(tick, IDLE_METER_POLL_MS);
+        return;
+      }
       invoke<LevelMeter[]>("observe_meters")
         .then((meters) => {
           if (!stopped) setLiveMeters(meters);
         })
         .catch(() => undefined)
         .finally(() => {
-          if (!stopped) timer = window.setTimeout(tick, 16);
+          if (!stopped) timer = window.setTimeout(tick, LIVE_METER_POLL_MS);
         });
     };
 
@@ -7550,6 +7562,10 @@ function meterLevelMapsEqual(left: Record<string, number>, right: Record<string,
   const rightKeys = Object.keys(right);
   if (leftKeys.length !== rightKeys.length) return false;
   return leftKeys.every((key) => Math.abs((left[key] ?? 0) - (right[key] ?? 0)) < 0.001);
+}
+
+function documentHasActiveFocus(): boolean {
+  return document.visibilityState === "visible" && document.hasFocus();
 }
 
 function channelBusMeterId(channelId: string, mixId: string): string {
