@@ -1926,6 +1926,7 @@ impl StreamerBinding {
     fn normalized(mut self) -> Option<Self> {
         self.control_id = clean_streamer_id(self.control_id)?;
         self.label = clean_app_display_name(&self.label).unwrap_or_else(|| self.control_id.clone());
+        self.action = self.action.without_audio_lifecycle();
         Some(self)
     }
 }
@@ -1993,6 +1994,15 @@ pub enum StreamerAction {
 impl Default for StreamerAction {
     fn default() -> Self {
         Self::Noop
+    }
+}
+
+impl StreamerAction {
+    fn without_audio_lifecycle(self) -> Self {
+        match self {
+            Self::StartOrRepairAudio | Self::CleanupAudioGraph => Self::Noop,
+            action => action,
+        }
     }
 }
 
@@ -3576,6 +3586,53 @@ mod tests {
 
         assert_eq!(config.version, CONFIG_VERSION);
         assert!(!config.settings.lock_default_output);
+    }
+
+    #[test]
+    fn streamer_bindings_migrate_audio_lifecycle_actions_to_noop() {
+        let raw = r#"
+        {
+          "streamer_devices": {
+            "profiles": {
+              "deck": {
+                "device_id": "deck",
+                "name": "Stream Deck",
+                "bindings": [
+                  {
+                    "control_id": "hid:button:1",
+                    "label": "Start",
+                    "control_kind": "button",
+                    "action": { "kind": "start_or_repair_audio" }
+                  },
+                  {
+                    "control_id": "hid:button:2",
+                    "label": "Legacy cleanup",
+                    "control_kind": "button",
+                    "action": { "kind": "cleanup_audio_graph" }
+                  },
+                  {
+                    "control_id": "hid:button:3",
+                    "label": "Prune",
+                    "control_kind": "button",
+                    "action": { "kind": "cleanup_stale_audio_graph" }
+                  }
+                ]
+              }
+            }
+          }
+        }
+        "#;
+
+        let config: MixerConfig = serde_json::from_str(raw).unwrap();
+        let config = config.normalized().unwrap();
+        let profile = config.streamer_devices.profiles.get("deck").unwrap();
+
+        assert!(matches!(profile.bindings[0].action, StreamerAction::Noop));
+        assert!(matches!(profile.bindings[1].action, StreamerAction::Noop));
+        assert!(matches!(
+            profile.bindings[2].action,
+            StreamerAction::CleanupStaleAudioGraph
+        ));
     }
 
     #[test]

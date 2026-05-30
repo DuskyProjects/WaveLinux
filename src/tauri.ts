@@ -443,18 +443,6 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return null;
   }
 
-  if (command === "repair_audio_graph") {
-    demoState.engine.audio_graph_running = true;
-    demoState.engine.message = "Audio graph running";
-    return { dry_run: true, planned: { commands: [], managed_nodes: [] }, outputs: [] };
-  }
-
-  if (command === "cleanup_audio_graph") {
-    demoState.engine.audio_graph_running = false;
-    demoState.engine.message = "Audio graph stopped";
-    return [];
-  }
-
   if (command === "cleanup_stale_audio_graph") {
     return [];
   }

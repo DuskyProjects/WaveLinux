@@ -124,8 +124,9 @@ wavelinux
 ```
 
 WaveLinux opens without mutating the audio graph unless startup restore is
-enabled. Use Start Audio to create the virtual devices, Repair to rebuild stale
-routes, and Stop/Cleanup to unload managed nodes.
+enabled. When startup restore is enabled, WaveLinux creates or restores its
+virtual devices on launch and removes WaveLinux-managed PipeWire nodes when
+the app fully quits.
 
 Closing the window hides it to the tray so audio can keep running. Use Quit
 from the tray menu to exit fully and remove WaveLinux-managed PipeWire nodes.

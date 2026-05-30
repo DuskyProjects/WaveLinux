@@ -6410,7 +6410,7 @@ fn graph_diagnostics(config: &MixerConfig, graph: &RuntimeGraph) -> Vec<Diagnost
             code: "graph.stopped".into(),
             severity: DiagnosticSeverity::Info,
             message: "WaveLinux audio graph is stopped".into(),
-            action: Some("Use Start Audio when you want to create virtual devices".into()),
+            action: Some("Quit and reopen WaveLinux to recreate virtual devices".into()),
         });
         return diagnostics;
     }

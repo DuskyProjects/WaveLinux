@@ -82,7 +82,6 @@ import type {
   Mix,
   MixBus,
   MixerSettings,
-  RepairReport,
   SoundCheckReport,
   StreamerAction,
   StreamerActionResult,
@@ -794,20 +793,6 @@ export default function App() {
     setToast(audioActionToast(title, commands, plannedCount));
   }, []);
 
-  const startOrRepairAudio = useCallback(async () => {
-    const title = state?.engine.audio_graph_running ? "Repair Audio" : "Start Audio";
-    setBusy(true);
-    try {
-      const report = await invoke<RepairReport>("repair_audio_graph");
-      scheduleRefresh(0);
-      recordAudioAction(title, report.outputs, report.planned.commands.length);
-    } catch (error) {
-      setToast(String(error));
-    } finally {
-      setBusy(false);
-    }
-  }, [recordAudioAction, scheduleRefresh, state?.engine.audio_graph_running]);
-
   const runAudioCommandList = useCallback(
     async (command: string, title: string) => {
       setBusy(true);
@@ -960,7 +945,6 @@ export default function App() {
           setSettings={setSettingsFast}
           updateBusy={updateBusy}
           updateInfo={updateInfo}
-          onCleanup={() => runAudioCommandList("cleanup_audio_graph", "Cleanup Audio")}
           onCheckUpdates={() => void checkUpdates(true).catch(() => undefined)}
           onInstallUpdate={() => {
             setUpdateBusy(true);
@@ -989,26 +973,6 @@ export default function App() {
     <div className="top-actions">
       <button className="icon-button" onClick={() => refresh()} title="Refresh" type="button">
         <RefreshCw size={17} />
-      </button>
-      {state?.engine.audio_graph_running && (
-        <button
-          className="secondary-button danger"
-          disabled={busy}
-          onClick={() => void runAudioCommandList("cleanup_audio_graph", "Stop Audio")}
-          type="button"
-        >
-          <Trash2 size={17} />
-          Stop
-        </button>
-      )}
-      <button
-        className="primary-button"
-        disabled={busy || !state}
-        onClick={() => void startOrRepairAudio()}
-        type="button"
-      >
-        <WandSparkles size={17} />
-        {state?.engine.audio_graph_running ? "Repair" : "Start Audio"}
       </button>
     </div>
   );
@@ -5055,7 +5019,6 @@ function EffectBlock({
 function DiagnosticsView({
   audioActionReport,
   onInstallEffectPlugins,
-  onCleanup,
   onPrune,
   pluginInstallBusy,
   state,
@@ -5063,7 +5026,6 @@ function DiagnosticsView({
 }: {
   audioActionReport: AudioActionReport | null;
   onInstallEffectPlugins: () => void;
-  onCleanup: () => void | Promise<unknown>;
   onPrune: () => void | Promise<unknown>;
   pluginInstallBusy: boolean;
   state: AppStateSnapshot;
@@ -5170,15 +5132,6 @@ function DiagnosticsView({
             >
               <WandSparkles size={16} />
               Prune
-            </button>
-            <button
-              className="secondary-button danger"
-              onClick={() => void onCleanup()}
-              type="button"
-              title="Disruptive: unload every WaveLinux-managed audio module"
-            >
-              <Trash2 size={16} />
-              Cleanup
             </button>
           </div>
         </div>
@@ -5654,7 +5607,6 @@ function SettingsView({
   setSettings,
   updateBusy,
   updateInfo,
-  onCleanup,
   onCheckUpdates,
   onInstallUpdate,
   onInstallEffectPlugins,
@@ -5673,7 +5625,6 @@ function SettingsView({
   setSettings: (settings: MixerSettings) => Promise<void>;
   updateBusy: boolean;
   updateInfo: UpdateInfo | null;
-  onCleanup: () => void | Promise<unknown>;
   onCheckUpdates: () => void;
   onInstallUpdate: () => void;
   onInstallEffectPlugins: () => void;
@@ -5958,7 +5909,7 @@ function SettingsView({
             </div>
           </div>
           <div className="system-grid">
-            <Stat icon={Cpu} label="Engine" value={state.engine.audio_graph_running ? "Running" : "Stopped"} />
+            <Stat icon={Cpu} label="Engine" value={state.engine.audio_graph_running ? "Running" : "Inactive"} />
             <Stat icon={Radio} label="Rate" value={`${state.config.audio.sample_rate_hz / 1000} kHz`} />
             <Stat icon={AudioLines} label="Format" value={`${state.config.audio.bit_depth}-bit`} />
           </div>
@@ -5983,7 +5934,6 @@ function SettingsView({
         <DiagnosticsView
           audioActionReport={audioActionReport}
           onInstallEffectPlugins={onInstallEffectPlugins}
-          onCleanup={onCleanup}
           onPrune={onPrune}
           pluginInstallBusy={pluginInstallBusy}
           state={state}
@@ -6988,9 +6938,7 @@ function streamerPermissionLabel(status: StreamerDeviceSummary["permission_statu
 function streamerActionOptions(state: AppStateSnapshot): SelectOption[] {
   const actions: Array<{ label: string; action: StreamerAction }> = [
     { label: "No action", action: { kind: "noop" } },
-    { label: "Start or repair audio", action: { kind: "start_or_repair_audio" } },
     { label: "Prune stale audio", action: { kind: "cleanup_stale_audio_graph" } },
-    { label: "Cleanup audio graph", action: { kind: "cleanup_audio_graph" } },
   ];
   for (const mix of state.config.mixes) {
     actions.push({

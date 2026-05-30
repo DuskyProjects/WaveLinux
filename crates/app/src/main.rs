@@ -674,20 +674,6 @@ fn get_graph_debug_report(engine: State<'_, EngineState>) -> Result<GraphDebugRe
 }
 
 #[tauri::command]
-fn repair_audio_graph(
-    engine: State<'_, EngineState>,
-) -> Result<wavelinux_engine::RepairReport, String> {
-    tauri_result(engine.engine.repair_audio_graph())
-}
-
-#[tauri::command]
-fn cleanup_audio_graph(
-    engine: State<'_, EngineState>,
-) -> Result<Vec<wavelinux_engine::CommandExecution>, String> {
-    tauri_result(engine.engine.cleanup_audio_graph())
-}
-
-#[tauri::command]
 fn cleanup_stale_audio_graph(
     engine: State<'_, EngineState>,
 ) -> Result<Vec<wavelinux_engine::CommandExecution>, String> {
@@ -1722,8 +1708,6 @@ fn main() {
             run_sound_check,
             run_diagnostics,
             get_graph_debug_report,
-            repair_audio_graph,
-            cleanup_audio_graph,
             cleanup_stale_audio_graph,
             restore_device,
             get_ui_theme_preference,

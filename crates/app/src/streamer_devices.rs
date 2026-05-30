@@ -273,25 +273,14 @@ fn run_action_with_value(
                 ),
             ))
         }
-        StreamerAction::StartOrRepairAudio => {
-            let report = engine.repair_audio_graph().map_err(|err| err.to_string())?;
-            Ok(action_result(
-                true,
-                format!(
-                    "Audio graph repaired with {} host commands",
-                    report.outputs.len()
-                ),
-            ))
-        }
-        StreamerAction::CleanupAudioGraph => {
-            let outputs = engine
-                .cleanup_audio_graph()
-                .map_err(|err| err.to_string())?;
-            Ok(action_result(
-                true,
-                format!("Audio cleanup ran {} host commands", outputs.len()),
-            ))
-        }
+        StreamerAction::StartOrRepairAudio => Ok(action_result(
+            false,
+            "Audio graph starts automatically when WaveLinux opens",
+        )),
+        StreamerAction::CleanupAudioGraph => Ok(action_result(
+            false,
+            "Audio graph cleanup runs when WaveLinux quits",
+        )),
         StreamerAction::CleanupStaleAudioGraph => {
             let outputs = engine
                 .cleanup_stale_audio_graph()
@@ -905,11 +894,6 @@ fn default_profile_for_device(
     }
     bindings.push(button_binding(
         default_control_id(device, 2),
-        "Start or repair audio",
-        StreamerAction::StartOrRepairAudio,
-    ));
-    bindings.push(button_binding(
-        default_control_id(device, 3),
         "Prune stale audio",
         StreamerAction::CleanupStaleAudioGraph,
     ));
@@ -920,7 +904,7 @@ fn default_profile_for_device(
         .unwrap_or_else(|| "stream".into());
     for (index, channel) in config.channels.iter().take(4).enumerate() {
         bindings.push(button_binding(
-            default_control_id(device, index + 4),
+            default_control_id(device, index + 3),
             format!("{} mute", channel.name),
             StreamerAction::ChannelMuteToggle {
                 channel_id: channel.id.clone(),
@@ -1478,6 +1462,38 @@ Client 24 : "RODECaster Pro II" [Kernel]
         let (vendor, product) = parse_hid_id("0003:00000FD9:00000080").unwrap();
         assert_eq!(vendor.as_deref(), Some("0fd9"));
         assert_eq!(product.as_deref(), Some("0080"));
+    }
+
+    #[test]
+    fn default_profile_skips_audio_lifecycle_actions() {
+        let config = MixerConfig::default();
+        let device = StreamerDeviceSummary {
+            id: "hidraw-test".into(),
+            name: "Stream Deck".into(),
+            family: StreamerDeviceFamily::StreamDeck,
+            transport: StreamerTransport::Hid,
+            capabilities: StreamerDeviceCapabilities {
+                buttons: true,
+                ..StreamerDeviceCapabilities::default()
+            },
+            connected: true,
+            permission_status: StreamerPermissionStatus::Ready,
+            source: "hidraw:/dev/hidraw0".into(),
+            ..StreamerDeviceSummary::default()
+        };
+
+        let profile = default_profile_for_device(&device, &config);
+
+        assert!(!profile.bindings.iter().any(|binding| {
+            matches!(
+                binding.action,
+                StreamerAction::StartOrRepairAudio | StreamerAction::CleanupAudioGraph
+            )
+        }));
+        assert!(profile
+            .bindings
+            .iter()
+            .any(|binding| matches!(binding.action, StreamerAction::CleanupStaleAudioGraph)));
     }
 
     #[test]
