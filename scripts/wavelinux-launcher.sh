@@ -2,8 +2,13 @@
 set -euo pipefail
 
 SUPPORT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wavelinux"
-APPIMAGE="${WAVELINUX_APPIMAGE:-$SUPPORT_DIR/WaveLinux_4.1.3_amd64.AppImage}"
+APPIMAGE="${WAVELINUX_APPIMAGE:-}"
 SANITIZER="$SUPPORT_DIR/sanitize-runtime-env.sh"
+
+if [[ -z "$APPIMAGE" ]]; then
+  APPIMAGE="$({ find "$SUPPORT_DIR" -maxdepth 1 -type f -name 'WaveLinux_*_amd64.AppImage' -print 2>/dev/null || true; } | sort -V | tail -n1)"
+  APPIMAGE="${APPIMAGE:-$SUPPORT_DIR/WaveLinux.AppImage}"
+fi
 
 if [[ -f "$SANITIZER" ]]; then
   # shellcheck source=/dev/null

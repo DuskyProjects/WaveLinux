@@ -2,11 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use time::OffsetDateTime;
 use uuid::Uuid;
 
-pub const CONFIG_VERSION: u32 = 7;
-pub const BACKUP_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 8;
 pub const MAX_MIXES: usize = 5;
 pub const MAX_SOFTWARE_CHANNELS: usize = 8;
 pub const MAX_HARDWARE_INPUTS: usize = 4;
@@ -47,8 +45,6 @@ pub enum ModelError {
     CannotDeleteLastMix,
     #[error("cannot delete the last channel")]
     CannotDeleteLastChannel,
-    #[error("setup template not found: {0}")]
-    TemplateNotFound(String),
     #[error("invalid volume: {0}")]
     InvalidVolume(String),
     #[error("invalid config: {0}")]
@@ -270,6 +266,8 @@ impl MixerConfig {
         self.ensure_system_channel();
         for mix in &mut self.mixes {
             mix.ensure_virtual_node_names();
+            mix.normalize_outputs();
+            mix.icon = clean_optional_mix_icon(mix.icon.take());
             mix.volume = clamp_unit(mix.volume);
         }
         for channel in &mut self.channels {
@@ -499,7 +497,7 @@ impl MixerConfig {
         let mix = Mix::new_fixed(&id, &name);
         self.mixes.push(mix.clone());
         for channel in &mut self.channels {
-            channel.mix_buses.insert(mix.id.clone(), MixBus::default());
+            channel.mix_buses.insert(mix.id.clone(), MixBus::disabled());
         }
         Ok(mix)
     }
@@ -687,6 +685,17 @@ impl MixerConfig {
         Ok(mix.clone())
     }
 
+    pub fn set_mix_icon(
+        &mut self,
+        mix_id: impl AsRef<str>,
+        icon: Option<String>,
+    ) -> Result<Mix, ModelError> {
+        let icon = clean_optional_mix_icon(icon);
+        let mix = self.mix_mut(mix_id.as_ref())?;
+        mix.icon = icon;
+        Ok(mix.clone())
+    }
+
     pub fn set_mix_monitor_output(
         &mut self,
         mix_id: impl AsRef<str>,
@@ -695,11 +704,28 @@ impl MixerConfig {
         let output = clean_optional_matcher(output);
         let mix = {
             let mix = self.mix_mut(mix_id.as_ref())?;
-            mix.monitor_output = output.clone();
+            mix.set_outputs(output.iter().cloned().collect());
             mix.clone()
         };
         if mix.id == "monitor" {
             self.device_policy.preferred_output = output;
+        }
+        Ok(mix)
+    }
+
+    pub fn set_mix_outputs(
+        &mut self,
+        mix_id: impl AsRef<str>,
+        outputs: Vec<DeviceId>,
+    ) -> Result<Mix, ModelError> {
+        let outputs = clean_output_devices(outputs);
+        let mix = {
+            let mix = self.mix_mut(mix_id.as_ref())?;
+            mix.set_outputs(outputs.clone());
+            mix.clone()
+        };
+        if mix.id == "monitor" {
+            self.device_policy.preferred_output = mix.monitor_output.clone();
         }
         Ok(mix)
     }
@@ -747,6 +773,24 @@ impl MixerConfig {
             .get_mut(mix_id)
             .ok_or_else(|| ModelError::MixNotFound(mix_id.into()))?;
         bus.muted = muted;
+        Ok(bus.clone())
+    }
+
+    pub fn set_channel_bus_enabled(
+        &mut self,
+        channel_id: impl AsRef<str>,
+        mix_id: impl AsRef<str>,
+        enabled: bool,
+    ) -> Result<MixBus, ModelError> {
+        let channel_id = channel_id.as_ref();
+        let mix_id = mix_id.as_ref();
+        self.ensure_mix_exists(mix_id)?;
+        let channel = self.channel_mut(channel_id)?;
+        let bus = channel
+            .mix_buses
+            .get_mut(mix_id)
+            .ok_or_else(|| ModelError::MixNotFound(mix_id.into()))?;
+        bus.enabled = enabled;
         Ok(bus.clone())
     }
 
@@ -1078,22 +1122,6 @@ impl MixerConfig {
         app
     }
 
-    pub fn apply_setup_template(
-        &mut self,
-        template_id: impl AsRef<str>,
-    ) -> Result<SetupTemplate, ModelError> {
-        let template_id = template_id.as_ref();
-        let template = setup_templates()
-            .into_iter()
-            .find(|template| template.id == template_id)
-            .ok_or_else(|| ModelError::TemplateNotFound(template_id.into()))?;
-        let mut next = config_for_setup_template(&template)?;
-        next.settings = self.settings.clone();
-        next.audio = self.audio.clone();
-        *self = next.normalized()?;
-        Ok(template)
-    }
-
     pub fn set_effect_chain(
         &mut self,
         channel_id: impl AsRef<str>,
@@ -1240,6 +1268,10 @@ pub struct Mix {
     pub virtual_source_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor_output: Option<DeviceId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_devices: Vec<DeviceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     #[serde(default = "default_unit_volume")]
     pub volume: f32,
     #[serde(default)]
@@ -1255,6 +1287,8 @@ impl Mix {
             virtual_sink_name: format!("wavelinux_mix_{safe}"),
             virtual_source_name: format!("wavelinux_mix_{safe}_source"),
             monitor_output: None,
+            output_devices: Vec::new(),
+            icon: None,
             volume: 1.0,
             muted: false,
         }
@@ -1268,6 +1302,30 @@ impl Mix {
         if self.virtual_source_name.trim().is_empty() {
             self.virtual_source_name = format!("wavelinux_mix_{safe}_source");
         }
+    }
+
+    pub fn outputs(&self) -> Vec<DeviceId> {
+        let outputs = clean_output_devices(self.output_devices.clone());
+        if outputs.is_empty() {
+            self.monitor_output.iter().cloned().collect()
+        } else {
+            outputs
+        }
+    }
+
+    pub fn set_outputs(&mut self, outputs: Vec<DeviceId>) {
+        self.output_devices = clean_output_devices(outputs);
+        self.monitor_output = self.output_devices.first().cloned();
+    }
+
+    fn normalize_outputs(&mut self) {
+        let mut outputs = clean_output_devices(std::mem::take(&mut self.output_devices));
+        if outputs.is_empty() {
+            if let Some(output) = clean_optional_matcher(self.monitor_output.take()) {
+                outputs.push(output);
+            }
+        }
+        self.set_outputs(outputs);
     }
 }
 
@@ -1401,6 +1459,8 @@ pub struct MixBus {
     pub volume: f32,
     #[serde(default)]
     pub muted: bool,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 impl Default for MixBus {
@@ -1408,6 +1468,16 @@ impl Default for MixBus {
         Self {
             volume: 1.0,
             muted: false,
+            enabled: true,
+        }
+    }
+}
+
+impl MixBus {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
         }
     }
 }
@@ -1655,60 +1725,6 @@ impl Default for FallbackHardwareProfile {
             bluetooth_mic_policy: BluetoothMicPolicy::NeverIfHfp,
             confidence: ProfileConfidence::Low,
         }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SetupTemplate {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub details: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ConfigBackup {
-    pub backup_version: u32,
-    pub exported_unix: i64,
-    pub config: MixerConfig,
-    #[serde(default)]
-    pub scenes: Vec<Scene>,
-}
-
-impl ConfigBackup {
-    pub fn new(config: MixerConfig, scenes: Vec<Scene>) -> Result<Self, ModelError> {
-        let backup = Self {
-            backup_version: BACKUP_VERSION,
-            exported_unix: OffsetDateTime::now_utc().unix_timestamp(),
-            config: config.normalized()?,
-            scenes: scenes
-                .into_iter()
-                .filter_map(|scene| {
-                    Scene::new(scene.name, scene.config.normalized().ok()?)
-                        .ok()
-                        .map(|mut normalized| {
-                            normalized.id = scene.id;
-                            normalized.created_unix = scene.created_unix;
-                            normalized
-                        })
-                })
-                .collect(),
-        };
-        backup.validate()?;
-        Ok(backup)
-    }
-
-    pub fn validate(&self) -> Result<(), ModelError> {
-        if self.backup_version == 0 {
-            return Err(ModelError::InvalidConfig(
-                "backup version must be non-zero".into(),
-            ));
-        }
-        self.config.clone().normalized()?;
-        for scene in &self.scenes {
-            scene.config.clone().normalized()?;
-        }
-        Ok(())
     }
 }
 
@@ -2418,26 +2434,6 @@ pub struct Diagnostic {
     pub action: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Scene {
-    pub id: String,
-    pub name: String,
-    pub created_unix: i64,
-    pub config: MixerConfig,
-}
-
-impl Scene {
-    pub fn new(name: impl AsRef<str>, config: MixerConfig) -> Result<Self, ModelError> {
-        let name = clean_name(name)?;
-        Ok(Self {
-            id: unique_slug(&name, std::iter::empty::<&str>()),
-            name,
-            created_unix: OffsetDateTime::now_utc().unix_timestamp(),
-            config,
-        })
-    }
-}
-
 pub fn clamp_unit(value: f32) -> f32 {
     if !value.is_finite() {
         1.0
@@ -2528,6 +2524,28 @@ fn clean_optional_matcher(value: Option<String>) -> Option<String> {
 
 fn clean_optional_device_id(value: Option<String>) -> Option<String> {
     clean_optional_matcher(value).filter(|value| value != "@DEFAULT_SOURCE@")
+}
+
+fn clean_output_devices(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    values
+        .into_iter()
+        .filter_map(|value| clean_optional_matcher(Some(value)))
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+fn clean_optional_mix_icon(value: Option<String>) -> Option<String> {
+    let value = clean_optional_matcher(value)?;
+    let value = value
+        .chars()
+        .take(32)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
+        .then_some(value)
 }
 
 fn clean_optional_profile_id(value: Option<String>) -> Option<String> {
@@ -2911,302 +2929,6 @@ fn slugify(value: &str) -> String {
     slug.trim_matches('_').to_string()
 }
 
-pub fn setup_templates() -> Vec<SetupTemplate> {
-    vec![
-        setup_template(
-            "streaming",
-            "Streaming",
-            "WaveLinux 3.1-style starter for OBS: mic, system, game, chat, music, browser, and SFX routed into Monitor and Stream.",
-            &[
-                "Monitor and Stream mixes",
-                "Seven ready-to-route source channels",
-                "Broadcast mic FX chain",
-                "Saved routes and offline volume presets for common apps",
-            ],
-        ),
-        setup_template(
-            "microphonefx",
-            "MicrophoneFX / Discord",
-            "A dedicated virtual microphone mix for Discord, Teams, games, and browser calls.",
-            &[
-                "Adds a MicrophoneFX virtual source",
-                "Routes mic, SFX, music, and chat into a call-safe mix",
-                "Keeps system/game audio mostly out of the microphone feed",
-                "Starts with speech cleanup effects on Input",
-            ],
-        ),
-        setup_template(
-            "discord_mix",
-            "Discord Mix",
-            "One-click virtual microphone mix for Discord with mic, music bed, SFX, and chat-safe levels.",
-            &[
-                "Adds a Discord Mix virtual source",
-                "Routes Input, SFX, and optional music into Discord",
-                "Keeps system/game/browser audio muted from the mic feed",
-                "Uses speech cleanup and conservative limiter settings",
-            ],
-        ),
-        setup_template(
-            "podcast",
-            "Podcast",
-            "Multi-mix layout for recording voice, remote guests, browser audio, music beds, and soundboard cues.",
-            &[
-                "Adds Podcast and Guest Mix outputs",
-                "Separates browser/guest audio from local monitoring",
-                "Keeps music/SFX lower in the recording mix",
-                "Uses conservative voice processing",
-            ],
-        ),
-        setup_template(
-            "work_call",
-            "Work Call",
-            "Clean meeting setup with microphone processing, browser call routing, and a simple Call Mix virtual source.",
-            &[
-                "Adds Call Mix for conferencing apps",
-                "Prioritizes mic clarity and low background noise",
-                "Routes browsers and chat apps into the call channel",
-                "Keeps music and game audio out by default",
-            ],
-        ),
-    ]
-}
-
-fn setup_template(id: &str, name: &str, description: &str, details: &[&str]) -> SetupTemplate {
-    SetupTemplate {
-        id: id.into(),
-        name: name.into(),
-        description: description.into(),
-        details: details.iter().map(|detail| (*detail).into()).collect(),
-    }
-}
-
-fn config_for_setup_template(template: &SetupTemplate) -> Result<MixerConfig, ModelError> {
-    let config = match template.id.as_str() {
-        "streaming" => streaming_template_config(),
-        "microphonefx" => microphonefx_template_config(),
-        "discord_mix" => discord_mix_template_config(),
-        "podcast" => podcast_template_config(),
-        "work_call" => work_call_template_config(),
-        other => return Err(ModelError::TemplateNotFound(other.into())),
-    };
-    config.normalized()
-}
-
-fn discord_mix_template_config() -> MixerConfig {
-    let mut config = microphonefx_template_config();
-    if let Some(mix) = config.mixes.iter_mut().find(|mix| mix.id == "microphonefx") {
-        mix.id = "discord_mix".into();
-        mix.name = "Discord Mix".into();
-        mix.virtual_sink_name = "wavelinux_mix_discord_mix".into();
-        mix.virtual_source_name = "wavelinux_mix_discord_mix_source".into();
-    }
-    for channel in &mut config.channels {
-        if let Some(bus) = channel.mix_buses.remove("microphonefx") {
-            channel.mix_buses.insert("discord_mix".into(), bus);
-        }
-    }
-    config
-}
-
-fn streaming_template_config() -> MixerConfig {
-    let mut config = template_config(
-        vec![
-            Mix::new_fixed("monitor", "Monitor"),
-            Mix::new_fixed("stream", "Stream"),
-        ],
-        vec![
-            template_channel(
-                "hardware_in",
-                "Input",
-                ChannelKind::Generic,
-                voice_fx_chain(),
-            ),
-            template_channel("system", "System", ChannelKind::System, Vec::new()),
-            template_channel("game", "Game", ChannelKind::Application, Vec::new()),
-            template_channel("chat", "Chat", ChannelKind::Application, Vec::new()),
-            template_channel("music", "Music", ChannelKind::Application, Vec::new()),
-            template_channel("browser", "Browser", ChannelKind::Application, Vec::new()),
-            template_channel("sfx", "SFX", ChannelKind::Soundboard, Vec::new()),
-        ],
-    );
-
-    set_template_bus(&mut config, "hardware_in", "monitor", 1.0, false);
-    set_template_bus(&mut config, "hardware_in", "stream", 0.88, false);
-    set_template_bus(&mut config, "system", "stream", 0.72, false);
-    set_template_bus(&mut config, "game", "stream", 0.74, false);
-    set_template_bus(&mut config, "chat", "stream", 0.68, false);
-    set_template_bus(&mut config, "music", "stream", 0.52, false);
-    set_template_bus(&mut config, "browser", "stream", 0.68, false);
-    set_template_bus(&mut config, "sfx", "stream", 0.62, false);
-    config.app_routes = vec![
-        route_app("discord", "chat"),
-        route_app("com.discordapp.discord", "chat"),
-        route_app("spotify", "music"),
-        route_app("firefox", "browser"),
-        route_app("com.google.chrome", "browser"),
-        route_app("com.brave.browser", "browser"),
-        route_app("com.valvesoftware.steam", "game"),
-        route_app("steam", "game"),
-    ];
-    config.app_volume_presets = vec![
-        volume_app("discord", 0.82),
-        volume_app("spotify", 0.66),
-        volume_app("firefox", 0.78),
-        volume_app("steam", 0.86),
-    ];
-    config
-}
-
-fn microphonefx_template_config() -> MixerConfig {
-    let mut config = template_config(
-        vec![
-            Mix::new_fixed("monitor", "Monitor"),
-            Mix::new_fixed("stream", "Stream"),
-            Mix::new_fixed("microphonefx", "MicrophoneFX"),
-        ],
-        vec![
-            template_channel(
-                "hardware_in",
-                "Input",
-                ChannelKind::Generic,
-                voice_fx_chain(),
-            ),
-            template_channel("system", "System", ChannelKind::System, Vec::new()),
-            template_channel("chat", "Chat", ChannelKind::Application, Vec::new()),
-            template_channel("music", "Music", ChannelKind::Application, Vec::new()),
-            template_channel("sfx", "SFX", ChannelKind::Soundboard, Vec::new()),
-            template_channel("browser", "Browser", ChannelKind::Application, Vec::new()),
-        ],
-    );
-
-    for channel_id in ["system", "chat", "browser"] {
-        set_template_bus(&mut config, channel_id, "microphonefx", 0.0, true);
-    }
-    set_template_bus(&mut config, "hardware_in", "monitor", 1.0, false);
-    set_template_bus(&mut config, "hardware_in", "microphonefx", 0.9, false);
-    set_template_bus(&mut config, "sfx", "microphonefx", 0.48, false);
-    set_template_bus(&mut config, "music", "microphonefx", 0.24, false);
-    set_template_bus(&mut config, "chat", "stream", 0.6, false);
-    set_template_bus(&mut config, "music", "stream", 0.5, false);
-    config.app_routes = vec![
-        route_app("discord", "chat"),
-        route_app("com.discordapp.discord", "chat"),
-        route_app("spotify", "music"),
-        route_app("firefox", "browser"),
-    ];
-    config.app_volume_presets = vec![volume_app("discord", 0.78), volume_app("spotify", 0.58)];
-    config
-}
-
-fn podcast_template_config() -> MixerConfig {
-    let mut config = template_config(
-        vec![
-            Mix::new_fixed("monitor", "Monitor"),
-            Mix::new_fixed("stream", "Stream"),
-            Mix::new_fixed("podcast", "Podcast"),
-            Mix::new_fixed("guest_mix", "Guest Mix"),
-        ],
-        vec![
-            template_channel(
-                "hardware_in",
-                "Input",
-                ChannelKind::Generic,
-                voice_fx_chain(),
-            ),
-            template_channel(
-                "guest",
-                "Guest",
-                ChannelKind::Application,
-                voice_light_fx_chain(),
-            ),
-            template_channel("browser", "Browser", ChannelKind::Application, Vec::new()),
-            template_channel("music", "Music", ChannelKind::Application, Vec::new()),
-            template_channel("sfx", "SFX", ChannelKind::Soundboard, Vec::new()),
-            template_channel("system", "System", ChannelKind::System, Vec::new()),
-        ],
-    );
-
-    set_template_bus(&mut config, "hardware_in", "monitor", 1.0, false);
-    set_template_bus(&mut config, "hardware_in", "podcast", 0.9, false);
-    set_template_bus(&mut config, "guest", "podcast", 0.82, false);
-    set_template_bus(&mut config, "browser", "podcast", 0.64, false);
-    set_template_bus(&mut config, "music", "podcast", 0.38, false);
-    set_template_bus(&mut config, "sfx", "podcast", 0.52, false);
-    set_template_bus(&mut config, "system", "podcast", 0.0, true);
-    set_template_bus(&mut config, "hardware_in", "guest_mix", 0.0, true);
-    set_template_bus(&mut config, "guest", "guest_mix", 0.9, false);
-    set_template_bus(&mut config, "browser", "guest_mix", 0.7, false);
-    set_template_bus(&mut config, "music", "guest_mix", 0.2, false);
-    config.app_routes = vec![
-        route_app("discord", "guest"),
-        route_app("zoom", "guest"),
-        route_app("us.zoom.zoom", "guest"),
-        route_app("firefox", "browser"),
-        route_app("spotify", "music"),
-    ];
-    config.app_volume_presets = vec![
-        volume_app("discord", 0.82),
-        volume_app("zoom", 0.82),
-        volume_app("spotify", 0.48),
-    ];
-    config
-}
-
-fn work_call_template_config() -> MixerConfig {
-    let mut config = template_config(
-        vec![
-            Mix::new_fixed("monitor", "Monitor"),
-            Mix::new_fixed("stream", "Stream"),
-            Mix::new_fixed("call_mix", "Call Mix"),
-        ],
-        vec![
-            template_channel(
-                "hardware_in",
-                "Input",
-                ChannelKind::Generic,
-                voice_fx_chain(),
-            ),
-            template_channel("chat", "Chat", ChannelKind::Application, Vec::new()),
-            template_channel("browser", "Browser", ChannelKind::Application, Vec::new()),
-            template_channel("system", "System", ChannelKind::System, Vec::new()),
-            template_channel("music", "Music", ChannelKind::Application, Vec::new()),
-        ],
-    );
-
-    set_template_bus(&mut config, "hardware_in", "monitor", 1.0, false);
-    set_template_bus(&mut config, "hardware_in", "call_mix", 0.9, false);
-    set_template_bus(&mut config, "chat", "call_mix", 0.0, true);
-    set_template_bus(&mut config, "browser", "call_mix", 0.0, true);
-    set_template_bus(&mut config, "system", "call_mix", 0.0, true);
-    set_template_bus(&mut config, "music", "call_mix", 0.0, true);
-    set_template_bus(&mut config, "music", "stream", 0.0, true);
-    config.app_routes = vec![
-        route_app("discord", "chat"),
-        route_app("slack", "chat"),
-        route_app("com.microsoft.teams", "chat"),
-        route_app("zoom", "chat"),
-        route_app("firefox", "browser"),
-        route_app("com.google.chrome", "browser"),
-    ];
-    config.app_volume_presets = vec![
-        volume_app("discord", 0.8),
-        volume_app("slack", 0.8),
-        volume_app("zoom", 0.82),
-    ];
-    config
-}
-
-fn template_config(mixes: Vec<Mix>, mut channels: Vec<Channel>) -> MixerConfig {
-    for channel in &mut channels {
-        channel.ensure_mix_buses(&mixes);
-    }
-    MixerConfig {
-        mixes,
-        channels,
-        ..MixerConfig::default()
-    }
-}
-
 fn unmute_hardware_monitor_bus(channels: &mut [Channel]) {
     for channel in channels
         .iter_mut()
@@ -3217,104 +2939,6 @@ fn unmute_hardware_monitor_bus(channels: &mut [Channel]) {
             bus.muted = false;
         }
     }
-}
-
-fn template_channel(
-    id: &str,
-    name: &str,
-    kind: ChannelKind,
-    effects: Vec<EffectInstance>,
-) -> Channel {
-    let mut channel = Channel::new_fixed(id, name, kind);
-    channel.effects = effects;
-    channel
-}
-
-fn set_template_bus(
-    config: &mut MixerConfig,
-    channel_id: &str,
-    mix_id: &str,
-    volume: f32,
-    muted: bool,
-) {
-    if let Some(bus) = config
-        .channels
-        .iter_mut()
-        .find(|channel| channel.id == channel_id)
-        .and_then(|channel| channel.mix_buses.get_mut(mix_id))
-    {
-        bus.volume = clamp_unit(volume);
-        bus.muted = muted;
-    }
-}
-
-fn route_app(app_id: &str, channel_id: &str) -> AppRoute {
-    AppRoute {
-        matcher: AppMatcher::from_app_id(app_id),
-        channel_id: channel_id.into(),
-    }
-}
-
-fn volume_app(app_id: &str, volume: f32) -> AppVolumePreset {
-    AppVolumePreset {
-        matcher: AppMatcher::from_app_id(app_id),
-        volume: clamp_unit(volume),
-    }
-}
-
-fn voice_fx_chain() -> Vec<EffectInstance> {
-    vec![
-        effect_instance("deepfilternet", &[("attenuation_limit_db", 24.0)]),
-        effect_instance("highpass", &[("frequency_hz", 80.0)]),
-        effect_instance(
-            "eq",
-            &[
-                ("low_freq_hz", 120.0),
-                ("low_gain_db", -2.0),
-                ("mid_freq_hz", 2500.0),
-                ("mid_gain_db", 2.0),
-                ("high_freq_hz", 8000.0),
-                ("high_gain_db", 1.5),
-            ],
-        ),
-        effect_instance(
-            "compressor",
-            &[
-                ("threshold_db", -18.0),
-                ("ratio", 4.0),
-                ("attack_ms", 5.0),
-                ("release_ms", 100.0),
-                ("makeup_gain_db", 3.0),
-            ],
-        ),
-        effect_instance("limiter", &[("input_gain_db", 0.0), ("ceiling_db", -1.0)]),
-    ]
-}
-
-fn voice_light_fx_chain() -> Vec<EffectInstance> {
-    vec![
-        effect_instance("highpass", &[("frequency_hz", 80.0)]),
-        effect_instance(
-            "compressor",
-            &[
-                ("threshold_db", -20.0),
-                ("ratio", 2.0),
-                ("attack_ms", 10.0),
-                ("release_ms", 120.0),
-                ("makeup_gain_db", 2.0),
-            ],
-        ),
-        effect_instance("limiter", &[("ceiling_db", -1.0)]),
-    ]
-}
-
-fn effect_instance(effect_id: &str, params: &[(&str, f32)]) -> EffectInstance {
-    let mut effect = EffectInstance::new(effect_id);
-    effect.params = params
-        .iter()
-        .map(|(key, value)| ((*key).into(), *value))
-        .collect();
-    effect
 }
 
 fn effect(
@@ -3538,49 +3162,40 @@ mod tests {
         let mix = config.create_mix("MicrophoneFX").unwrap();
         for channel in &config.channels {
             assert!(channel.mix_buses.contains_key(&mix.id));
+            assert!(!channel.mix_buses[&mix.id].enabled);
         }
     }
 
     #[test]
-    fn setup_templates_apply_complete_layouts() {
+    fn mix_outputs_migrate_legacy_monitor_output() {
+        let mut mix = Mix::new_fixed("monitor", "Monitor");
+        mix.monitor_output = Some("alsa_output.speakers".into());
+        mix.normalize_outputs();
+
+        assert_eq!(mix.outputs(), vec!["alsa_output.speakers"]);
+        assert_eq!(mix.output_devices, vec!["alsa_output.speakers"]);
+        assert_eq!(mix.monitor_output.as_deref(), Some("alsa_output.speakers"));
+    }
+
+    #[test]
+    fn mix_icons_are_normalized_and_can_be_cleared() {
         let mut config = MixerConfig::default();
-        let template = config.apply_setup_template("microphonefx").unwrap();
 
-        assert_eq!(template.id, "microphonefx");
-        assert!(config.mixes.iter().any(|mix| mix.id == "microphonefx"));
-        assert!(config
-            .channels
-            .iter()
-            .find(|channel| channel.id == "hardware_in")
-            .is_some_and(|channel| {
-                channel.effects.len() >= 3
-                    && channel
-                        .mix_buses
-                        .get("monitor")
-                        .is_some_and(|bus| !bus.muted)
-            }));
-        assert!(config
-            .app_routes
-            .iter()
-            .any(|route| route.channel_id == "chat"));
-        assert!(config
-            .app_volume_presets
-            .iter()
-            .any(|preset| (preset.volume - 0.78).abs() < f32::EPSILON));
-        config.validate().unwrap();
+        let mix = config
+            .set_mix_icon("monitor", Some("Radio".into()))
+            .unwrap();
+        assert_eq!(mix.icon.as_deref(), Some("radio"));
 
-        let template = config.apply_setup_template("discord_mix").unwrap();
-        assert_eq!(template.id, "discord_mix");
-        assert!(config.mixes.iter().any(|mix| {
-            mix.id == "discord_mix"
-                && mix.virtual_sink_name == "wavelinux_mix_discord_mix"
-                && mix.virtual_source_name == "wavelinux_mix_discord_mix_source"
-        }));
-        assert!(config.channels.iter().all(|channel| {
-            channel.mix_buses.contains_key("discord_mix")
-                && !channel.mix_buses.contains_key("microphonefx")
-        }));
-        config.validate().unwrap();
+        let mix = config
+            .set_mix_icon("monitor", Some("../not-a-token".into()))
+            .unwrap();
+        assert_eq!(mix.icon, None);
+
+        config.mixes[0].icon = Some("Chat".into());
+        config.mixes[1].icon = Some("bad/icon".into());
+        let config = config.normalized().unwrap();
+        assert_eq!(config.mixes[0].icon.as_deref(), Some("chat"));
+        assert_eq!(config.mixes[1].icon, None);
     }
 
     #[test]
@@ -3970,47 +3585,6 @@ mod tests {
 
         config.move_channel("music", 10).unwrap();
         assert_eq!(config.channels.last().unwrap().id, "music");
-    }
-
-    #[test]
-    fn scene_captures_config() {
-        let mut config = MixerConfig::default();
-        config.create_mix("MicrophoneFX").unwrap();
-        let scene = Scene::new("Streaming", config.clone()).unwrap();
-        assert_eq!(scene.name, "Streaming");
-        assert_eq!(scene.config.mixes.len(), config.mixes.len());
-    }
-
-    #[test]
-    fn config_backup_round_trips_config_and_scenes() {
-        let mut config = MixerConfig::default();
-        config.create_mix("Discord Mix").unwrap();
-        config
-            .set_channel_input_mode("hardware_in", ChannelInputMode::MonoRight)
-            .unwrap();
-        let scene = Scene::new("Discord", config.clone()).unwrap();
-
-        let backup = ConfigBackup::new(config, vec![scene.clone()]).unwrap();
-
-        assert_eq!(backup.backup_version, BACKUP_VERSION);
-        assert_eq!(backup.scenes.len(), 1);
-        assert_eq!(backup.scenes[0].id, scene.id);
-        assert!(backup.config.settings.keep_running_in_tray);
-        assert_eq!(
-            backup
-                .config
-                .channels
-                .iter()
-                .find(|channel| channel.id == "hardware_in")
-                .unwrap()
-                .input_mode,
-            ChannelInputMode::SumMono
-        );
-        backup.validate().unwrap();
-
-        let mut invalid = backup;
-        invalid.backup_version = 0;
-        assert!(invalid.validate().is_err());
     }
 
     #[test]

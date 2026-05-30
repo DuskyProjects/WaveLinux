@@ -583,6 +583,9 @@ fn meter_targets_for_config_inner(
             continue;
         };
         for (mix_id, bus) in &channel.mix_buses {
+            if !bus.enabled {
+                continue;
+            }
             let Some(mix) = mixes_by_id.get(mix_id.as_str()) else {
                 continue;
             };
@@ -787,15 +790,19 @@ pub fn plan_ensure_graph(config: &MixerConfig) -> PlannedGraph {
             commands.extend(plan_route_channel_to_effect(channel, &route_settings));
         }
         for mix in &config.mixes {
-            if channel.mix_buses.contains_key(&mix.id) {
+            if channel
+                .mix_buses
+                .get(&mix.id)
+                .is_some_and(|bus| bus.enabled)
+            {
                 commands.extend(plan_route_channel_to_mix(channel, mix, &route_settings));
             }
         }
     }
 
     for mix in &config.mixes {
-        if let Some(output) = &mix.monitor_output {
-            commands.extend(plan_route_mix_to_output(mix, output, &route_settings));
+        for output in mix.outputs() {
+            commands.extend(plan_route_mix_to_output(mix, &output, &route_settings));
         }
     }
 

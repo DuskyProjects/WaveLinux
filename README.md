@@ -4,11 +4,14 @@
 
 WaveLinux is a Linux-first creator audio mixer built with Rust, Tauri, React,
 TypeScript, and PipeWire. It is a native desktop app for software mixing,
-hardware-aware routing, and creator audio workflows.
+hardware-aware routing, creator audio workflows, and multiple selectable UI
+surfaces.
 
 The goal is Wave Link-style software mixing for Linux: virtual source faders,
-separate Monitor and Stream mixes, app routing, microphone processing, scenes,
-diagnostics, tray behavior, package builds, and open-source DSP replacements.
+separate Monitor and Stream mixes, app routing, microphone processing,
+diagnostics, tray behavior, package builds, open-source DSP replacements, and
+frontend surfaces that can evolve without coupling theme work to the Rust audio
+engine.
 
 WaveLinux is not an Elgato hardware control panel. Vendor-specific microphone
 features, Stream Deck integration, proprietary marketplace effects, and
@@ -17,6 +20,12 @@ Standard Linux audio hardware is the target.
 
 ## Highlights
 
+- WaveLinux now has a multi-surface UI system. The original WaveLinux interface
+  remains available as `wavelink2`, while the newer Wave Link 3-style matrix is
+  available in light and dark variants.
+- Custom UI theme JSON files can be dropped into the app theme folder and
+  selected from Settings without editing the Rust audio engine or rebuilding
+  WaveLinux.
 - Hardware profiles are individual JSON device files under `profiles/v1`
   with schema docs, examples, local overrides, signed remote bundle support,
   install-time hardware prewarm, and an editable safe generic fallback profile.
@@ -27,7 +36,7 @@ Standard Linux audio hardware is the target.
   capture is routed to DJI, USB, internal, or other non-Bluetooth microphones
   when available.
 - The Settings page contains Profiles and Health tabs, while the main mixer
-  navigation stays focused on mixing, routing, effects, scenes, and settings.
+  navigation stays focused on mixing, routing, effects, and settings.
 - Profile and route selectors are searchable, anchored to their controls, and
   sized for readable hardware/profile names.
 - Mixer commands use optimistic UI updates and coalesced backend refreshes so
@@ -63,6 +72,10 @@ Release history lives in `RELEASE_NOTES.md`.
 - Up to 5 virtual mixes
 - Up to 8 software routes plus hardware input routes
 - Two faders per source: Monitor and Stream
+- Built-in UI surfaces for the original WaveLinux/Wave Link 2-style mixer and
+  the Wave Link 3-style matrix mixer
+- Persistent interface selection with custom JSON theme files loaded from the
+  app config theme folder
 - Virtual mix outputs for OBS, Discord, browsers, games, meetings, and tools
 - App stream discovery, saved routing, app identity overrides, and offline rules
 - Automatic monitor output policy: Bluetooth, USB audio, jack, then speakers
@@ -76,7 +89,7 @@ Release history lives in `RELEASE_NOTES.md`.
 - Real channel/mix metering with stale-sample decay
 - Per-source effect chains through PipeWire filter-chain and LADSPA/open plugins
 - DeepFilterNet, RNNoise, high-pass, EQ, compressor, gate, and limiter catalog entries
-- Scenes, setup templates, diagnostics, sound checks, graph repair, and cleanup
+- Diagnostics, sound checks, graph repair, and cleanup
 - Close-to-tray desktop behavior with tray Quit for full graph cleanup
 - AppImage, deb, rpm, and AUR packaging
 - Signed in-app update checks for AppImage installs
@@ -232,6 +245,34 @@ routes, and Stop/Cleanup to unload managed nodes.
 Closing the window hides it to the tray so audio can keep running. Use Quit
 from the tray menu to exit fully and remove WaveLinux-managed PipeWire nodes.
 
+## Interface Themes
+
+WaveLinux separates UI selection from the audio engine. The Settings page has
+an Interface selector under General with built-in choices:
+
+- `WaveLinux Original (Wave Link 2-style)`: the original WaveLinux mixer
+  surface
+- `Wave Link 3-style Matrix`: the newer matrix mixer surface
+- `Wave Link 3-style Matrix Dark`: the same matrix workflow with dark tokens
+
+The selected interface is saved and restored on the next launch. Theme files do
+not alter mixer config, PipeWire graph behavior, hardware profiles, effects, or
+backend commands.
+
+Custom themes are JSON files loaded from the app config `themes` directory.
+Open Settings > General > Interface > Folder to reveal the directory, add one
+theme file per `.json`, then press Refresh or restart WaveLinux. On current
+Linux desktop builds the folder is typically:
+
+```bash
+~/.config/io.github.duskyprojects.WaveLinux/themes
+```
+
+Custom files choose one of the shipped UI surfaces and override WaveLinux CSS
+tokens such as background, panel, accent, text, border, danger, and effect LED
+colors. See `docs/themes.md` for the full file format, examples, and authoring
+notes.
+
 ## Updates
 
 AppImage installs can check signed release metadata from inside Settings.
@@ -341,11 +382,12 @@ Required GitHub Actions secrets:
 ## Project Layout
 
 - `crates/app`: Tauri desktop shell and IPC commands
-- `crates/engine`: config, scenes, diagnostics, graph orchestration, and state
+- `crates/engine`: config, diagnostics, graph orchestration, and state
 - `crates/model`: shared data model and migrations
 - `crates/pw`: PipeWire/PulseAudio command planning, parsing, and DSP rendering
 - `profiles/v1`: hardware profile schema, examples, author docs, and device seeds
 - `src`: React/TypeScript UI
+- `docs/themes.md`: custom UI theme file format and authoring guide
 - `scripts`: installers, release helpers, dependency checks, and validation
 - `packaging/aur`: Arch/AUR package metadata
 

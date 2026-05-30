@@ -42,6 +42,8 @@ export interface Mix {
   virtual_sink_name: string;
   virtual_source_name: string;
   monitor_output?: string | null;
+  output_devices?: string[];
+  icon?: string | null;
   volume: number;
   muted: boolean;
 }
@@ -49,6 +51,7 @@ export interface Mix {
 export interface MixBus {
   volume: number;
   muted: boolean;
+  enabled: boolean;
 }
 
 export interface AppMatcher {
@@ -290,27 +293,6 @@ export interface AppStateSnapshot {
   diagnostics: Diagnostic[];
   engine: EngineStatus;
   catalog: EffectCatalog;
-}
-
-export interface Scene {
-  id: string;
-  name: string;
-  created_unix: number;
-  config: MixerConfig;
-}
-
-export interface SetupTemplate {
-  id: string;
-  name: string;
-  description: string;
-  details: string[];
-}
-
-export interface ConfigBackup {
-  backup_version: number;
-  exported_unix: number;
-  config: MixerConfig;
-  scenes: Scene[];
 }
 
 export interface SoundCheckReport {

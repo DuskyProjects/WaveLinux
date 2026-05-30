@@ -21,12 +21,11 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 use wavelinux_model::{
-    safe_node_id, setup_templates, AppMatcher, AppRoute, AppStateSnapshot, AppStream,
-    AppVolumePreset, Channel, ChannelInputMode, ChannelKind, ConfigBackup, DeviceInfo, Diagnostic,
-    DiagnosticSeverity, EffectAvailability, EffectCatalog, EffectInstance, EngineStatus,
-    FallbackHardwareProfile, HardwareProfile, HardwareProfileUiState, KnownApp, LatencyPolicy,
-    LevelMeter, Mix, MixerConfig, MixerSettings, ModelError, RoutingPolicy, RuntimeGraph, Scene,
-    SetupTemplate,
+    safe_node_id, AppMatcher, AppRoute, AppStateSnapshot, AppStream, AppVolumePreset, Channel,
+    ChannelInputMode, ChannelKind, DeviceInfo, Diagnostic, DiagnosticSeverity, EffectAvailability,
+    EffectCatalog, EffectInstance, EngineStatus, FallbackHardwareProfile, HardwareProfile,
+    HardwareProfileUiState, KnownApp, LatencyPolicy, LevelMeter, Mix, MixerConfig, MixerSettings,
+    ModelError, RoutingPolicy, RuntimeGraph,
 };
 use wavelinux_pw::{
     channel_has_active_effects, channel_mix_route_revision, channel_mix_source_name,
@@ -87,8 +86,6 @@ pub enum EngineError {
     Io(String),
     #[error("json failed: {0}")]
     Json(String),
-    #[error("scene not found: {0}")]
-    SceneNotFound(String),
     #[error("lock poisoned")]
     LockPoisoned,
     #[error("audio graph is busy; try again in a moment")]
@@ -136,10 +133,6 @@ impl EnginePaths {
 
     fn config_file(&self) -> PathBuf {
         self.config_dir.join("config.json")
-    }
-
-    fn scenes_dir(&self) -> PathBuf {
-        self.data_dir.join("scenes")
     }
 
     fn effect_chains_dir(&self) -> PathBuf {
@@ -885,7 +878,6 @@ impl WaveLinuxEngine {
 
     pub fn new(paths: EnginePaths, options: EngineOptions) -> Result<Arc<Self>, EngineError> {
         fs::create_dir_all(&paths.config_dir)?;
-        fs::create_dir_all(paths.scenes_dir())?;
         fs::create_dir_all(paths.local_hardware_profiles_dir())?;
         let config = load_config(&paths)?.normalized()?;
         let pw = PwClient::new(options.dry_run);
@@ -1738,24 +1730,6 @@ impl WaveLinuxEngine {
         })
     }
 
-    pub fn list_setup_templates(&self) -> Vec<SetupTemplate> {
-        setup_templates()
-    }
-
-    pub fn apply_setup_template(
-        self: &Arc<Self>,
-        template_id: String,
-    ) -> Result<SetupTemplate, EngineError> {
-        let template = self.update_config(|config| config.apply_setup_template(&template_id))??;
-        self.rebuild_effect_chain_configs()?;
-        let _ = self.repair_audio_graph_if_running();
-        self.log_engine_event(
-            "template.apply",
-            format!("template={} name={}", template.id, template.name),
-        );
-        Ok(template)
-    }
-
     pub fn create_mix(self: &Arc<Self>, name: String) -> Result<Mix, EngineError> {
         let mix = self.update_config(|config| config.create_mix(name))??;
         let _ = self.repair_audio_graph_if_running();
@@ -1817,6 +1791,10 @@ impl WaveLinuxEngine {
         Ok(mix)
     }
 
+    pub fn set_mix_icon(&self, mix_id: String, icon: Option<String>) -> Result<Mix, EngineError> {
+        self.update_config(|config| config.set_mix_icon(mix_id, icon))?
+    }
+
     pub fn set_mix_monitor_output(
         self: &Arc<Self>,
         mix_id: String,
@@ -1829,6 +1807,16 @@ impl WaveLinuxEngine {
             }
             Ok(mix)
         })??;
+        let _ = self.repair_audio_graph_if_running();
+        Ok(mix)
+    }
+
+    pub fn set_mix_outputs(
+        self: &Arc<Self>,
+        mix_id: String,
+        outputs: Vec<String>,
+    ) -> Result<Mix, EngineError> {
+        let mix = self.update_config(|config| config.set_mix_outputs(mix_id, outputs))??;
         let _ = self.repair_audio_graph_if_running();
         Ok(mix)
     }
@@ -1933,7 +1921,7 @@ impl WaveLinuxEngine {
                             .or_else(|| (!config.mixes.is_empty()).then_some(0));
                         if let Some(mix_index) = mix_index {
                             let mix = &mut config.mixes[mix_index];
-                            mix.monitor_output = Some(output.clone());
+                            mix.set_outputs(vec![output.clone()]);
                             config.device_policy.preferred_output = Some(output);
                         }
                     }
@@ -2132,13 +2120,16 @@ impl WaveLinuxEngine {
         let mut outputs = Vec::new();
         if channel.linked {
             for (linked_mix_id, linked_bus) in &channel.mix_buses {
+                if !linked_bus.enabled {
+                    continue;
+                }
                 outputs.extend(self.execute_channel_bus_volume_unlocked(
                     &channel.id,
                     linked_mix_id,
                     linked_bus.volume,
                 ));
             }
-        } else {
+        } else if bus.enabled {
             outputs.extend(self.execute_channel_bus_volume_unlocked(
                 &channel.id,
                 &mix_id,
@@ -2172,9 +2163,26 @@ impl WaveLinuxEngine {
         }
 
         let _audio_commands = self.lock_audio_commands()?;
-        let outputs = self.execute_channel_bus_mute_unlocked(&channel_id, &mix_id, bus.muted);
+        let outputs = if bus.enabled {
+            self.execute_channel_bus_mute_unlocked(&channel_id, &mix_id, bus.muted)
+        } else {
+            Vec::new()
+        };
         self.log_command_executions("level.channel", &outputs);
         self.refresh_meter_targets_after_level_change();
+        Ok(bus)
+    }
+
+    pub fn set_channel_bus_enabled(
+        self: &Arc<Self>,
+        channel_id: String,
+        mix_id: String,
+        enabled: bool,
+    ) -> Result<wavelinux_model::MixBus, EngineError> {
+        let bus = self.update_config(|config| {
+            config.set_channel_bus_enabled(channel_id.clone(), mix_id.clone(), enabled)
+        })??;
+        let _ = self.repair_audio_graph_if_running();
         Ok(bus)
     }
 
@@ -2334,107 +2342,6 @@ impl WaveLinuxEngine {
             self.update_config(|config| config.bypass_effect(channel_id, instance_id, bypassed))??;
         self.schedule_effect_graph_sync(channel.id.clone());
         Ok(channel)
-    }
-
-    pub fn save_scene(&self, name: String) -> Result<Scene, EngineError> {
-        let config = self.read_config()?.clone();
-        let mut scene = Scene::new(name, config)?;
-        scene.id = format!("{}_{}", scene.id, Uuid::new_v4().simple());
-        let path = self.paths.scenes_dir().join(format!("{}.json", scene.id));
-        write_json(&path, &scene)?;
-        Ok(scene)
-    }
-
-    pub fn import_scene(&self, scene: Scene) -> Result<Scene, EngineError> {
-        let config = scene.config.normalized()?;
-        let mut imported = Scene::new(scene.name, config)?;
-        imported.id = format!("{}_{}", imported.id, Uuid::new_v4().simple());
-        let path = self
-            .paths
-            .scenes_dir()
-            .join(format!("{}.json", imported.id));
-        write_json(&path, &imported)?;
-        Ok(imported)
-    }
-
-    pub fn export_backup(&self) -> Result<ConfigBackup, EngineError> {
-        let config = self.read_config()?.clone();
-        let scenes = self.list_scenes()?;
-        ConfigBackup::new(config, scenes).map_err(EngineError::from)
-    }
-
-    pub fn import_backup(
-        self: &Arc<Self>,
-        backup: ConfigBackup,
-    ) -> Result<ConfigBackup, EngineError> {
-        backup.validate()?;
-        let config = backup.config.clone().normalized()?;
-        {
-            let mut current_config = self.write_config()?;
-            *current_config = config;
-        }
-        self.persist_config()?;
-
-        fs::create_dir_all(self.paths.scenes_dir())?;
-        for entry in fs::read_dir(self.paths.scenes_dir())? {
-            let entry = entry?;
-            if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
-                fs::remove_file(entry.path())?;
-            }
-        }
-        for scene in &backup.scenes {
-            let mut scene = scene.clone();
-            scene.config = scene.config.normalized()?;
-            write_json(
-                &self.paths.scenes_dir().join(format!("{}.json", scene.id)),
-                &scene,
-            )?;
-        }
-
-        self.rebuild_effect_chain_configs()?;
-        let _ = self.repair_audio_graph_if_running();
-        self.export_backup()
-    }
-
-    pub fn load_scene(self: &Arc<Self>, scene_id: String) -> Result<Scene, EngineError> {
-        let path = self.paths.scenes_dir().join(format!("{scene_id}.json"));
-        if !path.exists() {
-            return Err(EngineError::SceneNotFound(scene_id));
-        }
-        let scene: Scene = read_json(&path)?;
-        let config = scene.config.clone().normalized()?;
-        {
-            let mut current_config = self.write_config()?;
-            *current_config = config.clone();
-        }
-        self.persist_config()?;
-        self.rebuild_effect_chain_configs()?;
-        let _ = self.repair_audio_graph_if_running();
-        Ok(scene)
-    }
-
-    pub fn delete_scene(&self, scene_id: String) -> Result<Scene, EngineError> {
-        let path = self.paths.scenes_dir().join(format!("{scene_id}.json"));
-        if !path.exists() {
-            return Err(EngineError::SceneNotFound(scene_id));
-        }
-        let scene: Scene = read_json(&path)?;
-        fs::remove_file(path)?;
-        Ok(scene)
-    }
-
-    pub fn list_scenes(&self) -> Result<Vec<Scene>, EngineError> {
-        let mut scenes = Vec::new();
-        for entry in fs::read_dir(self.paths.scenes_dir())? {
-            let entry = entry?;
-            if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
-                if let Ok(scene) = read_json::<Scene>(&entry.path()) {
-                    scenes.push(scene);
-                }
-            }
-        }
-        scenes.sort_by_key(|scene| std::cmp::Reverse(scene.created_unix));
-        Ok(scenes)
     }
 
     pub fn cleanup_audio_graph(&self) -> Result<Vec<CommandExecution>, EngineError> {
@@ -2945,6 +2852,9 @@ impl WaveLinuxEngine {
                 plan_set_managed_sink_mute(&channel.virtual_sink_name, false),
             )));
             for (mix_id, bus) in &channel.mix_buses {
+                if !bus.enabled {
+                    continue;
+                }
                 outputs.extend(self.execute_channel_bus_volume_unlocked(
                     &channel.id,
                     mix_id,
@@ -3253,7 +3163,7 @@ impl WaveLinuxEngine {
                 action: if exists {
                     None
                 } else {
-                    Some("Change an effect or reload the scene to rebuild effect configs".into())
+                    Some("Change an effect to rebuild effect configs".into())
                 },
             });
 
@@ -3663,7 +3573,7 @@ impl WaveLinuxEngine {
             let mut config = self.write_config()?;
             if let Some(mix) = config.mixes.iter_mut().find(|mix| mix.id == "monitor") {
                 if mix.monitor_output.as_deref() != Some(output.as_str()) {
-                    mix.monitor_output = Some(output.clone());
+                    mix.set_outputs(vec![output.clone()]);
                     changed = true;
                 }
             }
@@ -4174,11 +4084,12 @@ impl WaveLinuxEngine {
                     );
                 }
 
-                for mix in config
-                    .mixes
-                    .iter()
-                    .filter(|mix| channel.mix_buses.contains_key(&mix.id))
-                {
+                for mix in config.mixes.iter().filter(|mix| {
+                    channel
+                        .mix_buses
+                        .get(&mix.id)
+                        .is_some_and(|bus| bus.enabled)
+                }) {
                     outputs.extend(
                         self.pw
                             .execute_all(plan_route_channel_to_mix(
@@ -4521,19 +4432,19 @@ fn effective_config_with_auto_devices(
     if effective.settings.monitor_follows_default_output {
         if let Some(auto_output) = auto_output {
             if let Some(mix) = effective.mixes.iter_mut().find(|mix| mix.id == "monitor") {
-                mix.monitor_output = Some(auto_output.clone());
+                mix.set_outputs(vec![auto_output.clone()]);
                 effective.device_policy.preferred_output = Some(auto_output);
             }
         }
     } else if let Some(auto_output) = auto_output {
         if let Some(mix) = effective.mixes.iter_mut().find(|mix| mix.id == "monitor") {
-            if mix
-                .monitor_output
-                .as_deref()
-                .is_some_and(|output| selected_output_is_unavailable(outputs, output))
+            let selected_outputs = mix.outputs();
+            if selected_outputs
+                .iter()
+                .any(|output| selected_output_is_unavailable(outputs, output))
             {
                 effective.device_policy.restorable_output = mix.monitor_output.clone();
-                mix.monitor_output = Some(auto_output.clone());
+                mix.set_outputs(vec![auto_output.clone()]);
                 effective.device_policy.preferred_output = Some(auto_output);
                 effective.device_policy.active_output_fallback = true;
             }
@@ -4836,14 +4747,15 @@ fn active_latency_policy_for_config(
     }
 
     for mix in &config.mixes {
-        if let Some(policy) = mix
-            .monitor_output
-            .as_deref()
-            .and_then(|output| outputs.iter().find(|device| device.id == output))
-            .and_then(|device| device.active_latency_policy.as_ref())
-        {
-            merge_latency_policy_floor(&mut combined, policy);
-            saw_policy = true;
+        for output in mix.outputs() {
+            if let Some(policy) = outputs
+                .iter()
+                .find(|device| device.id == output)
+                .and_then(|device| device.active_latency_policy.as_ref())
+            {
+                merge_latency_policy_floor(&mut combined, policy);
+                saw_policy = true;
+            }
         }
     }
 
@@ -4934,27 +4846,28 @@ fn bluetooth_monitor_route_signatures(
     config
         .mixes
         .iter()
-        .filter_map(|mix| {
-            let output = mix
-                .monitor_output
-                .as_deref()
-                .filter(|output| output.starts_with("bluez_output."))?;
-            let device = outputs
-                .iter()
-                .find(|device| output_device_can_route_sink(device, output))?;
-            Some((
-                mix.id.clone(),
-                BluetoothMonitorRouteSignature {
-                    output: device.id.clone(),
-                    serial: device
-                        .pipewire_properties
-                        .get("object.serial")
-                        .cloned()
-                        .or_else(|| device.pipewire_properties.get("object.id").cloned()),
-                    profile: device.active_profile.clone(),
-                    codec: device.active_codec.clone(),
-                },
-            ))
+        .flat_map(|mix| {
+            mix.outputs()
+                .into_iter()
+                .filter(|output| output.starts_with("bluez_output."))
+                .filter_map(move |output| {
+                    let device = outputs
+                        .iter()
+                        .find(|device| output_device_can_route_sink(device, &output))?;
+                    Some((
+                        format!("{}:{}", mix.id, output),
+                        BluetoothMonitorRouteSignature {
+                            output: device.id.clone(),
+                            serial: device
+                                .pipewire_properties
+                                .get("object.serial")
+                                .cloned()
+                                .or_else(|| device.pipewire_properties.get("object.id").cloned()),
+                            profile: device.active_profile.clone(),
+                            codec: device.active_codec.clone(),
+                        },
+                    ))
+                })
         })
         .collect()
 }
@@ -4966,12 +4879,16 @@ fn bluetooth_monitor_route_refresh_needed(
     managed_modules: &[ManagedModule],
 ) -> bool {
     let signatures = bluetooth_monitor_route_signatures(config, outputs);
-    signatures.iter().any(|(mix_id, signature)| {
+    signatures.iter().any(|(route_key, signature)| {
+        let mix_id = route_key
+            .split_once(':')
+            .map(|(mix_id, _)| mix_id)
+            .unwrap_or(route_key.as_str());
         let route_count = managed_modules
             .iter()
             .filter(|module| {
                 module.role.as_deref() == Some("mix_monitor")
-                    && module.mix_id.as_deref() == Some(mix_id.as_str())
+                    && module.mix_id.as_deref() == Some(mix_id)
                     && module
                         .sink_name
                         .as_deref()
@@ -4984,8 +4901,8 @@ fn bluetooth_monitor_route_refresh_needed(
 
         runtime
             .bluetooth_monitor_routes
-            .get(mix_id)
-            .is_some_and(|previous| previous != signature)
+            .get(route_key)
+            .is_none_or(|previous| previous != signature)
     })
 }
 
@@ -5345,37 +5262,26 @@ fn app_routing_graph_ready(
         }
     }
 
-    let Some(monitor_mix) = config
-        .mixes
-        .iter()
-        .find(|mix| mix.id == "monitor")
-        .or_else(|| config.mixes.first())
-    else {
-        return false;
-    };
-    let Some(monitor_output) = monitor_mix.monitor_output.as_deref() else {
-        return false;
-    };
-    let monitor_source = format!("{}.monitor", monitor_mix.virtual_sink_name);
-    if !managed_modules.iter().any(|module| {
-        module.role.as_deref() == Some("mix_monitor")
-            && module.mix_id.as_deref() == Some(monitor_mix.id.as_str())
-            && module.source_name.as_deref() == Some(monitor_source.as_str())
-            && module
-                .sink_name
-                .as_deref()
-                .is_some_and(|sink| audio_endpoint_names_match(sink, monitor_output))
-            && module.route_revision.as_deref()
-                == Some(
-                    mix_monitor_route_revision_for_sink(
-                        &config.settings,
-                        monitor_mix,
-                        monitor_output,
-                    )
-                    .as_str(),
-                )
-    }) {
-        return false;
+    for mix in &config.mixes {
+        let monitor_source = format!("{}.monitor", mix.virtual_sink_name);
+        for output in mix.outputs() {
+            if !managed_modules.iter().any(|module| {
+                module.role.as_deref() == Some("mix_monitor")
+                    && module.mix_id.as_deref() == Some(mix.id.as_str())
+                    && module.source_name.as_deref() == Some(monitor_source.as_str())
+                    && module
+                        .sink_name
+                        .as_deref()
+                        .is_some_and(|sink| audio_endpoint_names_match(sink, &output))
+                    && module.route_revision.as_deref()
+                        == Some(
+                            mix_monitor_route_revision_for_sink(&config.settings, mix, &output)
+                                .as_str(),
+                        )
+            }) {
+                return false;
+            }
+        }
     }
 
     config.channels.iter().all(|channel| {
@@ -5495,7 +5401,12 @@ fn channel_route_ready(
     }
     mixes
         .iter()
-        .filter(|mix| channel.mix_buses.contains_key(&mix.id))
+        .filter(|mix| {
+            channel
+                .mix_buses
+                .get(&mix.id)
+                .is_some_and(|bus| bus.enabled)
+        })
         .all(|mix| {
             managed_modules.iter().any(|module| {
                 module.role.as_deref() == Some("channel_to_mix")
@@ -5606,9 +5517,16 @@ fn module_is_stale_for_config(module: &ManagedModule, config: &MixerConfig) -> b
                 .iter()
                 .find(|mix| mix.id == mix_id)
                 .is_none_or(|mix| {
-                    let Some(output) = mix.monitor_output.as_deref() else {
+                    let Some(output) = module.sink_name.as_deref() else {
                         return true;
                     };
+                    if !mix
+                        .outputs()
+                        .iter()
+                        .any(|candidate| audio_endpoint_names_match(candidate, output))
+                    {
+                        return true;
+                    }
                     if module.route_revision.as_deref()
                         != Some(
                             mix_monitor_route_revision_for_sink(&config.settings, mix, output)
@@ -5696,7 +5614,7 @@ fn module_is_stale_for_config(module: &ManagedModule, config: &MixerConfig) -> b
             {
                 return true;
             }
-            !channel.mix_buses.contains_key(mix_id)
+            !channel.mix_buses.get(mix_id).is_some_and(|bus| bus.enabled)
                 || route_endpoint_mismatch(
                     module,
                     Some(&channel_mix_source_name(channel)),
@@ -6405,11 +6323,12 @@ fn route_diagnostics(
             }
         }
 
-        for mix in config
-            .mixes
-            .iter()
-            .filter(|mix| channel.mix_buses.contains_key(&mix.id))
-        {
+        for mix in config.mixes.iter().filter(|mix| {
+            channel
+                .mix_buses
+                .get(&mix.id)
+                .is_some_and(|bus| bus.enabled)
+        }) {
             if !output_names.contains(mix.virtual_sink_name.as_str()) {
                 continue;
             }
@@ -6735,20 +6654,20 @@ mod tests {
     fn routing_modules_for_config(config: &MixerConfig) -> Vec<ManagedModule> {
         let mut modules = Vec::new();
         for mix in &config.mixes {
-            if let Some(output) = &mix.monitor_output {
+            for output in mix.outputs() {
                 modules.push(ManagedModule {
-                    module_id: format!("monitor-{}", mix.id),
+                    module_id: format!("monitor-{}-{}", mix.id, safe_file_id(&output)),
                     role: Some("mix_monitor".into()),
                     channel_id: None,
                     mix_id: Some(mix.id.clone()),
                     route_revision: Some(mix_monitor_route_revision_for_sink(
                         &config.settings,
                         mix,
-                        output,
+                        &output,
                     )),
                     node_name: None,
                     source_name: Some(format!("{}.monitor", mix.virtual_sink_name)),
-                    sink_name: Some(output.clone()),
+                    sink_name: Some(output),
                 });
             }
         }
@@ -6766,11 +6685,12 @@ mod tests {
                     sink_name: Some(effect_chain_input_name(channel)),
                 });
             }
-            for mix in config
-                .mixes
-                .iter()
-                .filter(|mix| channel.mix_buses.contains_key(&mix.id))
-            {
+            for mix in config.mixes.iter().filter(|mix| {
+                channel
+                    .mix_buses
+                    .get(&mix.id)
+                    .is_some_and(|bus| bus.enabled)
+            }) {
                 modules.push(ManagedModule {
                     module_id: format!("{}-{}", channel.id, mix.id),
                     role: Some("channel_to_mix".into()),
@@ -7305,28 +7225,6 @@ mod tests {
         assert!(log.contains("[repair.start]"));
         assert!(log.contains("[repair.plan]"));
         assert!(log.contains("[repair.end]"));
-    }
-
-    #[test]
-    fn scenes_round_trip() {
-        let engine = test_engine();
-        engine.create_mix("Podcast".into()).unwrap();
-        let scene = engine.save_scene("Podcast setup".into()).unwrap();
-        engine.delete_mix("podcast".into()).unwrap();
-        engine.load_scene(scene.id.clone()).unwrap();
-        let state = engine.get_state().unwrap();
-        assert!(state.config.mixes.iter().any(|mix| mix.name == "Podcast"));
-        let imported = engine.import_scene(scene.clone()).unwrap();
-        assert_eq!(imported.name, scene.name);
-        assert_ne!(imported.id, scene.id);
-        assert!(engine
-            .list_scenes()
-            .unwrap()
-            .iter()
-            .any(|item| item.id == imported.id));
-        let removed = engine.delete_scene(scene.id.clone()).unwrap();
-        assert_eq!(removed.id, scene.id);
-        assert!(engine.delete_scene(scene.id).is_err());
     }
 
     #[test]
@@ -9185,58 +9083,6 @@ mod tests {
         assert!(state.config.app_volume_presets.is_empty());
         assert!(state.config.app_history[0].forgotten);
         assert!(!engine.restore_app(matcher).unwrap().unwrap().forgotten);
-    }
-
-    #[test]
-    fn setup_templates_are_listed_and_applied() {
-        let engine = test_engine();
-        assert!(engine
-            .list_setup_templates()
-            .iter()
-            .any(|template| template.id == "streaming"));
-
-        let template = engine.apply_setup_template("podcast".into()).unwrap();
-        let state = engine.get_state().unwrap();
-
-        assert_eq!(template.id, "podcast");
-        assert!(state.config.mixes.iter().any(|mix| mix.id == "podcast"));
-        assert!(state
-            .config
-            .channels
-            .iter()
-            .any(|channel| channel.id == "guest"));
-        assert!(state
-            .config
-            .app_volume_presets
-            .iter()
-            .any(|preset| (preset.volume - 0.82).abs() < f32::EPSILON));
-    }
-
-    #[test]
-    fn backup_export_import_replaces_config_and_scenes() {
-        let engine = test_engine();
-        engine.apply_setup_template("discord_mix".into()).unwrap();
-        let saved = engine.save_scene("Discord setup".into()).unwrap();
-        let backup = engine.export_backup().unwrap();
-
-        assert!(backup
-            .config
-            .mixes
-            .iter()
-            .any(|mix| mix.id == "discord_mix"));
-        assert!(backup.scenes.iter().any(|scene| scene.id == saved.id));
-
-        engine.apply_setup_template("podcast".into()).unwrap();
-        engine.import_backup(backup).unwrap();
-
-        let state = engine.get_state().unwrap();
-        assert!(state.config.mixes.iter().any(|mix| mix.id == "discord_mix"));
-        assert!(!state.config.mixes.iter().any(|mix| mix.id == "podcast"));
-        assert!(engine
-            .list_scenes()
-            .unwrap()
-            .iter()
-            .any(|scene| scene.id == saved.id));
     }
 
     #[test]

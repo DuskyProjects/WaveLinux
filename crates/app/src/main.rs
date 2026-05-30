@@ -1,13 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::fs::{File, OpenOptions};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -21,9 +22,8 @@ use wavelinux_engine::{
 };
 use wavelinux_model::{
     AppMatcher, AppRoute, AppStateSnapshot, AppVolumePreset, Channel, ChannelInputMode,
-    ChannelKind, ConfigBackup, EffectInstance, FallbackHardwareProfile, HardwareProfileUiState,
-    KnownApp, LatencyPolicy, LevelMeter, Mix, MixBus, MixerConfig, MixerSettings, RoutingPolicy,
-    Scene, SetupTemplate,
+    ChannelKind, EffectInstance, FallbackHardwareProfile, HardwareProfileUiState, KnownApp,
+    LatencyPolicy, LevelMeter, Mix, MixBus, MixerConfig, MixerSettings, RoutingPolicy,
 };
 
 struct EngineState {
@@ -34,11 +34,29 @@ struct ProcessLock {
     _file: File,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UiThemePreference {
+    theme_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UiThemeDefinition {
+    id: String,
+    name: String,
+    surface: String,
+    #[serde(default = "default_theme_variant")]
+    variant: String,
+    #[serde(default)]
+    tokens: BTreeMap<String, String>,
+}
+
 const RELEASES_URL: &str = "https://github.com/DuskyProjects/WaveLinux/releases";
 const STABLE_UPDATE_ENDPOINT: &str =
     "https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json";
 const BETA_UPDATE_ENDPOINT: &str =
     "https://github.com/DuskyProjects/WaveLinux/releases/download/prerelease/latest.json";
+const UI_THEME_PREFERENCE_FILE: &str = "ui-theme.json";
+const UI_THEMES_DIR: &str = "themes";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,12 +136,30 @@ fn set_mix_mute(
 }
 
 #[tauri::command]
+fn set_mix_icon(
+    engine: State<'_, EngineState>,
+    mix_id: String,
+    icon: Option<String>,
+) -> Result<Mix, String> {
+    tauri_result(engine.engine.set_mix_icon(mix_id, icon))
+}
+
+#[tauri::command]
 fn set_mix_monitor_output(
     engine: State<'_, EngineState>,
     mix_id: String,
     output: Option<String>,
 ) -> Result<Mix, String> {
     tauri_result(engine.engine.set_mix_monitor_output(mix_id, output))
+}
+
+#[tauri::command]
+fn set_mix_outputs(
+    engine: State<'_, EngineState>,
+    mix_id: String,
+    outputs: Vec<String>,
+) -> Result<Mix, String> {
+    tauri_result(engine.engine.set_mix_outputs(mix_id, outputs))
 }
 
 #[tauri::command]
@@ -196,6 +232,20 @@ fn set_channel_input_mode(
     input_mode: ChannelInputMode,
 ) -> Result<Channel, String> {
     tauri_result(engine.engine.set_channel_input_mode(channel_id, input_mode))
+}
+
+#[tauri::command]
+fn set_channel_bus_enabled(
+    engine: State<'_, EngineState>,
+    channel_id: String,
+    mix_id: String,
+    enabled: bool,
+) -> Result<MixBus, String> {
+    tauri_result(
+        engine
+            .engine
+            .set_channel_bus_enabled(channel_id, mix_id, enabled),
+    )
 }
 
 #[tauri::command]
@@ -465,54 +515,72 @@ fn restore_device(engine: State<'_, EngineState>, kind: String) -> Result<MixerC
 }
 
 #[tauri::command]
-fn save_scene(engine: State<'_, EngineState>, name: String) -> Result<Scene, String> {
-    tauri_result(engine.engine.save_scene(name))
+fn get_ui_theme_preference(app: AppHandle) -> Result<Option<UiThemePreference>, String> {
+    let path = ui_theme_preference_path(&app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let Ok(preference) = serde_json::from_str::<UiThemePreference>(&raw) else {
+        return Ok(None);
+    };
+    let Ok(theme_id) = clean_ui_theme_id(&normalize_ui_theme_id(&preference.theme_id)) else {
+        return Ok(None);
+    };
+    Ok(Some(UiThemePreference { theme_id }))
 }
 
 #[tauri::command]
-fn import_scene(engine: State<'_, EngineState>, scene: Scene) -> Result<Scene, String> {
-    tauri_result(engine.engine.import_scene(scene))
+fn set_ui_theme_preference(app: AppHandle, theme_id: String) -> Result<UiThemePreference, String> {
+    let preference = UiThemePreference {
+        theme_id: clean_ui_theme_id(&normalize_ui_theme_id(&theme_id))?,
+    };
+    let path = ui_theme_preference_path(&app)?;
+    let data = serde_json::to_string_pretty(&preference).map_err(|err| err.to_string())?;
+    fs::write(path, data).map_err(|err| err.to_string())?;
+    Ok(preference)
 }
 
 #[tauri::command]
-fn export_backup(engine: State<'_, EngineState>) -> Result<ConfigBackup, String> {
-    tauri_result(engine.engine.export_backup())
+fn list_ui_themes(app: AppHandle) -> Result<Vec<UiThemeDefinition>, String> {
+    let dir = ui_themes_dir(&app)?;
+    let mut seen = built_in_theme_ids();
+    let mut themes = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|err| err.to_string())? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(theme) = serde_json::from_str::<UiThemeDefinition>(&raw) else {
+            continue;
+        };
+        let Ok(theme) = normalize_ui_theme(theme) else {
+            continue;
+        };
+        if seen.insert(theme.id.clone()) {
+            themes.push(theme);
+        }
+    }
+    themes.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(themes)
 }
 
 #[tauri::command]
-fn import_backup(
-    engine: State<'_, EngineState>,
-    backup: ConfigBackup,
-) -> Result<ConfigBackup, String> {
-    tauri_result(engine.engine.import_backup(backup))
-}
-
-#[tauri::command]
-fn load_scene(engine: State<'_, EngineState>, scene_id: String) -> Result<Scene, String> {
-    tauri_result(engine.engine.load_scene(scene_id))
-}
-
-#[tauri::command]
-fn delete_scene(engine: State<'_, EngineState>, scene_id: String) -> Result<Scene, String> {
-    tauri_result(engine.engine.delete_scene(scene_id))
-}
-
-#[tauri::command]
-fn list_scenes(engine: State<'_, EngineState>) -> Result<Vec<Scene>, String> {
-    tauri_result(engine.engine.list_scenes())
-}
-
-#[tauri::command]
-fn list_setup_templates(engine: State<'_, EngineState>) -> Vec<SetupTemplate> {
-    engine.engine.list_setup_templates()
-}
-
-#[tauri::command]
-fn apply_setup_template(
-    engine: State<'_, EngineState>,
-    template_id: String,
-) -> Result<SetupTemplate, String> {
-    tauri_result(engine.engine.apply_setup_template(template_id))
+fn open_ui_theme_folder(app: AppHandle) -> Result<(), String> {
+    let dir = ui_themes_dir(&app)?;
+    app.opener()
+        .open_path(dir.to_string_lossy().to_string(), None::<String>)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -657,6 +725,114 @@ fn open_release_page(app: AppHandle) -> Result<(), String> {
 
 fn tauri_result<T>(result: Result<T, EngineError>) -> Result<T, String> {
     result.map_err(|err| err.to_string())
+}
+
+fn ui_theme_preference_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let config_dir = app.path().app_config_dir().map_err(|err| err.to_string())?;
+    fs::create_dir_all(&config_dir).map_err(|err| err.to_string())?;
+    Ok(config_dir.join(UI_THEME_PREFERENCE_FILE))
+}
+
+fn ui_themes_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let config_dir = app.path().app_config_dir().map_err(|err| err.to_string())?;
+    let theme_dir = config_dir.join(UI_THEMES_DIR);
+    fs::create_dir_all(&theme_dir).map_err(|err| err.to_string())?;
+    Ok(theme_dir)
+}
+
+fn built_in_theme_ids() -> BTreeSet<String> {
+    [
+        "wavelink2",
+        "wavelink3",
+        "wavelink3_dark",
+        "classic",
+        "wavelink",
+        "wavelink_dark",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+fn default_theme_variant() -> String {
+    "custom".into()
+}
+
+fn normalize_ui_theme(theme: UiThemeDefinition) -> Result<UiThemeDefinition, String> {
+    let id = clean_ui_theme_id(&theme.id)?;
+    if built_in_theme_ids().contains(&id) {
+        return Err("custom UI theme cannot replace a built-in theme".into());
+    }
+    let name = clean_ui_theme_name(&theme.name)?;
+    let surface = match theme.surface.as_str() {
+        "wavelink2" | "classic" => "wavelink2".into(),
+        "wavelink3" | "wavelink" => "wavelink3".into(),
+        _ => return Err("theme surface must be wavelink2 or wavelink3".into()),
+    };
+    let variant = match theme.variant.as_str() {
+        "light" | "dark" | "custom" => theme.variant,
+        _ => "custom".into(),
+    };
+    let mut tokens = BTreeMap::new();
+    for (key, value) in theme.tokens {
+        if !valid_theme_token_key(&key) {
+            return Err(format!("unsupported theme token: {key}"));
+        }
+        if value.len() > 120 {
+            return Err(format!("theme token {key} is too long"));
+        }
+        tokens.insert(key, value);
+    }
+    Ok(UiThemeDefinition {
+        id,
+        name,
+        surface,
+        variant,
+        tokens,
+    })
+}
+
+fn normalize_ui_theme_id(value: &str) -> String {
+    match value.trim() {
+        "classic" => "wavelink2".into(),
+        "wavelink" => "wavelink3".into(),
+        "wavelink_dark" => "wavelink3_dark".into(),
+        value => value.to_string(),
+    }
+}
+
+fn clean_ui_theme_id(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    let valid_length = (2..=41).contains(&trimmed.len());
+    let valid_first = trimmed
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit());
+    let valid_chars = trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_');
+    if valid_length && valid_first && valid_chars {
+        Ok(trimmed.to_string())
+    } else {
+        Err("invalid UI theme id".into())
+    }
+}
+
+fn clean_ui_theme_name(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("theme name is required".into());
+    }
+    Ok(trimmed.chars().take(80).collect())
+}
+
+fn valid_theme_token_key(value: &str) -> bool {
+    value.strip_prefix("--wl-").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    })
 }
 
 fn update_endpoint(settings: &MixerSettings) -> String {
@@ -837,7 +1013,9 @@ fn main() {
             delete_mix,
             set_mix_volume,
             set_mix_mute,
+            set_mix_icon,
             set_mix_monitor_output,
+            set_mix_outputs,
             create_channel,
             rename_channel,
             move_channel,
@@ -846,6 +1024,7 @@ fn main() {
             set_channel_input,
             set_hardware_input_device,
             set_channel_input_mode,
+            set_channel_bus_enabled,
             set_settings,
             list_hardware_profiles,
             set_device_hardware_profile,
@@ -876,15 +1055,10 @@ fn main() {
             cleanup_audio_graph,
             cleanup_stale_audio_graph,
             restore_device,
-            save_scene,
-            import_scene,
-            export_backup,
-            import_backup,
-            load_scene,
-            delete_scene,
-            list_scenes,
-            list_setup_templates,
-            apply_setup_template,
+            get_ui_theme_preference,
+            set_ui_theme_preference,
+            list_ui_themes,
+            open_ui_theme_folder,
             check_for_updates,
             install_update,
             open_release_page,
