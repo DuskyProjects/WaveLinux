@@ -1,6 +1,7 @@
 # WaveLinux
 <!-- Keep this screenshot in the README as the permanent project preview. -->
-<img width="1895" height="1108" alt="image" src="https://github.com/user-attachments/assets/22b52de8-d97d-4664-9772-c1c358122144" />
+<img width="1917" height="1093" alt="image" src="https://github.com/user-attachments/assets/63e32eed-16fe-43be-b86c-6b172a88f3bb" />
+
 
 WaveLinux is a Linux-first creator audio mixer built with Rust, Tauri, React,
 TypeScript, and PipeWire. It creates virtual sources and mixes, routes app
