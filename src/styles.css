@@ -1948,6 +1948,95 @@ input[type="range"] {
   font-size: 12px;
 }
 
+.elgato-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.9fr) minmax(320px, 1.1fr);
+  gap: 12px;
+  min-width: 0;
+}
+
+.elgato-device-list,
+.elgato-control-card,
+.elgato-info-grid {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  align-content: start;
+}
+
+.elgato-control-card,
+.elgato-device-row {
+  padding: 12px;
+  border: 1px solid #28313a;
+  border-radius: 8px;
+  background: #10151b;
+}
+
+.elgato-device-row {
+  display: grid;
+  gap: 8px;
+}
+
+.elgato-device-row.active {
+  border-color: #48d7e6;
+  background: #12222a;
+}
+
+.elgato-device-row strong,
+.elgato-device-row span,
+.elgato-device-row small,
+.elgato-info-grid strong,
+.elgato-info-grid span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.elgato-device-row span,
+.elgato-device-row small,
+.elgato-info-grid span {
+  color: #9aa7b3;
+  font-size: 12px;
+}
+
+.elgato-device-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.elgato-device-meta span {
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid #2d3944;
+  border-radius: 999px;
+  background: #151c23;
+  color: #d5e3eb;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.elgato-state-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+
+.elgato-info-grid {
+  grid-template-columns: minmax(84px, auto) minmax(0, 1fr);
+  padding: 10px 0;
+  border-top: 1px solid #28313a;
+  border-bottom: 1px solid #28313a;
+}
+
+.elgato-info-grid strong {
+  text-align: right;
+  font-size: 12px;
+}
+
 .panel-header.compact {
   min-height: 0;
   padding: 0;
@@ -3348,7 +3437,9 @@ button:disabled {
 .wl-shell.dark .wl-workspace:not(.mixer) .diagnostic-row,
 .wl-shell.dark .wl-workspace:not(.mixer) .hardware-source-card,
 .wl-shell.dark .wl-workspace:not(.mixer) .profile-editor,
-.wl-shell.dark .wl-workspace:not(.mixer) .profile-device-row {
+.wl-shell.dark .wl-workspace:not(.mixer) .profile-device-row,
+.wl-shell.dark .wl-workspace:not(.mixer) .elgato-control-card,
+.wl-shell.dark .wl-workspace:not(.mixer) .elgato-device-row {
   border-color: var(--wl-border, #2a333d);
   background: var(--wl-panel, #181f27);
   color: var(--wl-text, #e8edf2);
@@ -3574,7 +3665,12 @@ button:disabled {
   }
 
   .hardware-profile-grid,
+  .elgato-grid,
   .profile-device-row {
+    grid-template-columns: 1fr;
+  }
+
+  .elgato-state-grid {
     grid-template-columns: 1fr;
   }
 

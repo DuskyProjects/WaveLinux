@@ -28,6 +28,8 @@ use wavelinux_model::{
     MixerSettings, RoutingPolicy,
 };
 
+mod elgato;
+
 struct EngineState {
     engine: Arc<WaveLinuxEngine>,
 }
@@ -349,6 +351,61 @@ fn set_hardware_profile_policy(
         latency_policy,
         routing_policy,
     ))
+}
+
+#[tauri::command]
+fn list_elgato_devices(
+    engine: State<'_, EngineState>,
+) -> Result<Vec<elgato::ElgatoDeviceSummary>, String> {
+    let state = engine.engine.get_state().map_err(|err| err.to_string())?;
+    Ok(elgato::summarize_devices(
+        state.graph.inputs.iter(),
+        state.graph.outputs.iter(),
+    ))
+}
+
+#[tauri::command]
+fn read_elgato_wave_xlr(
+    engine: State<'_, EngineState>,
+) -> Result<elgato::ElgatoWaveXlrState, String> {
+    ensure_elgato_wave_xlr_detected(&engine.engine)?;
+    elgato::read_wave_xlr_state().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_elgato_wave_xlr_gain(
+    engine: State<'_, EngineState>,
+    gain_raw: u16,
+) -> Result<elgato::ElgatoWaveXlrState, String> {
+    ensure_elgato_wave_xlr_detected(&engine.engine)?;
+    elgato::set_wave_xlr_gain(gain_raw).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_elgato_wave_xlr_mute(
+    engine: State<'_, EngineState>,
+    muted: bool,
+) -> Result<elgato::ElgatoWaveXlrState, String> {
+    ensure_elgato_wave_xlr_detected(&engine.engine)?;
+    elgato::set_wave_xlr_mute(muted).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_elgato_wave_xlr_hp_volume_db(
+    engine: State<'_, EngineState>,
+    db: f32,
+) -> Result<elgato::ElgatoWaveXlrState, String> {
+    ensure_elgato_wave_xlr_detected(&engine.engine)?;
+    elgato::set_wave_xlr_hp_volume_db(db).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_elgato_wave_xlr_low_impedance(
+    engine: State<'_, EngineState>,
+    enabled: bool,
+) -> Result<elgato::ElgatoWaveXlrState, String> {
+    ensure_elgato_wave_xlr_detected(&engine.engine)?;
+    elgato::set_wave_xlr_low_impedance(enabled).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -889,6 +946,18 @@ fn install_effect_plugins(
 
 fn tauri_result<T>(result: Result<T, EngineError>) -> Result<T, String> {
     result.map_err(|err| err.to_string())
+}
+
+fn ensure_elgato_wave_xlr_detected(engine: &WaveLinuxEngine) -> Result<(), String> {
+    let state = engine.get_state().map_err(|err| err.to_string())?;
+    let detected = elgato::summarize_devices(state.graph.inputs.iter(), state.graph.outputs.iter())
+        .into_iter()
+        .any(|device| device.controls_supported);
+    if detected {
+        Ok(())
+    } else {
+        Err("Elgato Wave XLR controls are unavailable because no supported Elgato device is detected".into())
+    }
 }
 
 fn missing_effect_ids(availability: &[EffectAvailability]) -> Vec<String> {
@@ -1503,6 +1572,12 @@ fn main() {
             set_device_hardware_profile,
             set_fallback_hardware_profile,
             set_hardware_profile_policy,
+            list_elgato_devices,
+            read_elgato_wave_xlr,
+            set_elgato_wave_xlr_gain,
+            set_elgato_wave_xlr_mute,
+            set_elgato_wave_xlr_hp_volume_db,
+            set_elgato_wave_xlr_low_impedance,
             set_channel_volume,
             set_channel_mute,
             assign_app_to_channel,

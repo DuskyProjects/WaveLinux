@@ -7,10 +7,10 @@ TypeScript, and PipeWire. It creates virtual sources and mixes, routes app
 audio, applies open-source microphone effects, and provides selectable UI
 surfaces for Linux desktop audio workflows.
 
-WaveLinux is not an Elgato hardware control panel. Vendor-specific microphone
-features, Stream Deck integration, proprietary marketplace effects, and
-hardware Clipguard behavior are intentionally out of scope for WaveLinux.
-Standard Linux audio hardware is the target.
+WaveLinux targets standard Linux audio hardware first, with optional
+device-specific controls where the protocol is open enough to support safely.
+Stream Deck integration, proprietary marketplace effects, and hardware
+Clipguard behavior remain out of scope.
 
 ## Features
 
@@ -31,6 +31,8 @@ Standard Linux audio hardware is the target.
 - Bluetooth A2DP profile protection when possible
 - Hardware profile matching for common USB, Bluetooth, PCI, and platform audio
   endpoints
+- Elgato Wave XLR gain, mute, headphone volume, and low-impedance controls when
+  supported Elgato hardware is detected
 - Editable safe generic default profile plus per-device manual profile assignment
 - Local profile overrides that survive app updates without executable hooks
 - Signed remote hardware profile downloads from GitHub Releases
@@ -58,6 +60,7 @@ Required host services and tools:
 - `wpctl`
 - `pw-cli`
 - `pw-dump`
+- libusb 1.0 shared library for optional Elgato Wave XLR hardware controls
 
 Recommended optional effect packages:
 
@@ -195,6 +198,15 @@ Profile authoring files:
 - `profiles/v1/examples`
 - `profiles/v1/README.md`
 
+## Elgato Controls
+
+When WaveLinux detects an Elgato audio device, Settings shows an Elgato tab.
+Wave XLR hardware controls are available there for microphone gain, mute,
+headphone volume, and low-impedance mode. The tab is hidden on systems without
+detected Elgato hardware, and the libusb control path is loaded only after a
+supported Wave XLR is detected. The Wave XLR USB protocol details are based on
+the OpenWave project: https://github.com/rikkichy/openwave
+
 ## Interface Themes
 
 WaveLinux separates UI selection from the audio engine. The Settings page has
@@ -313,6 +325,40 @@ Required GitHub Actions secrets:
 - `docs/themes.md`: custom UI theme file format and authoring guide
 - `scripts`: installers, release helpers, dependency checks, and validation
 - `packaging/aur`: Arch/AUR package metadata
+
+## Open Source Credits
+
+WaveLinux is GPL-3.0-only, but it is built with and integrates with other open
+source projects. This acknowledgement is intentionally human-readable; release
+builders should still preserve third-party license files for bundled Cargo and
+npm dependencies from `Cargo.lock` and `yarn.lock`.
+
+Direct code, protocol, and runtime dependencies:
+
+| Project | License | WaveLinux use |
+| --- | --- | --- |
+| [OpenWave](https://github.com/rikkichy/openwave) | MIT | Wave XLR USB control-transfer protocol notes and behavior used for optional Elgato controls. |
+| [Tauri](https://tauri.app/) and Tauri plugins | MIT OR Apache-2.0 | Desktop shell, IPC, tray, updater, opener, shell, and single-instance support. |
+| [React](https://react.dev/) and React DOM | MIT | Frontend UI framework. |
+| [TypeScript](https://www.typescriptlang.org/) | Apache-2.0 | Frontend type system and compiler. |
+| [Vite](https://vite.dev/) and `@vitejs/plugin-react` | MIT | Frontend development server and production build tooling. |
+| [Lucide](https://lucide.dev/) / `lucide-react` | ISC | UI icon set. |
+| [PipeWire](https://pipewire.org/) and `pipewire-rs` / libspa bindings | MIT | Linux audio graph integration, device discovery, routing, and metering. |
+| [WirePlumber](https://pipewire.pages.freedesktop.org/wireplumber/) | MIT | Host session-manager integration target for PipeWire desktops. |
+| [libusb](https://github.com/libusb/libusb) | LGPL-2.1-or-later | Dynamically loaded host shared library for optional Elgato Wave XLR controls. |
+| Rust support crates: `anyhow`, `base64`, `directories`, `libc`, `serde`, `serde_json`, `tempfile`, `thiserror`, `time`, `url`, `uuid` | MIT OR Apache-2.0 | Serialization, errors, paths, test files, URLs, timestamps, identifiers, and libc bindings. |
+| Rust support crate: `include_dir` | MIT | Embeds packaged hardware profile assets. |
+| Rust support crate: `libloading` | ISC | Lazy runtime loading for the optional libusb control path. |
+
+Optional open-source integrations that WaveLinux can detect or configure, but
+does not bundle in normal release artifacts:
+
+| Project | License | Notes |
+| --- | --- | --- |
+| [SWH LADSPA plugins](https://github.com/swh/ladspa) | GPL-2.0 | Optional compressor, gate, and limiter plugin support installed from the user's distro packages. |
+| [noise-suppression-for-voice](https://github.com/werman/noise-suppression-for-voice) / RNNoise | GPL-3.0 | Optional RNNoise LADSPA noise suppression support installed from the user's distro packages. |
+| [DeepFilterNet3 LADSPA/PipeWire plugins](https://github.com/Rikorose/DeepFilterNet) | MIT OR Apache-2.0 | Optional DeepFilterNet noise suppression support installed from the user's distro packages when available. |
+| PulseAudio-compatible tools (`pactl`) and PipeWire tools (`wpctl`, `pw-cli`, `pw-dump`) | LGPL-2.1-or-later / MIT | Host command-line tools used for graph inspection, routing, and diagnostics. |
 
 ## License
 

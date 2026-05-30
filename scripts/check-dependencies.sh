@@ -203,6 +203,11 @@ for program in pipewire pactl wpctl pw-cli pw-dump; do
     missing_commands+=("$program")
   fi
 done
+missing_libraries=()
+if ! { command_exists ldconfig && ldconfig -p 2>/dev/null | grep -q 'libusb-1\.0\.so\.0'; } &&
+   [[ ! -e /usr/lib/libusb-1.0.so.0 && ! -e /usr/lib64/libusb-1.0.so.0 && ! -e /usr/lib/x86_64-linux-gnu/libusb-1.0.so.0 ]]; then
+  missing_libraries+=("libusb-1.0")
+fi
 
 runtime_candidates=()
 effect_candidates=()
@@ -210,20 +215,20 @@ aur_effect_candidates=()
 
 case "$manager" in
   apt)
-    runtime_candidates=(pipewire wireplumber pipewire-pulse pipewire-bin pulseaudio-utils libwebkit2gtk-4.1-0 libayatana-appindicator3-1)
+    runtime_candidates=(pipewire wireplumber pipewire-pulse pipewire-bin pulseaudio-utils libwebkit2gtk-4.1-0 libayatana-appindicator3-1 libusb-1.0-0)
     effect_candidates=(swh-plugins lsp-plugins-ladspa librnnoise-ladspa deepfilternet-ladspa deepfilternet)
     ;;
   dnf)
-    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils webkit2gtk4.1 libappindicator-gtk3)
+    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils webkit2gtk4.1 libappindicator-gtk3 libusb1)
     effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise noise-suppression-for-voice deepfilternet)
     ;;
   pacman)
-    runtime_candidates=(pipewire wireplumber pipewire-pulse libpulse webkit2gtk-4.1 gtk3 libayatana-appindicator)
+    runtime_candidates=(pipewire wireplumber pipewire-pulse libpulse webkit2gtk-4.1 gtk3 libayatana-appindicator libusb)
     effect_candidates=(swh-plugins noise-suppression-for-voice)
     aur_effect_candidates=(deepfilternet-plugin-pipewire-bin noise-suppression-for-voice deepfilternet deepfilternet-ladspa)
     ;;
   zypper)
-    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils libwebkit2gtk-4_1-0 typelib-1_0-AyatanaAppIndicator3-0_1)
+    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils libwebkit2gtk-4_1-0 typelib-1_0-AyatanaAppIndicator3-0_1 libusb-1_0-0)
     effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise deepfilternet)
     ;;
 esac
@@ -264,13 +269,19 @@ else
   echo "Runtime tools missing: ${missing_commands[*]}"
 fi
 
+if (( ${#missing_libraries[@]} == 0 )); then
+  echo "Runtime libraries: ok"
+else
+  echo "Runtime libraries missing: ${missing_libraries[*]}"
+fi
+
 if (( ${#missing_effects[@]} == 0 )); then
   echo "Optional effects: ok"
 else
   echo "Optional effects missing: ${missing_effects[*]}"
 fi
 
-if (( INSTALL == 1 && ${#missing_commands[@]} > 0 )); then
+if (( INSTALL == 1 && ( ${#missing_commands[@]} > 0 || ${#missing_libraries[@]} > 0 ) )); then
   mapfile -t packages < <(resolve_packages "$manager" "${runtime_candidates[@]}")
   if (( ${#packages[@]} > 0 )); then
     echo "Installing runtime packages: ${packages[*]}"
@@ -301,6 +312,6 @@ if (( INSTALL_EFFECTS == 1 && ${#missing_effects[@]} > 0 )); then
   fi
 fi
 
-if (( STRICT == 1 && ( ${#missing_commands[@]} > 0 || ${#missing_effects[@]} > 0 ) )); then
+if (( STRICT == 1 && ( ${#missing_commands[@]} > 0 || ${#missing_libraries[@]} > 0 || ${#missing_effects[@]} > 0 ) )); then
   exit 1
 fi

@@ -125,6 +125,10 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return demoHardwareProfileState();
   }
 
+  if (command === "list_elgato_devices") {
+    return [];
+  }
+
   if (command === "create_mix") {
     const name = String(args?.name ?? "New Mix");
     const id = slug(name);

@@ -5095,9 +5095,10 @@ dependencies = [
 
 [[package]]
 name = "wavelinux-app"
-version = "4.2.1"
+version = "4.3.0"
 dependencies = [
  "libc",
+ "libloading 0.8.9",
  "serde",
  "serde_json",
  "tauri",
@@ -5106,6 +5107,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "thiserror 2.0.18",
  "time",
  "url",
  "wavelinux-engine",

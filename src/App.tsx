@@ -65,6 +65,8 @@ import type {
   Channel,
   ChannelKind,
   CommandExecution,
+  ElgatoDeviceSummary,
+  ElgatoWaveXlrState,
   EffectPluginInstallResult,
   EffectDefinition,
   EffectAvailability,
@@ -190,7 +192,7 @@ type SelectOption = {
   disabled?: boolean;
 };
 
-type SettingsTab = "general" | "profiles" | "health";
+type SettingsTab = "general" | "profiles" | "elgato" | "health";
 
 type MixerDrawer =
   | { type: "routing" }
@@ -5404,6 +5406,16 @@ function SettingsView({
 }) {
   const updateSettings = (settings: MixerSettings) => void setSettings(settings);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
+  const hasElgatoDevices = useMemo(
+    () => [...state.graph.inputs, ...state.graph.outputs].some(isElgatoAudioDevice),
+    [state.graph.inputs, state.graph.outputs],
+  );
+
+  useEffect(() => {
+    if (!hasElgatoDevices && settingsTab === "elgato") {
+      setSettingsTab("general");
+    }
+  }, [hasElgatoDevices, settingsTab]);
 
   return (
     <section className={settingsTab === "health" ? "settings-view wide" : "settings-view"}>
@@ -5431,6 +5443,17 @@ function SettingsView({
             <Cable size={16} />
             Profiles
           </button>
+          {hasElgatoDevices && (
+            <button
+              className={settingsTab === "elgato" ? "settings-tab active" : "settings-tab"}
+              onClick={() => setSettingsTab("elgato")}
+              role="tab"
+              type="button"
+            >
+              <Mic size={16} />
+              Elgato
+            </button>
+          )}
           <button
             className={settingsTab === "health" ? "settings-tab active" : "settings-tab"}
             onClick={() => setSettingsTab("health")}
@@ -5626,6 +5649,8 @@ function SettingsView({
 
       {settingsTab === "profiles" && <HardwareProfilesView state={state} />}
 
+      {settingsTab === "elgato" && hasElgatoDevices && <ElgatoDevicesView />}
+
       {settingsTab === "health" && (
         <DiagnosticsView
           audioActionReport={audioActionReport}
@@ -5637,6 +5662,182 @@ function SettingsView({
           run={run}
         />
       )}
+    </section>
+  );
+}
+
+function ElgatoDevicesView() {
+  const [devices, setDevices] = useState<ElgatoDeviceSummary[]>([]);
+  const [waveXlr, setWaveXlr] = useState<ElgatoWaveXlrState | null>(null);
+  const [elgatoError, setElgatoError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const commandBusy = useRef(false);
+
+  const loadElgato = useCallback(async (showBusy = false) => {
+    if (commandBusy.current) return;
+    if (showBusy) setBusy(true);
+    try {
+      const nextDevices = await invoke<ElgatoDeviceSummary[]>("list_elgato_devices");
+      setDevices(nextDevices);
+      if (nextDevices.some((device) => device.controls_supported)) {
+        const nextState = await invoke<ElgatoWaveXlrState>("read_elgato_wave_xlr");
+        setWaveXlr(nextState);
+        setElgatoError(null);
+      } else {
+        setWaveXlr(null);
+        setElgatoError(null);
+      }
+    } catch (error) {
+      setElgatoError(String(error));
+    } finally {
+      if (showBusy) setBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      void loadElgato(false);
+    };
+    tick();
+    const interval = window.setInterval(tick, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [loadElgato]);
+
+  const runWaveCommand = async (command: string, args: Record<string, unknown>) => {
+    commandBusy.current = true;
+    setBusy(true);
+    try {
+      const nextState = await invoke<ElgatoWaveXlrState>(command, args);
+      setWaveXlr(nextState);
+      setElgatoError(null);
+    } catch (error) {
+      setElgatoError(String(error));
+    } finally {
+      commandBusy.current = false;
+      setBusy(false);
+    }
+  };
+
+  const controllableDevice = devices.find((device) => device.controls_supported);
+
+  return (
+    <section className="panel single-panel">
+      <div className="panel-header">
+        <h2>Elgato Devices</h2>
+        <div className="panel-actions">
+          <button
+            className="secondary-button"
+            disabled={busy}
+            onClick={() => void loadElgato(true)}
+            type="button"
+          >
+            <RefreshCw size={16} />
+            Refresh
+          </button>
+        </div>
+      </div>
+      {elgatoError && (
+        <div className="effect-warning">
+          <CircleAlert size={15} />
+          <span>{elgatoError}</span>
+        </div>
+      )}
+      <div className="elgato-grid">
+        <div className="elgato-device-list">
+          {devices.map((device) => (
+            <div
+              className={device.controls_supported ? "elgato-device-row active" : "elgato-device-row"}
+              key={device.id}
+            >
+              <div>
+                <strong>{device.name}</strong>
+                <span>{device.description}</span>
+              </div>
+              <div className="elgato-device-meta">
+                <span>{elgatoKindLabel(device.kind)}</span>
+                <span>{device.bus ?? "unknown"}</span>
+                {device.product_id && <span>{device.vendor_id ?? "usb"}:{device.product_id}</span>}
+              </div>
+              <small>{device.message}</small>
+            </div>
+          ))}
+          {devices.length === 0 && <EmptyState label="No Elgato audio devices detected" />}
+        </div>
+
+        <div className="elgato-control-card">
+          <div className="panel-header compact">
+            <h2>{controllableDevice?.name ?? "Wave XLR"}</h2>
+            <Mic size={18} />
+          </div>
+          {waveXlr ? (
+            <>
+              <div className="elgato-state-grid">
+                <Stat icon={Gauge} label="Gain" value={formatHexGain(waveXlr.gain_raw)} />
+                <Stat icon={Headphones} label="Headphones" value={`${waveXlr.hp_volume_db.toFixed(1)} dB`} />
+                <Stat icon={SlidersHorizontal} label="Knob" value={waveXlr.volume_select === "headphones" ? "Headphones" : "Gain"} />
+              </div>
+              <div className="elgato-info-grid">
+                <span>Firmware</span>
+                <strong>{waveXlr.firmware_version ?? "Unknown"}</strong>
+                <span>API</span>
+                <strong>{waveXlr.api_version ?? "Unknown"}</strong>
+                <span>Serial</span>
+                <strong>{waveXlr.serial ?? "Unknown"}</strong>
+              </div>
+              <Toggle
+                label="Mute microphone"
+                onChange={(muted) =>
+                  void runWaveCommand("set_elgato_wave_xlr_mute", { muted })
+                }
+                value={waveXlr.muted}
+              />
+              <VolumeFader
+                compact
+                formatValue={(value) => formatHexGain(Math.round(value))}
+                label="Gain"
+                max={waveXlr.gain_max_raw}
+                min={0}
+                step={64}
+                unit=""
+                value={waveXlr.gain_raw}
+                onChange={(value) => {
+                  const gainRaw = Math.round(value);
+                  void runWaveCommand("set_elgato_wave_xlr_gain", {
+                    gainRaw,
+                    gain_raw: gainRaw,
+                  });
+                }}
+              />
+              <VolumeFader
+                compact
+                label="Headphones"
+                max={waveXlr.hp_max_db}
+                min={waveXlr.hp_min_db}
+                step={0.5}
+                unit=" dB"
+                value={waveXlr.hp_volume_db}
+                onChange={(db) =>
+                  void runWaveCommand("set_elgato_wave_xlr_hp_volume_db", { db })
+                }
+              />
+              <Toggle
+                label="Low impedance"
+                onChange={(enabled) =>
+                  void runWaveCommand("set_elgato_wave_xlr_low_impedance", { enabled })
+                }
+                value={waveXlr.low_impedance}
+              />
+            </>
+          ) : (
+            <EmptyState label="No controllable Wave XLR found" />
+          )}
+        </div>
+      </div>
     </section>
   );
 }
@@ -5946,6 +6147,8 @@ function VolumeFader({
   max = 1,
   unit = "%",
   compact = false,
+  step,
+  formatValue,
   onChange,
 }: {
   label: string;
@@ -5954,6 +6157,8 @@ function VolumeFader({
   max?: number;
   unit?: string;
   compact?: boolean;
+  step?: number;
+  formatValue?: (value: number) => string;
   onChange: (value: number) => void | Promise<unknown>;
 }) {
   const normalizedPercent = unit === "%" && min === 0 && max === 1;
@@ -5963,6 +6168,7 @@ function VolumeFader({
   const [draft, setDraft] = useState(incomingSliderValue);
   const lastCommitted = useRef(incomingSliderValue);
   const display = normalizedPercent ? Math.round(draft) : Math.round(draft * 10) / 10;
+  const displayText = formatValue ? formatValue(draft) : `${display}${unit}`;
 
   useEffect(() => {
     const next = normalizedPercent ? value * 100 : value;
@@ -5990,11 +6196,11 @@ function VolumeFader({
           if (shouldCommitSliderKey(event)) commit(Number(event.currentTarget.value));
         }}
         onPointerUp={(event) => commit(Number(event.currentTarget.value))}
-        step={unit === "%" ? 1 : 0.1}
+        step={step ?? (unit === "%" ? 1 : 0.1)}
         type="range"
         value={draft}
       />
-      <strong>{display}{unit}</strong>
+      <strong>{displayText}</strong>
     </label>
   );
 }
@@ -6043,6 +6249,19 @@ function hardwareProfileOptionLabel(profile: HardwareProfileSummary): string {
   return `${profile.name} · ${profile.source}`;
 }
 
+function elgatoKindLabel(kind: ElgatoDeviceSummary["kind"]): string {
+  return {
+    wave_xlr: "Wave XLR",
+    wave_microphone: "Wave microphone",
+    capture_audio: "Capture audio",
+    audio_endpoint: "Audio endpoint",
+  }[kind];
+}
+
+function formatHexGain(value: number): string {
+  return `0x${Math.max(0, Math.round(value)).toString(16).toUpperCase().padStart(4, "0")}`;
+}
+
 function hardwareProfileSummaryFromFallback(profile: FallbackHardwareProfile): HardwareProfileSummary {
   return {
     id: profile.id,
@@ -6061,6 +6280,29 @@ function isHardwareProfileDevice(device: DeviceInfo): boolean {
   if (text.includes("wavelinux")) return false;
   if (text.includes(".monitor") || text.includes("monitor of")) return false;
   return true;
+}
+
+function isElgatoAudioDevice(device: DeviceInfo): boolean {
+  if (device.is_virtual || device.bus === "virtual") return false;
+  const vendorId = normalizeUsbId(device.vendor_id);
+  const profileId = device.matched_profile_id?.toLowerCase() ?? "";
+  const text = [device.id, device.name, device.description].join(" ").toLowerCase();
+  return (
+    vendorId === "0fd9" ||
+    profileId.startsWith("elgato.") ||
+    text.includes("elgato") ||
+    text.includes("wave xlr") ||
+    text.includes("wave:3")
+  );
+}
+
+function normalizeUsbId(value?: string | null): string {
+  const normalized = (value ?? "")
+    .trim()
+    .replace(/^0x/i, "")
+    .toLowerCase()
+    .replace(/[^0-9a-f]/g, "");
+  return normalized ? normalized.padStart(4, "0") : "";
 }
 
 function primaryBusMixes(mixes: Mix[]): Mix[] {

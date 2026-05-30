@@ -170,6 +170,44 @@ export interface HardwareProfileUiState {
   fallback_profile: FallbackHardwareProfile;
 }
 
+export type ElgatoDeviceKind =
+  | "wave_xlr"
+  | "wave_microphone"
+  | "capture_audio"
+  | "audio_endpoint";
+
+export interface ElgatoDeviceSummary {
+  id: string;
+  name: string;
+  description: string;
+  kind: ElgatoDeviceKind;
+  controls_supported: boolean;
+  bus?: string | null;
+  vendor_id?: string | null;
+  product_id?: string | null;
+  alsa_card?: string | null;
+  matched_profile_id?: string | null;
+  message: string;
+}
+
+export type ElgatoWaveXlrKnobTarget = "gain" | "headphones";
+
+export interface ElgatoWaveXlrState {
+  connected: boolean;
+  gain_raw: number;
+  gain_max_raw: number;
+  gain_percent: number;
+  muted: boolean;
+  hp_volume_db: number;
+  hp_min_db: number;
+  hp_max_db: number;
+  low_impedance: boolean;
+  volume_select: ElgatoWaveXlrKnobTarget;
+  api_version?: string | null;
+  firmware_version?: string | null;
+  serial?: string | null;
+}
+
 export interface MixerConfig {
   version: number;
   mixes: Mix[];

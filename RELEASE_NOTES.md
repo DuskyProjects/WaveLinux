@@ -1,3 +1,17 @@
+# WaveLinux 4.3.0
+
+WaveLinux 4.3.0 adds optional Elgato hardware control support while keeping the
+main mixer path device-neutral.
+
+## Features
+
+- Adds an Elgato Settings tab only when Elgato audio hardware is detected.
+- Adds Wave XLR gain, mute, headphone volume, low-impedance, firmware, API, and
+  serial controls using the OpenWave USB control-transfer approach.
+- Loads libusb only inside the detected Wave XLR control path so systems without
+  Elgato hardware do not load the extra shared library during normal startup.
+- Adds libusb to release packaging and dependency checks.
+
 # WaveLinux 4.2.1
 
 WaveLinux 4.2.1 is a follow-up stability and polish release for the new
