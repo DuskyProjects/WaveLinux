@@ -141,6 +141,7 @@ const SOURCE_ICON_OPTIONS: IconOption[] = [
   { id: "audio", label: "Audio", icon: AudioLines },
 ];
 const SELECT_VISIBLE_OPTION_LIMIT = 80;
+const ELGATO_POLL_MS = 1500;
 const UI_METER_ATTACK_SECONDS = 0.018;
 const UI_METER_RELEASE_SECONDS = 0.34;
 const UI_METER_FLOOR = 0.003;
@@ -5672,24 +5673,34 @@ function ElgatoDevicesView() {
   const [elgatoError, setElgatoError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const commandBusy = useRef(false);
+  const loadBusy = useRef(false);
 
   const loadElgato = useCallback(async (showBusy = false) => {
-    if (commandBusy.current) return;
+    if (commandBusy.current || loadBusy.current) return;
+    loadBusy.current = true;
     if (showBusy) setBusy(true);
     try {
       const nextDevices = await invoke<ElgatoDeviceSummary[]>("list_elgato_devices");
       setDevices(nextDevices);
       if (nextDevices.some((device) => device.controls_supported)) {
-        const nextState = await invoke<ElgatoWaveXlrState>("read_elgato_wave_xlr");
-        setWaveXlr(nextState);
-        setElgatoError(null);
+        try {
+          const nextState = await invoke<ElgatoWaveXlrState>("read_elgato_wave_xlr");
+          setWaveXlr(nextState);
+          setElgatoError(null);
+        } catch (error) {
+          setWaveXlr(null);
+          setElgatoError(String(error));
+        }
       } else {
         setWaveXlr(null);
         setElgatoError(null);
       }
     } catch (error) {
+      setDevices([]);
+      setWaveXlr(null);
       setElgatoError(String(error));
     } finally {
+      loadBusy.current = false;
       if (showBusy) setBusy(false);
     }
   }, []);
@@ -5701,21 +5712,30 @@ function ElgatoDevicesView() {
       void loadElgato(false);
     };
     tick();
-    const interval = window.setInterval(tick, 1000);
+    const interval = window.setInterval(tick, ELGATO_POLL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(interval);
     };
   }, [loadElgato]);
 
+  const waitForElgatoRefresh = async () => {
+    while (loadBusy.current) {
+      await new Promise((resolve) => window.setTimeout(resolve, 25));
+    }
+  };
+
   const runWaveCommand = async (command: string, args: Record<string, unknown>) => {
+    if (commandBusy.current) return;
     commandBusy.current = true;
     setBusy(true);
     try {
+      await waitForElgatoRefresh();
       const nextState = await invoke<ElgatoWaveXlrState>(command, args);
       setWaveXlr(nextState);
       setElgatoError(null);
     } catch (error) {
+      setWaveXlr(null);
       setElgatoError(String(error));
     } finally {
       commandBusy.current = false;
@@ -5790,6 +5810,7 @@ function ElgatoDevicesView() {
                 <strong>{waveXlr.serial ?? "Unknown"}</strong>
               </div>
               <Toggle
+                disabled={busy}
                 label="Mute microphone"
                 onChange={(muted) =>
                   void runWaveCommand("set_elgato_wave_xlr_mute", { muted })
@@ -5798,6 +5819,7 @@ function ElgatoDevicesView() {
               />
               <VolumeFader
                 compact
+                disabled={busy}
                 formatValue={(value) => formatHexGain(Math.round(value))}
                 label="Gain"
                 max={waveXlr.gain_max_raw}
@@ -5815,6 +5837,7 @@ function ElgatoDevicesView() {
               />
               <VolumeFader
                 compact
+                disabled={busy}
                 label="Headphones"
                 max={waveXlr.hp_max_db}
                 min={waveXlr.hp_min_db}
@@ -5826,6 +5849,7 @@ function ElgatoDevicesView() {
                 }
               />
               <Toggle
+                disabled={busy}
                 label="Low impedance"
                 onChange={(enabled) =>
                   void runWaveCommand("set_elgato_wave_xlr_low_impedance", { enabled })
@@ -5833,6 +5857,8 @@ function ElgatoDevicesView() {
                 value={waveXlr.low_impedance}
               />
             </>
+          ) : controllableDevice ? (
+            <EmptyState label={elgatoError ? "Wave XLR controls unavailable" : "Reading Wave XLR controls"} />
           ) : (
             <EmptyState label="No controllable Wave XLR found" />
           )}
@@ -6147,6 +6173,7 @@ function VolumeFader({
   max = 1,
   unit = "%",
   compact = false,
+  disabled = false,
   step,
   formatValue,
   onChange,
@@ -6157,6 +6184,7 @@ function VolumeFader({
   max?: number;
   unit?: string;
   compact?: boolean;
+  disabled?: boolean;
   step?: number;
   formatValue?: (value: number) => string;
   onChange: (value: number) => void | Promise<unknown>;
@@ -6177,17 +6205,22 @@ function VolumeFader({
   }, [normalizedPercent, value]);
 
   const commit = useCallback((raw: number) => {
+    if (disabled) return;
     const next = Number.isFinite(raw) ? Math.max(sliderMin, Math.min(sliderMax, raw)) : incomingSliderValue;
     setDraft(next);
     if (lastCommitted.current === next) return;
     lastCommitted.current = next;
     void onChange(normalizedPercent ? next / 100 : next);
-  }, [incomingSliderValue, normalizedPercent, onChange, sliderMax, sliderMin]);
+  }, [disabled, incomingSliderValue, normalizedPercent, onChange, sliderMax, sliderMin]);
 
   return (
-    <label className={compact ? "fader-row compact" : "fader-row"}>
+    <label
+      aria-disabled={disabled}
+      className={`${compact ? "fader-row compact" : "fader-row"}${disabled ? " disabled" : ""}`}
+    >
       <span>{label}</span>
       <input
+        disabled={disabled}
         max={sliderMax}
         min={sliderMin}
         onBlur={(event) => commit(Number(event.currentTarget.value))}
@@ -6208,14 +6241,21 @@ function VolumeFader({
 function Toggle({
   label,
   value,
+  disabled = false,
   onChange,
 }: {
   label: string;
   value: boolean;
+  disabled?: boolean;
   onChange: (value: boolean) => void | Promise<unknown>;
 }) {
   return (
-    <button className="toggle-row" onClick={() => onChange(!value)} type="button">
+    <button
+      className="toggle-row"
+      disabled={disabled}
+      onClick={() => onChange(!value)}
+      type="button"
+    >
       <span>{label}</span>
       <span className={value ? "toggle on" : "toggle"} />
     </button>

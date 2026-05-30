@@ -499,7 +499,11 @@ fn elgato_device_key(device: &DeviceInfo) -> String {
         return format!("alsa-card-{card}");
     }
     if let (Some(vendor), Some(product)) = (&device.vendor_id, &device.product_id) {
-        return format!("usb-{vendor}-{product}");
+        return format!(
+            "usb-{}-{}",
+            normalize_hex_id(vendor),
+            normalize_hex_id(product)
+        );
     }
     if let Some(profile) = &device.matched_profile_id {
         return profile.clone();
@@ -703,6 +707,32 @@ mod tests {
         device.vendor_id = Some("1234".into());
         let summaries = summarize_devices([&device], std::iter::empty::<&DeviceInfo>());
         assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn ignores_wave_xlr_product_id_without_elgato_identity() {
+        let mut device = test_device("Generic USB audio", None);
+        device.vendor_id = Some("1234".into());
+        device.product_id = Some("0x007d".into());
+        let summaries = summarize_devices([&device], std::iter::empty::<&DeviceInfo>());
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn merges_usb_ids_with_different_hex_formatting() {
+        let mut input = test_device("Elgato Wave XLR input", Some("elgato.wave-xlr"));
+        input.alsa_card = None;
+        input.vendor_id = Some("0x0FD9".into());
+        input.product_id = Some("0x007D".into());
+
+        let mut output = test_device("Elgato Wave XLR output", Some("elgato.wave-xlr"));
+        output.alsa_card = None;
+        output.vendor_id = Some("0fd9".into());
+        output.product_id = Some("007d".into());
+
+        let summaries = summarize_devices([&input], [&output]);
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].controls_supported);
     }
 
     #[test]

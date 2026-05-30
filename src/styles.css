@@ -952,6 +952,14 @@ input[type="range"] {
   font-variant-numeric: tabular-nums;
 }
 
+.fader-row.disabled {
+  opacity: 0.62;
+}
+
+.fader-row.disabled input[type="range"] {
+  cursor: not-allowed;
+}
+
 .master-stats {
   margin-top: 18px;
   align-items: stretch;
