@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CONFIG_VERSION: u32 = 8;
+pub const CONFIG_VERSION: u32 = 9;
 pub const MAX_MIXES: usize = 5;
 pub const MAX_SOFTWARE_CHANNELS: usize = 8;
 pub const MAX_HARDWARE_INPUTS: usize = 4;
@@ -138,6 +138,7 @@ pub struct MixerConfig {
     pub app_identity_overrides: Vec<AppIdentityOverride>,
     pub app_label_overrides: Vec<AppLabelOverride>,
     pub device_policy: DevicePolicy,
+    pub streamer_devices: StreamerDevicesConfig,
     pub settings: MixerSettings,
     pub audio: AudioSpec,
 }
@@ -173,6 +174,7 @@ impl Default for MixerConfig {
             app_identity_overrides: Vec::new(),
             app_label_overrides: Vec::new(),
             device_policy: DevicePolicy::default(),
+            streamer_devices: StreamerDevicesConfig::default(),
             settings: MixerSettings::default(),
             audio: AudioSpec::default(),
         }
@@ -292,6 +294,7 @@ impl MixerConfig {
         }
         self.normalize_app_identity();
         self.normalize_device_policy();
+        self.normalize_streamer_devices();
         self.normalize_app_routes();
         self.normalize_app_volume_presets();
         self.normalize_app_history();
@@ -399,6 +402,10 @@ impl MixerConfig {
             .fallback_hardware_profile
             .clone()
             .normalized();
+    }
+
+    fn normalize_streamer_devices(&mut self) {
+        self.streamer_devices = std::mem::take(&mut self.streamer_devices).normalized();
     }
 
     fn normalize_app_volume_presets(&mut self) {
@@ -1146,6 +1153,52 @@ impl MixerConfig {
         Ok(channel.clone())
     }
 
+    pub fn ensure_streamer_binding_profiles(
+        &mut self,
+        profiles: Vec<StreamerBindingProfile>,
+    ) -> StreamerDevicesConfig {
+        for profile in profiles {
+            let Some(profile) = profile.normalized() else {
+                continue;
+            };
+            self.streamer_devices
+                .profiles
+                .entry(profile.device_id.clone())
+                .or_insert(profile);
+        }
+        self.normalize_streamer_devices();
+        self.streamer_devices.clone()
+    }
+
+    pub fn set_streamer_device_enabled(
+        &mut self,
+        device_id: impl Into<String>,
+        enabled: bool,
+    ) -> Result<StreamerDevicesConfig, ModelError> {
+        let device_id = clean_streamer_id(device_id.into()).ok_or(ModelError::InvalidName)?;
+        let profile = self
+            .streamer_devices
+            .profiles
+            .entry(device_id.clone())
+            .or_insert_with(|| StreamerBindingProfile::new(device_id));
+        profile.enabled = enabled;
+        profile.safe_preset = false;
+        self.normalize_streamer_devices();
+        Ok(self.streamer_devices.clone())
+    }
+
+    pub fn set_streamer_binding_profile(
+        &mut self,
+        profile: StreamerBindingProfile,
+    ) -> Result<StreamerBindingProfile, ModelError> {
+        let profile = profile.normalized().ok_or(ModelError::InvalidName)?;
+        self.streamer_devices
+            .profiles
+            .insert(profile.device_id.clone(), profile.clone());
+        self.normalize_streamer_devices();
+        Ok(profile)
+    }
+
     pub fn set_effect_param(
         &mut self,
         channel_id: impl AsRef<str>,
@@ -1679,6 +1732,304 @@ pub struct DevicePolicy {
     pub hardware_profile_assignments: BTreeMap<DeviceId, String>,
     #[serde(default)]
     pub fallback_hardware_profile: FallbackHardwareProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct StreamerDevicesConfig {
+    pub version: u32,
+    pub profiles: BTreeMap<String, StreamerBindingProfile>,
+}
+
+impl StreamerDevicesConfig {
+    pub fn normalized(mut self) -> Self {
+        self.version = STREAMER_DEVICES_CONFIG_VERSION;
+        self.profiles = self
+            .profiles
+            .into_values()
+            .filter_map(StreamerBindingProfile::normalized)
+            .map(|profile| (profile.device_id.clone(), profile))
+            .collect();
+        self
+    }
+}
+
+impl Default for StreamerDevicesConfig {
+    fn default() -> Self {
+        Self {
+            version: STREAMER_DEVICES_CONFIG_VERSION,
+            profiles: BTreeMap::new(),
+        }
+    }
+}
+
+const STREAMER_DEVICES_CONFIG_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamerDeviceFamily {
+    StreamDeck,
+    Rode,
+    GoXlr,
+    MidiSurface,
+    Loupedeck,
+    XKeys,
+    UnknownSupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamerTransport {
+    Hid,
+    Midi,
+    AudioProfile,
+    Bridge,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamerPermissionStatus {
+    Ready,
+    PermissionDenied,
+    Busy,
+    MissingRuntime,
+    UnsupportedProtocol,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StreamerDeviceCapabilities {
+    pub buttons: bool,
+    pub dials: bool,
+    pub faders: bool,
+    pub pads: bool,
+    pub display_feedback: bool,
+    pub midi_feedback: bool,
+    pub audio_endpoint: bool,
+}
+
+impl Default for StreamerDeviceCapabilities {
+    fn default() -> Self {
+        Self {
+            buttons: false,
+            dials: false,
+            faders: false,
+            pads: false,
+            display_feedback: false,
+            midi_feedback: false,
+            audio_endpoint: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamerControlKind {
+    Button,
+    Dial,
+    Fader,
+    Pad,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct StreamerDeviceSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub family: StreamerDeviceFamily,
+    pub transport: StreamerTransport,
+    pub vendor_id: Option<String>,
+    pub product_id: Option<String>,
+    pub capabilities: StreamerDeviceCapabilities,
+    pub connected: bool,
+    pub enabled: bool,
+    pub permission_status: StreamerPermissionStatus,
+    pub matched_profile_id: Option<String>,
+    pub source: String,
+    pub message: String,
+}
+
+impl Default for StreamerDeviceSummary {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            description: String::new(),
+            family: StreamerDeviceFamily::UnknownSupported,
+            transport: StreamerTransport::AudioProfile,
+            vendor_id: None,
+            product_id: None,
+            capabilities: StreamerDeviceCapabilities::default(),
+            connected: false,
+            enabled: true,
+            permission_status: StreamerPermissionStatus::UnsupportedProtocol,
+            matched_profile_id: None,
+            source: String::new(),
+            message: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct StreamerBindingProfile {
+    pub device_id: String,
+    pub family: Option<StreamerDeviceFamily>,
+    pub name: String,
+    pub enabled: bool,
+    pub safe_preset: bool,
+    pub bindings: Vec<StreamerBinding>,
+}
+
+impl StreamerBindingProfile {
+    pub fn new(device_id: String) -> Self {
+        Self {
+            device_id,
+            family: None,
+            name: "Streamer Device".into(),
+            enabled: true,
+            safe_preset: false,
+            bindings: Vec::new(),
+        }
+    }
+
+    fn normalized(mut self) -> Option<Self> {
+        self.device_id = clean_streamer_id(self.device_id)?;
+        self.name = clean_app_display_name(&self.name).unwrap_or_else(|| "Streamer Device".into());
+        self.bindings = self
+            .bindings
+            .into_iter()
+            .filter_map(StreamerBinding::normalized)
+            .collect();
+        Some(self)
+    }
+}
+
+impl Default for StreamerBindingProfile {
+    fn default() -> Self {
+        Self::new(String::new())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct StreamerBinding {
+    pub control_id: String,
+    pub label: String,
+    pub control_kind: StreamerControlKind,
+    pub action: StreamerAction,
+}
+
+impl StreamerBinding {
+    fn normalized(mut self) -> Option<Self> {
+        self.control_id = clean_streamer_id(self.control_id)?;
+        self.label = clean_app_display_name(&self.label).unwrap_or_else(|| self.control_id.clone());
+        Some(self)
+    }
+}
+
+impl Default for StreamerBinding {
+    fn default() -> Self {
+        Self {
+            control_id: String::new(),
+            label: String::new(),
+            control_kind: StreamerControlKind::Unknown,
+            action: StreamerAction::Noop,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StreamerAction {
+    Noop,
+    MixMuteToggle {
+        mix_id: MixId,
+    },
+    MixVolumeSet {
+        mix_id: MixId,
+        volume: f32,
+    },
+    MixVolumeSetFromControl {
+        mix_id: MixId,
+    },
+    MixVolumeAdjust {
+        mix_id: MixId,
+        delta: f32,
+    },
+    ChannelMuteToggle {
+        channel_id: ChannelId,
+        mix_id: MixId,
+    },
+    ChannelBusEnabledToggle {
+        channel_id: ChannelId,
+        mix_id: MixId,
+    },
+    ChannelVolumeSet {
+        channel_id: ChannelId,
+        mix_id: MixId,
+        volume: f32,
+    },
+    ChannelVolumeSetFromControl {
+        channel_id: ChannelId,
+        mix_id: MixId,
+    },
+    ChannelVolumeAdjust {
+        channel_id: ChannelId,
+        mix_id: MixId,
+        delta: f32,
+    },
+    EffectBypassToggle {
+        channel_id: ChannelId,
+        instance_id: EffectInstanceId,
+    },
+    StartOrRepairAudio,
+    CleanupAudioGraph,
+    CleanupStaleAudioGraph,
+}
+
+impl Default for StreamerAction {
+    fn default() -> Self {
+        Self::Noop
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct StreamerLearnResult {
+    pub device_id: String,
+    pub control_id: Option<String>,
+    pub control_kind: StreamerControlKind,
+    pub message: String,
+}
+
+impl Default for StreamerLearnResult {
+    fn default() -> Self {
+        Self {
+            device_id: String::new(),
+            control_id: None,
+            control_kind: StreamerControlKind::Unknown,
+            message: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct StreamerActionResult {
+    pub performed: bool,
+    pub message: String,
+}
+
+impl Default for StreamerActionResult {
+    fn default() -> Self {
+        Self {
+            performed: false,
+            message: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2603,6 +2954,10 @@ fn clean_optional_icon(value: Option<String>) -> Option<String> {
 
 fn clean_optional_profile_id(value: Option<String>) -> Option<String> {
     clean_optional_matcher(value).map(|value| value.chars().take(128).collect())
+}
+
+fn clean_streamer_id(value: String) -> Option<String> {
+    clean_optional_matcher(Some(value)).map(|value| value.chars().take(160).collect())
 }
 
 fn clean_optional_label(value: Option<String>) -> Option<String> {

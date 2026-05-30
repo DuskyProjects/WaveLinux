@@ -1988,6 +1988,83 @@ input[type="range"] {
   min-width: 0;
 }
 
+.streamer-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.8fr) minmax(420px, 1.2fr);
+  gap: 12px;
+  min-width: 0;
+}
+
+.streamer-device-list,
+.streamer-binding-panel,
+.streamer-binding-list {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  align-content: start;
+}
+
+.streamer-device-row,
+.streamer-binding-panel,
+.streamer-binding-row {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #28313a;
+  border-radius: 8px;
+  background: #10151b;
+}
+
+.streamer-device-row {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  color: inherit;
+  text-align: left;
+}
+
+.streamer-device-row.active,
+.streamer-binding-row.active {
+  border-color: #48d7e6;
+  background: #12222a;
+}
+
+.streamer-device-row strong,
+.streamer-device-row span,
+.streamer-device-row small,
+.streamer-binding-panel h2,
+.streamer-binding-panel span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.streamer-device-row span,
+.streamer-device-row small,
+.streamer-binding-panel .panel-header span {
+  color: #9aa7b3;
+  font-size: 12px;
+}
+
+.streamer-binding-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.streamer-binding-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(120px, 0.8fr) minmax(180px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.streamer-binding-buttons {
+  display: flex;
+  gap: 6px;
+}
+
 .elgato-device-list,
 .elgato-control-card,
 .elgato-info-grid {
@@ -3699,7 +3776,12 @@ button:disabled {
 
   .hardware-profile-grid,
   .elgato-grid,
+  .streamer-grid,
   .profile-device-row {
+    grid-template-columns: 1fr;
+  }
+
+  .streamer-binding-row {
     grid-template-columns: 1fr;
   }
 

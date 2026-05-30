@@ -129,6 +129,53 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return [];
   }
 
+  if (command === "list_streamer_devices") {
+    return [];
+  }
+
+  if (command === "get_streamer_bindings") {
+    return structuredClone(demoState.config.streamer_devices);
+  }
+
+  if (command === "set_streamer_device_enabled") {
+    const deviceId = stringArg(args, "deviceId") || stringArg(args, "device_id");
+    const enabled = boolArg(args, "enabled", true);
+    if (deviceId) {
+      demoState.config.streamer_devices.profiles[deviceId] = {
+        device_id: deviceId,
+        family: null,
+        name: "Streamer Device",
+        enabled,
+        safe_preset: false,
+        bindings: demoState.config.streamer_devices.profiles[deviceId]?.bindings ?? [],
+      };
+    }
+    return structuredClone(demoState.config.streamer_devices);
+  }
+
+  if (command === "set_streamer_binding_profile") {
+    const profile = args?.profile;
+    if (profile && typeof profile === "object" && "device_id" in profile) {
+      const next = structuredClone(profile) as typeof demoState.config.streamer_devices.profiles[string];
+      demoState.config.streamer_devices.profiles[next.device_id] = next;
+      return next;
+    }
+    return {};
+  }
+
+  if (command === "learn_streamer_control") {
+    return {
+      device_id: stringArg(args, "deviceId") || stringArg(args, "device_id"),
+      control_id: null,
+      control_kind: "unknown",
+      message: "No streamer device is connected in demo mode",
+    };
+  }
+
+  if (command === "run_streamer_action_test") {
+    return { performed: false, message: "No streamer device is connected in demo mode" };
+  }
+
   if (command === "create_mix") {
     const name = String(args?.name ?? "New Mix");
     const id = slug(name);
@@ -1379,6 +1426,10 @@ export const demoState: AppStateSnapshot = {
       active_output_fallback: false,
       hardware_profile_assignments: {},
       fallback_hardware_profile: defaultDemoFallbackProfile(),
+    },
+    streamer_devices: {
+      version: 1,
+      profiles: {},
     },
   },
   graph: {

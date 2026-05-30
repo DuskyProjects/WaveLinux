@@ -25,7 +25,7 @@ use wavelinux_model::{
     ChannelInputMode, ChannelKind, DeviceInfo, Diagnostic, DiagnosticSeverity, EffectAvailability,
     EffectCatalog, EffectInstance, EngineStatus, FallbackHardwareProfile, HardwareProfile,
     HardwareProfileUiState, KnownApp, LatencyPolicy, LevelMeter, Mix, MixerConfig, MixerSettings,
-    ModelError, RoutingPolicy, RuntimeGraph,
+    ModelError, RoutingPolicy, RuntimeGraph, StreamerBindingProfile, StreamerDevicesConfig,
 };
 use wavelinux_pw::{
     channel_has_active_effects, channel_mix_route_revision, channel_mix_source_name,
@@ -1977,6 +1977,32 @@ impl WaveLinuxEngine {
         let catalog = self.hardware_profiles()?;
         let config = self.read_config()?.clone();
         Ok(hardware_profile_ui_state(&catalog, &config.device_policy))
+    }
+
+    pub fn streamer_devices_config(&self) -> Result<StreamerDevicesConfig, EngineError> {
+        Ok(self.read_config()?.streamer_devices.clone())
+    }
+
+    pub fn ensure_streamer_binding_profiles(
+        &self,
+        profiles: Vec<StreamerBindingProfile>,
+    ) -> Result<StreamerDevicesConfig, EngineError> {
+        self.update_config(|config| Ok(config.ensure_streamer_binding_profiles(profiles)))?
+    }
+
+    pub fn set_streamer_device_enabled(
+        &self,
+        device_id: String,
+        enabled: bool,
+    ) -> Result<StreamerDevicesConfig, EngineError> {
+        self.update_config(|config| config.set_streamer_device_enabled(device_id, enabled))?
+    }
+
+    pub fn set_streamer_binding_profile(
+        &self,
+        profile: StreamerBindingProfile,
+    ) -> Result<StreamerBindingProfile, EngineError> {
+        self.update_config(|config| config.set_streamer_binding_profile(profile))?
     }
 
     pub fn set_device_hardware_profile(

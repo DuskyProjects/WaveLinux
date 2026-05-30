@@ -203,10 +203,21 @@ for program in pipewire pactl wpctl pw-cli pw-dump; do
     missing_commands+=("$program")
   fi
 done
+missing_streamer_commands=()
+if ! command_exists aseqdump; then
+  missing_streamer_commands+=("aseqdump")
+fi
 missing_libraries=()
 if ! { command_exists ldconfig && ldconfig -p 2>/dev/null | grep -q 'libusb-1\.0\.so\.0'; } &&
    [[ ! -e /usr/lib/libusb-1.0.so.0 && ! -e /usr/lib64/libusb-1.0.so.0 && ! -e /usr/lib/x86_64-linux-gnu/libusb-1.0.so.0 ]]; then
   missing_libraries+=("libusb-1.0")
+fi
+streamer_discovery_notes=()
+if [[ ! -d /sys/class/hidraw ]]; then
+  streamer_discovery_notes+=("hidraw sysfs unavailable")
+fi
+if [[ ! -r /proc/asound/seq/clients ]]; then
+  streamer_discovery_notes+=("ALSA sequencer client list unavailable")
 fi
 
 runtime_candidates=()
@@ -215,20 +226,20 @@ aur_effect_candidates=()
 
 case "$manager" in
   apt)
-    runtime_candidates=(pipewire wireplumber pipewire-pulse pipewire-bin pulseaudio-utils libwebkit2gtk-4.1-0 libayatana-appindicator3-1 libusb-1.0-0)
+    runtime_candidates=(pipewire wireplumber pipewire-pulse pipewire-bin pulseaudio-utils alsa-utils libwebkit2gtk-4.1-0 libayatana-appindicator3-1 libusb-1.0-0)
     effect_candidates=(swh-plugins lsp-plugins-ladspa librnnoise-ladspa deepfilternet-ladspa deepfilternet)
     ;;
   dnf)
-    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils webkit2gtk4.1 libappindicator-gtk3 libusb1)
+    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils alsa-utils webkit2gtk4.1 libappindicator-gtk3 libusb1)
     effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise noise-suppression-for-voice deepfilternet)
     ;;
   pacman)
-    runtime_candidates=(pipewire wireplumber pipewire-pulse libpulse webkit2gtk-4.1 gtk3 libayatana-appindicator libusb)
+    runtime_candidates=(pipewire wireplumber pipewire-pulse libpulse alsa-utils webkit2gtk-4.1 gtk3 libayatana-appindicator libusb)
     effect_candidates=(swh-plugins noise-suppression-for-voice)
     aur_effect_candidates=(deepfilternet-plugin-pipewire-bin noise-suppression-for-voice deepfilternet deepfilternet-ladspa)
     ;;
   zypper)
-    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils libwebkit2gtk-4_1-0 typelib-1_0-AyatanaAppIndicator3-0_1 libusb-1_0-0)
+    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils alsa libwebkit2gtk-4_1-0 typelib-1_0-AyatanaAppIndicator3-0_1 libusb-1_0-0)
     effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise deepfilternet)
     ;;
 esac
@@ -280,8 +291,18 @@ if (( ${#missing_effects[@]} == 0 )); then
 else
   echo "Optional effects missing: ${missing_effects[*]}"
 fi
+if (( ${#streamer_discovery_notes[@]} == 0 )); then
+  echo "Streamer device discovery: ok"
+else
+  echo "Streamer device discovery notes: ${streamer_discovery_notes[*]}"
+fi
+if (( ${#missing_streamer_commands[@]} == 0 )); then
+  echo "Streamer device runtime: ok"
+else
+  echo "Streamer device runtime missing: ${missing_streamer_commands[*]}"
+fi
 
-if (( INSTALL == 1 && ( ${#missing_commands[@]} > 0 || ${#missing_libraries[@]} > 0 ) )); then
+if (( INSTALL == 1 && ( ${#missing_commands[@]} > 0 || ${#missing_streamer_commands[@]} > 0 || ${#missing_libraries[@]} > 0 ) )); then
   mapfile -t packages < <(resolve_packages "$manager" "${runtime_candidates[@]}")
   if (( ${#packages[@]} > 0 )); then
     echo "Installing runtime packages: ${packages[*]}"
@@ -312,6 +333,6 @@ if (( INSTALL_EFFECTS == 1 && ${#missing_effects[@]} > 0 )); then
   fi
 fi
 
-if (( STRICT == 1 && ( ${#missing_commands[@]} > 0 || ${#missing_libraries[@]} > 0 || ${#missing_effects[@]} > 0 ) )); then
+if (( STRICT == 1 && ( ${#missing_commands[@]} > 0 || ${#missing_streamer_commands[@]} > 0 || ${#missing_libraries[@]} > 0 || ${#missing_effects[@]} > 0 ) )); then
   exit 1
 fi

@@ -25,10 +25,12 @@ use wavelinux_model::{
     AppMatcher, AppRoute, AppStateSnapshot, AppVolumePreset, Channel, ChannelInputMode,
     ChannelKind, EffectAvailability, EffectCatalog, EffectInstance, FallbackHardwareProfile,
     HardwareProfileUiState, KnownApp, LatencyPolicy, LevelMeter, Mix, MixBus, MixerConfig,
-    MixerSettings, ReleaseChannel, RoutingPolicy,
+    MixerSettings, ReleaseChannel, RoutingPolicy, StreamerAction, StreamerActionResult,
+    StreamerBindingProfile, StreamerDeviceSummary, StreamerDevicesConfig, StreamerLearnResult,
 };
 
 mod elgato;
+mod streamer_devices;
 
 struct EngineState {
     engine: Arc<WaveLinuxEngine>,
@@ -351,6 +353,85 @@ fn set_hardware_profile_policy(
         latency_policy,
         routing_policy,
     ))
+}
+
+#[tauri::command]
+fn list_streamer_devices(
+    engine: State<'_, EngineState>,
+) -> Result<Vec<StreamerDeviceSummary>, String> {
+    let state = engine.engine.get_state().map_err(|err| err.to_string())?;
+    let mut devices = streamer_devices::discover_devices(&state);
+    let missing_profiles = devices.iter().any(|device| {
+        !state
+            .config
+            .streamer_devices
+            .profiles
+            .contains_key(&device.id)
+    });
+    let bindings = if missing_profiles {
+        let defaults = streamer_devices::default_profiles_for_devices(&devices, &state.config);
+        engine
+            .engine
+            .ensure_streamer_binding_profiles(defaults)
+            .map_err(|err| err.to_string())?
+    } else {
+        state.config.streamer_devices
+    };
+    for device in &mut devices {
+        if let Some(profile) = bindings.profiles.get(&device.id) {
+            device.enabled = profile.enabled;
+        }
+    }
+    Ok(devices)
+}
+
+#[tauri::command]
+fn get_streamer_bindings(engine: State<'_, EngineState>) -> Result<StreamerDevicesConfig, String> {
+    engine
+        .engine
+        .streamer_devices_config()
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_streamer_device_enabled(
+    engine: State<'_, EngineState>,
+    device_id: String,
+    enabled: bool,
+) -> Result<StreamerDevicesConfig, String> {
+    engine
+        .engine
+        .set_streamer_device_enabled(device_id, enabled)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_streamer_binding_profile(
+    engine: State<'_, EngineState>,
+    profile: StreamerBindingProfile,
+) -> Result<StreamerBindingProfile, String> {
+    engine
+        .engine
+        .set_streamer_binding_profile(profile)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn learn_streamer_control(
+    engine: State<'_, EngineState>,
+    device_id: String,
+) -> Result<StreamerLearnResult, String> {
+    let state = engine.engine.get_state().map_err(|err| err.to_string())?;
+    let devices = streamer_devices::discover_devices(&state);
+    streamer_devices::learn_control(&devices, &device_id)
+}
+
+#[tauri::command]
+fn run_streamer_action_test(
+    engine: State<'_, EngineState>,
+    action: StreamerAction,
+) -> Result<StreamerActionResult, String> {
+    streamer_devices::run_action(&engine.engine, action)
 }
 
 #[tauri::command]
@@ -1608,6 +1689,12 @@ fn main() {
             set_device_hardware_profile,
             set_fallback_hardware_profile,
             set_hardware_profile_policy,
+            list_streamer_devices,
+            get_streamer_bindings,
+            set_streamer_device_enabled,
+            set_streamer_binding_profile,
+            learn_streamer_control,
+            run_streamer_action_test,
             list_elgato_devices,
             read_elgato_wave_xlr,
             set_elgato_wave_xlr_gain,
@@ -1666,6 +1753,7 @@ fn main() {
 
     let engine = WaveLinuxEngine::from_xdg().expect("failed to start WaveLinux engine");
     let background = engine.spawn_background();
+    let streamer_runtime = streamer_devices::StreamerDeviceRuntime::start(Arc::clone(&engine));
     let run_engine = Arc::clone(&engine);
     let run_shutdown = Arc::clone(&shutdown_started);
     app.manage(EngineState {
@@ -1689,6 +1777,7 @@ fn main() {
         _ => {}
     });
 
+    drop(streamer_runtime);
     engine.stop_background();
     let _ = background.join();
     let _ = engine.cleanup_audio_graph();

@@ -170,6 +170,100 @@ export interface HardwareProfileUiState {
   fallback_profile: FallbackHardwareProfile;
 }
 
+export type StreamerDeviceFamily =
+  | "stream_deck"
+  | "rode"
+  | "go_xlr"
+  | "midi_surface"
+  | "loupedeck"
+  | "x_keys"
+  | "unknown_supported";
+
+export type StreamerTransport = "hid" | "midi" | "audio_profile" | "bridge";
+export type StreamerPermissionStatus =
+  | "ready"
+  | "permission_denied"
+  | "busy"
+  | "missing_runtime"
+  | "unsupported_protocol";
+export type StreamerControlKind = "button" | "dial" | "fader" | "pad" | "unknown";
+
+export interface StreamerDeviceCapabilities {
+  buttons: boolean;
+  dials: boolean;
+  faders: boolean;
+  pads: boolean;
+  display_feedback: boolean;
+  midi_feedback: boolean;
+  audio_endpoint: boolean;
+}
+
+export interface StreamerDeviceSummary {
+  id: string;
+  name: string;
+  description: string;
+  family: StreamerDeviceFamily;
+  transport: StreamerTransport;
+  vendor_id?: string | null;
+  product_id?: string | null;
+  capabilities: StreamerDeviceCapabilities;
+  connected: boolean;
+  enabled: boolean;
+  permission_status: StreamerPermissionStatus;
+  matched_profile_id?: string | null;
+  source: string;
+  message: string;
+}
+
+export interface StreamerDevicesConfig {
+  version: number;
+  profiles: Record<string, StreamerBindingProfile>;
+}
+
+export interface StreamerBindingProfile {
+  device_id: string;
+  family?: StreamerDeviceFamily | null;
+  name: string;
+  enabled: boolean;
+  safe_preset: boolean;
+  bindings: StreamerBinding[];
+}
+
+export interface StreamerBinding {
+  control_id: string;
+  label: string;
+  control_kind: StreamerControlKind;
+  action: StreamerAction;
+}
+
+export type StreamerAction =
+  | { kind: "noop" }
+  | { kind: "mix_mute_toggle"; mix_id: string }
+  | { kind: "mix_volume_set"; mix_id: string; volume: number }
+  | { kind: "mix_volume_set_from_control"; mix_id: string }
+  | { kind: "mix_volume_adjust"; mix_id: string; delta: number }
+  | { kind: "channel_mute_toggle"; channel_id: string; mix_id: string }
+  | { kind: "channel_bus_enabled_toggle"; channel_id: string; mix_id: string }
+  | { kind: "channel_volume_set"; channel_id: string; mix_id: string; volume: number }
+  | { kind: "channel_volume_set_from_control"; channel_id: string; mix_id: string }
+  | { kind: "channel_volume_adjust"; channel_id: string; mix_id: string; delta: number }
+  | { kind: "effect_bypass_toggle"; channel_id: string; instance_id: string }
+  | { kind: "start_or_repair_audio" }
+  | { kind: "cleanup_audio_graph" }
+  | { kind: "cleanup_stale_audio_graph" };
+
+export interface StreamerLearnResult {
+  device_id: string;
+  control_id?: string | null;
+  control_kind: StreamerControlKind;
+  message: string;
+}
+
+export interface StreamerActionResult {
+  performed: boolean;
+  message: string;
+}
+
 export type ElgatoDeviceKind =
   | "wave_xlr"
   | "wave_microphone"
@@ -218,6 +312,7 @@ export interface MixerConfig {
   app_identity_overrides: AppIdentityOverride[];
   app_label_overrides: AppLabelOverride[];
   device_policy: DevicePolicy;
+  streamer_devices: StreamerDevicesConfig;
   settings: MixerSettings;
   audio: AudioSpec;
 }

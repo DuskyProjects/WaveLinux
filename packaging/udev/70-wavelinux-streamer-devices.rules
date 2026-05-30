@@ -1,0 +1,10 @@
+# Optional WaveLinux streamer-device access rules.
+# Modern desktop sessions normally grant TAG+="uaccess" devices to the active user.
+
+# Elgato Stream Deck family.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", TAG+="uaccess"
+
+# P.I. Engineering X-keys family.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05f3", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="05f3", TAG+="uaccess"

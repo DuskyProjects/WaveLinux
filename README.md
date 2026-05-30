@@ -34,6 +34,8 @@ Clipguard behavior remain out of scope.
   endpoints
 - Elgato Wave XLR gain, mute, headphone volume, and low-impedance controls when
   supported Elgato hardware is detected
+- Stream Deck-style HID and MIDI streamer hardware detection with mixer binding
+  profiles that stay hidden until supported hardware is connected
 - Editable safe generic default profile plus per-device manual profile assignment
 - Local profile overrides that survive app updates without executable hooks
 - Signed remote hardware profile downloads from GitHub Releases
@@ -62,6 +64,8 @@ Required host services and tools:
 - `pw-cli`
 - `pw-dump`
 - libusb 1.0 shared library for optional Elgato Wave XLR hardware controls
+- Linux hidraw/sysfs access for Stream Deck-style streamer device detection
+- ALSA sequencer client listing and `aseqdump` for MIDI streamer device binding
 
 Recommended optional effect packages:
 
@@ -208,6 +212,30 @@ detected Elgato hardware, and the libusb control path is loaded only after a
 supported Wave XLR is detected. The Wave XLR USB protocol details are based on
 the OpenWave project: https://github.com/rikkichy/openwave
 
+## Streamer Device Bindings
+
+When WaveLinux detects supported streamer hardware, Settings shows a Streamers
+tab. It is hidden when no supported Stream Deck-style HID, RODE/GoXLR-style
+MIDI, or recognized streamer audio/control device is connected. Device discovery
+uses cheap Linux sysfs, hidraw, PipeWire, and ALSA sequencer inspection first;
+WaveLinux only keeps hidraw devices open or starts `aseqdump` MIDI capture when
+a detected device has enabled bindings.
+
+Bindings can target mixer mute and volume controls, source-to-mix controls, and
+audio graph repair or cleanup actions. A safe preset is created the first time a
+device is seen, and hardware access reports permission, busy, missing runtime, or
+unsupported protocol states instead of showing inactive controls.
+
+For hidraw permissions, packaged installs may include:
+
+```text
+packaging/udev/70-wavelinux-streamer-devices.rules
+```
+
+After installing udev rules manually, reload rules with your distribution's
+standard `udevadm control --reload-rules && udevadm trigger` flow and reconnect
+the device.
+
 ## Interface Themes
 
 WaveLinux separates UI selection from the audio engine. The Settings page has
@@ -341,6 +369,7 @@ Direct code, protocol, and runtime dependencies:
 | Project | License | WaveLinux use |
 | --- | --- | --- |
 | [OpenWave](https://github.com/rikkichy/openwave) | MIT | Wave XLR USB control-transfer protocol notes and behavior used for optional Elgato controls. |
+| [Elgato Stream Deck HID documentation](https://docs.elgato.com/streamdeck/hid/intro) | Reference documentation | Stream Deck HID device model and packet behavior used to guide lazy HID detection and raw report binding IDs. |
 | [Tauri](https://tauri.app/) and Tauri plugins | MIT OR Apache-2.0 | Desktop shell, IPC, tray, updater, opener, shell, and single-instance support. |
 | [React](https://react.dev/) and React DOM | MIT | Frontend UI framework. |
 | [TypeScript](https://www.typescriptlang.org/) | Apache-2.0 | Frontend type system and compiler. |
@@ -349,6 +378,7 @@ Direct code, protocol, and runtime dependencies:
 | [PipeWire](https://pipewire.org/) and `pipewire-rs` / libspa bindings | MIT | Linux audio graph integration, device discovery, routing, and metering. |
 | [WirePlumber](https://pipewire.pages.freedesktop.org/wireplumber/) | MIT | Host session-manager integration target for PipeWire desktops. |
 | [libusb](https://github.com/libusb/libusb) | LGPL-2.1-or-later | Dynamically loaded host shared library for optional Elgato Wave XLR controls. |
+| [ALSA utilities](https://www.alsa-project.org/) (`aseqdump`) | GPL-2.0-or-later | Host MIDI event capture for connected streamer control surfaces, started only for enabled detected MIDI devices. |
 | Rust support crates: `anyhow`, `base64`, `directories`, `libc`, `serde`, `serde_json`, `tempfile`, `thiserror`, `time`, `url`, `uuid` | MIT OR Apache-2.0 | Serialization, errors, paths, test files, URLs, timestamps, identifiers, and libc bindings. |
 | Rust support crate: `include_dir` | MIT | Embeds packaged hardware profile assets. |
 | Rust support crate: `libloading` | ISC | Lazy runtime loading for the optional libusb control path. |
@@ -361,6 +391,9 @@ does not bundle in normal release artifacts:
 | [SWH LADSPA plugins](https://github.com/swh/ladspa) | GPL-2.0 | Optional compressor, gate, and limiter plugin support installed from the user's distro packages. |
 | [noise-suppression-for-voice](https://github.com/werman/noise-suppression-for-voice) / RNNoise | GPL-3.0 | Optional RNNoise LADSPA noise suppression support installed from the user's distro packages. |
 | [DeepFilterNet3 LADSPA/PipeWire plugins](https://github.com/Rikorose/DeepFilterNet) | MIT OR Apache-2.0 | Optional DeepFilterNet noise suppression support installed from the user's distro packages when available. |
+| [OpenDeck](https://github.com/nekename/OpenDeck) | GPL-3.0-or-later | Open-source Linux Stream Deck implementation used as a compatibility and udev-permission reference. |
+| [Bitfocus Companion](https://github.com/bitfocus/companion) | MIT | Open-source streamer surface ecosystem reference for Stream Deck, Loupedeck, X-keys, and similar devices. |
+| [GoXLR Utility](https://github.com/GoXLR-on-Linux/goxlr-utility) | MIT | Open-source GoXLR control software reference for Linux behavior and control-surface expectations. |
 | PulseAudio-compatible tools (`pactl`) and PipeWire tools (`wpctl`, `pw-cli`, `pw-dump`) | LGPL-2.1-or-later / MIT | Host command-line tools used for graph inspection, routing, and diagnostics. |
 
 ## License
