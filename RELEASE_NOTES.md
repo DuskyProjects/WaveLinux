@@ -1,3 +1,33 @@
+# WaveLinux 4.2.1
+
+WaveLinux 4.2.1 is a follow-up stability and polish release for the new
+multi-surface UI system, custom theme loading, effect plugin setup, and
+DeepFilterNet3 microphone processing.
+
+## Fixes
+
+- Defaults new installs to the Wave Link 3-style Matrix Dark interface while
+  preserving any saved user interface choice.
+- Adds a built-in Settings > Health > Effect Availability installer for missing
+  optional LADSPA plugins, including DeepFilterNet3, RNNoise, and SWH dynamics.
+- Verifies DeepFilterNet LADSPA availability by checking for a DeepFilterNet3
+  model marker instead of accepting ambiguous legacy plugins.
+- Tunes DeepFilterNet3 defaults for live mic use with a less lossy input/output
+  gain stage, a lower reduction limit, a quieter-speech threshold, balanced
+  Voice/Natural/Noisy Room presets, and a larger realtime processing buffer.
+- Keeps the system default capture device on `wavelinux-mic` instead of the
+  stream mix, so microphone effects remain available without making stream mix
+  audio the default input.
+- Adds source/channel icon editing and keeps mix/source icon choices normalized
+  and persistent.
+- Moves mixer-side editing controls into flyout panels for app routing, source
+  settings, output settings, and FX workflows.
+- Fixes light theme contrast issues, mute button styling, matrix scroll/padding
+  problems, and effect active indicators.
+- Removes the unused Scenes capability from the UI/code path.
+- Updates the app icon set and simplifies the README into setup-focused project
+  documentation.
+
 # WaveLinux 4.2.0
 
 WaveLinux 4.2.0 is a feature release that adds selectable UI surfaces and a

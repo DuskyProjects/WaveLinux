@@ -76,6 +76,7 @@ export interface Channel {
   kind: ChannelKind;
   virtual_sink_name: string;
   source_device?: string | null;
+  icon?: string | null;
   input_mode: ChannelInputMode;
   linked: boolean;
   mix_buses: Record<string, MixBus>;
@@ -395,5 +396,18 @@ export interface UpdateInfo {
 export interface UpdateInstallResult {
   installed: boolean;
   version?: string | null;
+  message: string;
+}
+
+export interface EffectPluginInstallResult {
+  attempted: boolean;
+  success: boolean;
+  manager: string;
+  packages: string[];
+  aur_packages: string[];
+  missing_before: string[];
+  missing_after: string[];
+  stdout: string;
+  stderr: string;
   message: string;
 }

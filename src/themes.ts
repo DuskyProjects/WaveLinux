@@ -13,6 +13,7 @@ export interface UiThemeDefinition {
 }
 
 const THEME_ID_STORAGE_KEY = "wavelinux.ui.themeId.v1";
+export const DEFAULT_UI_THEME_ID = "wavelink3_dark";
 const LEGACY_THEME_ALIASES: Record<string, string> = {
   classic: "wavelink2",
   wavelink: "wavelink3",
@@ -53,11 +54,11 @@ export const builtInUiThemes: UiThemeDefinition[] = [
 ];
 
 export function loadStoredThemeId(): string {
-  if (typeof window === "undefined") return "wavelink2";
+  if (typeof window === "undefined") return DEFAULT_UI_THEME_ID;
   try {
-    return normalizeThemeId(window.localStorage.getItem(THEME_ID_STORAGE_KEY) || "wavelink2");
+    return normalizeThemeId(window.localStorage.getItem(THEME_ID_STORAGE_KEY) || DEFAULT_UI_THEME_ID);
   } catch {
-    return "wavelink2";
+    return DEFAULT_UI_THEME_ID;
   }
 }
 
@@ -76,7 +77,12 @@ export function allUiThemes(customThemes: UiThemeDefinition[]): UiThemeDefinitio
 
 export function resolveUiTheme(themeId: string, customThemes: UiThemeDefinition[]): UiThemeDefinition {
   const normalizedThemeId = normalizeThemeId(themeId);
-  return allUiThemes(customThemes).find((theme) => theme.id === normalizedThemeId) ?? builtInUiThemes[0];
+  const themes = allUiThemes(customThemes);
+  return (
+    themes.find((theme) => theme.id === normalizedThemeId) ??
+    themes.find((theme) => theme.id === DEFAULT_UI_THEME_ID) ??
+    builtInUiThemes[0]
+  );
 }
 
 export function normalizeFileUiThemes(value: unknown): UiThemeDefinition[] {

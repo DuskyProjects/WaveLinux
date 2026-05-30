@@ -219,8 +219,8 @@ case "$manager" in
     ;;
   pacman)
     runtime_candidates=(pipewire wireplumber pipewire-pulse libpulse webkit2gtk-4.1 gtk3 libayatana-appindicator)
-    effect_candidates=(swh-plugins lsp-plugins rnnoise)
-    aur_effect_candidates=(noise-suppression-for-voice deepfilternet deepfilternet-ladspa)
+    effect_candidates=(swh-plugins noise-suppression-for-voice)
+    aur_effect_candidates=(deepfilternet-plugin-pipewire-bin noise-suppression-for-voice deepfilternet deepfilternet-ladspa)
     ;;
   zypper)
     runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils libwebkit2gtk-4_1-0 typelib-1_0-AyatanaAppIndicator3-0_1)
@@ -228,9 +228,25 @@ case "$manager" in
     ;;
 esac
 
+ladspa_file_has_marker() {
+  local marker="$1"
+  shift
+  local pattern path
+  while IFS= read -r root; do
+    [[ -d "$root" ]] || continue
+    for pattern in "$@"; do
+      for path in "$root"/$pattern; do
+        [[ -f "$path" ]] || continue
+        grep -a -q "$marker" "$path" && return 0
+      done
+    done
+  done < <(existing_ladspa_paths)
+  return 1
+}
+
 missing_effects=()
-if ! ladspa_has_any 'libdeep_filter_ladspa.so' 'deep_filter_ladspa.so' 'libdeepfilternet_ladspa.so' 'deepfilternet_ladspa.so' 'libdeep_filter_net_ladspa.so' 'deep_filter_net_ladspa.so'; then
-  missing_effects+=("DeepFilterNet")
+if ! ladspa_file_has_marker 'DeepFilterNet3' 'libdeep_filter_ladspa.so' 'deep_filter_ladspa.so' 'libdeepfilternet_ladspa.so' 'deepfilternet_ladspa.so' 'libdeep_filter_net_ladspa.so' 'deep_filter_net_ladspa.so'; then
+  missing_effects+=("DeepFilterNet3")
 fi
 if ! ladspa_has_any 'librnnoise_ladspa.so' 'rnnoise_ladspa.so'; then
   missing_effects+=("RNNoise")

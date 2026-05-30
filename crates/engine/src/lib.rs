@@ -5,12 +5,12 @@ use std::mem;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use directories::{BaseDirs, ProjectDirs};
 use pipewire as pw;
@@ -65,8 +65,9 @@ const METER_STALE_RELEASE_PER_SECOND: f32 = 0.08;
 const METER_DISPLAY_FLOOR_DB: f32 = -54.0;
 const METER_DISPLAY_CEILING_DB: f32 = 0.0;
 const METER_DISPLAY_EXPONENT: f32 = 1.15;
-const EFFECT_GRAPH_SYNC_DEBOUNCE: Duration = Duration::from_millis(180);
-const GRAPH_REPAIR_DEBOUNCE: Duration = Duration::from_millis(160);
+const EFFECT_GRAPH_SYNC_DEBOUNCE: Duration = Duration::from_millis(500);
+const GRAPH_REPAIR_DEBOUNCE: Duration = Duration::from_millis(650);
+const FX_LOG_WARNING_WINDOW: Duration = Duration::from_secs(10 * 60);
 const AUDIO_COMMAND_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
 const CAPTURE_MOVE_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const APP_STREAM_MOVE_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
@@ -841,6 +842,7 @@ pub struct WaveLinuxEngine {
     config: RwLock<MixerConfig>,
     runtime: RwLock<RuntimeCache>,
     meter_supervisor: Mutex<MeterSupervisor>,
+    effect_chain_processes: Mutex<BTreeMap<String, Child>>,
     runtime_refresh: Mutex<()>,
     host_diagnostics: Mutex<TimedCache<Vec<Diagnostic>>>,
     effect_availability: Mutex<TimedCache<Vec<EffectAvailability>>>,
@@ -888,6 +890,7 @@ impl WaveLinuxEngine {
             runtime: RwLock::new(RuntimeCache::new(options.dry_run)),
             config: RwLock::new(config),
             meter_supervisor: Mutex::new(MeterSupervisor::new(options.dry_run)),
+            effect_chain_processes: Mutex::new(BTreeMap::new()),
             runtime_refresh: Mutex::new(()),
             host_diagnostics: Mutex::new(TimedCache::default()),
             effect_availability: Mutex::new(TimedCache::default()),
@@ -1136,6 +1139,7 @@ impl WaveLinuxEngine {
                     )
                 })
                 .unwrap_or(false);
+        let mut route_mutations_deferred = false;
         if audio_graph_running
             && !self.stop.load(Ordering::SeqCst)
             && (auto_device_repair_needed
@@ -1159,50 +1163,56 @@ impl WaveLinuxEngine {
                 "auto hardware device changed while graph was running; repairing audio routes"
             };
             self.log_engine_event("hotplug.device", reason);
-            let _audio_commands = self.lock_audio_commands()?;
-            if !self.stop.load(Ordering::SeqCst) {
-                let mut outputs = Vec::new();
-                if default_lock_only_repair {
-                    outputs.extend(self.apply_default_device_locks(&audio_config)?);
-                } else if bluetooth_monitor_route_refresh_needed {
-                    outputs.extend(self.repair_bluetooth_monitor_routes_unlocked(&audio_config)?);
+            let audio_commands = self.try_lock_audio_commands_for_refresh("hotplug.device")?;
+            if let Some(_audio_commands) = audio_commands {
+                if !self.stop.load(Ordering::SeqCst) {
+                    let mut outputs = Vec::new();
+                    if default_lock_only_repair {
+                        outputs.extend(self.apply_default_device_locks(&audio_config)?);
+                    } else if bluetooth_monitor_route_refresh_needed {
+                        outputs
+                            .extend(self.repair_bluetooth_monitor_routes_unlocked(&audio_config)?);
+                    }
+                    if active_effect_route_repair_needed {
+                        outputs.extend(self.repair_audio_graph_unlocked()?.outputs);
+                    } else if !default_lock_only_repair
+                        && (auto_device_route_repair_needed || default_device_lock_repair_needed)
+                    {
+                        outputs.extend(self.repair_auto_device_routes_unlocked()?);
+                    }
+                    self.log_command_executions("hotplug.device", &outputs);
+                    if default_lock_only_repair {
+                        default_source = self.pw.default_source().ok().flatten();
+                        default_sink = self.pw.default_sink().ok().flatten();
+                        active_sink = self.pw.active_playback_sink().ok().flatten();
+                    } else {
+                        let (next_graph, timings) =
+                            self.snapshot_for_config_timed(Some(&config))?;
+                        graph = next_graph;
+                        snapshot_command_timings.extend(timings);
+                        bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
+                        default_source = self.pw.default_source().ok().flatten();
+                        default_sink = self.pw.default_sink().ok().flatten();
+                        active_sink = self.pw.active_playback_sink().ok().flatten();
+                        managed_modules = self.pw.managed_modules().unwrap_or_default();
+                    }
+                    audio_config = effective_config_with_profiled_devices(
+                        &config,
+                        &graph.inputs,
+                        &graph.outputs,
+                        &bluetooth_cards,
+                        default_source.as_deref(),
+                        default_sink.as_deref(),
+                        active_sink.as_deref(),
+                    );
+                    audio_graph_running = graph_has_wavelinux_nodes(&graph);
                 }
-                if active_effect_route_repair_needed {
-                    outputs.extend(self.repair_audio_graph_unlocked()?.outputs);
-                } else if !default_lock_only_repair
-                    && (auto_device_route_repair_needed || default_device_lock_repair_needed)
-                {
-                    outputs.extend(self.repair_auto_device_routes_unlocked()?);
-                }
-                self.log_command_executions("hotplug.device", &outputs);
-                if default_lock_only_repair {
-                    default_source = self.pw.default_source().ok().flatten();
-                    default_sink = self.pw.default_sink().ok().flatten();
-                    active_sink = self.pw.active_playback_sink().ok().flatten();
-                } else {
-                    let (next_graph, timings) = self.snapshot_for_config_timed(Some(&config))?;
-                    graph = next_graph;
-                    snapshot_command_timings.extend(timings);
-                    bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
-                    default_source = self.pw.default_source().ok().flatten();
-                    default_sink = self.pw.default_sink().ok().flatten();
-                    active_sink = self.pw.active_playback_sink().ok().flatten();
-                    managed_modules = self.pw.managed_modules().unwrap_or_default();
-                }
-                audio_config = effective_config_with_profiled_devices(
-                    &config,
-                    &graph.inputs,
-                    &graph.outputs,
-                    &bluetooth_cards,
-                    default_source.as_deref(),
-                    default_sink.as_deref(),
-                    active_sink.as_deref(),
-                );
-                audio_graph_running = graph_has_wavelinux_nodes(&graph);
+            } else {
+                route_mutations_deferred = true;
             }
         }
         record_refresh_phase(&mut refresh_phases, &mut phase_started, "repair");
-        if audio_graph_running && !self.stop.load(Ordering::SeqCst) {
+        if audio_graph_running && !self.stop.load(Ordering::SeqCst) && !route_mutations_deferred {
             self.persist_followed_monitor_output_selection(&config, &audio_config)?;
             let graph_ready_for_apps =
                 app_routing_graph_ready(&audio_config, &graph, &managed_modules);
@@ -1795,6 +1805,14 @@ impl WaveLinuxEngine {
         self.update_config(|config| config.set_mix_icon(mix_id, icon))?
     }
 
+    pub fn set_channel_icon(
+        &self,
+        channel_id: String,
+        icon: Option<String>,
+    ) -> Result<Channel, EngineError> {
+        self.update_config(|config| config.set_channel_icon(channel_id, icon))?
+    }
+
     pub fn set_mix_monitor_output(
         self: &Arc<Self>,
         mix_id: String,
@@ -2353,6 +2371,7 @@ impl WaveLinuxEngine {
             .unwrap_or(false);
         let outputs = {
             let _audio_commands = self.lock_audio_commands()?;
+            self.stop_all_tracked_effect_chain_processes();
             let mut outputs = self.cleanup_stale_processes()?;
             outputs.extend(self.cleanup_all_modules_until_clear()?);
             outputs.extend(self.restore_startup_default_devices(restore_default_output));
@@ -2459,6 +2478,7 @@ impl WaveLinuxEngine {
             .map(|config| config.settings.lock_default_output)
             .unwrap_or(false);
         let _audio_commands = self.lock_audio_commands()?;
+        self.stop_all_tracked_effect_chain_processes();
         let mut outputs = self.cleanup_stale_processes()?;
         outputs.extend(self.cleanup_all_modules_until_clear()?);
         outputs.extend(self.restore_startup_default_devices(restore_default_output));
@@ -2881,8 +2901,8 @@ impl WaveLinuxEngine {
             }
         }
         if config.settings.lock_default_input {
-            if let Some(mix) = default_input_mix(config) {
-                commands.push(plan_set_default_source(&mix.virtual_source_name));
+            if let Some(source) = default_input_source(config) {
+                commands.push(plan_set_default_source(&source));
             }
         }
 
@@ -3077,7 +3097,19 @@ impl WaveLinuxEngine {
                 stderr: String::new(),
                 skipped: true,
             })
+        } else if self.effect_chain_process_is_tracked(&channel.id)
+            && self.effect_chain_nodes_visible(channel)
+        {
+            Ok(CommandOutput {
+                command: command.clone(),
+                stdout: String::new(),
+                stderr: "effect helper is already running".into(),
+                skipped: true,
+            })
         } else {
+            if self.effect_chain_process_is_tracked(&channel.id) {
+                self.stop_tracked_effect_chain_process(&channel.id);
+            }
             let stdout = OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -3099,11 +3131,29 @@ impl WaveLinuxEngine {
                     }
                     child
                         .spawn()
-                        .map(|_| CommandOutput {
-                            command: command.clone(),
-                            stdout: String::new(),
-                            stderr: log_path.display().to_string(),
-                            skipped: false,
+                        .and_then(|child_process| {
+                            let pid = child_process.id();
+                            let mut processes =
+                                self.effect_chain_processes.lock().map_err(|_| {
+                                    std::io::Error::other("effect process lock poisoned")
+                                })?;
+                            if let Some(mut previous) =
+                                processes.insert(channel.id.clone(), child_process)
+                            {
+                                let previous_pid = previous.id();
+                                let _ = previous.kill();
+                                let _ = previous.wait();
+                                self.log_engine_event(
+                                    "effects.process",
+                                    format!("replaced tracked {} pid={previous_pid}", channel.id),
+                                );
+                            }
+                            Ok(CommandOutput {
+                                command: command.clone(),
+                                stdout: String::new(),
+                                stderr: format!("{} pid={pid}", log_path.display()),
+                                skipped: false,
+                            })
                         })
                         .map_err(|err| {
                             if err.kind() == std::io::ErrorKind::NotFound {
@@ -3241,18 +3291,17 @@ impl WaveLinuxEngine {
     }
 
     fn effect_chain_log_mentions_realtime_underrun(&self, channel: &Channel) -> bool {
-        fs::read_to_string(self.effect_chain_log_path(channel))
-            .map(|log| {
-                let log = log.to_ascii_lowercase();
-                log.contains("underrun detected") || log.contains("processing too slow")
-            })
-            .unwrap_or(false)
+        effect_chain_log_mentions_recent(
+            &self.effect_chain_log_path(channel),
+            &["underrun detected", "processing too slow"],
+        )
     }
 
     fn effect_chain_log_mentions_clipping(&self, channel: &Channel) -> bool {
-        fs::read_to_string(self.effect_chain_log_path(channel))
-            .map(|log| log.to_ascii_lowercase().contains("clipping detected"))
-            .unwrap_or(false)
+        effect_chain_log_mentions_recent(
+            &self.effect_chain_log_path(channel),
+            &["clipping detected"],
+        )
     }
 
     fn cleanup_modules(
@@ -3375,14 +3424,127 @@ impl WaveLinuxEngine {
         outputs
     }
 
+    fn reap_effect_chain_processes(&self) {
+        let mut exited = Vec::new();
+        let Ok(mut processes) = self.effect_chain_processes.lock() else {
+            self.log_engine_event(
+                "effects.process",
+                "failed to reap effect helpers; lock poisoned",
+            );
+            return;
+        };
+
+        processes.retain(|channel_id, child| {
+            let pid = child.id();
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    exited.push(format!("{channel_id} pid={pid} status={status}"));
+                    false
+                }
+                Ok(None) => true,
+                Err(err) => {
+                    exited.push(format!("{channel_id} pid={pid} wait_error={err}"));
+                    false
+                }
+            }
+        });
+        drop(processes);
+
+        for message in exited {
+            self.log_engine_event("effects.process", format!("reaped {message}"));
+        }
+    }
+
+    fn active_effect_chain_pids(&self) -> BTreeSet<String> {
+        self.reap_effect_chain_processes();
+        self.effect_chain_processes
+            .lock()
+            .map(|processes| {
+                processes
+                    .values()
+                    .map(|child| child.id().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn effect_chain_process_is_tracked(&self, channel_id: &str) -> bool {
+        self.reap_effect_chain_processes();
+        self.effect_chain_processes
+            .lock()
+            .map(|processes| processes.contains_key(channel_id))
+            .unwrap_or(false)
+    }
+
+    fn effect_chain_nodes_visible(&self, channel: &Channel) -> bool {
+        let source_name = effect_chain_source_name(channel);
+        let input_name = effect_chain_input_name(channel);
+        let graph = self
+            .pw
+            .snapshot_for_config_with_effect_availability(None, Vec::new());
+        graph.inputs.iter().any(|source| source.name == source_name)
+            && graph.outputs.iter().any(|sink| sink.name == input_name)
+    }
+
+    fn stop_tracked_effect_chain_process(&self, channel_id: &str) {
+        let child = self
+            .effect_chain_processes
+            .lock()
+            .ok()
+            .and_then(|mut processes| processes.remove(channel_id));
+        let Some(mut child) = child else {
+            return;
+        };
+
+        let pid = child.id();
+        match child.kill() {
+            Ok(()) => match child.wait() {
+                Ok(status) => self.log_engine_event(
+                    "effects.process",
+                    format!("stopped tracked {channel_id} pid={pid} status={status}"),
+                ),
+                Err(err) => self.log_engine_event(
+                    "effects.process",
+                    format!("stopped tracked {channel_id} pid={pid}; wait failed: {err}"),
+                ),
+            },
+            Err(err) => self.log_engine_event(
+                "effects.process",
+                format!("failed to stop tracked {channel_id} pid={pid}: {err}"),
+            ),
+        }
+    }
+
+    fn stop_all_tracked_effect_chain_processes(&self) {
+        let channel_ids = self
+            .effect_chain_processes
+            .lock()
+            .map(|processes| processes.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for channel_id in channel_ids {
+            self.stop_tracked_effect_chain_process(&channel_id);
+        }
+    }
+
     fn cleanup_stale_processes(&self) -> Result<Vec<CommandExecution>, EngineError> {
-        let processes = self.pw.stale_processes()?;
-        Ok(self
+        let active_effect_pids = self.active_effect_chain_pids();
+        let processes = self
+            .pw
+            .stale_processes()?
+            .into_iter()
+            .filter(|process| !active_effect_pids.contains(&process.pid))
+            .collect::<Vec<_>>();
+        let outputs = self
             .pw
             .execute_all(plan_kill_stale_processes(&processes))
             .into_iter()
             .map(command_execution)
-            .collect())
+            .collect();
+        if !processes.is_empty() {
+            thread::sleep(Duration::from_millis(50));
+            self.reap_effect_chain_processes();
+        }
+        Ok(outputs)
     }
 
     fn cleanup_stale_modules_for_config(
@@ -3635,6 +3797,23 @@ impl WaveLinuxEngine {
         }
     }
 
+    fn try_lock_audio_commands_for_refresh(
+        &self,
+        area: &str,
+    ) -> Result<Option<MutexGuard<'_, ()>>, EngineError> {
+        match self.audio_commands.try_lock() {
+            Ok(guard) => Ok(Some(guard)),
+            Err(TryLockError::Poisoned(_)) => Err(EngineError::LockPoisoned),
+            Err(TryLockError::WouldBlock) => {
+                self.log_engine_event(
+                    area,
+                    "graph mutation already in progress; deferring automatic route repair",
+                );
+                Ok(None)
+            }
+        }
+    }
+
     fn lock_runtime_refresh(&self) -> Result<MutexGuard<'_, ()>, EngineError> {
         self.runtime_refresh
             .lock()
@@ -3694,6 +3873,16 @@ impl WaveLinuxEngine {
             cache.value = probe_effect_availability(&EffectCatalog::default());
             cache.checked_at = Some(Instant::now());
         }
+        Ok(cache.value.clone())
+    }
+
+    pub fn refresh_effect_availability(&self) -> Result<Vec<EffectAvailability>, EngineError> {
+        let mut cache = self
+            .effect_availability
+            .lock()
+            .map_err(|_| EngineError::LockPoisoned)?;
+        cache.value = probe_effect_availability(&EffectCatalog::default());
+        cache.checked_at = Some(Instant::now());
         Ok(cache.value.clone())
     }
 
@@ -3980,7 +4169,30 @@ impl WaveLinuxEngine {
                     return;
                 }
                 engine.log_engine_event("repair.auto", "running deferred graph repair");
-                match engine.repair_audio_graph() {
+                let audio_commands = match engine.try_lock_audio_commands_for_refresh("repair.auto")
+                {
+                    Ok(Some(guard)) => guard,
+                    Ok(None) => {
+                        engine.log_engine_event(
+                            "repair.auto",
+                            "deferred graph repair requeued; graph mutation is still running",
+                        );
+                        engine.schedule_audio_graph_repair();
+                        return;
+                    }
+                    Err(err) => {
+                        engine.log_engine_event(
+                            "repair.auto",
+                            format!("deferred repair failed before start: {err}"),
+                        );
+                        return;
+                    }
+                };
+                engine.log_engine_event("repair.start", "requested audio graph repair");
+                let result = engine.repair_audio_graph_unlocked();
+                drop(audio_commands);
+                let _ = engine.refresh_runtime();
+                match result {
                     Ok(report) => {
                         engine.log_command_executions("repair.auto", &report.outputs);
                     }
@@ -4030,6 +4242,8 @@ impl WaveLinuxEngine {
                     .map(command_execution),
             );
             if !effect_processes.is_empty() {
+                thread::sleep(Duration::from_millis(50));
+                self.reap_effect_chain_processes();
                 for channel in channels
                     .iter()
                     .copied()
@@ -4551,11 +4765,24 @@ fn startup_microphone_level_reset_commands(
         })
         .flat_map(|input| {
             [
-                plan_set_source_volume(&input.id, 1.0),
+                plan_set_source_volume(&input.id, safe_startup_input_volume(input)),
                 plan_set_source_mute(&input.id, false),
             ]
         })
         .collect()
+}
+
+fn safe_startup_input_volume(input: &DeviceInfo) -> f32 {
+    let text = format!("{} {}", input.id, input.description).to_lowercase();
+    if input.bus == Some(wavelinux_model::DeviceBus::Pci)
+        || text.contains("digital microphone")
+        || text.contains("built-in")
+        || text.contains("internal")
+    {
+        0.46
+    } else {
+        1.0
+    }
 }
 
 fn best_monitor_output(outputs: &[DeviceInfo]) -> Option<String> {
@@ -5003,11 +5230,10 @@ fn default_input_lock_repair_needed(config: &MixerConfig, default_source: Option
     if !config.settings.lock_default_input {
         return false;
     }
-    let Some(expected) = default_input_mix(config).map(|mix| mix.virtual_source_name.as_str())
-    else {
+    let Some(expected) = default_input_source(config) else {
         return false;
     };
-    default_source.is_none_or(|source| !audio_endpoint_names_match(source, expected))
+    default_source.is_none_or(|source| !audio_endpoint_names_match(source, &expected))
 }
 
 fn default_output_lock_repair_needed(config: &MixerConfig, default_sink: Option<&str>) -> bool {
@@ -5029,16 +5255,14 @@ fn capture_stream_move_commands_to_locked_default_input(
     if !config.settings.lock_default_input {
         return Vec::new();
     }
-    let Some(expected_source) =
-        default_input_mix(config).map(|mix| mix.virtual_source_name.as_str())
-    else {
+    let Some(expected_source) = default_input_source(config) else {
         return Vec::new();
     };
 
     source_outputs
         .iter()
-        .filter(|route| capture_stream_should_move_to_locked_default_input(route, expected_source))
-        .map(|route| plan_move_capture_stream_to_source(&route.id, expected_source))
+        .filter(|route| capture_stream_should_move_to_locked_default_input(route, &expected_source))
+        .map(|route| plan_move_capture_stream_to_source(&route.id, &expected_source))
         .collect()
 }
 
@@ -5084,11 +5308,11 @@ fn source_output_is_wavelinux_owned(route: &SourceOutputRoute) -> bool {
     route.role.is_some()
         || route.channel_id.is_some()
         || route.mix_id.is_some()
-        || route_value_contains_wavelinux(route.target_object.as_deref())
-        || route_value_contains_wavelinux(route.source_name.as_deref())
         || route_value_contains_wavelinux(route.application_name.as_deref())
         || route_value_contains_wavelinux(route.node_name.as_deref())
         || route_value_contains_wavelinux(route.media_name.as_deref())
+        || route_value_is_loopback_node(route.node_name.as_deref())
+        || route_value_is_loopback_node(route.media_name.as_deref())
 }
 
 fn route_value_contains_wavelinux(value: Option<&str>) -> bool {
@@ -5207,12 +5431,19 @@ fn default_output_channel(config: &MixerConfig) -> Option<&Channel> {
         })
 }
 
-fn default_input_mix(config: &MixerConfig) -> Option<&Mix> {
+fn route_value_is_loopback_node(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.to_ascii_lowercase();
+        value.starts_with("input.loopback-") || value.starts_with("loopback-")
+    })
+}
+
+fn default_input_source(config: &MixerConfig) -> Option<String> {
     config
-        .mixes
+        .channels
         .iter()
-        .find(|mix| mix.id == "stream")
-        .or_else(|| config.mixes.first())
+        .find(|channel| channel.kind.uses_hardware_slot())
+        .map(channel_mix_source_name)
 }
 
 fn graph_has_wavelinux_nodes(graph: &RuntimeGraph) -> bool {
@@ -5422,6 +5653,24 @@ fn channel_route_ready(
 
 fn is_restorable_device(device: &str) -> bool {
     !device.to_ascii_lowercase().contains("wavelinux")
+}
+
+fn effect_chain_log_mentions_recent(path: &Path, markers: &[&str]) -> bool {
+    let Ok(log) = fs::read_to_string(path) else {
+        return false;
+    };
+    let log = log.to_ascii_lowercase();
+    if !markers.iter().any(|marker| log.contains(marker)) {
+        return false;
+    }
+
+    let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) else {
+        return true;
+    };
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) => age <= FX_LOG_WARNING_WINDOW,
+        Err(_) => true,
+    }
 }
 
 fn safe_file_id(value: &str) -> String {
@@ -7483,15 +7732,23 @@ mod tests {
     }
 
     #[test]
-    fn default_locks_choose_system_and_stream_nodes() {
-        let config = MixerConfig::default();
+    fn default_locks_choose_system_and_hardware_input_nodes() {
+        let mut config = MixerConfig::default();
         assert_eq!(
             default_output_channel(&config).map(|channel| channel.virtual_sink_name.as_str()),
             Some("wavelinux_channel_system")
         );
         assert_eq!(
-            default_input_mix(&config).map(|mix| mix.virtual_source_name.as_str()),
-            Some("wavelinux_mix_stream_source")
+            default_input_source(&config).as_deref(),
+            Some("wavelinux_channel_hardware_in.monitor")
+        );
+
+        config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("limiter")])
+            .unwrap();
+        assert_eq!(
+            default_input_source(&config).as_deref(),
+            Some("wavelinux-mic")
         );
     }
 
@@ -7510,7 +7767,19 @@ mod tests {
         ));
         assert!(!default_input_lock_repair_needed(
             &config,
+            Some("wavelinux_channel_hardware_in.monitor")
+        ));
+
+        config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("limiter")])
+            .unwrap();
+        assert!(default_input_lock_repair_needed(
+            &config,
             Some("wavelinux_mix_stream_source")
+        ));
+        assert!(!default_input_lock_repair_needed(
+            &config,
+            Some("wavelinux-mic")
         ));
     }
 
@@ -7557,11 +7826,15 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(
             commands[0].args,
-            ["move-source-output", "99", "wavelinux_mix_stream_source"]
+            [
+                "move-source-output",
+                "99",
+                "wavelinux_channel_hardware_in.monitor"
+            ]
         );
 
         let already_routed = SourceOutputRoute {
-            source_name: Some("wavelinux_mix_stream_source".into()),
+            source_name: Some("wavelinux_channel_hardware_in.monitor".into()),
             ..route.clone()
         };
         assert!(
@@ -7569,13 +7842,53 @@ mod tests {
                 .is_empty()
         );
 
+        let old_stream_default = SourceOutputRoute {
+            source_name: Some("wavelinux_mix_stream_source".into()),
+            target_object: Some("wavelinux_mix_stream_source".into()),
+            ..route.clone()
+        };
+        let commands =
+            capture_stream_move_commands_to_locked_default_input(&config, &[old_stream_default]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].args,
+            [
+                "move-source-output",
+                "99",
+                "wavelinux_channel_hardware_in.monitor"
+            ]
+        );
+
+        config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("limiter")])
+            .unwrap();
+        let commands = capture_stream_move_commands_to_locked_default_input(
+            &config,
+            std::slice::from_ref(&route),
+        );
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].args,
+            ["move-source-output", "99", "wavelinux-mic"]
+        );
+
         let wavelinux_owned = SourceOutputRoute {
             source_name: Some("alsa_input.usb_mic".into()),
             application_name: Some("WaveLinux filter-chain".into()),
-            ..route
+            ..route.clone()
         };
         assert!(
             capture_stream_move_commands_to_locked_default_input(&config, &[wavelinux_owned])
+                .is_empty()
+        );
+
+        let loopback_route = SourceOutputRoute {
+            node_name: Some("input.loopback-2169-33".into()),
+            media_name: Some("loopback-2169-33 input".into()),
+            ..route
+        };
+        assert!(
+            capture_stream_move_commands_to_locked_default_input(&config, &[loopback_route])
                 .is_empty()
         );
     }
@@ -8614,6 +8927,36 @@ mod tests {
     }
 
     #[test]
+    fn startup_microphone_level_reset_uses_safe_internal_mic_gain() {
+        let mut internal = device(
+            "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source",
+            "700 Series Chipset Family HD Audio Controller Digital Microphone",
+            true,
+        );
+        internal.bus = Some(wavelinux_model::DeviceBus::Pci);
+
+        let commands = startup_microphone_level_reset_commands(&[internal], &[]);
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            commands[0].args,
+            [
+                "set-source-volume",
+                "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source",
+                "46%"
+            ]
+        );
+        assert_eq!(
+            commands[1].args,
+            [
+                "set-source-mute",
+                "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source",
+                "0"
+            ]
+        );
+    }
+
+    #[test]
     fn effective_config_drops_bluetooth_input_that_would_force_hfp() {
         let mut config = MixerConfig::default();
         let hardware = config
@@ -8732,6 +9075,62 @@ mod tests {
             diagnostic.code == "effects.source.hardware_in"
                 && diagnostic.severity == DiagnosticSeverity::Info
         }));
+    }
+
+    #[test]
+    fn recent_fx_chain_log_warnings_are_reported_in_diagnostics() {
+        let engine = test_engine();
+        let mut config = MixerConfig::default();
+        config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("deepfilternet")])
+            .unwrap();
+        let channel = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        fs::write(
+            engine.effect_chain_log_path(channel),
+            "Underrun detected (RTF: 1.14). Processing too slow!\nPossible clipping detected (1.000).\n",
+        )
+        .unwrap();
+
+        let diagnostics = engine.effect_chain_diagnostics(&config, &RuntimeGraph::default());
+
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "effects.underrun.hardware_in"));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "effects.clipping.hardware_in"));
+    }
+
+    #[test]
+    fn quiet_fx_chain_log_does_not_report_realtime_or_clipping_warnings() {
+        let engine = test_engine();
+        let mut config = MixerConfig::default();
+        config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("deepfilternet")])
+            .unwrap();
+        let channel = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        fs::write(
+            engine.effect_chain_log_path(channel),
+            "filter-chain running\n",
+        )
+        .unwrap();
+
+        let diagnostics = engine.effect_chain_diagnostics(&config, &RuntimeGraph::default());
+
+        assert!(!diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "effects.underrun.hardware_in"));
+        assert!(!diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "effects.clipping.hardware_in"));
     }
 
     #[test]
