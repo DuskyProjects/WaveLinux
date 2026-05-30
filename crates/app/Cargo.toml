@@ -12,6 +12,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 libloading = "0.8"
 libc = "0.2"
+semver = "1"
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = ["image-png", "tray-icon"] }

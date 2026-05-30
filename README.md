@@ -239,6 +239,8 @@ notes.
 ## Updates
 
 AppImage installs can check signed release metadata from inside Settings.
+The updater includes a Beta updates checkbox for testing-branch prereleases;
+leave it unchecked to stay on stable releases.
 Package-managed installs should update through their package manager.
 
 ## Development

@@ -101,3 +101,24 @@ jobs:
           body_path: RELEASE_NOTES.md
           prerelease: ${{ contains(github.ref_name, 'pre') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
           files: target/release/upload/*
+
+      - name: Publish moving beta update feed
+        if: startsWith(github.ref, 'refs/tags/') && (contains(github.ref_name, 'pre') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag -f prerelease "$GITHUB_SHA"
+          git push origin refs/tags/prerelease --force
+          if gh release view prerelease >/dev/null 2>&1; then
+            gh release edit prerelease \
+              --title "WaveLinux prerelease" \
+              --notes "Latest WaveLinux beta/prerelease build." \
+              --prerelease
+            gh release upload prerelease target/release/upload/* --clobber
+          else
+            gh release create prerelease target/release/upload/* \
+              --target "$GITHUB_SHA" \
+              --title "WaveLinux prerelease" \
+              --notes "Latest WaveLinux beta/prerelease build." \
+              --prerelease
+          fi

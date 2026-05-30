@@ -11,6 +11,8 @@ main mixer path device-neutral.
 - Loads libusb only inside the detected Wave XLR control path so systems without
   Elgato hardware do not load the extra shared library during normal startup.
 - Adds libusb to release packaging and dependency checks.
+- Adds a Beta updates checkbox in the updater that tracks the testing branch
+  prerelease feed without changing stable update checks.
 
 # WaveLinux 4.2.1
 

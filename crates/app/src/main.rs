@@ -25,7 +25,7 @@ use wavelinux_model::{
     AppMatcher, AppRoute, AppStateSnapshot, AppVolumePreset, Channel, ChannelInputMode,
     ChannelKind, EffectAvailability, EffectCatalog, EffectInstance, FallbackHardwareProfile,
     HardwareProfileUiState, KnownApp, LatencyPolicy, LevelMeter, Mix, MixBus, MixerConfig,
-    MixerSettings, RoutingPolicy,
+    MixerSettings, ReleaseChannel, RoutingPolicy,
 };
 
 mod elgato;
@@ -691,19 +691,31 @@ fn open_ui_theme_folder(app: AppHandle) -> Result<(), String> {
 async fn check_for_updates(
     app: AppHandle,
     engine: State<'_, EngineState>,
+    release_channel: Option<ReleaseChannel>,
 ) -> Result<UpdateInfo, String> {
-    let settings = engine
+    let mut settings = engine
         .engine
         .get_state()
         .map_err(|err| err.to_string())?
         .config
         .settings;
+    if let Some(release_channel) = release_channel {
+        settings.release_channel = release_channel;
+    }
     let endpoint = update_endpoint(&settings);
     let endpoint_url = endpoint
         .parse::<url::Url>()
         .map_err(|err| err.to_string())?;
+    let current_update_version = current_update_version();
+    let current_version = current_update_version.to_string();
     let updater = app
         .updater_builder()
+        .version_comparator({
+            let current_update_version = current_update_version.clone();
+            move |_current_version, remote_release| {
+                remote_release.version > current_update_version.clone()
+            }
+        })
         .endpoints(vec![endpoint_url])
         .map_err(|err| err.to_string())?
         .build()
@@ -716,7 +728,7 @@ async fn check_for_updates(
             return Ok(UpdateInfo {
                 available: false,
                 install_supported,
-                current_version: env!("CARGO_PKG_VERSION").to_string(),
+                current_version,
                 version: None,
                 date: None,
                 body: None,
@@ -736,7 +748,7 @@ async fn check_for_updates(
             UpdateInfo {
                 available: true,
                 install_supported,
-                current_version: update.current_version,
+                current_version,
                 version: Some(version.clone()),
                 date,
                 body: update.body,
@@ -756,7 +768,7 @@ async fn check_for_updates(
         None => UpdateInfo {
             available: false,
             install_supported,
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            current_version,
             version: None,
             date: None,
             body: None,
@@ -773,6 +785,7 @@ async fn check_for_updates(
 async fn install_update(
     app: AppHandle,
     engine: State<'_, EngineState>,
+    release_channel: Option<ReleaseChannel>,
 ) -> Result<UpdateInstallResult, String> {
     if !is_appimage_install() {
         return Err(
@@ -781,18 +794,25 @@ async fn install_update(
         );
     }
 
-    let settings = engine
+    let mut settings = engine
         .engine
         .get_state()
         .map_err(|err| err.to_string())?
         .config
         .settings;
+    if let Some(release_channel) = release_channel {
+        settings.release_channel = release_channel;
+    }
     let endpoint = update_endpoint(&settings);
     let endpoint_url = endpoint
         .parse::<url::Url>()
         .map_err(|err| err.to_string())?;
+    let current_update_version = current_update_version();
     let updater = app
         .updater_builder()
+        .version_comparator(move |_current_version, remote_release| {
+            remote_release.version > current_update_version.clone()
+        })
         .endpoints(vec![endpoint_url])
         .map_err(|err| err.to_string())?
         .build()
@@ -1386,10 +1406,26 @@ fn update_endpoint(settings: &MixerSettings) -> String {
     }
 }
 
+fn current_update_version() -> semver::Version {
+    let version = build_release_tag()
+        .map(|tag| tag.trim_start_matches('v'))
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+
+    semver::Version::parse(version)
+        .or_else(|_| semver::Version::parse(env!("CARGO_PKG_VERSION")))
+        .expect("package version is valid semver")
+}
+
+fn build_release_tag() -> Option<&'static str> {
+    option_env!("WAVELINUX_RELEASE_TAG")
+        .or(option_env!("GITHUB_REF_NAME"))
+        .filter(|tag| !tag.trim().is_empty())
+}
+
 fn release_channel_name(settings: &MixerSettings) -> &'static str {
-    match settings.release_channel {
-        wavelinux_model::ReleaseChannel::Beta => "beta",
-        wavelinux_model::ReleaseChannel::Stable => "stable",
+    match &settings.release_channel {
+        ReleaseChannel::Beta => "beta",
+        ReleaseChannel::Stable => "stable",
     }
 }
 

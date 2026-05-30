@@ -817,11 +817,12 @@ export default function App() {
   const checkUpdates = useCallback(async (showToast = true) => {
     setUpdateBusy(true);
     try {
-      const next = await invoke<UpdateInfo>("check_for_updates");
+      const releaseChannel = state?.config.settings.release_channel ?? "stable";
+      const next = await invoke<UpdateInfo>("check_for_updates", { releaseChannel });
       setUpdateInfo(next);
       if (showToast || next.available) setToast(next.message);
       if (next.available && state?.config.settings.auto_install_updates && next.install_supported) {
-        const result = await invoke<UpdateInstallResult>("install_update");
+        const result = await invoke<UpdateInstallResult>("install_update", { releaseChannel });
         setToast(result.message);
       }
       return next;
@@ -831,7 +832,7 @@ export default function App() {
     } finally {
       setUpdateBusy(false);
     }
-  }, [state?.config.settings.auto_install_updates]);
+  }, [state?.config.settings.auto_install_updates, state?.config.settings.release_channel]);
 
   const installEffectPlugins = useCallback(async () => {
     setPluginInstallBusy(true);
@@ -953,7 +954,8 @@ export default function App() {
           onCheckUpdates={() => void checkUpdates(true).catch(() => undefined)}
           onInstallUpdate={() => {
             setUpdateBusy(true);
-            invoke<UpdateInstallResult>("install_update")
+            const releaseChannel = state.config.settings.release_channel;
+            invoke<UpdateInstallResult>("install_update", { releaseChannel })
               .then((result) => setToast(result.message))
               .catch((error) => setToast(String(error)))
               .finally(() => setUpdateBusy(false));
@@ -5407,6 +5409,9 @@ function SettingsView({
 }) {
   const updateSettings = (settings: MixerSettings) => void setSettings(settings);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
+  const visibleUpdateInfo =
+    updateInfo?.channel === state.config.settings.release_channel ? updateInfo : null;
+  const betaUpdatesEnabled = state.config.settings.release_channel === "beta";
   const hasElgatoDevices = useMemo(
     () => [...state.graph.inputs, ...state.graph.outputs].some(isElgatoAudioDevice),
     [state.graph.inputs, state.graph.outputs],
@@ -5541,23 +5546,6 @@ function SettingsView({
               }
               value={state.config.settings.auto_install_updates}
             />
-            <div className="settings-control">
-              <span>Release channel</span>
-              <AppSelect
-                ariaLabel="Release channel"
-                onChange={(value) =>
-                  void updateSettings({
-                    ...state.config.settings,
-                    release_channel: value === "beta" ? "beta" : "stable",
-                  })
-                }
-                options={[
-                  { value: "stable", label: "Stable" },
-                  { value: "beta", label: "Pre-release" },
-                ]}
-                value={state.config.settings.release_channel}
-              />
-            </div>
           </div>
           <div className="settings-section">
             <div className="panel-header compact">
@@ -5566,12 +5554,25 @@ function SettingsView({
             </div>
             <div className="update-card">
               <div>
-                <strong>{updateInfo?.message ?? "Update status has not been checked"}</strong>
+                <strong>{visibleUpdateInfo?.message ?? "Update status has not been checked"}</strong>
                 <span>
-                  {updateInfo
-                    ? `${updateInfo.channel} · current ${updateInfo.current_version}${updateInfo.version ? ` · latest ${updateInfo.version}` : ""}`
+                  {visibleUpdateInfo
+                    ? `${visibleUpdateInfo.channel} · current ${visibleUpdateInfo.current_version}${visibleUpdateInfo.version ? ` · latest ${visibleUpdateInfo.version}` : ""}`
                     : "Signed AppImage updates, plus deb/rpm/AUR package releases"}
                 </span>
+                <label className="updater-checkbox">
+                  <input
+                    checked={betaUpdatesEnabled}
+                    onChange={(event) =>
+                      updateSettings({
+                        ...state.config.settings,
+                        release_channel: event.currentTarget.checked ? "beta" : "stable",
+                      })
+                    }
+                    type="checkbox"
+                  />
+                  <span>Beta updates</span>
+                </label>
               </div>
               <div className="panel-actions">
                 <button className="secondary-button" disabled={updateBusy} onClick={onCheckUpdates} type="button">
@@ -5580,10 +5581,10 @@ function SettingsView({
                 </button>
                 <button
                   className="secondary-button"
-                  disabled={updateBusy || !updateInfo?.available || !updateInfo.install_supported}
+                  disabled={updateBusy || !visibleUpdateInfo?.available || !visibleUpdateInfo.install_supported}
                   onClick={onInstallUpdate}
                   title={
-                    updateInfo?.install_supported === false
+                    visibleUpdateInfo?.install_supported === false
                       ? "Install through your package manager or use the AppImage"
                       : "Download, verify, install, and restart"
                   }

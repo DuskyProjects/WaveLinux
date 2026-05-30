@@ -341,6 +341,10 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
   }
 
   if (command === "check_for_updates") {
+    const releaseChannel =
+      stringArg(args, "releaseChannel") ||
+      stringArg(args, "release_channel") ||
+      demoState.config.settings.release_channel;
     return {
       available: false,
       install_supported: false,
@@ -350,8 +354,11 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       body: null,
       url: null,
       release_url: "https://github.com/DuskyProjects/WaveLinux/releases",
-      channel: demoState.config.settings.release_channel,
-      endpoint: "https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json",
+      channel: releaseChannel,
+      endpoint:
+        releaseChannel === "beta"
+          ? "https://github.com/DuskyProjects/WaveLinux/releases/download/prerelease/latest.json"
+          : "https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json",
       message: "WaveLinux is up to date",
     };
   }

@@ -1866,6 +1866,31 @@ input[type="range"] {
   white-space: nowrap;
 }
 
+.updater-checkbox {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  color: #dbe5ef;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.updater-checkbox input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: #45bacb;
+}
+
+.update-card .updater-checkbox span {
+  color: inherit;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
 .settings-section {
   display: grid;
   gap: 10px;
