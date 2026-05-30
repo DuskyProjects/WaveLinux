@@ -6,21 +6,27 @@ import {
   BadgeCheck,
   Cable,
   Check,
+  Chrome,
   CircleAlert,
   CircleMinus,
   CirclePlus,
+  Clapperboard,
   Clipboard,
   Copy,
   Cpu,
   Download,
   ExternalLink,
   Gauge,
+  Gamepad2,
   GitBranch,
   GripVertical,
   Headphones,
+  Info,
   Maximize2,
+  MessageCircle,
   Mic,
   Minimize2,
+  Monitor,
   MonitorSpeaker,
   Music2,
   Pencil,
@@ -59,6 +65,7 @@ import type {
   Channel,
   ChannelKind,
   CommandExecution,
+  EffectPluginInstallResult,
   EffectDefinition,
   EffectAvailability,
   EffectInstance,
@@ -108,7 +115,8 @@ const MAX_MIXES = 5;
 const AUTO_MONITOR_OUTPUT_VALUE = "__auto_monitor_output__";
 const CLEAR_MIX_OUTPUTS_VALUE = "__clear_mix_outputs__";
 const MIX_TEMPLATE_NAMES = ["Personal", "Chat", "Stream"];
-const MIX_ICON_OPTIONS: Array<{ id: string; label: string; icon: typeof SlidersHorizontal }> = [
+type IconOption = { id: string; label: string; icon: typeof SlidersHorizontal };
+const MIX_ICON_OPTIONS: IconOption[] = [
   { id: "headphones", label: "Personal", icon: Headphones },
   { id: "radio", label: "Stream", icon: Radio },
   { id: "chat", label: "Chat", icon: Cable },
@@ -116,6 +124,18 @@ const MIX_ICON_OPTIONS: Array<{ id: string; label: string; icon: typeof SlidersH
   { id: "monitor", label: "Monitor", icon: MonitorSpeaker },
   { id: "mic", label: "Mic", icon: Mic },
   { id: "sparkles", label: "FX", icon: Sparkles },
+  { id: "audio", label: "Audio", icon: AudioLines },
+];
+const SOURCE_ICON_OPTIONS: IconOption[] = [
+  { id: "mic", label: "Microphone", icon: Mic },
+  { id: "system", label: "System", icon: Monitor },
+  { id: "game", label: "Game", icon: Gamepad2 },
+  { id: "chat", label: "Chat", icon: MessageCircle },
+  { id: "music", label: "Music", icon: Music2 },
+  { id: "browser", label: "Browser", icon: Chrome },
+  { id: "sfx", label: "SFX", icon: Sparkles },
+  { id: "media", label: "Media", icon: Clapperboard },
+  { id: "headphones", label: "Monitor", icon: Headphones },
   { id: "audio", label: "Audio", icon: AudioLines },
 ];
 const SELECT_VISIBLE_OPTION_LIMIT = 80;
@@ -164,10 +184,6 @@ type SourceCandidate = {
   streamId?: string;
 };
 
-type RenameTarget =
-  | { type: "source"; id: string; name: string }
-  | { type: "mix"; id: string; name: string };
-
 type SelectOption = {
   value: string;
   label: string;
@@ -175,6 +191,14 @@ type SelectOption = {
 };
 
 type SettingsTab = "general" | "profiles" | "health";
+
+type MixerDrawer =
+  | { type: "routing" }
+  | { type: "effects"; channelId: string }
+  | { type: "mix"; mixId: string }
+  | { type: "source"; channelId: string };
+
+type SetEffectChain = (channelId: string, effects: EffectInstance[]) => Promise<Channel>;
 
 function defaultMixBus(enabled = true): MixBus {
   return { volume: 1, muted: false, enabled };
@@ -189,6 +213,7 @@ export default function App() {
   const [audioActionReport, setAudioActionReport] = useState<AudioActionReport | null>(null);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
+  const [pluginInstallBusy, setPluginInstallBusy] = useState(false);
   const autoUpdateCheckStarted = useRef(false);
   const refreshTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const refreshInFlight = useRef(false);
@@ -535,6 +560,25 @@ export default function App() {
     [patchMix, refresh, scheduleRefresh],
   );
 
+  const setChannelIconFast = useCallback(
+    async (channelId: string, icon: string | null) => {
+      patchChannel(channelId, { icon });
+      try {
+        const channel = await invoke<Channel>("set_channel_icon", {
+          channelId,
+          channel_id: channelId,
+          icon,
+        });
+        patchChannel(channel.id, { icon: channel.icon ?? null });
+        scheduleRefresh();
+      } catch (error) {
+        setToast(String(error));
+        await refresh().catch(() => undefined);
+      }
+    },
+    [patchChannel, refresh, scheduleRefresh],
+  );
+
   const setChannelBusMuteFast = useCallback(
     async (channelId: string, mixId: string, muted: boolean) => {
       patchChannelBus(channelId, mixId, { muted });
@@ -585,6 +629,23 @@ export default function App() {
       } catch (error) {
         setToast(String(error));
         await refresh().catch(() => undefined);
+      }
+    },
+    [patchChannel, refresh, scheduleRefresh],
+  );
+
+  const setEffectChainFast = useCallback<SetEffectChain>(
+    async (channelId, effects) => {
+      patchChannel(channelId, { effects });
+      try {
+        const channel = await invoke<Channel>("set_effect_chain", { channelId, effects });
+        patchChannel(channel.id, { effects: channel.effects });
+        scheduleRefresh();
+        return channel;
+      } catch (error) {
+        setToast(String(error));
+        await refresh().catch(() => undefined);
+        throw error;
       }
     },
     [patchChannel, refresh, scheduleRefresh],
@@ -769,6 +830,19 @@ export default function App() {
     }
   }, [state?.config.settings.auto_install_updates]);
 
+  const installEffectPlugins = useCallback(async () => {
+    setPluginInstallBusy(true);
+    try {
+      const result = await invoke<EffectPluginInstallResult>("install_effect_plugins");
+      setToast(result.message);
+      await refresh().catch(() => undefined);
+    } catch (error) {
+      setToast(String(error));
+    } finally {
+      setPluginInstallBusy(false);
+    }
+  }, [refresh]);
+
   useEffect(() => {
     refresh().catch((error) => setToast(String(error)));
     const intervalMs = state?.engine.audio_graph_running ? 750 : 1000;
@@ -824,6 +898,8 @@ export default function App() {
             setMixIcon={setMixIconFast}
             setMixMute={setMixMuteFast}
             setMixVolume={setMixVolumeFast}
+            setEffectChain={setEffectChainFast}
+            setChannelIcon={setChannelIconFast}
             setAppStreamMute={setAppStreamMuteFast}
             setSelectedChannelId={setSelectedChannelId}
             setSettings={setSettingsFast}
@@ -859,6 +935,7 @@ export default function App() {
           selectedChannelId={selectedChannelId}
           setSelectedChannelId={setSelectedChannelId}
           setChannelInput={setChannelInputFast}
+          setEffectChain={setEffectChainFast}
         />
       )}
       {activeView === "settings" && (
@@ -882,6 +959,8 @@ export default function App() {
             void invoke("open_release_page").catch((error) => setToast(String(error)));
           }}
           onPrune={() => runAudioCommandList("cleanup_stale_audio_graph", "Prune Stale Audio")}
+          onInstallEffectPlugins={() => void installEffectPlugins()}
+          pluginInstallBusy={pluginInstallBusy}
           activeThemeId={activeTheme.id}
           onOpenThemeFolder={() => void openThemeFolder().catch((error) => setToast(String(error)))}
           onReloadThemes={() => void reloadUiThemes().catch((error) => setToast(String(error)))}
@@ -1293,6 +1372,8 @@ function WaveLinkMixerView({
   setMixOutputs,
   setMixMute,
   setMixVolume,
+  setEffectChain,
+  setChannelIcon,
   setSelectedChannelId,
   setSettings,
   state,
@@ -1310,6 +1391,8 @@ function WaveLinkMixerView({
   setMixOutputs: (mixId: string, outputs: string[]) => Promise<void>;
   setMixMute: (mixId: string, muted: boolean) => Promise<void>;
   setMixVolume: (mixId: string, volume: number) => Promise<void>;
+  setEffectChain: SetEffectChain;
+  setChannelIcon: (channelId: string, icon: string | null) => Promise<void>;
   setSelectedChannelId: (channelId: string) => void;
   setSettings: (settings: MixerSettings) => Promise<void>;
   state: AppStateSnapshot;
@@ -1322,8 +1405,7 @@ function WaveLinkMixerView({
   const [mixCreatorOpen, setMixCreatorOpen] = useState(false);
   const mixerDensityTouched = useRef(false);
   const [matrixCollapsed, setMatrixCollapsed] = useState(prefersCompactWaveLinkMixer);
-  const [routingDrawerOpen, setRoutingDrawerOpen] = useState(false);
-  const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
+  const [drawer, setDrawer] = useState<MixerDrawer | null>(null);
 
   useEffect(() => {
     setLiveMeters(state.graph.meters);
@@ -1382,6 +1464,28 @@ function WaveLinkMixerView({
   const offlineEntries = useMemo(() => offlineRoutingEntries(state), [state]);
 
   const selectedChannel = state.config.channels.find((channel) => channel.id === selectedChannelId);
+  const drawerOpen = drawer !== null;
+  const selectMixerChannel = useCallback((channelId: string) => {
+    setSelectedChannelId(channelId);
+    setDrawer((current) => {
+      if (current?.type === "effects") return { type: "effects", channelId };
+      if (current?.type === "source") return { type: "source", channelId };
+      return current;
+    });
+  }, [setSelectedChannelId]);
+
+  useEffect(() => {
+    if (!drawer) return;
+    if (drawer.type === "mix" && !state.config.mixes.some((mix) => mix.id === drawer.mixId)) {
+      setDrawer(null);
+    }
+    if (
+      (drawer.type === "source" || drawer.type === "effects") &&
+      !state.config.channels.some((channel) => channel.id === drawer.channelId)
+    ) {
+      setDrawer(null);
+    }
+  }, [drawer, state.config.channels, state.config.mixes]);
 
   return (
     <section className={matrixCollapsed ? "wl-mixer compact" : "wl-mixer"}>
@@ -1426,21 +1530,27 @@ function WaveLinkMixerView({
             Mix
           </button>
           <button
-            aria-pressed={routingDrawerOpen}
-            className={routingDrawerOpen ? "secondary-button active" : "secondary-button"}
-            onClick={() => setRoutingDrawerOpen((current) => !current)}
-            title={routingDrawerOpen ? "Hide app routing drawer" : "Show app routing drawer"}
+            aria-pressed={drawer?.type === "routing"}
+            className={drawer?.type === "routing" ? "secondary-button active" : "secondary-button"}
+            onClick={() => setDrawer((current) => current?.type === "routing" ? null : { type: "routing" })}
+            title={drawer?.type === "routing" ? "Hide app routing drawer" : "Show app routing drawer"}
             type="button"
           >
             <Cable size={16} />
             Apps
           </button>
           <button
-            className="secondary-button"
+            aria-pressed={drawer?.type === "effects" && drawer.channelId === selectedChannel?.id}
+            className={drawer?.type === "effects" && drawer.channelId === selectedChannel?.id ? "secondary-button active" : "secondary-button"}
             disabled={!selectedChannel}
             onClick={() => {
-              if (selectedChannel) setSelectedChannelId(selectedChannel.id);
-              setActiveView("effects");
+              if (!selectedChannel) return;
+              setSelectedChannelId(selectedChannel.id);
+              setDrawer((current) =>
+                current?.type === "effects" && current.channelId === selectedChannel.id
+                  ? null
+                  : { type: "effects", channelId: selectedChannel.id },
+              );
             }}
             type="button"
           >
@@ -1450,7 +1560,7 @@ function WaveLinkMixerView({
         </div>
       </div>
 
-      <div className={routingDrawerOpen ? "wl-mixer-grid drawer-open" : "wl-mixer-grid"}>
+      <div className={drawerOpen ? "wl-mixer-grid drawer-open" : "wl-mixer-grid"}>
         <div className="wl-matrix-panel">
           <div className="wl-matrix-scroll">
             <div
@@ -1463,47 +1573,36 @@ function WaveLinkMixerView({
                 <strong>Inputs</strong>
                 <span>Route each source into every output mix</span>
               </div>
-              {state.config.mixes.map((mix, index) => (
+              {state.config.mixes.map((mix) => (
                 <WaveLinkMixHeader
-                  canDelete={state.config.mixes.length > 1}
-                  canMoveDown={index < state.config.mixes.length - 1}
-                  canMoveUp={index > 0}
                   key={mix.id}
                   mix={mix}
                   outputs={outputs}
-                  onRename={() => setRenameTarget({ type: "mix", id: mix.id, name: mix.name })}
-                  run={run}
-                  setMixIcon={setMixIcon}
-                  setMixOutputs={setMixOutputs}
+                  onOpenSettings={() => setDrawer({ type: "mix", mixId: mix.id })}
                   setMixMute={setMixMute}
                   setMixVolume={setMixVolume}
-                  setSettings={setSettings}
                   settings={state.config.settings}
                   vuLevel={levelFor(mix.id)}
                 />
               ))}
 
-              {state.config.channels.map((channel, index) => (
+              {state.config.channels.map((channel) => (
                 <WaveLinkSourceRow
-                  canMoveDown={index < state.config.channels.length - 1}
-                  canMoveUp={index > 0}
                   channel={channel}
                   appStreams={streamsByChannelId.get(channel.id) ?? []}
                   isSelected={channel.id === selectedChannelId}
                   key={channel.id}
                   microphoneInputs={microphoneInputs}
                   mixes={state.config.mixes}
-                  run={run}
-                  onRename={() => setRenameTarget({ type: "source", id: channel.id, name: channelDisplayName(channel) })}
-                  selectEffects={() => {
+                  onOpenSettings={() => setDrawer({ type: "source", channelId: channel.id })}
+                  openEffects={() => {
                     setSelectedChannelId(channel.id);
-                    setActiveView("effects");
+                    setDrawer({ type: "effects", channelId: channel.id });
                   }}
                   setChannelBusMute={setChannelBusMute}
                   setChannelBusEnabled={setChannelBusEnabled}
                   setChannelBusVolume={setChannelBusVolume}
-                  setChannelInput={setChannelInput}
-                  setSelectedChannelId={setSelectedChannelId}
+                  setSelectedChannelId={selectMixerChannel}
                   sourceVuLevel={levelFor(channel.id)}
                   vuForBus={(mix, bus) => channelBusVuLevel(channel, mix, bus, levelFor)}
                 />
@@ -1512,14 +1611,14 @@ function WaveLinkMixerView({
           </div>
         </div>
 
-        {routingDrawerOpen && (
+        {drawer && (
           <>
           <button
-            aria-label="Close app routing"
+            aria-label="Close mixer drawer"
             className="wl-drawer-scrim"
-            onClick={() => setRoutingDrawerOpen(false)}
             type="button"
           />
+          {drawer.type === "routing" && (
           <aside className="wl-routing-drawer">
             <div className="wl-drawer-header">
               <div>
@@ -1530,7 +1629,7 @@ function WaveLinkMixerView({
                 <button className="mini-icon-button" onClick={() => setActiveView("routing")} title="Open routing" type="button">
                   <ExternalLink size={14} />
                 </button>
-                <button className="mini-icon-button" onClick={() => setRoutingDrawerOpen(false)} title="Close app routing" type="button">
+                <button className="mini-icon-button" onClick={() => setDrawer(null)} title="Close app routing" type="button">
                   x
                 </button>
               </div>
@@ -1571,6 +1670,76 @@ function WaveLinkMixerView({
               )}
             </div>
           </aside>
+          )}
+          {drawer.type === "effects" && (() => {
+            const channel = state.config.channels.find((item) => item.id === drawer.channelId);
+            if (!channel) return null;
+            return (
+              <aside className="wl-routing-drawer wl-effects-drawer">
+                <div className="wl-drawer-header">
+                  <div>
+                    <strong>FX</strong>
+                    <span>{channelDisplayName(channel)}</span>
+                  </div>
+                  <div className="wl-inline-actions">
+                    <button className="mini-icon-button" onClick={() => setActiveView("effects")} title="Open effects workspace" type="button">
+                      <ExternalLink size={14} />
+                    </button>
+                    <button className="mini-icon-button" onClick={() => setDrawer(null)} title="Close FX" type="button">
+                      x
+                    </button>
+                  </div>
+                </div>
+                <WaveLinkEffectsEditor
+                  channel={channel}
+                  className="wl-drawer-body"
+                  setChannelInput={setChannelInput}
+                  setEffectChain={setEffectChain}
+                  state={state}
+                />
+              </aside>
+            );
+          })()}
+          {drawer.type === "mix" && (() => {
+            const mixIndex = state.config.mixes.findIndex((item) => item.id === drawer.mixId);
+            const mix = state.config.mixes[mixIndex];
+            if (!mix) return null;
+            return (
+              <WaveLinkMixSettingsDrawer
+                canDelete={state.config.mixes.length > 1}
+                canMoveDown={mixIndex < state.config.mixes.length - 1}
+                canMoveUp={mixIndex > 0}
+                mix={mix}
+                onClose={() => setDrawer(null)}
+                outputs={outputs}
+                run={run}
+                setMixIcon={setMixIcon}
+                setMixMute={setMixMute}
+                setMixOutputs={setMixOutputs}
+                setMixVolume={setMixVolume}
+                setSettings={setSettings}
+                settings={state.config.settings}
+                vuLevel={levelFor(mix.id)}
+              />
+            );
+          })()}
+          {drawer.type === "source" && (() => {
+            const channelIndex = state.config.channels.findIndex((item) => item.id === drawer.channelId);
+            const channel = state.config.channels[channelIndex];
+            if (!channel) return null;
+            return (
+              <WaveLinkSourceSettingsDrawer
+                canMoveDown={channelIndex < state.config.channels.length - 1}
+                canMoveUp={channelIndex > 0}
+                channel={channel}
+                microphoneInputs={microphoneInputs}
+                onClose={() => setDrawer(null)}
+                run={run}
+                setChannelInput={setChannelInput}
+                setChannelIcon={setChannelIcon}
+              />
+            );
+          })()}
           </>
         )}
       </div>
@@ -1588,13 +1757,6 @@ function WaveLinkMixerView({
           onClose={() => setMixCreatorOpen(false)}
           run={run}
           setMixIcon={setMixIcon}
-        />
-      )}
-      {renameTarget && (
-        <WaveLinkRenameDialog
-          onClose={() => setRenameTarget(null)}
-          run={run}
-          target={renameTarget}
         />
       )}
     </section>
@@ -1848,90 +2010,26 @@ function WaveLinkCreateMixDialog({
   return createPortal(body, document.body);
 }
 
-function WaveLinkRenameDialog({
-  onClose,
-  run,
-  target,
-}: {
-  onClose: () => void;
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
-  target: RenameTarget;
-}) {
-  const [name, setName] = useState(target.name);
-  const [busy, setBusy] = useState(false);
-  const cleanName = name.trim();
-  const body = (
-    <div className="wl-modal-backdrop" onMouseDown={onClose}>
-      <form
-        className="wl-dialog compact"
-        onMouseDown={(event) => event.stopPropagation()}
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (!cleanName || busy) return;
-          setBusy(true);
-          const command = target.type === "mix" ? "rename_mix" : "rename_channel";
-          const args = target.type === "mix"
-            ? { mixId: target.id, name: cleanName }
-            : { channelId: target.id, name: cleanName };
-          void run(command, args, target.type === "mix" ? "Mix renamed" : "Source renamed")
-            .then(onClose)
-            .catch(() => undefined)
-            .finally(() => setBusy(false));
-        }}
-      >
-        <div className="wl-dialog-header">
-          <strong>{target.type === "mix" ? "Rename Mix" : "Rename Source"}</strong>
-          <button className="mini-icon-button" onClick={onClose} type="button">x</button>
-        </div>
-        <label className="wl-dialog-field">
-          <span>Name</span>
-          <input autoFocus value={name} onChange={(event) => setName(event.currentTarget.value)} />
-        </label>
-        <div className="wl-dialog-actions">
-          <button className="secondary-button" onClick={onClose} type="button">Cancel</button>
-          <button className="primary-button" disabled={busy || !cleanName} type="submit">
-            <Pencil size={16} />
-            Rename
-          </button>
-        </div>
-      </form>
-    </div>
-  );
-  return createPortal(body, document.body);
-}
-
 function WaveLinkMixHeader({
-  canDelete,
-  canMoveDown,
-  canMoveUp,
   mix,
-  onRename,
+  onOpenSettings,
   outputs,
-  run,
-  setMixIcon,
-  setMixOutputs,
   setMixMute,
   setMixVolume,
-  setSettings,
   settings,
   vuLevel,
 }: {
-  canDelete: boolean;
-  canMoveDown: boolean;
-  canMoveUp: boolean;
   mix: Mix;
-  onRename: () => void;
+  onOpenSettings: () => void;
   outputs: DeviceInfo[];
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
-  setMixIcon: (mixId: string, icon: string | null) => Promise<void>;
-  setMixOutputs: (mixId: string, outputs: string[]) => Promise<void>;
   setMixMute: (mixId: string, muted: boolean) => Promise<void>;
   setMixVolume: (mixId: string, volume: number) => Promise<void>;
-  setSettings: (settings: MixerSettings) => Promise<void>;
   settings: MixerSettings;
   vuLevel: number;
 }) {
   const MixIcon = mixIconComponent(mixIconId(mix));
+  const selectedOutputs = mixOutputDevices(mix);
+  const outputSummary = mixOutputSummary(mix, outputs, settings);
   return (
     <div className="wl-mix-header">
       <div className="wl-mix-title">
@@ -1954,60 +2052,181 @@ function WaveLinkMixHeader({
         setMixVolume={setMixVolume}
         vuLevel={vuLevel}
       />
-      <WaveLinkMixIconPicker
-        mixId={mix.id}
-        selectedIcon={mixIconId(mix)}
-        setMixIcon={setMixIcon}
-      />
-      <WaveLinkMixOutputs
-        mix={mix}
-        outputs={outputs}
-        setMixOutputs={setMixOutputs}
-        setSettings={setSettings}
-        settings={settings}
-      />
+      <div className="wl-mix-output-summary" title={outputSummary}>
+        {mix.id === "monitor" && settings.monitor_follows_default_output ? (
+          <span className="wl-output-chip">Auto output</span>
+        ) : selectedOutputs.length > 0 ? (
+          <span className="wl-output-chip">{outputSummary}</span>
+        ) : (
+          <span className="wl-output-chip muted">No direct output</span>
+        )}
+      </div>
       <div className="wl-inline-actions">
         <button
           className="mini-icon-button"
-          disabled={!canMoveUp}
-          onClick={() => void run("move_mix", { mixId: mix.id, direction: -1 }, "Mix moved")}
-          title="Move mix left"
+          onClick={onOpenSettings}
+          title={`${mix.name} settings`}
           type="button"
         >
-          <ArrowUp size={14} />
-        </button>
-        <button
-          className="mini-icon-button"
-          disabled={!canMoveDown}
-          onClick={() => void run("move_mix", { mixId: mix.id, direction: 1 }, "Mix moved")}
-          title="Move mix right"
-          type="button"
-        >
-          <ArrowDown size={14} />
-        </button>
-        <button
-          className="mini-icon-button"
-          onClick={onRename}
-          title="Rename mix"
-          type="button"
-        >
-          <Pencil size={14} />
-        </button>
-        <button
-          className="mini-icon-button danger"
-          disabled={!canDelete}
-          onClick={() => {
-            if (window.confirm(`Delete ${mix.name}?`)) {
-              void run("delete_mix", { mixId: mix.id }, "Mix deleted");
-            }
-          }}
-          title="Delete mix"
-          type="button"
-        >
-          <Trash2 size={14} />
+          <SlidersHorizontal size={14} />
         </button>
       </div>
     </div>
+  );
+}
+
+function WaveLinkMixSettingsDrawer({
+  canDelete,
+  canMoveDown,
+  canMoveUp,
+  mix,
+  onClose,
+  outputs,
+  run,
+  setMixIcon,
+  setMixMute,
+  setMixOutputs,
+  setMixVolume,
+  setSettings,
+  settings,
+  vuLevel,
+}: {
+  canDelete: boolean;
+  canMoveDown: boolean;
+  canMoveUp: boolean;
+  mix: Mix;
+  onClose: () => void;
+  outputs: DeviceInfo[];
+  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  setMixIcon: (mixId: string, icon: string | null) => Promise<void>;
+  setMixMute: (mixId: string, muted: boolean) => Promise<void>;
+  setMixOutputs: (mixId: string, outputs: string[]) => Promise<void>;
+  setMixVolume: (mixId: string, volume: number) => Promise<void>;
+  setSettings: (settings: MixerSettings) => Promise<void>;
+  settings: MixerSettings;
+  vuLevel: number;
+}) {
+  const [name, setName] = useState(mix.name);
+  const [busy, setBusy] = useState(false);
+  const cleanName = name.trim();
+  const MixIcon = mixIconComponent(mixIconId(mix));
+
+  useEffect(() => {
+    setName(mix.name);
+  }, [mix.id, mix.name]);
+
+  return (
+    <aside className="wl-routing-drawer wl-settings-drawer">
+      <form
+        className="wl-drawer-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!cleanName || cleanName === mix.name || busy) return;
+          setBusy(true);
+          void run("rename_mix", { mixId: mix.id, name: cleanName }, "Mix renamed")
+            .catch(() => undefined)
+            .finally(() => setBusy(false));
+        }}
+      >
+        <div className="wl-drawer-header">
+          <div>
+            <strong>Output Settings</strong>
+            <span>{mix.virtual_source_name}</span>
+          </div>
+          <button className="mini-icon-button" onClick={onClose} title="Close output settings" type="button">
+            x
+          </button>
+        </div>
+        <div className="wl-drawer-body">
+          <div className="wl-editor-summary">
+            <MixIcon size={20} />
+            <div>
+              <strong>{mix.name}</strong>
+              <span>{mixOutputSummary(mix, outputs, settings)}</span>
+            </div>
+          </div>
+          <label className="wl-dialog-field">
+            <span>Name</span>
+            <input value={name} onChange={(event) => setName(event.currentTarget.value)} />
+          </label>
+          <button className="secondary-button" disabled={busy || !cleanName || cleanName === mix.name} type="submit">
+            <Pencil size={16} />
+            Save Name
+          </button>
+          <div className="wl-drawer-section-title">
+            <span>Icon</span>
+            <strong>{mixIconLabel(mixIconId(mix))}</strong>
+          </div>
+          <WaveLinkMixIconPicker
+            mixId={mix.id}
+            selectedIcon={mixIconId(mix)}
+            setMixIcon={setMixIcon}
+          />
+          <div className="wl-drawer-section-title">
+            <span>Output Routes</span>
+            <strong>{mixOutputDevices(mix).length}</strong>
+          </div>
+          <WaveLinkMixOutputs
+            mix={mix}
+            outputs={outputs}
+            setMixOutputs={setMixOutputs}
+            setSettings={setSettings}
+            settings={settings}
+          />
+          <div className="wl-drawer-section-title">
+            <span>Master</span>
+            <strong>{volumeToPercent(mix.volume)}</strong>
+          </div>
+          <WaveLinkMasterControl mix={mix} setMixVolume={setMixVolume} vuLevel={vuLevel} />
+          <button
+            className={mix.muted ? "secondary-button danger active" : "secondary-button"}
+            onClick={() => void setMixMute(mix.id, !mix.muted).catch(() => undefined)}
+            type="button"
+          >
+            {mix.muted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+            {mix.muted ? "Unmute Output" : "Mute Output"}
+          </button>
+          <div className="wl-drawer-section-title">
+            <span>Order</span>
+            <strong>Matrix</strong>
+          </div>
+          <div className="wl-drawer-action-grid">
+            <button
+              className="secondary-button"
+              disabled={!canMoveUp}
+              onClick={() => void run("move_mix", { mixId: mix.id, direction: -1 }, "Mix moved")}
+              type="button"
+            >
+              <ArrowUp size={16} />
+              Left
+            </button>
+            <button
+              className="secondary-button"
+              disabled={!canMoveDown}
+              onClick={() => void run("move_mix", { mixId: mix.id, direction: 1 }, "Mix moved")}
+              type="button"
+            >
+              <ArrowDown size={16} />
+              Right
+            </button>
+          </div>
+          <button
+            className="secondary-button danger"
+            disabled={!canDelete}
+            onClick={() => {
+              if (window.confirm(`Delete ${mix.name}?`)) {
+                onClose();
+                void run("delete_mix", { mixId: mix.id }, "Mix deleted");
+              }
+            }}
+            type="button"
+          >
+            <Trash2 size={16} />
+            Delete Output
+          </button>
+        </div>
+      </form>
+    </aside>
   );
 }
 
@@ -2030,6 +2249,36 @@ function WaveLinkMixIconPicker({
             aria-pressed={selectedIcon === option.id}
             key={option.id}
             onClick={() => void setMixIcon(mixId, option.id).catch(() => undefined)}
+            title={option.label}
+            type="button"
+          >
+            <Icon size={14} />
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function WaveLinkChannelIconPicker({
+  channelId,
+  selectedIcon,
+  setChannelIcon,
+}: {
+  channelId: string;
+  selectedIcon: string;
+  setChannelIcon: (channelId: string, icon: string | null) => Promise<void>;
+}) {
+  return (
+    <div className="wl-mix-icon-picker" aria-label="Source icon">
+      {SOURCE_ICON_OPTIONS.map((option) => {
+        const Icon = option.icon;
+        return (
+          <button
+            className={selectedIcon === option.id ? "active" : ""}
+            aria-pressed={selectedIcon === option.id}
+            key={option.id}
+            onClick={() => void setChannelIcon(channelId, option.id).catch(() => undefined)}
             title={option.label}
             type="button"
           >
@@ -2172,49 +2421,37 @@ function WaveLinkMasterControl({
 
 function WaveLinkSourceRow({
   appStreams,
-  canMoveDown,
-  canMoveUp,
   channel,
   isSelected,
   microphoneInputs,
   mixes,
-  onRename,
-  run,
-  selectEffects,
+  onOpenSettings,
+  openEffects,
   setChannelBusEnabled,
   setChannelBusMute,
   setChannelBusVolume,
-  setChannelInput,
   setSelectedChannelId,
   sourceVuLevel,
   vuForBus,
 }: {
   appStreams: AppStream[];
-  canMoveDown: boolean;
-  canMoveUp: boolean;
   channel: Channel;
   isSelected: boolean;
   microphoneInputs: AppStateSnapshot["graph"]["inputs"];
   mixes: Mix[];
-  onRename: () => void;
-  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
-  selectEffects: () => void;
+  onOpenSettings: () => void;
+  openEffects: () => void;
   setChannelBusEnabled: (channelId: string, mixId: string, enabled: boolean) => Promise<void>;
   setChannelBusMute: (channelId: string, mixId: string, muted: boolean) => Promise<void>;
   setChannelBusVolume: (channelId: string, mixId: string, volume: number) => Promise<void>;
-  setChannelInput: (channelId: string, sourceDevice: string | null) => Promise<void>;
   setSelectedChannelId: (channelId: string) => void;
   sourceVuLevel: number;
   vuForBus: (mix: Mix, bus: MixBus) => number;
 }) {
-  const Icon = channelIcon(channel.kind);
+  const Icon = channelIconComponent(channel);
   const isHardware = isHardwareChannel(channel);
   const displayName = channelDisplayName(channel);
   const activeEffectCount = channel.effects.filter((effect) => !effect.bypassed).length;
-  const selectedInputMissing =
-    isHardware &&
-    channel.source_device &&
-    !microphoneInputs.some((input) => input.id === channel.source_device);
 
   return (
     <>
@@ -2232,27 +2469,6 @@ function WaveLinkSourceRow({
         <div className="wl-source-meter" aria-hidden="true">
           <div className="wl-source-meter-fill" style={{ width: trackSize(sourceVuLevel) }} />
         </div>
-        {isHardware && (
-          <AppSelect
-            ariaLabel={`${displayName} microphone`}
-            className="wl-source-select"
-            onChange={(nextValue) => void setChannelInput(channel.id, nextValue || null).catch(() => undefined)}
-            options={[
-              { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto mic") },
-              ...(selectedInputMissing
-                ? [{
-                    value: channel.source_device ?? "",
-                    label: channel.source_device ?? "",
-                  }]
-                : []),
-              ...microphoneInputs.map((input) => ({
-                value: input.id,
-                label: input.description,
-              })),
-            ]}
-            value={channel.source_device ?? ""}
-          />
-        )}
         {appStreams.length > 0 && (
           <div className="wl-source-app-chips" aria-label={`${displayName} active apps`}>
             {appStreams.slice(0, 3).map((stream) => (
@@ -2265,25 +2481,10 @@ function WaveLinkSourceRow({
         )}
         <div className="wl-source-actions">
           <button
-            className={channel.linked ? "mini-icon-button active" : "mini-icon-button"}
-            onClick={(event) => {
-              event.stopPropagation();
-              void run(
-                "set_channel_linked",
-                { channelId: channel.id, linked: !channel.linked },
-                channel.linked ? "Sliders unlinked" : "Sliders linked",
-              );
-            }}
-            title={channel.linked ? "Unlink send sliders" : "Link send sliders"}
-            type="button"
-          >
-            <GitBranch size={14} />
-          </button>
-          <button
             className="mini-icon-button fx-led-button"
             onClick={(event) => {
               event.stopPropagation();
-              selectEffects();
+              openEffects();
             }}
             title={activeEffectCount > 0 ? `${activeEffectCount} active effects` : "No active effects"}
             type="button"
@@ -2293,51 +2494,14 @@ function WaveLinkSourceRow({
           </button>
           <button
             className="mini-icon-button"
-            disabled={!canMoveUp}
             onClick={(event) => {
               event.stopPropagation();
-              void run("move_channel", { channelId: channel.id, direction: -1 }, "Source moved");
+              onOpenSettings();
             }}
-            title="Move source up"
+            title={`${displayName} settings`}
             type="button"
           >
-            <ArrowUp size={14} />
-          </button>
-          <button
-            className="mini-icon-button"
-            disabled={!canMoveDown}
-            onClick={(event) => {
-              event.stopPropagation();
-              void run("move_channel", { channelId: channel.id, direction: 1 }, "Source moved");
-            }}
-            title="Move source down"
-            type="button"
-          >
-            <ArrowDown size={14} />
-          </button>
-          <button
-            className="mini-icon-button"
-            onClick={(event) => {
-              event.stopPropagation();
-              onRename();
-            }}
-            title="Rename source"
-            type="button"
-          >
-            <Pencil size={14} />
-          </button>
-          <button
-            className="mini-icon-button danger"
-            onClick={(event) => {
-              event.stopPropagation();
-              if (window.confirm(`Delete ${displayName}?`)) {
-                void run("delete_channel", { channelId: channel.id }, "Source deleted");
-              }
-            }}
-            title="Delete source"
-            type="button"
-          >
-            <Trash2 size={14} />
+            <SlidersHorizontal size={14} />
           </button>
         </div>
       </div>
@@ -2357,6 +2521,175 @@ function WaveLinkSourceRow({
         );
       })}
     </>
+  );
+}
+
+function WaveLinkSourceSettingsDrawer({
+  canMoveDown,
+  canMoveUp,
+  channel,
+  microphoneInputs,
+  onClose,
+  run,
+  setChannelIcon,
+  setChannelInput,
+}: {
+  canMoveDown: boolean;
+  canMoveUp: boolean;
+  channel: Channel;
+  microphoneInputs: AppStateSnapshot["graph"]["inputs"];
+  onClose: () => void;
+  run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
+  setChannelIcon: (channelId: string, icon: string | null) => Promise<void>;
+  setChannelInput: (channelId: string, sourceDevice: string | null) => Promise<void>;
+}) {
+  const [name, setName] = useState(channelDisplayName(channel));
+  const [busy, setBusy] = useState(false);
+  const displayName = channelDisplayName(channel);
+  const cleanName = name.trim();
+  const Icon = channelIconComponent(channel);
+  const isHardware = isHardwareChannel(channel);
+  const selectedInputMissing =
+    isHardware &&
+    channel.source_device &&
+    !microphoneInputs.some((input) => input.id === channel.source_device);
+
+  useEffect(() => {
+    setName(channelDisplayName(channel));
+  }, [channel.id, channel.name]);
+
+  return (
+    <aside className="wl-routing-drawer wl-settings-drawer">
+      <form
+        className="wl-drawer-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!cleanName || cleanName === displayName || busy) return;
+          setBusy(true);
+          void run("rename_channel", { channelId: channel.id, name: cleanName }, "Source renamed")
+            .catch(() => undefined)
+            .finally(() => setBusy(false));
+        }}
+      >
+        <div className="wl-drawer-header">
+          <div>
+            <strong>Source Settings</strong>
+            <span>{displayName}</span>
+          </div>
+          <button className="mini-icon-button" onClick={onClose} title="Close source settings" type="button">
+            x
+          </button>
+        </div>
+        <div className="wl-drawer-body">
+          <div className="wl-editor-summary">
+            <Icon size={20} />
+            <div>
+              <strong>{displayName}</strong>
+              <span>{isHardware ? channelInputLabel(channel, microphoneInputs) : channel.virtual_sink_name}</span>
+            </div>
+          </div>
+          <label className="wl-dialog-field">
+            <span>Name</span>
+            <input value={name} onChange={(event) => setName(event.currentTarget.value)} />
+          </label>
+          <button className="secondary-button" disabled={busy || !cleanName || cleanName === displayName} type="submit">
+            <Pencil size={16} />
+            Save Name
+          </button>
+          <div className="wl-drawer-section-title">
+            <span>Icon</span>
+            <strong>{sourceIconLabel(channelIconId(channel))}</strong>
+          </div>
+          <WaveLinkChannelIconPicker
+            channelId={channel.id}
+            selectedIcon={channelIconId(channel)}
+            setChannelIcon={setChannelIcon}
+          />
+          {isHardware && (
+            <>
+              <div className="wl-drawer-section-title">
+                <span>Hardware Input</span>
+                <strong>Mono</strong>
+              </div>
+              <AppSelect
+                ariaLabel={`${displayName} microphone`}
+                className="wl-source-select"
+                onChange={(nextValue) => void setChannelInput(channel.id, nextValue || null).catch(() => undefined)}
+                options={[
+                  { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto mic") },
+                  ...(selectedInputMissing
+                    ? [{
+                        value: channel.source_device ?? "",
+                        label: channel.source_device ?? "",
+                      }]
+                    : []),
+                  ...microphoneInputs.map((input) => ({
+                    value: input.id,
+                    label: input.description,
+                  })),
+                ]}
+                value={channel.source_device ?? ""}
+              />
+            </>
+          )}
+          <div className="wl-drawer-section-title">
+            <span>Send Control</span>
+            <strong>{channel.linked ? "Linked" : "Split"}</strong>
+          </div>
+          <button
+            className={channel.linked ? "secondary-button active" : "secondary-button"}
+            onClick={() =>
+              void run(
+                "set_channel_linked",
+                { channelId: channel.id, linked: !channel.linked },
+                channel.linked ? "Sliders unlinked" : "Sliders linked",
+              )
+            }
+            type="button"
+          >
+            <GitBranch size={16} />
+            {channel.linked ? "Unlink Sends" : "Link Sends"}
+          </button>
+          <div className="wl-drawer-section-title">
+            <span>Order</span>
+            <strong>Sources</strong>
+          </div>
+          <div className="wl-drawer-action-grid">
+            <button
+              className="secondary-button"
+              disabled={!canMoveUp}
+              onClick={() => void run("move_channel", { channelId: channel.id, direction: -1 }, "Source moved")}
+              type="button"
+            >
+              <ArrowUp size={16} />
+              Up
+            </button>
+            <button
+              className="secondary-button"
+              disabled={!canMoveDown}
+              onClick={() => void run("move_channel", { channelId: channel.id, direction: 1 }, "Source moved")}
+              type="button"
+            >
+              <ArrowDown size={16} />
+              Down
+            </button>
+          </div>
+          <button
+            className="secondary-button danger"
+            onClick={() => {
+              if (window.confirm(`Delete ${displayName}?`)) {
+                onClose();
+                void run("delete_channel", { channelId: channel.id }, "Source deleted");
+              }
+            }}
+            type="button"
+          >
+            <Trash2 size={16} />
+            Delete Source
+          </button>
+        </div>
+      </form>
+    </aside>
   );
 }
 
@@ -3861,18 +4194,364 @@ function AppIdentityActions({
   );
 }
 
+function WaveLinkEffectsEditor({
+  channel,
+  className,
+  setChannelInput,
+  setEffectChain,
+  state,
+}: {
+  channel?: Channel;
+  className?: string;
+  setChannelInput: (channelId: string, sourceDevice: string | null) => Promise<void>;
+  setEffectChain: SetEffectChain;
+  state: AppStateSnapshot;
+}) {
+  const microphoneInputs = useMemo(
+    () => sortedMicrophoneInputs(state.graph.inputs),
+    [state.graph.inputs],
+  );
+  const [effectClipboard, setEffectClipboard] = useState<EffectInstance | null>(null);
+  const [draftEffectsByChannel, setDraftEffectsByChannel] = useState<Record<string, EffectInstance[]>>({});
+  const [pendingEffectWrites, setPendingEffectWrites] = useState<Record<string, number>>({});
+  const [effectError, setEffectError] = useState<string | null>(null);
+  const effectWriteGeneration = useRef<Record<string, number>>({});
+  const selectedEffects = channel
+    ? draftEffectsByChannel[channel.id] ?? channel.effects
+    : [];
+
+  useEffect(() => {
+    setDraftEffectsByChannel((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const source of state.config.channels) {
+        const draft = next[source.id];
+        if (draft && effectChainsEqual(draft, source.effects)) {
+          delete next[source.id];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [state.config.channels]);
+
+  const updateEffects = (effects: EffectInstance[], message?: string, preferredInstanceId?: string) => {
+    if (!channel) return;
+    const channelId = channel.id;
+    const optimisticEffects = normalizeSourceEffects(effects, preferredInstanceId);
+    const writeGeneration = (effectWriteGeneration.current[channelId] ?? 0) + 1;
+    effectWriteGeneration.current[channelId] = writeGeneration;
+    setEffectError(null);
+    setDraftEffectsByChannel((current) => ({
+      ...current,
+      [channelId]: optimisticEffects,
+    }));
+    setPendingEffectWrites((current) => ({
+      ...current,
+      [channelId]: (current[channelId] ?? 0) + 1,
+    }));
+    void setEffectChain(channelId, optimisticEffects)
+      .then((nextChannel) => {
+        if (effectWriteGeneration.current[channelId] !== writeGeneration) return;
+        setDraftEffectsByChannel((current) => ({
+          ...current,
+          [channelId]: nextChannel.effects,
+        }));
+        if (message) setEffectError(null);
+      })
+      .catch((error) => {
+        if (effectWriteGeneration.current[channelId] !== writeGeneration) return;
+        setEffectError(String(error));
+        setDraftEffectsByChannel((current) => {
+          const next = { ...current };
+          delete next[channelId];
+          return next;
+        });
+      })
+      .finally(() => {
+        setPendingEffectWrites((current) => {
+          const count = Math.max(0, (current[channelId] ?? 1) - 1);
+          const next = { ...current };
+          if (count === 0) {
+            delete next[channelId];
+          } else {
+            next[channelId] = count;
+          }
+          return next;
+        });
+      });
+  };
+
+  const addEffect = (effect: EffectDefinition) => {
+    if (!channel) return;
+    const existing = selectedEffects.find((item) => item.effect_id === effect.id);
+    if (existing && isSingleInstanceEffect(effect.id)) {
+      if (!existing.bypassed) return;
+      updateEffects(
+        selectedEffects.map((item) =>
+          item.instance_id === existing.instance_id ? { ...item, bypassed: false } : item,
+        ),
+        "Effect enabled",
+        existing.instance_id,
+      );
+      return;
+    }
+    const instance: EffectInstance = {
+      instance_id: crypto.randomUUID(),
+      effect_id: effect.id,
+      name: null,
+      bypassed: false,
+      params: Object.fromEntries(effect.params.map((param) => [param.id, param.default])),
+    };
+    updateEffects([...selectedEffects, instance], "Effect added", instance.instance_id);
+  };
+
+  const applyPreset = (instanceId: string, values: Record<string, number>) => {
+    if (!channel) return;
+    updateEffects(
+      selectedEffects.map((effect) =>
+        effect.instance_id === instanceId
+          ? { ...effect, params: { ...effect.params, ...values } }
+          : effect,
+      ),
+      "Preset applied",
+    );
+  };
+
+  const updateEffectParam = (instanceId: string, paramId: string, value: number) => {
+    if (!channel) return;
+    updateEffects(
+      selectedEffects.map((effect) =>
+        effect.instance_id === instanceId
+          ? { ...effect, params: { ...effect.params, [paramId]: value } }
+          : effect,
+      ),
+      "Effect updated",
+    );
+  };
+
+  const toggleEffectBypass = (instanceId: string, bypassed: boolean) => {
+    if (!channel) return;
+    updateEffects(
+      selectedEffects.map((effect) =>
+        effect.instance_id === instanceId ? { ...effect, bypassed } : effect,
+      ),
+      bypassed ? "Effect bypassed" : "Effect enabled",
+      bypassed ? undefined : instanceId,
+    );
+  };
+
+  const moveEffect = (index: number, direction: -1 | 1) => {
+    const target = index + direction;
+    if (!channel || target < 0 || target >= selectedEffects.length) return;
+    const effects = [...selectedEffects];
+    [effects[index], effects[target]] = [effects[target], effects[index]];
+    updateEffects(effects, "Effect reordered");
+  };
+
+  const renameEffect = (instanceId: string) => {
+    if (!channel) return;
+    const effect = selectedEffects.find((item) => item.instance_id === instanceId);
+    if (!effect) return;
+    const definition = state.catalog.effects.find((item) => item.id === effect.effect_id);
+    const name = window.prompt("Effect name", effect.name ?? definition?.name ?? effect.effect_id);
+    if (!name) return;
+    updateEffects(
+      selectedEffects.map((item) =>
+        item.instance_id === instanceId ? { ...item, name: name.trim() || null } : item,
+      ),
+      "Effect renamed",
+    );
+  };
+
+  const copyEffect = (effect: EffectInstance) => {
+    setEffectClipboard(structuredClone(effect));
+  };
+
+  const pasteEffect = () => {
+    if (!channel || !effectClipboard) return;
+    const pastedEffect = {
+      ...structuredClone(effectClipboard),
+      instance_id: crypto.randomUUID(),
+      name: effectClipboard.name ? `${effectClipboard.name} Copy` : null,
+    };
+    const existing = selectedEffects.find((effect) => effect.effect_id === pastedEffect.effect_id);
+    if (existing && isSingleInstanceEffect(pastedEffect.effect_id)) {
+      updateEffects(
+        selectedEffects.map((effect) =>
+          effect.instance_id === existing.instance_id
+            ? { ...pastedEffect, instance_id: existing.instance_id }
+            : effect,
+        ),
+        "Effect replaced",
+        existing.instance_id,
+      );
+      return;
+    }
+    updateEffects([...selectedEffects, pastedEffect], "Effect pasted", pastedEffect.instance_id);
+  };
+
+  const deleteEffect = (instanceId: string) => {
+    if (!channel) return;
+    updateEffects(
+      selectedEffects.filter((effect) => effect.instance_id !== instanceId),
+      "Effect removed",
+    );
+  };
+
+  return (
+    <div className={["wl-effects-editor-stack", className].filter(Boolean).join(" ")}>
+      <div className="panel wl-effect-chain-panel">
+        <div className="panel-header">
+          <h2>{channel ? channelDisplayName(channel) : "Effects"}</h2>
+          <div className="panel-actions">
+            <button
+              className="secondary-button"
+              disabled={!channel || state.catalog.effects.length === 0}
+              onClick={() => {
+                if (!state.catalog.effects[0]) return;
+                addEffect(state.catalog.effects[0]);
+              }}
+              type="button"
+            >
+              <CirclePlus size={16} />
+              Add
+            </button>
+            <button
+              className="secondary-button"
+              disabled={!channel || !effectClipboard}
+              onClick={pasteEffect}
+              type="button"
+              title="Paste copied effect"
+            >
+              <Clipboard size={16} />
+              Paste
+            </button>
+          </div>
+        </div>
+        {(pendingEffectWrites[channel?.id ?? ""] ?? 0) > 0 && (
+          <div className="effect-sync-status">Syncing effect chain...</div>
+        )}
+        {effectError && (
+          <div className="effect-warning">
+            <CircleAlert size={15} />
+            <span>{effectError}</span>
+          </div>
+        )}
+        {channel && isHardwareChannel(channel) && (
+          <div className="hardware-source-card">
+            <label className="field-label" htmlFor={`effects-microphone-source-${channel.id}`}>
+              Microphone
+            </label>
+            <AppSelect
+              ariaLabel="Microphone"
+              id={`effects-microphone-source-${channel.id}`}
+              onChange={(value) =>
+                void setChannelInput(channel.id, value || null).catch(() => undefined)
+              }
+              options={[
+                { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto hardware input") },
+                ...microphoneInputs.map((input) => ({
+                  value: input.id,
+                  label: input.description,
+                })),
+              ]}
+              value={channel.source_device ?? ""}
+            />
+            <div className="field-label">Input mode</div>
+            <div className="static-field">Mono</div>
+          </div>
+        )}
+        <div className="effect-chain">
+          {selectedEffects.map((effect, index) => {
+            const definition = state.catalog.effects.find((item) => item.id === effect.effect_id);
+            return (
+              <EffectBlock
+                availability={state.graph.effect_availability.find((item) => item.effect_id === effect.effect_id)}
+                definition={definition}
+                effect={effect}
+                index={index}
+                key={effect.instance_id}
+                onCopy={copyEffect}
+                onDelete={deleteEffect}
+                onMove={moveEffect}
+                onRename={renameEffect}
+                onApplyPreset={applyPreset}
+                onToggleBypass={toggleEffectBypass}
+                onUpdateParam={updateEffectParam}
+                total={selectedEffects.length}
+              />
+            );
+          })}
+          {selectedEffects.length === 0 && <EmptyState label="No effects on this channel" />}
+        </div>
+      </div>
+      <div className="panel catalog-panel wl-effects-catalog-panel">
+        <div className="panel-header">
+          <h2>Catalog</h2>
+          <Sparkles size={18} />
+        </div>
+        <div className="catalog-grid">
+          {state.catalog.effects.map((effect) => {
+            const availability = state.graph.effect_availability.find((item) => item.effect_id === effect.id);
+            const isEnabled = selectedEffects.some((item) => item.effect_id === effect.id && !item.bypassed);
+            const isPresent = selectedEffects.some((item) => item.effect_id === effect.id);
+            const isUnavailable = availability?.available === false;
+            const itemClassName = [
+              "catalog-item",
+              isEnabled ? "enabled" : "",
+              isPresent && !isEnabled ? "bypassed" : "",
+            ]
+              .filter(Boolean)
+              .join(" ");
+            return (
+              <button
+                className={itemClassName}
+                disabled={!channel}
+                key={effect.id}
+                onClick={() => addEffect(effect)}
+                title={
+                  isEnabled
+                    ? "Enabled on this source"
+                    : isUnavailable
+                      ? availability.detail
+                      : isPresent
+                        ? "Bypassed on this source"
+                        : "Add to this source"
+                }
+                type="button"
+              >
+                <span>{effect.name}</span>
+                {isUnavailable ? (
+                  <CircleAlert size={15} />
+                ) : isEnabled ? (
+                  <Check size={15} />
+                ) : (
+                  <CirclePlus size={15} />
+                )}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function EffectsView({
   state,
   selectedChannel,
   selectedChannelId,
   setSelectedChannelId,
   setChannelInput,
+  setEffectChain,
 }: {
   state: AppStateSnapshot;
   selectedChannel?: Channel;
   selectedChannelId: string;
   setSelectedChannelId: (channelId: string) => void;
   setChannelInput: (channelId: string, sourceDevice: string | null) => Promise<void>;
+  setEffectChain: SetEffectChain;
 }) {
   const microphoneInputs = useMemo(
     () => sortedMicrophoneInputs(state.graph.inputs),
@@ -3917,7 +4596,7 @@ function EffectsView({
       ...current,
       [channelId]: (current[channelId] ?? 0) + 1,
     }));
-    void invoke<Channel>("set_effect_chain", { channelId, effects: optimisticEffects })
+    void setEffectChain(channelId, optimisticEffects)
       .then((channel) => {
         if (effectWriteGeneration.current[channelId] !== writeGeneration) return;
         setDraftEffectsByChannel((current) => ({
@@ -4360,14 +5039,18 @@ function EffectBlock({
 
 function DiagnosticsView({
   audioActionReport,
+  onInstallEffectPlugins,
   onCleanup,
   onPrune,
+  pluginInstallBusy,
   state,
   run,
 }: {
   audioActionReport: AudioActionReport | null;
+  onInstallEffectPlugins: () => void;
   onCleanup: () => void | Promise<unknown>;
   onPrune: () => void | Promise<unknown>;
+  pluginInstallBusy: boolean;
   state: AppStateSnapshot;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
@@ -4467,14 +5150,18 @@ function DiagnosticsView({
         {graphReport && <GraphDebugSummary report={graphReport} />}
         {audioActionReport && <AudioActionSummary report={audioActionReport} />}
         <LatencySummary state={state} />
-        <EffectAvailabilitySummary state={state} />
+        <EffectAvailabilitySummary
+          installBusy={pluginInstallBusy}
+          onInstallMissing={onInstallEffectPlugins}
+          state={state}
+        />
       </div>
     </section>
   );
 }
 
 function LatencySummary({ state }: { state: AppStateSnapshot }) {
-  const heavyFx = state.config.channels.flatMap((channel) =>
+  const latencySensitiveFx = state.config.channels.flatMap((channel) =>
     channel.effects
       .filter((effect) => !effect.bypassed && ["deepfilternet", "rnnoise", "convolver"].includes(effect.effect_id))
       .map((effect) => `${channelDisplayName(channel)}: ${effect.effect_id}`),
@@ -4494,8 +5181,8 @@ function LatencySummary({ state }: { state: AppStateSnapshot }) {
           <strong>Latency</strong>
           <span>PipeWire path estimate for monitoring and virtual mic use</span>
         </div>
-        <div className={heavyFx.length ? "command-pill warning" : "command-pill"}>
-          {heavyFx.length ? "Review FX" : "Low"}
+        <div className={latencySensitiveFx.length ? "command-pill info" : "command-pill"}>
+          {latencySensitiveFx.length ? "DSP Active" : "Low"}
         </div>
       </div>
       <div className="command-stats">
@@ -4508,10 +5195,10 @@ function LatencySummary({ state }: { state: AppStateSnapshot }) {
         <Stat icon={Cable} label="Routes" value={String(activeMixRoutes)} />
         <Stat icon={Activity} label="Mode" value={state.config.settings.low_latency_mic_monitoring ? "Low" : "Stable"} />
       </div>
-      {heavyFx.length > 0 && (
-        <div className="latency-note">
-          <CircleAlert size={15} />
-          <span>{heavyFx.join(", ")}</span>
+      {latencySensitiveFx.length > 0 && (
+        <div className="latency-note info">
+          <Info size={15} />
+          <span>{latencySensitiveFx.join(", ")}</span>
         </div>
       )}
     </div>
@@ -4616,10 +5303,19 @@ function AudioActionSummary({ report }: { report: AudioActionReport }) {
   );
 }
 
-function EffectAvailabilitySummary({ state }: { state: AppStateSnapshot }) {
+function EffectAvailabilitySummary({
+  installBusy,
+  onInstallMissing,
+  state,
+}: {
+  installBusy: boolean;
+  onInstallMissing: () => void;
+  state: AppStateSnapshot;
+}) {
   const availabilityById = new Map(state.graph.effect_availability.map((item) => [item.effect_id, item]));
   const available = state.graph.effect_availability.filter((item) => item.available).length;
   const total = state.catalog.effects.length;
+  const missing = total - available;
 
   return (
     <div className="fx-availability">
@@ -4628,8 +5324,22 @@ function EffectAvailabilitySummary({ state }: { state: AppStateSnapshot }) {
           <strong>Effect Availability</strong>
           <span>{available}/{total} open DSP replacements detected</span>
         </div>
-        <div className={available === total ? "command-pill" : "command-pill warning"}>
-          {available === total ? "Ready" : `${total - available} missing`}
+        <div className="panel-actions">
+          {missing > 0 && (
+            <button
+              className="secondary-button"
+              disabled={installBusy}
+              onClick={onInstallMissing}
+              title="Install missing optional LADSPA effect plugins with the system package manager"
+              type="button"
+            >
+              <Download size={16} />
+              {installBusy ? "Installing" : "Install FX"}
+            </button>
+          )}
+          <div className={available === total ? "command-pill" : "command-pill warning"}>
+            {available === total ? "Ready" : `${missing} missing`}
+          </div>
         </div>
       </div>
       <div className="fx-availability-list">
@@ -4668,8 +5378,10 @@ function SettingsView({
   onCleanup,
   onCheckUpdates,
   onInstallUpdate,
+  onInstallEffectPlugins,
   onOpenReleases,
   onPrune,
+  pluginInstallBusy,
 }: {
   activeThemeId: string;
   audioActionReport: AudioActionReport | null;
@@ -4685,8 +5397,10 @@ function SettingsView({
   onCleanup: () => void | Promise<unknown>;
   onCheckUpdates: () => void;
   onInstallUpdate: () => void;
+  onInstallEffectPlugins: () => void;
   onOpenReleases: () => void;
   onPrune: () => void | Promise<unknown>;
+  pluginInstallBusy: boolean;
 }) {
   const updateSettings = (settings: MixerSettings) => void setSettings(settings);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
@@ -4915,8 +5629,10 @@ function SettingsView({
       {settingsTab === "health" && (
         <DiagnosticsView
           audioActionReport={audioActionReport}
+          onInstallEffectPlugins={onInstallEffectPlugins}
           onCleanup={onCleanup}
           onPrune={onPrune}
+          pluginInstallBusy={pluginInstallBusy}
           state={state}
           run={run}
         />
@@ -5384,9 +6100,56 @@ function mixIconComponent(iconId: string): typeof SlidersHorizontal {
   return MIX_ICON_OPTIONS.find((option) => option.id === iconId)?.icon ?? AudioLines;
 }
 
+function mixIconLabel(iconId: string): string {
+  return MIX_ICON_OPTIONS.find((option) => option.id === iconId)?.label ?? "Audio";
+}
+
+function sourceIconLabel(iconId: string): string {
+  return SOURCE_ICON_OPTIONS.find((option) => option.id === iconId)?.label ?? "Audio";
+}
+
+function channelIconId(channel: Channel): string {
+  return channel.icon || defaultChannelIconForChannel(channel);
+}
+
+function channelIconComponent(channel: Channel): typeof Headphones {
+  const iconId = channelIconId(channel);
+  return (
+    SOURCE_ICON_OPTIONS.find((option) => option.id === iconId)?.icon ??
+    MIX_ICON_OPTIONS.find((option) => option.id === iconId)?.icon ??
+    AudioLines
+  ) as typeof Headphones;
+}
+
+function defaultChannelIconForChannel(channel: Channel): string {
+  const value = `${channel.id} ${channel.name}`.toLowerCase();
+  if (channel.kind === "microphone" || channel.kind === "generic" || value.includes("input") || value.includes("mic")) {
+    return "mic";
+  }
+  if (channel.kind === "soundboard" || value.includes("sfx") || value.includes("sound")) return "sfx";
+  if (channel.kind === "system" || value.includes("system") || value.includes("desktop")) return "system";
+  if (value.includes("game")) return "game";
+  if (value.includes("browser") || value.includes("web") || value.includes("chrome") || value.includes("firefox")) return "browser";
+  if (value.includes("chat") || value.includes("discord") || value.includes("voice")) return "chat";
+  if (value.includes("music") || value.includes("spotify")) return "music";
+  if (value.includes("media") || value.includes("video")) return "media";
+  return "audio";
+}
+
 function mixOutputDevices(mix: Mix): string[] {
   const outputs = mix.output_devices?.filter(Boolean) ?? [];
   return outputs.length > 0 ? outputs : mix.monitor_output ? [mix.monitor_output] : [];
+}
+
+function mixOutputSummary(mix: Mix, outputs: DeviceInfo[], settings: MixerSettings): string {
+  if (mix.id === "monitor" && settings.monitor_follows_default_output) return "Auto output";
+  const selectedOutputs = mixOutputDevices(mix);
+  if (selectedOutputs.length === 0) return "No direct output";
+  const labels = selectedOutputs.map((outputId) =>
+    outputs.find((output) => output.id === outputId)?.description ?? outputId,
+  );
+  if (labels.length <= 2) return labels.join(", ");
+  return `${labels.slice(0, 2).join(", ")} +${labels.length - 2}`;
 }
 
 function matcherForStream(stream: AppStream): AppMatcher {

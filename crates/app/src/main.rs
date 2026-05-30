@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -22,8 +23,9 @@ use wavelinux_engine::{
 };
 use wavelinux_model::{
     AppMatcher, AppRoute, AppStateSnapshot, AppVolumePreset, Channel, ChannelInputMode,
-    ChannelKind, EffectInstance, FallbackHardwareProfile, HardwareProfileUiState, KnownApp,
-    LatencyPolicy, LevelMeter, Mix, MixBus, MixerConfig, MixerSettings, RoutingPolicy,
+    ChannelKind, EffectAvailability, EffectCatalog, EffectInstance, FallbackHardwareProfile,
+    HardwareProfileUiState, KnownApp, LatencyPolicy, LevelMeter, Mix, MixBus, MixerConfig,
+    MixerSettings, RoutingPolicy,
 };
 
 struct EngineState {
@@ -80,6 +82,42 @@ struct UpdateInstallResult {
     installed: bool,
     version: Option<String>,
     message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct EffectPluginInstallResult {
+    attempted: bool,
+    success: bool,
+    manager: String,
+    packages: Vec<String>,
+    aur_packages: Vec<String>,
+    missing_before: Vec<String>,
+    missing_after: Vec<String>,
+    stdout: String,
+    stderr: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageManager {
+    Apt,
+    Dnf,
+    Pacman,
+    Zypper,
+    Unknown,
+}
+
+impl PackageManager {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Apt => "apt",
+            Self::Dnf => "dnf",
+            Self::Pacman => "pacman",
+            Self::Zypper => "zypper",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[tauri::command]
@@ -142,6 +180,15 @@ fn set_mix_icon(
     icon: Option<String>,
 ) -> Result<Mix, String> {
     tauri_result(engine.engine.set_mix_icon(mix_id, icon))
+}
+
+#[tauri::command]
+fn set_channel_icon(
+    engine: State<'_, EngineState>,
+    channel_id: String,
+    icon: Option<String>,
+) -> Result<Channel, String> {
+    tauri_result(engine.engine.set_channel_icon(channel_id, icon))
 }
 
 #[tauri::command]
@@ -723,8 +770,432 @@ fn open_release_page(app: AppHandle) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
+#[tauri::command]
+fn install_effect_plugins(
+    engine: State<'_, EngineState>,
+) -> Result<EffectPluginInstallResult, String> {
+    let before = engine
+        .engine
+        .refresh_effect_availability()
+        .map_err(|err| err.to_string())?;
+    let missing_before = missing_effect_names(&before);
+    if missing_before.is_empty() {
+        return Ok(EffectPluginInstallResult {
+            attempted: false,
+            success: true,
+            manager: detect_package_manager().id().into(),
+            packages: Vec::new(),
+            aur_packages: Vec::new(),
+            missing_before,
+            missing_after: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            message: "All optional effect plugins are already installed and detected".into(),
+        });
+    }
+
+    let missing_ids = missing_effect_ids(&before);
+    let manager = detect_package_manager();
+    if manager == PackageManager::Unknown {
+        return Ok(EffectPluginInstallResult {
+            attempted: false,
+            success: false,
+            manager: manager.id().into(),
+            packages: Vec::new(),
+            aur_packages: Vec::new(),
+            missing_before,
+            missing_after: missing_effect_names(&before),
+            stdout: String::new(),
+            stderr: String::new(),
+            message: "No supported package manager was found. Install DeepFilterNet3, RNNoise, and SWH LADSPA packages manually.".into(),
+        });
+    }
+
+    let (packages, aur_packages) = resolve_effect_plugin_packages(manager, &missing_ids);
+    if packages.is_empty() && aur_packages.is_empty() {
+        return Ok(EffectPluginInstallResult {
+            attempted: false,
+            success: false,
+            manager: manager.id().into(),
+            packages,
+            aur_packages,
+            missing_before,
+            missing_after: missing_effect_names(&before),
+            stdout: String::new(),
+            stderr: String::new(),
+            message: format!(
+                "No known installable packages were found for {}. Install the missing effect plugins manually.",
+                manager.id()
+            ),
+        });
+    }
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut command_failed = None;
+
+    if !packages.is_empty() {
+        match install_system_packages(manager, &packages) {
+            Ok(output) => {
+                append_output(&mut stdout, &mut stderr, output);
+            }
+            Err(err) => {
+                command_failed = Some(err);
+            }
+        }
+    }
+
+    if command_failed.is_none() && !aur_packages.is_empty() {
+        match install_aur_packages(&aur_packages) {
+            Ok(output) => {
+                append_output(&mut stdout, &mut stderr, output);
+            }
+            Err(err) => {
+                command_failed = Some(err);
+            }
+        }
+    }
+
+    let after = engine
+        .engine
+        .refresh_effect_availability()
+        .map_err(|err| err.to_string())?;
+    let missing_after = missing_effect_names(&after);
+    let success = command_failed.is_none() && missing_after.is_empty();
+    let message = if let Some(err) = command_failed {
+        format!("Effect plugin install did not complete: {err}")
+    } else if missing_after.is_empty() {
+        "Effect plugins installed and detected. Repair audio if a running FX chain needs the new plugins.".into()
+    } else {
+        format!(
+            "Install finished, but WaveLinux still cannot verify: {}",
+            missing_after.join(", ")
+        )
+    };
+
+    Ok(EffectPluginInstallResult {
+        attempted: true,
+        success,
+        manager: manager.id().into(),
+        packages,
+        aur_packages,
+        missing_before,
+        missing_after,
+        stdout,
+        stderr,
+        message,
+    })
+}
+
 fn tauri_result<T>(result: Result<T, EngineError>) -> Result<T, String> {
     result.map_err(|err| err.to_string())
+}
+
+fn missing_effect_ids(availability: &[EffectAvailability]) -> Vec<String> {
+    availability
+        .iter()
+        .filter(|effect| !effect.available)
+        .map(|effect| effect.effect_id.clone())
+        .collect()
+}
+
+fn missing_effect_names(availability: &[EffectAvailability]) -> Vec<String> {
+    let catalog = EffectCatalog::default();
+    availability
+        .iter()
+        .filter(|effect| !effect.available)
+        .map(|effect| {
+            catalog
+                .effects
+                .iter()
+                .find(|definition| definition.id == effect.effect_id)
+                .map(|definition| definition.name.clone())
+                .unwrap_or_else(|| effect.effect_id.clone())
+        })
+        .collect()
+}
+
+fn resolve_effect_plugin_packages(
+    manager: PackageManager,
+    missing_ids: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut packages = Vec::new();
+    let mut aur_packages = Vec::new();
+
+    if missing_ids.iter().any(|id| id == "deepfilternet") {
+        match manager {
+            PackageManager::Apt => {
+                push_first_available_package(
+                    manager,
+                    &mut packages,
+                    &["deepfilternet-ladspa", "deepfilternet"],
+                );
+            }
+            PackageManager::Dnf | PackageManager::Zypper => {
+                push_first_available_package(manager, &mut packages, &["deepfilternet"]);
+            }
+            PackageManager::Pacman => {
+                push_first_available_package(
+                    manager,
+                    &mut packages,
+                    &["deepfilternet-plugin-pipewire-bin"],
+                );
+                if packages
+                    .iter()
+                    .all(|package| package != "deepfilternet-plugin-pipewire-bin")
+                {
+                    push_first_available_aur_package(
+                        &mut aur_packages,
+                        &[
+                            "deepfilternet-plugin-pipewire-bin",
+                            "deepfilternet-ladspa",
+                            "deepfilternet",
+                        ],
+                    );
+                }
+            }
+            PackageManager::Unknown => {}
+        }
+    }
+
+    if missing_ids.iter().any(|id| id == "rnnoise") {
+        match manager {
+            PackageManager::Apt => {
+                push_first_available_package(
+                    manager,
+                    &mut packages,
+                    &["librnnoise-ladspa", "noise-suppression-for-voice"],
+                );
+            }
+            PackageManager::Dnf => {
+                push_first_available_package(
+                    manager,
+                    &mut packages,
+                    &["noise-suppression-for-voice", "rnnoise"],
+                );
+            }
+            PackageManager::Pacman => {
+                push_first_available_package(
+                    manager,
+                    &mut packages,
+                    &["noise-suppression-for-voice"],
+                );
+                if packages
+                    .iter()
+                    .all(|package| package != "noise-suppression-for-voice")
+                {
+                    push_first_available_aur_package(
+                        &mut aur_packages,
+                        &["noise-suppression-for-voice"],
+                    );
+                }
+            }
+            PackageManager::Zypper => {
+                push_first_available_package(manager, &mut packages, &["rnnoise"]);
+            }
+            PackageManager::Unknown => {}
+        }
+    }
+
+    if missing_ids
+        .iter()
+        .any(|id| matches!(id.as_str(), "compressor" | "gate" | "limiter"))
+    {
+        match manager {
+            PackageManager::Apt => push_first_available_package(
+                manager,
+                &mut packages,
+                &["swh-plugins", "lsp-plugins-ladspa"],
+            ),
+            PackageManager::Dnf | PackageManager::Zypper => push_first_available_package(
+                manager,
+                &mut packages,
+                &["ladspa-swh-plugins", "lsp-plugins-ladspa"],
+            ),
+            PackageManager::Pacman => {
+                push_first_available_package(manager, &mut packages, &["swh-plugins"]);
+            }
+            PackageManager::Unknown => {}
+        }
+    }
+
+    (packages, aur_packages)
+}
+
+fn push_first_available_package(
+    manager: PackageManager,
+    packages: &mut Vec<String>,
+    candidates: &[&str],
+) {
+    if let Some(package) = candidates
+        .iter()
+        .find(|package| package_available(manager, package))
+    {
+        push_unique(packages, package);
+    }
+}
+
+fn push_first_available_aur_package(packages: &mut Vec<String>, candidates: &[&str]) {
+    if let Some(package) = candidates
+        .iter()
+        .find(|package| aur_package_available(package))
+    {
+        push_unique(packages, package);
+    }
+}
+
+fn push_unique(packages: &mut Vec<String>, package: &str) {
+    if packages.iter().all(|item| item != package) {
+        packages.push(package.into());
+    }
+}
+
+fn detect_package_manager() -> PackageManager {
+    if command_exists("apt-get") {
+        PackageManager::Apt
+    } else if command_exists("dnf") {
+        PackageManager::Dnf
+    } else if command_exists("pacman") {
+        PackageManager::Pacman
+    } else if command_exists("zypper") {
+        PackageManager::Zypper
+    } else {
+        PackageManager::Unknown
+    }
+}
+
+fn package_available(manager: PackageManager, package: &str) -> bool {
+    let (program, args): (&str, Vec<&str>) = match manager {
+        PackageManager::Apt => ("apt-cache", vec!["show", package]),
+        PackageManager::Dnf => ("dnf", vec!["-q", "info", package]),
+        PackageManager::Pacman => ("pacman", vec!["-Si", package]),
+        PackageManager::Zypper => (
+            "zypper",
+            vec!["--non-interactive", "search", "--exact-match", package],
+        ),
+        PackageManager::Unknown => return false,
+    };
+    command_status_success(program, &args)
+}
+
+fn aur_package_available(package: &str) -> bool {
+    if command_exists("paru") {
+        command_status_success("paru", &["-Si", package])
+    } else if command_exists("yay") {
+        command_status_success("yay", &["-Si", package])
+    } else {
+        false
+    }
+}
+
+fn install_system_packages(
+    manager: PackageManager,
+    packages: &[String],
+) -> Result<Vec<Output>, String> {
+    let mut outputs = Vec::new();
+    match manager {
+        PackageManager::Apt => {
+            outputs.push(run_privileged_command("apt-get", &["update".into()])?);
+            let mut args = vec!["install".into(), "-y".into()];
+            args.extend(packages.iter().cloned());
+            outputs.push(run_privileged_command("apt-get", &args)?);
+        }
+        PackageManager::Dnf => {
+            let mut args = vec!["install".into(), "-y".into()];
+            args.extend(packages.iter().cloned());
+            outputs.push(run_privileged_command("dnf", &args)?);
+        }
+        PackageManager::Pacman => {
+            let mut args = vec!["-S".into(), "--needed".into(), "--noconfirm".into()];
+            args.extend(packages.iter().cloned());
+            outputs.push(run_privileged_command("pacman", &args)?);
+        }
+        PackageManager::Zypper => {
+            let mut args = vec![
+                "--non-interactive".into(),
+                "install".into(),
+                "--no-recommends".into(),
+            ];
+            args.extend(packages.iter().cloned());
+            outputs.push(run_privileged_command("zypper", &args)?);
+        }
+        PackageManager::Unknown => {}
+    }
+    Ok(outputs)
+}
+
+fn install_aur_packages(packages: &[String]) -> Result<Vec<Output>, String> {
+    let helper = if command_exists("paru") {
+        "paru"
+    } else if command_exists("yay") {
+        "yay"
+    } else {
+        return Err("No AUR helper found for DeepFilterNet3. Install paru or yay, or install deepfilternet-plugin-pipewire-bin manually.".into());
+    };
+
+    let mut args = vec!["-S".into(), "--needed".into(), "--noconfirm".into()];
+    args.extend(packages.iter().cloned());
+    Ok(vec![run_command_capture(helper, &args)?])
+}
+
+fn run_privileged_command(program: &str, args: &[String]) -> Result<Output, String> {
+    if running_as_root() {
+        return run_command_capture(program, args);
+    }
+    if command_exists("pkexec") {
+        let mut pkexec_args = vec![program.to_string()];
+        pkexec_args.extend(args.iter().cloned());
+        return run_command_capture("pkexec", &pkexec_args);
+    }
+    if command_exists("sudo") {
+        let mut sudo_args = vec!["-n".to_string(), program.to_string()];
+        sudo_args.extend(args.iter().cloned());
+        return run_command_capture("sudo", &sudo_args);
+    }
+    Err("No pkexec or sudo command is available for privileged package installation".into())
+}
+
+fn run_command_capture(program: &str, args: &[String]) -> Result<Output, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|err| format!("{program} failed to start: {err}"))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(format!(
+            "{} {} exited with status {}: {}",
+            program,
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn command_status_success(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn command_exists(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+}
+
+fn running_as_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+fn append_output(stdout: &mut String, stderr: &mut String, outputs: Vec<Output>) {
+    for output in outputs {
+        stdout.push_str(&String::from_utf8_lossy(&output.stdout));
+        stderr.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
 }
 
 fn ui_theme_preference_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -874,7 +1345,7 @@ fn shutdown_audio_graph(engine: &WaveLinuxEngine, shutdown_started: &AtomicBool)
 fn show_main_window(app: &AppHandle) {
     let window = app.get_webview_window("main").or_else(|| {
         WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-            .title("WaveLinux 4.1")
+            .title(format!("WaveLinux {}", env!("CARGO_PKG_VERSION")))
             .inner_size(1280.0, 820.0)
             .min_inner_size(960.0, 640.0)
             .resizable(true)
@@ -923,10 +1394,11 @@ fn build_tray(
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
     let icon = Image::from_bytes(include_bytes!("../icons/tray-icon.png"))?;
+    let tooltip = format!("WaveLinux {}", env!("CARGO_PKG_VERSION"));
 
     TrayIconBuilder::with_id("main")
         .icon(icon)
-        .tooltip("WaveLinux 4.1")
+        .tooltip(&tooltip)
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "show" => {
@@ -1014,6 +1486,7 @@ fn main() {
             set_mix_volume,
             set_mix_mute,
             set_mix_icon,
+            set_channel_icon,
             set_mix_monitor_output,
             set_mix_outputs,
             create_channel,
@@ -1062,6 +1535,7 @@ fn main() {
             check_for_updates,
             install_update,
             open_release_page,
+            install_effect_plugins,
         ])
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

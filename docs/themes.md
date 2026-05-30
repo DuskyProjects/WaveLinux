@@ -36,6 +36,9 @@ WaveLinux ships these built-in choices:
 - `wavelink3`: Wave Link 3-style Matrix, the newer light matrix workflow.
 - `wavelink3_dark`: Wave Link 3-style Matrix Dark.
 
+When there is no saved interface preference yet, WaveLinux starts with
+`wavelink3_dark`.
+
 Legacy ids are accepted for migration:
 
 - `classic` resolves to `wavelink2`.

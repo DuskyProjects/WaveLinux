@@ -1,5 +1,5 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import { loadStoredThemeId, saveStoredThemeId } from "./themes";
+import { DEFAULT_UI_THEME_ID, loadStoredThemeId, saveStoredThemeId } from "./themes";
 import type {
   AppMatcher,
   AppStateSnapshot,
@@ -54,7 +54,7 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
   }
 
   if (command === "set_ui_theme_preference") {
-    const themeId = stringArg(args, "themeId") || stringArg(args, "theme_id") || "wavelink2";
+    const themeId = stringArg(args, "themeId") || stringArg(args, "theme_id") || DEFAULT_UI_THEME_ID;
     saveStoredThemeId(themeId);
     return { theme_id: themeId };
   }
@@ -238,6 +238,7 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       kind,
       virtual_sink_name: `wavelinux_channel_${id}`,
       source_device: null,
+      icon: null,
       input_mode: kind === "generic" || kind === "microphone" ? "sum_mono" : "stereo",
       linked: false,
       mix_buses: Object.fromEntries(
@@ -263,6 +264,15 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     const channel = findChannel(stringArg(args, "channelId"));
     const name = stringArg(args, "name");
     if (channel && name) channel.name = name;
+    return channel ?? {};
+  }
+
+  if (command === "set_channel_icon") {
+    const channel = findChannel(stringArg(args, "channelId"));
+    if (channel) {
+      const icon = stringArg(args, "icon");
+      channel.icon = icon || null;
+    }
     return channel ?? {};
   }
 
@@ -330,7 +340,7 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return {
       available: false,
       install_supported: false,
-      current_version: "4.2.0",
+      current_version: "4.2.1",
       version: null,
       date: null,
       body: null,
@@ -347,6 +357,27 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       installed: false,
       version: null,
       message: "Self-update is available for AppImage installs",
+    };
+  }
+
+  if (command === "install_effect_plugins") {
+    for (const effect of demoState.graph.effect_availability) {
+      effect.available = true;
+      if (effect.effect_id === "deepfilternet") {
+        effect.detail = "/usr/lib/ladspa/libdeep_filter_ladspa.so (DeepFilterNet3 model)";
+      }
+    }
+    return {
+      attempted: true,
+      success: true,
+      manager: "demo",
+      packages: [],
+      aur_packages: [],
+      missing_before: [],
+      missing_after: [],
+      stdout: "",
+      stderr: "",
+      message: "Effect plugins installed and detected",
     };
   }
 
@@ -913,16 +944,32 @@ const catalog: EffectCatalog = {
   effects: [
     {
       id: "deepfilternet",
-      name: "DeepFilterNet",
-      description: "Neural noise suppression",
+      name: "DeepFilterNet3",
+      description: "DeepFilterNet3 neural noise suppression",
       plugin_hint: {},
       params: [
+        {
+          id: "input_trim_db",
+          label: "Input Trim",
+          min: -24,
+          max: 0,
+          default: -6,
+          unit: " dB",
+        },
+        {
+          id: "output_makeup_db",
+          label: "Output Makeup",
+          min: 0,
+          max: 18,
+          default: 6,
+          unit: " dB",
+        },
         {
           id: "attenuation_limit_db",
           label: "Reduction Limit",
           min: 0,
           max: 100,
-          default: 100,
+          default: 18,
           unit: " dB",
         },
         {
@@ -938,7 +985,7 @@ const catalog: EffectCatalog = {
           label: "Max ERB Threshold",
           min: -15,
           max: 35,
-          default: 35,
+          default: 30,
           unit: " dB",
         },
         {
@@ -946,7 +993,7 @@ const catalog: EffectCatalog = {
           label: "Max DF Threshold",
           min: -15,
           max: 35,
-          default: 35,
+          default: 20,
           unit: " dB",
         },
         {
@@ -954,7 +1001,7 @@ const catalog: EffectCatalog = {
           label: "Min Buffer",
           min: 0,
           max: 10,
-          default: 0,
+          default: 8,
           unit: " frames",
         },
         {
@@ -967,9 +1014,45 @@ const catalog: EffectCatalog = {
         },
       ],
       presets: [
-        { name: "Natural 12 dB", values: { attenuation_limit_db: 12 } },
-        { name: "Medium 24 dB", values: { attenuation_limit_db: 24 } },
-        { name: "Full 100 dB", values: { attenuation_limit_db: 100 } },
+        {
+          name: "Balanced Voice",
+          values: {
+            input_trim_db: -6,
+            output_makeup_db: 6,
+            attenuation_limit_db: 18,
+            min_processing_threshold_db: -15,
+            max_erb_processing_threshold_db: 30,
+            max_df_processing_threshold_db: 20,
+            min_processing_buffer_frames: 8,
+            post_filter_beta: 0,
+          },
+        },
+        {
+          name: "Natural Voice",
+          values: {
+            input_trim_db: -3,
+            output_makeup_db: 3,
+            attenuation_limit_db: 12,
+            min_processing_threshold_db: -15,
+            max_erb_processing_threshold_db: 30,
+            max_df_processing_threshold_db: 10,
+            min_processing_buffer_frames: 6,
+            post_filter_beta: 0,
+          },
+        },
+        {
+          name: "Noisy Room",
+          values: {
+            input_trim_db: -6,
+            output_makeup_db: 6,
+            attenuation_limit_db: 70,
+            min_processing_threshold_db: -15,
+            max_erb_processing_threshold_db: 30,
+            max_df_processing_threshold_db: 20,
+            min_processing_buffer_frames: 8,
+            post_filter_beta: 0,
+          },
+        },
       ],
     },
     {
@@ -1245,6 +1328,7 @@ export const demoState: AppStateSnapshot = {
         kind,
         virtual_sink_name: `wavelinux_channel_${id}`,
         source_device: index === 0 ? "alsa_input.usb_interface" : null,
+        icon: null,
         input_mode: kind === "generic" ? "sum_mono" : "stereo",
         linked: false,
         mix_buses: {
@@ -1314,7 +1398,7 @@ export const demoState: AppStateSnapshot = {
   },
   diagnostics: [
     { code: "host_command.pipewire", severity: "info", message: "pipewire is available", action: null },
-    { code: "plugin.deepfilternet", severity: "info", message: "DeepFilterNet LADSPA detected", action: null },
+    { code: "plugin.deepfilternet", severity: "info", message: "DeepFilterNet3 LADSPA detected", action: null },
   ],
   engine: {
     dry_run: true,
