@@ -236,6 +236,13 @@ After installing udev rules manually, reload rules with your distribution's
 standard `udevadm control --reload-rules && udevadm trigger` flow and reconnect
 the device.
 
+## Testing Health Reports
+
+For beta testing and GitHub issues, use `Settings -> Health -> Testing Health
+Report`. It creates one copyable Markdown block with engine state, update
+channel, diagnostics, audio device summaries, Elgato detection, streamer-device
+detection, and recent debug-log lines.
+
 ## Interface Themes
 
 WaveLinux separates UI selection from the audio engine. The Settings page has

@@ -1085,7 +1085,9 @@ input[type="range"] {
 .graph-debug,
 .graph-debug-grid,
 .latency-card,
-.fx-availability {
+.fx-availability,
+.testing-health,
+.testing-health-report {
   box-sizing: border-box;
   width: 100%;
   min-width: 0;
@@ -1882,6 +1884,22 @@ input[type="range"] {
   height: 16px;
   margin: 0;
   accent-color: var(--wl-accent, #45bacb);
+}
+
+.testing-health .panel-actions {
+  flex: 0 0 auto;
+}
+
+.testing-health-report {
+  min-height: 280px;
+  resize: vertical;
+  border: 1px solid #28313a;
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(12, 18, 24, 0.72);
+  color: var(--wl-text, #dbe5ef);
+  font: 12px/1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  scrollbar-width: thin;
 }
 
 .update-card .updater-checkbox span {

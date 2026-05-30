@@ -66,6 +66,7 @@ import type {
   Channel,
   ChannelKind,
   CommandExecution,
+  Diagnostic,
   ElgatoDeviceSummary,
   ElgatoWaveXlrState,
   EffectPluginInstallResult,
@@ -5070,7 +5071,66 @@ function DiagnosticsView({
 }) {
   const [report, setReport] = useState<SoundCheckReport | null>(null);
   const [graphReport, setGraphReport] = useState<GraphDebugReport | null>(null);
+  const [streamerDevices, setStreamerDevices] = useState<StreamerDeviceSummary[]>([]);
+  const [streamerDeviceError, setStreamerDeviceError] = useState<string | null>(null);
+  const [elgatoDevices, setElgatoDevices] = useState<ElgatoDeviceSummary[]>([]);
+  const [elgatoDeviceError, setElgatoDeviceError] = useState<string | null>(null);
+  const [testingReportStatus, setTestingReportStatus] = useState<string | null>(null);
   const diagnostics = report?.diagnostics ?? state.diagnostics;
+  const loadTestingDevices = useCallback(async () => {
+    try {
+      const next = await invoke<StreamerDeviceSummary[]>("list_streamer_devices");
+      setStreamerDevices(next);
+      setStreamerDeviceError(null);
+    } catch (error) {
+      setStreamerDevices([]);
+      setStreamerDeviceError(String(error));
+    }
+    try {
+      const next = await invoke<ElgatoDeviceSummary[]>("list_elgato_devices");
+      setElgatoDevices(next);
+      setElgatoDeviceError(null);
+    } catch (error) {
+      setElgatoDevices([]);
+      setElgatoDeviceError(String(error));
+    }
+  }, []);
+  useEffect(() => {
+    void loadTestingDevices();
+  }, [loadTestingDevices]);
+  const testingHealthReport = useMemo(
+    () =>
+      buildTestingHealthReport({
+        audioActionReport,
+        diagnostics,
+        elgatoDeviceError,
+        elgatoDevices,
+        graphReport,
+        report,
+        state,
+        streamerDeviceError,
+        streamerDevices,
+      }),
+    [
+      audioActionReport,
+      diagnostics,
+      elgatoDeviceError,
+      elgatoDevices,
+      graphReport,
+      report,
+      state,
+      streamerDeviceError,
+      streamerDevices,
+    ],
+  );
+  const copyTestingHealthReport = async () => {
+    try {
+      await navigator.clipboard.writeText(testingHealthReport);
+      setTestingReportStatus("Copied");
+    } catch {
+      setTestingReportStatus("Copy failed");
+    }
+  };
   return (
     <section className="two-column diagnostics-view">
       <div className="panel">
@@ -5169,9 +5229,214 @@ function DiagnosticsView({
           onInstallMissing={onInstallEffectPlugins}
           state={state}
         />
+        <TestingHealthReport
+          onCopy={copyTestingHealthReport}
+          onRefresh={loadTestingDevices}
+          report={testingHealthReport}
+          status={testingReportStatus}
+        />
       </div>
     </section>
   );
+}
+
+function TestingHealthReport({
+  onCopy,
+  onRefresh,
+  report,
+  status,
+}: {
+  onCopy: () => void | Promise<unknown>;
+  onRefresh: () => void | Promise<unknown>;
+  report: string;
+  status: string | null;
+}) {
+  return (
+    <div className="testing-health command-report">
+      <div className="command-report-header">
+        <div>
+          <strong>Testing Health Report</strong>
+          <span>GitHub issue payload</span>
+        </div>
+        <div className="panel-actions">
+          <button
+            className="secondary-button"
+            onClick={() => void onRefresh()}
+            type="button"
+          >
+            <RefreshCw size={16} />
+            Refresh
+          </button>
+          <button
+            className="secondary-button"
+            onClick={() => void onCopy()}
+            type="button"
+          >
+            {status === "Copied" ? <Check size={16} /> : <Copy size={16} />}
+            {status ?? "Copy"}
+          </button>
+        </div>
+      </div>
+      <textarea
+        aria-label="Testing health report"
+        className="testing-health-report"
+        readOnly
+        value={report}
+      />
+    </div>
+  );
+}
+
+function buildTestingHealthReport({
+  audioActionReport,
+  diagnostics,
+  elgatoDeviceError,
+  elgatoDevices,
+  graphReport,
+  report,
+  state,
+  streamerDeviceError,
+  streamerDevices,
+}: {
+  audioActionReport: AudioActionReport | null;
+  diagnostics: Diagnostic[];
+  elgatoDeviceError: string | null;
+  elgatoDevices: ElgatoDeviceSummary[];
+  graphReport: GraphDebugReport | null;
+  report: SoundCheckReport | null;
+  state: AppStateSnapshot;
+  streamerDeviceError: string | null;
+  streamerDevices: StreamerDeviceSummary[];
+}) {
+  const settings = state.config.settings;
+  const missingEffects =
+    report?.missing_effects ??
+    state.graph.effect_availability
+      .filter((effect) => !effect.available)
+      .map((effect) => `${effect.effect_id}: ${effect.detail}`);
+  const lines = [
+    "# WaveLinux Testing Health Report",
+    "",
+    `Generated: ${new Date().toISOString()}`,
+    `Config version: ${state.config.version}`,
+    `Release channel: ${settings.release_channel}`,
+    `Auto check updates: ${yesNo(settings.auto_check_updates)}`,
+    `Auto install updates: ${yesNo(settings.auto_install_updates)}`,
+    "",
+    "## Engine",
+    `Healthy: ${yesNo(state.engine.healthy)}`,
+    `Audio graph running: ${yesNo(state.engine.audio_graph_running)}`,
+    `Dry run: ${yesNo(state.engine.dry_run)}`,
+    `Message: ${state.engine.message || "none"}`,
+    `Last refresh unix: ${state.engine.last_refresh_unix}`,
+    "",
+    "## Audio Settings",
+    `Sample rate: ${state.config.audio.sample_rate_hz}`,
+    `Bit depth: ${state.config.audio.bit_depth}`,
+    `Channel layout: ${state.config.audio.channel_layout}`,
+    `Mono inputs to stereo: ${yesNo(state.config.audio.mono_inputs_to_stereo)}`,
+    `Low-latency monitoring: ${yesNo(settings.low_latency_mic_monitoring)}`,
+    `Stream sync delay: ${settings.stream_sync_delay_msec} ms`,
+    `Monitor sync delay: ${settings.monitor_sync_delay_msec} ms`,
+    "",
+    "## Graph Counts",
+    `Mixes: ${state.config.mixes.length}`,
+    `Channels: ${state.config.channels.length}`,
+    `Inputs: ${state.graph.inputs.length}`,
+    `Outputs: ${state.graph.outputs.length}`,
+    `App streams: ${state.graph.app_streams.length}`,
+    `Meters: ${state.graph.meters.length}`,
+    `Managed modules: ${graphReport?.managed_modules.length ?? "not loaded"}`,
+    `Routes: ${graphReport ? graphReport.sink_input_routes.length + graphReport.source_output_routes.length : "not loaded"}`,
+    `Stale processes: ${graphReport?.stale_processes.length ?? "not loaded"}`,
+    "",
+    "## Devices",
+    "Inputs:",
+    ...reportDeviceList(state.graph.inputs),
+    "Outputs:",
+    ...reportDeviceList(state.graph.outputs),
+    "",
+    "## Streamer Devices",
+    ...(streamerDeviceError ? [`Detection error: ${streamerDeviceError}`] : reportStreamerDevices(streamerDevices)),
+    "",
+    "## Elgato Devices",
+    ...(elgatoDeviceError ? [`Detection error: ${elgatoDeviceError}`] : reportElgatoDevices(elgatoDevices)),
+    "",
+    "## Diagnostics",
+    ...reportDiagnostics(diagnostics),
+    "",
+    "## Effects",
+    ...(missingEffects.length ? missingEffects.map((effect) => `- Missing: ${effect}`) : ["- Missing: none"]),
+    "",
+    "## Sound Check",
+    report
+      ? `Active streams: ${report.active_stream_count}; virtual mixes: ${report.virtual_mix_count}; debug log: ${report.debug_log_path || "none"}`
+      : "Not run",
+    "",
+    "## Last Audio Action",
+    audioActionReport
+      ? `${audioActionReport.title}; commands: ${audioActionReport.commands.length}; planned: ${audioActionReport.plannedCount ?? "unknown"}; finished: ${new Date(audioActionReport.finishedAt).toISOString()}`
+      : "None",
+    "",
+    "## Recent Debug Log",
+    ...reportRecentLog(report, graphReport),
+  ];
+  return lines.join("\n");
+}
+
+function reportDeviceList(devices: DeviceInfo[]): string[] {
+  if (devices.length === 0) return ["- none"];
+  return devices.slice(0, 20).map((device) => {
+    const usb = device.vendor_id || device.product_id ? ` usb=${valueOrNone(device.vendor_id)}:${valueOrNone(device.product_id)}` : "";
+    const profile = device.matched_profile_id || device.active_profile || "none";
+    const defaultState = device.is_default ? " default" : "";
+    const virtualState = device.is_virtual ? " virtual" : "";
+    return `- ${device.description || device.name} | id=${device.id} | available=${yesNo(device.is_available)}${defaultState}${virtualState} | bus=${valueOrNone(device.bus)}${usb} | profile=${profile}`;
+  });
+}
+
+function reportStreamerDevices(devices: StreamerDeviceSummary[]): string[] {
+  if (devices.length === 0) return ["- none detected"];
+  return devices.map((device) => {
+    const usb = device.vendor_id || device.product_id ? ` | usb=${valueOrNone(device.vendor_id)}:${valueOrNone(device.product_id)}` : "";
+    return `- ${device.name} | ${device.family}/${device.transport} | enabled=${yesNo(device.enabled)} | status=${device.permission_status}${usb} | caps=${formatStreamerCaps(device)} | ${device.message || "no message"}`;
+  });
+}
+
+function reportElgatoDevices(devices: ElgatoDeviceSummary[]): string[] {
+  if (devices.length === 0) return ["- none detected"];
+  return devices.map((device) => {
+    const usb = device.vendor_id || device.product_id ? ` | usb=${valueOrNone(device.vendor_id)}:${valueOrNone(device.product_id)}` : "";
+    return `- ${device.name} | ${device.kind} | controls=${yesNo(device.controls_supported)} | bus=${valueOrNone(device.bus)}${usb} | alsa_card=${valueOrNone(device.alsa_card)} | ${device.message || "no message"}`;
+  });
+}
+
+function reportDiagnostics(diagnostics: Diagnostic[]): string[] {
+  if (diagnostics.length === 0) return ["- none"];
+  return diagnostics.map((item) => `- [${item.severity}] ${item.code}: ${item.message}${item.action ? ` (${item.action})` : ""}`);
+}
+
+function reportRecentLog(report: SoundCheckReport | null, graphReport: GraphDebugReport | null): string[] {
+  const lines = graphReport?.recent_log_lines.length
+    ? graphReport.recent_log_lines
+    : report?.recent_log_lines ?? [];
+  if (lines.length === 0) return ["No recent log lines captured."];
+  return ["```text", ...lines.slice(-25), "```"];
+}
+
+function formatStreamerCaps(device: StreamerDeviceSummary): string {
+  const caps = Object.entries(device.capabilities)
+    .filter(([, enabled]) => enabled)
+    .map(([key]) => key);
+  return caps.length ? caps.join(",") : "none";
+}
+
+function yesNo(value: boolean): string {
+  return value ? "yes" : "no";
+}
+
+function valueOrNone(value: string | null | undefined): string {
+  return value && value.trim() ? value : "none";
 }
 
 function LatencySummary({ state }: { state: AppStateSnapshot }) {
