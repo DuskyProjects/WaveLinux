@@ -64,6 +64,18 @@ const BETA_UPDATE_ENDPOINT: &str =
 const UI_THEME_PREFERENCE_FILE: &str = "ui-theme.json";
 const UI_THEMES_DIR: &str = "themes";
 
+fn apply_webkit_runtime_defaults() {
+    if std::env::var_os("WAVELINUX_DISABLE_WEBKIT_WORKAROUNDS").is_some()
+        || std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some()
+    {
+        return;
+    }
+
+    // WebKitGTK's DMA-BUF renderer can abort the WebProcess on some compositor/GPU stacks.
+    // Set this before Tauri initializes WebKit so child processes inherit it.
+    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct UpdateInfo {
@@ -1635,6 +1647,8 @@ fn main() {
     }) {
         std::process::exit(run_hardware_profile_prewarm());
     }
+
+    apply_webkit_runtime_defaults();
 
     let shutdown_started = Arc::new(AtomicBool::new(false));
     let allow_exit = Arc::new(AtomicBool::new(false));

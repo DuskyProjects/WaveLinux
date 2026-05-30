@@ -28,7 +28,14 @@ wavelinux_sanitize_runtime_env() {
     2>/dev/null || true
 }
 
+wavelinux_apply_webkit_runtime_defaults() {
+  if [[ -z "${WAVELINUX_DISABLE_WEBKIT_WORKAROUNDS:-}" && -z "${WEBKIT_DISABLE_DMABUF_RENDERER+x}" ]]; then
+    export WEBKIT_DISABLE_DMABUF_RENDERER=1
+  fi
+}
+
 wavelinux_sanitize_runtime_env
+wavelinux_apply_webkit_runtime_defaults
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   if (( $# > 0 )); then
