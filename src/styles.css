@@ -1872,7 +1872,7 @@ input[type="range"] {
   align-items: center;
   gap: 8px;
   margin-top: 8px;
-  color: #dbe5ef;
+  color: var(--wl-text, #dbe5ef);
   cursor: pointer;
   font-size: 13px;
 }
@@ -1881,7 +1881,7 @@ input[type="range"] {
   width: 16px;
   height: 16px;
   margin: 0;
-  accent-color: #45bacb;
+  accent-color: var(--wl-accent, #45bacb);
 }
 
 .update-card .updater-checkbox span {
