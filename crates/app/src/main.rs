@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -63,17 +63,648 @@ const BETA_UPDATE_ENDPOINT: &str =
     "https://github.com/DuskyProjects/WaveLinux/releases/download/prerelease/latest.json";
 const UI_THEME_PREFERENCE_FILE: &str = "ui-theme.json";
 const UI_THEMES_DIR: &str = "themes";
+const WEBKIT_DMABUF_DISABLE_ENV: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+const WEBKIT_COMPOSITING_DISABLE_ENV: &str = "WEBKIT_DISABLE_COMPOSITING_MODE";
+const WEBKIT_SANDBOX_DISABLE_ENV: &str = "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS";
+const WEBKIT_WORKAROUNDS_DISABLE_ENV: &str = "WAVELINUX_DISABLE_WEBKIT_WORKAROUNDS";
+const WEBKIT_SANDBOX_KEEP_ENV: &str = "WAVELINUX_KEEP_WEBKIT_SANDBOX";
+const RUNTIME_INSTALL_SKIP_ENV: &str = "WAVELINUX_SKIP_RUNTIME_INSTALL";
+const RUNTIME_INSTALL_FORCE_ENV: &str = "WAVELINUX_INSTALL_RUNTIME_ON_START";
+const RUNTIME_DEPS_ASSUME_ENV: &str = "WAVELINUX_ASSUME_RUNTIME_DEPS";
+const APT_RUNTIME_PACKAGES: &[&str] = &[
+    "pipewire",
+    "wireplumber",
+    "pipewire-pulse",
+    "pipewire-bin",
+    "pulseaudio-utils",
+    "alsa-utils",
+    "libwebkit2gtk-4.1-0",
+    "libayatana-appindicator3-1",
+    "libusb-1.0-0",
+    "bubblewrap",
+    "xdg-dbus-proxy",
+    "xwayland",
+    "libegl1",
+    "libgl1",
+    "libgbm1",
+    "libdrm2",
+    "gstreamer1.0-plugins-base",
+    "gstreamer1.0-plugins-good",
+    "fonts-dejavu-core",
+    "xdg-desktop-portal",
+];
+const APT_APPIMAGE_HOST_PACKAGES: &[&str] = &[
+    "pipewire",
+    "wireplumber",
+    "pipewire-pulse",
+    "pipewire-bin",
+    "pulseaudio-utils",
+    "alsa-utils",
+    "xwayland",
+    "libegl1",
+    "libgl1",
+    "libgbm1",
+    "libdrm2",
+    "fonts-dejavu-core",
+    "xdg-desktop-portal",
+];
+const APT_PORTAL_BACKENDS: &[&str] = &[
+    "xdg-desktop-portal-gtk",
+    "xdg-desktop-portal-kde",
+    "xdg-desktop-portal-gnome",
+    "xdg-desktop-portal-wlr",
+];
+const DNF_RUNTIME_PACKAGES: &[&str] = &[
+    "pipewire",
+    "wireplumber",
+    "pipewire-pulseaudio",
+    "pulseaudio-utils",
+    "alsa-utils",
+    "webkit2gtk4.1",
+    "libappindicator-gtk3",
+    "libusb1",
+    "bubblewrap",
+    "xdg-dbus-proxy",
+    "xorg-x11-server-Xwayland",
+    "mesa-libEGL",
+    "mesa-libGL",
+    "mesa-libgbm",
+    "libdrm",
+    "gstreamer1-plugins-base",
+    "gstreamer1-plugins-good",
+    "google-noto-sans-fonts",
+    "xdg-desktop-portal",
+];
+const DNF_APPIMAGE_HOST_PACKAGES: &[&str] = &[
+    "pipewire",
+    "wireplumber",
+    "pipewire-pulseaudio",
+    "pulseaudio-utils",
+    "alsa-utils",
+    "xorg-x11-server-Xwayland",
+    "mesa-libEGL",
+    "mesa-libGL",
+    "mesa-libgbm",
+    "libdrm",
+    "google-noto-sans-fonts",
+    "xdg-desktop-portal",
+];
+const DNF_PORTAL_BACKENDS: &[&str] = &[
+    "xdg-desktop-portal-gtk",
+    "xdg-desktop-portal-kde",
+    "xdg-desktop-portal-gnome",
+    "xdg-desktop-portal-wlr",
+    "xdg-desktop-portal-hyprland",
+];
+const ARCH_RUNTIME_PACKAGES: &[&str] = &[
+    "pipewire",
+    "wireplumber",
+    "pipewire-pulse",
+    "libpulse",
+    "alsa-utils",
+    "webkit2gtk-4.1",
+    "bubblewrap",
+    "xdg-dbus-proxy",
+    "xorg-xwayland",
+    "mesa",
+    "libglvnd",
+    "gtk3",
+    "gstreamer",
+    "gst-plugins-base-libs",
+    "gst-plugins-good",
+    "noto-fonts",
+    "libayatana-appindicator",
+    "libusb",
+    "xdg-desktop-portal",
+];
+const ARCH_APPIMAGE_HOST_PACKAGES: &[&str] = &[
+    "pipewire",
+    "wireplumber",
+    "pipewire-pulse",
+    "libpulse",
+    "alsa-utils",
+    "xorg-xwayland",
+    "mesa",
+    "libglvnd",
+    "noto-fonts",
+    "xdg-desktop-portal",
+];
+const ARCH_PORTAL_BACKENDS: &[&str] = &[
+    "xdg-desktop-portal-gtk",
+    "xdg-desktop-portal-kde",
+    "xdg-desktop-portal-hyprland",
+    "xdg-desktop-portal-wlr",
+    "xdg-desktop-portal-gnome",
+];
+const ZYPPER_RUNTIME_PACKAGES: &[&str] = &[
+    "pipewire",
+    "wireplumber",
+    "pipewire-pulseaudio",
+    "pulseaudio-utils",
+    "alsa",
+    "libwebkit2gtk-4_1-0",
+    "typelib-1_0-AyatanaAppIndicator3-0_1",
+    "libusb-1_0-0",
+    "bubblewrap",
+    "xdg-dbus-proxy",
+    "xwayland",
+    "Mesa-libEGL1",
+    "Mesa-libGL1",
+    "libgbm1",
+    "libdrm2",
+    "gstreamer-plugins-base",
+    "gstreamer-plugins-good",
+    "google-noto-sans-fonts",
+    "xdg-desktop-portal",
+];
+const ZYPPER_APPIMAGE_HOST_PACKAGES: &[&str] = &[
+    "pipewire",
+    "wireplumber",
+    "pipewire-pulseaudio",
+    "pulseaudio-utils",
+    "alsa",
+    "xwayland",
+    "Mesa-libEGL1",
+    "Mesa-libGL1",
+    "libgbm1",
+    "libdrm2",
+    "google-noto-sans-fonts",
+    "xdg-desktop-portal",
+];
+const ZYPPER_PORTAL_BACKENDS: &[&str] = &[
+    "xdg-desktop-portal-gtk",
+    "xdg-desktop-portal-kde",
+    "xdg-desktop-portal-gnome",
+    "xdg-desktop-portal-wlr",
+];
+
+fn prepare_appimage_bundled_runtime() {
+    let Some(runtime_dir) = appimage_bundled_runtime_dir() else {
+        return;
+    };
+
+    prepend_env_path("PATH", runtime_dir.join("bin"));
+    prepend_env_path("LD_LIBRARY_PATH", runtime_dir.join("lib"));
+}
+
+fn appimage_bundled_runtime_dir() -> Option<PathBuf> {
+    let appdir = std::env::var_os("APPDIR")
+        .map(PathBuf::from)
+        .or_else(|| appdir_from_current_exe());
+    appdir
+        .map(|path| path.join("usr/wavelinux-runtime"))
+        .filter(|path| path.is_dir())
+}
+
+fn appdir_from_current_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut current = exe.parent();
+    while let Some(path) = current {
+        if path.join("AppRun").is_file() && path.join("usr").is_dir() {
+            return Some(path.to_path_buf());
+        }
+        current = path.parent();
+    }
+    None
+}
+
+fn prepend_env_path(key: &str, path: PathBuf) {
+    if !path.is_dir() {
+        return;
+    }
+
+    let current = std::env::var_os(key).unwrap_or_default();
+    let mut paths = Vec::new();
+    paths.push(path);
+    paths.extend(std::env::split_paths(&current));
+    if let Ok(joined) = std::env::join_paths(paths) {
+        std::env::set_var(key, joined);
+    }
+}
 
 fn apply_webkit_runtime_defaults() {
-    if std::env::var_os("WAVELINUX_DISABLE_WEBKIT_WORKAROUNDS").is_some()
-        || std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some()
-    {
+    if std::env::var_os(WEBKIT_WORKAROUNDS_DISABLE_ENV).is_some() {
         return;
     }
 
     // WebKitGTK's DMA-BUF renderer can abort the WebProcess on some compositor/GPU stacks.
     // Set this before Tauri initializes WebKit so child processes inherit it.
-    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    set_env_default(WEBKIT_DMABUF_DISABLE_ENV, "1");
+    set_env_default(WEBKIT_COMPOSITING_DISABLE_ENV, "1");
+
+    let missing_helpers = missing_webkit_sandbox_helpers();
+    let session_bus = session_bus_path_status();
+    if std::env::var_os(WEBKIT_SANDBOX_KEEP_ENV).is_none()
+        && std::env::var_os(WEBKIT_SANDBOX_DISABLE_ENV).is_none()
+        && (!missing_helpers.is_empty() || matches!(session_bus, Some((_, false))))
+    {
+        set_env_default(WEBKIT_SANDBOX_DISABLE_ENV, "1");
+        eprintln!(
+            "WaveLinux WebKit compatibility: disabled WebKit sandbox because required runtime pieces are missing or inaccessible."
+        );
+        if !missing_helpers.is_empty() {
+            eprintln!(
+                "WaveLinux WebKit compatibility: missing helpers: {}. On Arch/CachyOS install: sudo pacman -S --needed bubblewrap xdg-dbus-proxy",
+                missing_helpers.join(", ")
+            );
+        }
+        if let Some((path, false)) = session_bus {
+            eprintln!(
+                "WaveLinux WebKit compatibility: DBus session bus socket is not accessible: {path}"
+            );
+        }
+    }
+}
+
+fn set_env_default(key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        std::env::set_var(key, value);
+    }
+}
+
+fn command_exists(program: &str) -> bool {
+    if program.contains('/') {
+        return Path::new(program).is_file();
+    }
+
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|directory| directory.join(program).is_file())
+        })
+        .unwrap_or(false)
+}
+
+fn missing_webkit_sandbox_helpers() -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !command_exists("bwrap") {
+        missing.push("bwrap");
+    } else if !bwrap_can_create_minimal_sandbox() {
+        missing.push("bwrap usable sandbox");
+    }
+    if !command_exists("xdg-dbus-proxy") {
+        missing.push("xdg-dbus-proxy");
+    }
+    missing
+}
+
+fn bwrap_can_create_minimal_sandbox() -> bool {
+    Command::new("bwrap")
+        .args(["--ro-bind", "/", "/", "/usr/bin/true"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn session_bus_path_status() -> Option<(String, bool)> {
+    let address = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok()?;
+    let path = address
+        .strip_prefix("unix:path=")
+        .and_then(|value| value.split(',').next())
+        .filter(|value| !value.is_empty())?;
+    Some((path.to_string(), Path::new(path).exists()))
+}
+
+fn is_arch_like_system() -> bool {
+    [
+        "/etc/arch-release",
+        "/etc/cachyos-release",
+        "/etc/manjaro-release",
+    ]
+    .into_iter()
+    .any(|path| Path::new(path).exists())
+}
+
+fn pacman_package_installed(package: &str) -> bool {
+    Command::new("pacman")
+        .args(["-Qq", package])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn missing_arch_runtime_packages() -> Vec<&'static str> {
+    if !is_arch_like_system() || !command_exists("pacman") {
+        return Vec::new();
+    }
+
+    ARCH_RUNTIME_PACKAGES
+        .iter()
+        .copied()
+        .filter(|package| !pacman_package_installed(package))
+        .chain(
+            (!ARCH_PORTAL_BACKENDS
+                .iter()
+                .any(|package| pacman_package_installed(package)))
+            .then_some("xdg-desktop-portal-gtk"),
+        )
+        .collect()
+}
+
+fn print_runtime_dependency_report() -> i32 {
+    let manager = detect_package_manager();
+    let missing_runtime = if manager == PackageManager::Unknown {
+        Vec::new()
+    } else {
+        missing_runtime_packages_for_manager(manager)
+    };
+    let missing_arch = missing_arch_runtime_packages();
+    let missing_helpers = missing_webkit_sandbox_helpers();
+    let session_bus = session_bus_path_status();
+
+    println!("WaveLinux runtime dependency check");
+    println!("Package manager: {}", manager.id());
+    println!("AppImage runtime: {}", is_appimage_install());
+    println!(
+        "AppImage bundled runtime: {}",
+        appimage_bundled_runtime_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "unavailable".into())
+    );
+    println!("Arch-like system: {}", is_arch_like_system());
+    println!("pacman available: {}", command_exists("pacman"));
+    println!("bwrap available: {}", command_exists("bwrap"));
+    println!(
+        "xdg-dbus-proxy available: {}",
+        command_exists("xdg-dbus-proxy")
+    );
+    match &session_bus {
+        Some((path, exists)) => println!("DBus session bus: {path} exists={exists}"),
+        None => println!("DBus session bus: unavailable or not a unix:path address"),
+    }
+    println!(
+        "session: XDG_SESSION_TYPE={} DISPLAY={} WAYLAND_DISPLAY={}",
+        std::env::var("XDG_SESSION_TYPE").unwrap_or_default(),
+        std::env::var("DISPLAY").unwrap_or_default(),
+        std::env::var("WAYLAND_DISPLAY").unwrap_or_default()
+    );
+    println!(
+        "webkit env: {}={} {}={} {}={}",
+        WEBKIT_DMABUF_DISABLE_ENV,
+        std::env::var(WEBKIT_DMABUF_DISABLE_ENV).unwrap_or_default(),
+        WEBKIT_COMPOSITING_DISABLE_ENV,
+        std::env::var(WEBKIT_COMPOSITING_DISABLE_ENV).unwrap_or_default(),
+        WEBKIT_SANDBOX_DISABLE_ENV,
+        std::env::var(WEBKIT_SANDBOX_DISABLE_ENV).unwrap_or_default()
+    );
+
+    if manager == PackageManager::Unknown {
+        println!("Runtime packages: package manager unsupported");
+    } else if missing_runtime.is_empty() {
+        println!("Runtime packages: ok");
+    } else {
+        println!("Runtime packages missing: {}", missing_runtime.join(" "));
+        println!(
+            "Install command: {}",
+            install_command_for_user(manager, &missing_runtime)
+        );
+    }
+
+    if missing_arch.is_empty() {
+        println!("Arch runtime packages: ok");
+    } else {
+        println!("Arch runtime packages missing: {}", missing_arch.join(" "));
+        println!(
+            "Install on Arch/CachyOS: sudo pacman -Syu --needed {}",
+            missing_arch.join(" ")
+        );
+    }
+
+    if !missing_helpers.is_empty() {
+        println!(
+            "WebKit sandbox helpers missing: {}",
+            missing_helpers.join(" ")
+        );
+    }
+
+    if missing_runtime.is_empty()
+        && missing_arch.is_empty()
+        && missing_helpers.is_empty()
+        && !matches!(session_bus, Some((_, false)))
+    {
+        0
+    } else {
+        1
+    }
+}
+
+fn install_runtime_dependencies_from_cli() -> i32 {
+    let manager = detect_package_manager();
+    if manager == PackageManager::Unknown {
+        eprintln!("WaveLinux setup: no supported package manager was found.");
+        return 1;
+    }
+
+    let missing = missing_runtime_packages_for_manager(manager);
+    if missing.is_empty() {
+        println!("WaveLinux runtime packages are already installed.");
+        return 0;
+    }
+
+    println!(
+        "Installing WaveLinux runtime packages with {}: {}",
+        manager.id(),
+        missing.join(" ")
+    );
+    println!("Command: {}", install_command_for_user(manager, &missing));
+    match install_system_packages(manager, &missing) {
+        Ok(_) => {
+            let missing_after = missing_runtime_packages_for_manager(manager);
+            if missing_after.is_empty() {
+                println!("WaveLinux runtime dependency install completed.");
+                0
+            } else {
+                eprintln!(
+                    "WaveLinux setup: install completed, but these packages still look missing: {}",
+                    missing_after.join(" ")
+                );
+                1
+            }
+        }
+        Err(err) => {
+            eprintln!("WaveLinux setup: runtime dependency install failed: {err}");
+            1
+        }
+    }
+}
+
+fn ensure_runtime_dependencies_before_ui() {
+    if std::env::var_os(RUNTIME_DEPS_ASSUME_ENV).is_some()
+        || std::env::var_os(RUNTIME_INSTALL_SKIP_ENV).is_some()
+        || (!is_appimage_install() && std::env::var_os(RUNTIME_INSTALL_FORCE_ENV).is_none())
+    {
+        return;
+    }
+
+    let manager = detect_package_manager();
+    if manager == PackageManager::Unknown {
+        eprintln!(
+            "WaveLinux setup: no supported package manager was found for AppImage runtime preflight."
+        );
+        return;
+    }
+
+    let missing = missing_runtime_packages_for_manager(manager);
+    if missing.is_empty() {
+        return;
+    }
+
+    let command = install_command_for_user(manager, &missing);
+    let prompt = format!(
+        "WaveLinux needs a few system packages before this AppImage can start safely on this Linux install.\n\nPackages:\n{}\n\nWaveLinux will ask for administrator permission and run:\n\n{}",
+        missing.join(" "),
+        command
+    );
+
+    if !confirm_runtime_dependency_install(&prompt) {
+        let message = format!(
+            "WaveLinux setup was cancelled. Install these packages, then open WaveLinux again:\n\n{command}"
+        );
+        show_runtime_setup_message(
+            "WaveLinux setup cancelled",
+            &message,
+            RuntimeSetupMessageKind::Error,
+        );
+        std::process::exit(1);
+    }
+
+    match install_system_packages(manager, &missing) {
+        Ok(_) => {
+            let missing_after = missing_runtime_packages_for_manager(manager);
+            if missing_after.is_empty() {
+                show_runtime_setup_message(
+                    "WaveLinux setup complete",
+                    "Required runtime packages were installed. WaveLinux will continue launching now.",
+                    RuntimeSetupMessageKind::Info,
+                );
+            } else {
+                let message = format!(
+                    "WaveLinux tried to install required packages, but these still look missing:\n\n{}\n\nManual command:\n{}",
+                    missing_after.join(" "),
+                    install_command_for_user(manager, &missing_after)
+                );
+                show_runtime_setup_message(
+                    "WaveLinux setup incomplete",
+                    &message,
+                    RuntimeSetupMessageKind::Error,
+                );
+                std::process::exit(1);
+            }
+        }
+        Err(err) => {
+            let message = format!(
+                "WaveLinux could not install required runtime packages.\n\n{err}\n\nManual command:\n{command}"
+            );
+            show_runtime_setup_message(
+                "WaveLinux setup failed",
+                &message,
+                RuntimeSetupMessageKind::Error,
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeSetupMessageKind {
+    Info,
+    Error,
+}
+
+fn confirm_runtime_dependency_install(message: &str) -> bool {
+    if std::env::var_os("WAVELINUX_ASSUME_YES").is_some() {
+        return true;
+    }
+
+    if command_exists("zenity") {
+        return Command::new("zenity")
+            .args([
+                "--question",
+                "--title",
+                "WaveLinux setup",
+                "--width",
+                "620",
+                "--ok-label",
+                "Install",
+                "--cancel-label",
+                "Cancel",
+                "--text",
+                message,
+            ])
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+
+    if command_exists("kdialog") {
+        return Command::new("kdialog")
+            .args(["--title", "WaveLinux setup", "--yesno", message])
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+
+    if command_exists("xmessage") {
+        return Command::new("xmessage")
+            .args([
+                "-center",
+                "-buttons",
+                "Install:0,Cancel:1",
+                "-title",
+                "WaveLinux setup",
+                message,
+            ])
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+
+    eprintln!("WaveLinux setup: {message}");
+    true
+}
+
+fn show_runtime_setup_message(title: &str, message: &str, kind: RuntimeSetupMessageKind) {
+    eprintln!("{title}: {message}");
+
+    if command_exists("zenity") {
+        let dialog_kind = match kind {
+            RuntimeSetupMessageKind::Info => "--info",
+            RuntimeSetupMessageKind::Error => "--error",
+        };
+        let _ = Command::new("zenity")
+            .args([
+                dialog_kind,
+                "--title",
+                title,
+                "--width",
+                "620",
+                "--text",
+                message,
+            ])
+            .status();
+        return;
+    }
+
+    if command_exists("kdialog") {
+        let dialog_kind = match kind {
+            RuntimeSetupMessageKind::Info => "--msgbox",
+            RuntimeSetupMessageKind::Error => "--error",
+        };
+        let _ = Command::new("kdialog")
+            .args(["--title", title, dialog_kind, message])
+            .status();
+        return;
+    }
+
+    if command_exists("xmessage") {
+        let _ = Command::new("xmessage")
+            .args(["-center", "-title", title, message])
+            .status();
+        return;
+    }
+
+    if command_exists("notify-send") {
+        let _ = Command::new("notify-send").args([title, message]).status();
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1232,6 +1863,102 @@ fn detect_package_manager() -> PackageManager {
     }
 }
 
+fn runtime_packages_for_manager(manager: PackageManager) -> &'static [&'static str] {
+    if is_appimage_install() {
+        return match manager {
+            PackageManager::Apt => APT_APPIMAGE_HOST_PACKAGES,
+            PackageManager::Dnf => DNF_APPIMAGE_HOST_PACKAGES,
+            PackageManager::Pacman => ARCH_APPIMAGE_HOST_PACKAGES,
+            PackageManager::Zypper => ZYPPER_APPIMAGE_HOST_PACKAGES,
+            PackageManager::Unknown => &[],
+        };
+    }
+
+    match manager {
+        PackageManager::Apt => APT_RUNTIME_PACKAGES,
+        PackageManager::Dnf => DNF_RUNTIME_PACKAGES,
+        PackageManager::Pacman => ARCH_RUNTIME_PACKAGES,
+        PackageManager::Zypper => ZYPPER_RUNTIME_PACKAGES,
+        PackageManager::Unknown => &[],
+    }
+}
+
+fn portal_backend_packages_for_manager(manager: PackageManager) -> &'static [&'static str] {
+    match manager {
+        PackageManager::Apt => APT_PORTAL_BACKENDS,
+        PackageManager::Dnf => DNF_PORTAL_BACKENDS,
+        PackageManager::Pacman => ARCH_PORTAL_BACKENDS,
+        PackageManager::Zypper => ZYPPER_PORTAL_BACKENDS,
+        PackageManager::Unknown => &[],
+    }
+}
+
+fn runtime_package_available(manager: PackageManager, package: &str) -> bool {
+    if manager == PackageManager::Pacman {
+        return true;
+    }
+    package_available(manager, package)
+}
+
+fn package_installed(manager: PackageManager, package: &str) -> bool {
+    match manager {
+        PackageManager::Apt => Command::new("dpkg-query")
+            .args(["-W", "-f=${Status}", package])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("install ok installed")
+            }),
+        PackageManager::Dnf | PackageManager::Zypper => {
+            command_status_success("rpm", &["-q", package])
+        }
+        PackageManager::Pacman => pacman_package_installed(package),
+        PackageManager::Unknown => false,
+    }
+}
+
+fn missing_runtime_packages_for_manager(manager: PackageManager) -> Vec<String> {
+    let mut packages = Vec::new();
+    for package in runtime_packages_for_manager(manager) {
+        if runtime_package_available(manager, package) && !package_installed(manager, package) {
+            push_unique(&mut packages, package);
+        }
+    }
+
+    let portal_backends = portal_backend_packages_for_manager(manager);
+    if !portal_backends.is_empty()
+        && !portal_backends
+            .iter()
+            .any(|package| package_installed(manager, package))
+    {
+        if let Some(package) = portal_backends
+            .iter()
+            .find(|package| runtime_package_available(manager, package))
+        {
+            if !package_installed(manager, package) {
+                push_unique(&mut packages, package);
+            }
+        }
+    }
+
+    packages
+}
+
+fn install_command_for_user(manager: PackageManager, packages: &[String]) -> String {
+    let package_list = packages.join(" ");
+    match manager {
+        PackageManager::Apt => {
+            format!("sudo apt-get update && sudo apt-get install -y {package_list}")
+        }
+        PackageManager::Dnf => format!("sudo dnf install -y {package_list}"),
+        PackageManager::Pacman => format!("sudo pacman -Syu --needed {package_list}"),
+        PackageManager::Zypper => {
+            format!("sudo zypper --non-interactive install --no-recommends {package_list}")
+        }
+        PackageManager::Unknown => format!("install manually: {package_list}"),
+    }
+}
+
 fn package_available(manager: PackageManager, package: &str) -> bool {
     let (program, args): (&str, Vec<&str>) = match manager {
         PackageManager::Apt => ("apt-cache", vec!["show", package]),
@@ -1274,7 +2001,7 @@ fn install_system_packages(
             outputs.push(run_privileged_command("dnf", &args)?);
         }
         PackageManager::Pacman => {
-            let mut args = vec!["-S".into(), "--needed".into(), "--noconfirm".into()];
+            let mut args = vec!["-Syu".into(), "--needed".into(), "--noconfirm".into()];
             args.extend(packages.iter().cloned());
             outputs.push(run_privileged_command("pacman", &args)?);
         }
@@ -1316,7 +2043,7 @@ fn run_privileged_command(program: &str, args: &[String]) -> Result<Output, Stri
         return run_command_capture("pkexec", &pkexec_args);
     }
     if command_exists("sudo") {
-        let mut sudo_args = vec!["-n".to_string(), program.to_string()];
+        let mut sudo_args = vec![program.to_string()];
         sudo_args.extend(args.iter().cloned());
         return run_command_capture("sudo", &sudo_args);
     }
@@ -1348,11 +2075,6 @@ fn command_status_success(program: &str, args: &[&str]) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
-}
-
-fn command_exists(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
 }
 
 fn running_as_root() -> bool {
@@ -1510,6 +2232,15 @@ fn release_channel_name(settings: &MixerSettings) -> &'static str {
 
 fn is_appimage_install() -> bool {
     std::env::var_os("APPIMAGE").is_some()
+        || std::env::var_os("APPDIR").is_some()
+        || std::env::current_exe().is_ok_and(|path| {
+            path.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .starts_with(".mount_Wave")
+            })
+        })
 }
 
 fn is_missing_update_metadata_error(message: &str) -> bool {
@@ -1639,7 +2370,30 @@ fn print_hardware_profile_prewarm_report(report: &HardwareProfilePrewarmReport) 
 }
 
 fn main() {
-    if std::env::args().any(|arg| {
+    prepare_appimage_bundled_runtime();
+
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--install-runtime-dependencies" | "--install-runtime"
+        )
+    }) {
+        std::process::exit(install_runtime_dependencies_from_cli());
+    }
+
+    if args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--check-runtime-dependencies" | "--check-runtime"
+        )
+    }) {
+        apply_webkit_runtime_defaults();
+        std::process::exit(print_runtime_dependency_report());
+    }
+
+    if args.iter().any(|arg| {
         matches!(
             arg.as_str(),
             "--prewarm-hardware-profiles" | "--check-hardware-profiles"
@@ -1648,6 +2402,7 @@ fn main() {
         std::process::exit(run_hardware_profile_prewarm());
     }
 
+    ensure_runtime_dependencies_before_ui();
     apply_webkit_runtime_defaults();
 
     let shutdown_started = Arc::new(AtomicBool::new(false));

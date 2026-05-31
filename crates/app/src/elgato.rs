@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::ffi::c_void;
+use std::ffi::{c_void, OsString};
 use std::os::raw::{c_int, c_uint};
 use std::process::Command;
 use std::time::Duration;
@@ -173,8 +173,8 @@ struct LibUsb {
 impl LibUsb {
     fn load() -> Result<Self, ElgatoError> {
         let mut last_error = String::new();
-        for name in ["libusb-1.0.so.0", "libusb-1.0.so"] {
-            let library = match unsafe { Library::new(name) } {
+        for name in libusb_candidates() {
+            let library = match unsafe { Library::new(&name) } {
                 Ok(library) => library,
                 Err(err) => {
                     last_error = err.to_string();
@@ -260,6 +260,23 @@ impl LibUsb {
             Ok(code as usize)
         }
     }
+}
+
+fn libusb_candidates() -> Vec<OsString> {
+    let mut candidates = Vec::new();
+    if let Some(appdir) = std::env::var_os("APPDIR") {
+        candidates.push(
+            std::path::PathBuf::from(appdir)
+                .join("usr/wavelinux-runtime/lib/libusb-1.0.so.0")
+                .into_os_string(),
+        );
+    }
+    candidates.extend(
+        ["libusb-1.0.so.0", "libusb-1.0.so"]
+            .into_iter()
+            .map(OsString::from),
+    );
+    candidates
 }
 
 impl Drop for LibUsb {

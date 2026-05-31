@@ -17,6 +17,7 @@ fi
 
 cd "$ROOT_DIR/crates/app"
 export NO_STRIP="${NO_STRIP:-0}"
+"$ROOT_DIR/scripts/stage-appimage-runtime.sh"
 if [[ -z "${WAVELINUX_RELEASE_TAG:-}" ]]; then
   WAVELINUX_RELEASE_TAG="${GITHUB_REF_NAME:-}"
 fi

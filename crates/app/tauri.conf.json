@@ -40,6 +40,12 @@
     "shortDescription": "Linux creator audio mixer",
     "longDescription": "WaveLinux is a Rust and PipeWire creator audio mixer for Linux.",
     "linux": {
+      "appimage": {
+        "bundleMediaFramework": true,
+        "files": {
+          "/usr/wavelinux-runtime": "appimage-extra/usr/wavelinux-runtime"
+        }
+      },
       "deb": {
         "depends": [
           "pipewire",
@@ -48,7 +54,19 @@
           "pulseaudio-utils",
           "libwebkit2gtk-4.1-0",
           "libayatana-appindicator3-1",
-          "libusb-1.0-0"
+          "libusb-1.0-0",
+          "bubblewrap",
+          "xdg-dbus-proxy",
+          "xwayland",
+          "libegl1",
+          "libgl1",
+          "libgbm1",
+          "libdrm2",
+          "gstreamer1.0-plugins-base",
+          "gstreamer1.0-plugins-good",
+          "fonts-dejavu-core",
+          "xdg-desktop-portal",
+          "xdg-desktop-portal-gtk"
         ],
         "recommends": ["swh-plugins", "librnnoise-ladspa"]
       },
@@ -59,7 +77,19 @@
           "pipewire-pulseaudio",
           "pulseaudio-utils",
           "webkit2gtk4.1",
-          "libusb1"
+          "libusb1",
+          "bubblewrap",
+          "xdg-dbus-proxy",
+          "xorg-x11-server-Xwayland",
+          "mesa-libEGL",
+          "mesa-libGL",
+          "mesa-libgbm",
+          "libdrm",
+          "gstreamer1-plugins-base",
+          "gstreamer1-plugins-good",
+          "google-noto-sans-fonts",
+          "xdg-desktop-portal",
+          "xdg-desktop-portal-gtk"
         ],
         "recommends": ["ladspa-swh-plugins", "lsp-plugins-ladspa", "rnnoise"]
       }

@@ -31,13 +31,19 @@ jobs:
             desktop-file-utils \
             file \
             libayatana-appindicator3-dev \
+            libcap2 \
             libgtk-3-dev \
             librsvg2-dev \
+            libusb-1.0-0 \
             libwebkit2gtk-4.1-dev \
             patchelf \
             pkg-config \
             rpm \
             squashfs-tools \
+            bubblewrap \
+            xdg-dbus-proxy \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
             libpipewire-0.3-dev \
             libspa-0.2-dev
 
@@ -58,12 +64,16 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
+          FEED_TAG="$TAG"
+          if [[ "$TAG" == *pre* || "$TAG" == *beta* || "$TAG" == *rc* || "$TAG" == *testing* || "$TAG" == *Testing* ]]; then
+            FEED_TAG="prerelease"
+          fi
           ARTIFACT="$(find target/release/bundle/appimage \( -name '*.AppImage.tar.gz' -o -name '*.AppImage' \) | sort | head -n 1)"
           python3 scripts/build-updater-manifest.py \
             --artifact "$ARTIFACT" \
             --version "$VERSION" \
             --repo "$GITHUB_REPOSITORY" \
-            --tag "$TAG" \
+            --tag "$FEED_TAG" \
             --output target/release/bundle/latest.json \
             --notes "WaveLinux $VERSION"
 
@@ -94,31 +104,39 @@ jobs:
           path: target/release/upload/*
 
       - name: Publish GitHub release assets
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && !(contains(github.ref_name, 'pre') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'testing') || contains(github.ref_name, 'Testing'))
         uses: softprops/action-gh-release@v3
         with:
           name: WaveLinux ${{ github.ref_name }}
           body_path: RELEASE_NOTES.md
-          prerelease: ${{ contains(github.ref_name, 'pre') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          prerelease: false
           files: target/release/upload/*
 
-      - name: Publish moving beta update feed
-        if: startsWith(github.ref, 'refs/tags/') && (contains(github.ref_name, 'pre') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc'))
+      - name: Publish moving testing update feed
+        if: startsWith(github.ref, 'refs/tags/') && (contains(github.ref_name, 'pre') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'testing') || contains(github.ref_name, 'Testing'))
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DISPLAY_VERSION="${VERSION%%-*}"
+          TITLE="WaveLinux ${DISPLAY_VERSION} Testing"
+
           git tag -f prerelease "$GITHUB_SHA"
           git push origin refs/tags/prerelease --force
           if gh release view prerelease >/dev/null 2>&1; then
+            gh release view prerelease --json assets -q '.assets[].name' |
+              while IFS= read -r asset; do
+                [[ -n "$asset" ]] && gh release delete-asset prerelease "$asset" -y
+              done
             gh release edit prerelease \
-              --title "WaveLinux prerelease" \
-              --notes "Latest WaveLinux beta/prerelease build." \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES.md \
               --prerelease
             gh release upload prerelease target/release/upload/* --clobber
           else
             gh release create prerelease target/release/upload/* \
               --target "$GITHUB_SHA" \
-              --title "WaveLinux prerelease" \
-              --notes "Latest WaveLinux beta/prerelease build." \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES.md \
               --prerelease
           fi

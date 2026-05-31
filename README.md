@@ -63,7 +63,8 @@ Required host services and tools:
 - `wpctl`
 - `pw-cli`
 - `pw-dump`
-- libusb 1.0 shared library for optional Elgato Wave XLR hardware controls
+- Host display/session pieces: Xwayland when needed, Mesa/GL/GBM/DRM libraries,
+  fonts, and a desktop portal backend
 - Linux hidraw/sysfs access for Stream Deck-style streamer device detection
 - ALSA sequencer client listing and `aseqdump` for MIDI streamer device binding
 
@@ -115,6 +116,15 @@ The installer also runs a hardware profile prewarm check so WaveLinux can fetch
 signed remote profile bundles for detected audio devices when release assets
 are available.
 
+AppImage releases bundle WebKitGTK/GTK, GStreamer media support, WebKit sandbox
+helpers, and libusb for optional Elgato controls. First launch still runs a
+runtime preflight before WebKit starts for host-bound pieces such as PipeWire,
+desktop display/GL libraries, fonts, and portals. If a fresh Linux install is
+missing those packages, WaveLinux prompts for admin permission through the
+desktop and installs the distro packages it can verify with apt, dnf, pacman, or
+zypper. If setup cannot complete, it exits with a copyable manual command
+instead of opening a half-broken WebKit process.
+
 ## Run
 
 Launch WaveLinux from the app menu or:
@@ -152,12 +162,23 @@ Install only optional effect packages:
 yarn effects:install
 ```
 
-The dependency installer checks first. It does not install packages unless you
-explicitly run the install command or set the corresponding environment flags.
-The desktop app also exposes the same flow in Settings -> Health -> Effect
-Availability. Use Install FX to install missing optional LADSPA plugins through
-the detected package manager, then WaveLinux re-checks that DeepFilterNet3,
-RNNoise, and SWH dynamics are actually available.
+The dependency installer checks first. Source-tree installs do not install
+packages unless you explicitly run the install command or set the corresponding
+environment flags. AppImage releases run a slimmer host runtime check on first
+launch and can install required system packages before WebKit starts. To run that
+preflight manually:
+
+```bash
+./WaveLinux_4.3.0_amd64.AppImage --check-runtime-dependencies
+./WaveLinux_4.3.0_amd64.AppImage --install-runtime-dependencies
+```
+
+Use `WAVELINUX_SKIP_RUNTIME_INSTALL=1` to skip the AppImage preflight, or
+`WAVELINUX_ASSUME_RUNTIME_DEPS=1` when a packager has already provided all host
+runtime dependencies. The desktop app also exposes the optional plugin flow in
+Settings -> Health -> Effect Availability. Use Install FX to install missing
+optional LADSPA plugins through the detected package manager, then WaveLinux
+re-checks that DeepFilterNet3, RNNoise, and SWH dynamics are actually available.
 
 ## ALSA-Only Apps
 
@@ -379,13 +400,19 @@ Direct code, protocol, and runtime dependencies:
 | [OpenWave](https://github.com/rikkichy/openwave) | MIT | Wave XLR USB control-transfer protocol notes and behavior used for optional Elgato controls. |
 | [Elgato Stream Deck HID documentation](https://docs.elgato.com/streamdeck/hid/intro) | Reference documentation | Stream Deck HID device model and packet behavior used to guide lazy HID detection and raw report binding IDs. |
 | [Tauri](https://tauri.app/) and Tauri plugins | MIT OR Apache-2.0 | Desktop shell, IPC, tray, updater, opener, shell, and single-instance support. |
+| [WebKitGTK](https://webkitgtk.org/) and [GTK](https://gtk.org/) | LGPL-2.1-or-later plus WebKit third-party notices | Linux webview/runtime stack used by Tauri desktop builds. |
 | [React](https://react.dev/) and React DOM | MIT | Frontend UI framework. |
 | [TypeScript](https://www.typescriptlang.org/) | Apache-2.0 | Frontend type system and compiler. |
 | [Vite](https://vite.dev/) and `@vitejs/plugin-react` | MIT | Frontend development server and production build tooling. |
 | [Lucide](https://lucide.dev/) / `lucide-react` | ISC | UI icon set. |
 | [PipeWire](https://pipewire.org/) and `pipewire-rs` / libspa bindings | MIT | Linux audio graph integration, device discovery, routing, and metering. |
 | [WirePlumber](https://pipewire.pages.freedesktop.org/wireplumber/) | MIT | Host session-manager integration target for PipeWire desktops. |
-| [libusb](https://github.com/libusb/libusb) | LGPL-2.1-or-later | Dynamically loaded host shared library for optional Elgato Wave XLR controls. |
+| [bubblewrap](https://github.com/containers/bubblewrap) and [xdg-dbus-proxy](https://github.com/flatpak/xdg-dbus-proxy) | LGPL-2.0-or-later / LGPL-2.1-or-later | WebKitGTK sandbox helpers staged into AppImage releases when available from the build host. |
+| [xdg-desktop-portal](https://github.com/flatpak/xdg-desktop-portal) | LGPL-2.1-or-later | Host desktop portal integration used by Linux desktop sessions. |
+| [Mesa](https://www.mesa3d.org/), libdrm, libglvnd, and Xwayland | MIT/BSD/X11-style licenses | Host GL/EGL/GBM/DRM and Xwayland runtime pieces needed by WebKitGTK AppImage launches on common Linux desktops. |
+| [GStreamer](https://gstreamer.freedesktop.org/) base/good plugins | LGPL-2.1-or-later | Host media stack used by WebKitGTK and desktop audio/video runtime dependencies. |
+| [Noto Fonts](https://notofonts.github.io/) | OFL-1.1 | Host fallback fonts installed by dependency preflight on minimal desktops. |
+| [libusb](https://github.com/libusb/libusb) | LGPL-2.1-or-later | Dynamically loaded shared library for optional Elgato Wave XLR controls; staged into AppImage releases when available from the build host. |
 | [ALSA utilities](https://www.alsa-project.org/) (`aseqdump`) | GPL-2.0-or-later | Host MIDI event capture for connected streamer control surfaces, started only for enabled detected MIDI devices. |
 | Rust support crates: `anyhow`, `base64`, `directories`, `libc`, `serde`, `serde_json`, `tempfile`, `thiserror`, `time`, `url`, `uuid` | MIT OR Apache-2.0 | Serialization, errors, paths, test files, URLs, timestamps, identifiers, and libc bindings. |
 | Rust support crate: `include_dir` | MIT | Embeds packaged hardware profile assets. |

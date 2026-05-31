@@ -10,7 +10,13 @@ main mixer path device-neutral.
   serial controls using the OpenWave USB control-transfer approach.
 - Loads libusb only inside the detected Wave XLR control path so systems without
   Elgato hardware do not load the extra shared library during normal startup.
-- Adds libusb to release packaging and dependency checks.
+- Adds AppImage startup preflight for missing host runtime pieces before WebKit
+  starts, with copyable install commands and native package-manager installs
+  through apt, dnf, pacman, or zypper.
+- Bundles more safe AppImage-side runtime pieces: GStreamer media support,
+  WebKit sandbox helpers, and libusb for optional Elgato controls.
+- Adds libusb and WebKit/AppImage runtime pieces to release packaging and
+  dependency checks.
 - Adds a Beta updates checkbox in the updater that tracks the testing branch
   prerelease feed without changing stable update checks.
 
