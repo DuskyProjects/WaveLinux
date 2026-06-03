@@ -22,6 +22,7 @@ import {
   GripVertical,
   Headphones,
   Info,
+  Keyboard,
   Maximize2,
   MessageCircle,
   Mic,
@@ -65,6 +66,9 @@ import type {
   Channel,
   ChannelKind,
   CommandExecution,
+  Diagnostic,
+  ElgatoDeviceSummary,
+  ElgatoWaveXlrState,
   EffectPluginInstallResult,
   EffectDefinition,
   EffectAvailability,
@@ -78,8 +82,14 @@ import type {
   Mix,
   MixBus,
   MixerSettings,
-  RepairReport,
   SoundCheckReport,
+  StreamerAction,
+  StreamerActionResult,
+  StreamerBinding,
+  StreamerBindingProfile,
+  StreamerDeviceSummary,
+  StreamerDevicesConfig,
+  StreamerLearnResult,
   UpdateInfo,
   UpdateInstallResult,
 } from "./types";
@@ -139,6 +149,10 @@ const SOURCE_ICON_OPTIONS: IconOption[] = [
   { id: "audio", label: "Audio", icon: AudioLines },
 ];
 const SELECT_VISIBLE_OPTION_LIMIT = 80;
+const ELGATO_POLL_MS = 1500;
+const STREAMER_DEVICE_POLL_MS = 1500;
+const LIVE_METER_POLL_MS = 16;
+const IDLE_METER_POLL_MS = 250;
 const UI_METER_ATTACK_SECONDS = 0.018;
 const UI_METER_RELEASE_SECONDS = 0.34;
 const UI_METER_FLOOR = 0.003;
@@ -190,7 +204,7 @@ type SelectOption = {
   disabled?: boolean;
 };
 
-type SettingsTab = "general" | "profiles" | "health";
+type SettingsTab = "general" | "profiles" | "streamers" | "elgato" | "health";
 
 type MixerDrawer =
   | { type: "routing" }
@@ -781,20 +795,6 @@ export default function App() {
     setToast(audioActionToast(title, commands, plannedCount));
   }, []);
 
-  const startOrRepairAudio = useCallback(async () => {
-    const title = state?.engine.audio_graph_running ? "Repair Audio" : "Start Audio";
-    setBusy(true);
-    try {
-      const report = await invoke<RepairReport>("repair_audio_graph");
-      scheduleRefresh(0);
-      recordAudioAction(title, report.outputs, report.planned.commands.length);
-    } catch (error) {
-      setToast(String(error));
-    } finally {
-      setBusy(false);
-    }
-  }, [recordAudioAction, scheduleRefresh, state?.engine.audio_graph_running]);
-
   const runAudioCommandList = useCallback(
     async (command: string, title: string) => {
       setBusy(true);
@@ -814,11 +814,12 @@ export default function App() {
   const checkUpdates = useCallback(async (showToast = true) => {
     setUpdateBusy(true);
     try {
-      const next = await invoke<UpdateInfo>("check_for_updates");
+      const releaseChannel = state?.config.settings.release_channel ?? "stable";
+      const next = await invoke<UpdateInfo>("check_for_updates", { releaseChannel });
       setUpdateInfo(next);
       if (showToast || next.available) setToast(next.message);
       if (next.available && state?.config.settings.auto_install_updates && next.install_supported) {
-        const result = await invoke<UpdateInstallResult>("install_update");
+        const result = await invoke<UpdateInstallResult>("install_update", { releaseChannel });
         setToast(result.message);
       }
       return next;
@@ -828,7 +829,7 @@ export default function App() {
     } finally {
       setUpdateBusy(false);
     }
-  }, [state?.config.settings.auto_install_updates]);
+  }, [state?.config.settings.auto_install_updates, state?.config.settings.release_channel]);
 
   const installEffectPlugins = useCallback(async () => {
     setPluginInstallBusy(true);
@@ -946,11 +947,11 @@ export default function App() {
           setSettings={setSettingsFast}
           updateBusy={updateBusy}
           updateInfo={updateInfo}
-          onCleanup={() => runAudioCommandList("cleanup_audio_graph", "Cleanup Audio")}
           onCheckUpdates={() => void checkUpdates(true).catch(() => undefined)}
           onInstallUpdate={() => {
             setUpdateBusy(true);
-            invoke<UpdateInstallResult>("install_update")
+            const releaseChannel = state.config.settings.release_channel;
+            invoke<UpdateInstallResult>("install_update", { releaseChannel })
               .then((result) => setToast(result.message))
               .catch((error) => setToast(String(error)))
               .finally(() => setUpdateBusy(false));
@@ -974,26 +975,6 @@ export default function App() {
     <div className="top-actions">
       <button className="icon-button" onClick={() => refresh()} title="Refresh" type="button">
         <RefreshCw size={17} />
-      </button>
-      {state?.engine.audio_graph_running && (
-        <button
-          className="secondary-button danger"
-          disabled={busy}
-          onClick={() => void runAudioCommandList("cleanup_audio_graph", "Stop Audio")}
-          type="button"
-        >
-          <Trash2 size={17} />
-          Stop
-        </button>
-      )}
-      <button
-        className="primary-button"
-        disabled={busy || !state}
-        onClick={() => void startOrRepairAudio()}
-        type="button"
-      >
-        <WandSparkles size={17} />
-        {state?.engine.audio_graph_running ? "Repair" : "Start Audio"}
       </button>
     </div>
   );
@@ -1188,13 +1169,18 @@ function MixerView({
     let stopped = false;
     let timer = 0;
     const tick = () => {
+      if (!documentHasActiveFocus()) {
+        setLiveMeters([]);
+        timer = window.setTimeout(tick, IDLE_METER_POLL_MS);
+        return;
+      }
       invoke<LevelMeter[]>("observe_meters")
         .then((meters) => {
           if (!stopped) setLiveMeters(meters);
         })
         .catch(() => undefined)
         .finally(() => {
-          if (!stopped) timer = window.setTimeout(tick, 16);
+          if (!stopped) timer = window.setTimeout(tick, LIVE_METER_POLL_MS);
         });
     };
 
@@ -1431,13 +1417,18 @@ function WaveLinkMixerView({
     let stopped = false;
     let timer = 0;
     const tick = () => {
+      if (!documentHasActiveFocus()) {
+        setLiveMeters([]);
+        timer = window.setTimeout(tick, IDLE_METER_POLL_MS);
+        return;
+      }
       invoke<LevelMeter[]>("observe_meters")
         .then((meters) => {
           if (!stopped) setLiveMeters(meters);
         })
         .catch(() => undefined)
         .finally(() => {
-          if (!stopped) timer = window.setTimeout(tick, 16);
+          if (!stopped) timer = window.setTimeout(tick, LIVE_METER_POLL_MS);
         });
     };
 
@@ -5040,7 +5031,6 @@ function EffectBlock({
 function DiagnosticsView({
   audioActionReport,
   onInstallEffectPlugins,
-  onCleanup,
   onPrune,
   pluginInstallBusy,
   state,
@@ -5048,7 +5038,6 @@ function DiagnosticsView({
 }: {
   audioActionReport: AudioActionReport | null;
   onInstallEffectPlugins: () => void;
-  onCleanup: () => void | Promise<unknown>;
   onPrune: () => void | Promise<unknown>;
   pluginInstallBusy: boolean;
   state: AppStateSnapshot;
@@ -5056,7 +5045,66 @@ function DiagnosticsView({
 }) {
   const [report, setReport] = useState<SoundCheckReport | null>(null);
   const [graphReport, setGraphReport] = useState<GraphDebugReport | null>(null);
+  const [streamerDevices, setStreamerDevices] = useState<StreamerDeviceSummary[]>([]);
+  const [streamerDeviceError, setStreamerDeviceError] = useState<string | null>(null);
+  const [elgatoDevices, setElgatoDevices] = useState<ElgatoDeviceSummary[]>([]);
+  const [elgatoDeviceError, setElgatoDeviceError] = useState<string | null>(null);
+  const [testingReportStatus, setTestingReportStatus] = useState<string | null>(null);
   const diagnostics = report?.diagnostics ?? state.diagnostics;
+  const loadTestingDevices = useCallback(async () => {
+    try {
+      const next = await invoke<StreamerDeviceSummary[]>("list_streamer_devices");
+      setStreamerDevices(next);
+      setStreamerDeviceError(null);
+    } catch (error) {
+      setStreamerDevices([]);
+      setStreamerDeviceError(String(error));
+    }
+    try {
+      const next = await invoke<ElgatoDeviceSummary[]>("list_elgato_devices");
+      setElgatoDevices(next);
+      setElgatoDeviceError(null);
+    } catch (error) {
+      setElgatoDevices([]);
+      setElgatoDeviceError(String(error));
+    }
+  }, []);
+  useEffect(() => {
+    void loadTestingDevices();
+  }, [loadTestingDevices]);
+  const testingHealthReport = useMemo(
+    () =>
+      buildTestingHealthReport({
+        audioActionReport,
+        diagnostics,
+        elgatoDeviceError,
+        elgatoDevices,
+        graphReport,
+        report,
+        state,
+        streamerDeviceError,
+        streamerDevices,
+      }),
+    [
+      audioActionReport,
+      diagnostics,
+      elgatoDeviceError,
+      elgatoDevices,
+      graphReport,
+      report,
+      state,
+      streamerDeviceError,
+      streamerDevices,
+    ],
+  );
+  const copyTestingHealthReport = async () => {
+    try {
+      await navigator.clipboard.writeText(testingHealthReport);
+      setTestingReportStatus("Copied");
+    } catch {
+      setTestingReportStatus("Copy failed");
+    }
+  };
   return (
     <section className="two-column diagnostics-view">
       <div className="panel">
@@ -5096,15 +5144,6 @@ function DiagnosticsView({
             >
               <WandSparkles size={16} />
               Prune
-            </button>
-            <button
-              className="secondary-button danger"
-              onClick={() => void onCleanup()}
-              type="button"
-              title="Disruptive: unload every WaveLinux-managed audio module"
-            >
-              <Trash2 size={16} />
-              Cleanup
             </button>
           </div>
         </div>
@@ -5155,9 +5194,214 @@ function DiagnosticsView({
           onInstallMissing={onInstallEffectPlugins}
           state={state}
         />
+        <TestingHealthReport
+          onCopy={copyTestingHealthReport}
+          onRefresh={loadTestingDevices}
+          report={testingHealthReport}
+          status={testingReportStatus}
+        />
       </div>
     </section>
   );
+}
+
+function TestingHealthReport({
+  onCopy,
+  onRefresh,
+  report,
+  status,
+}: {
+  onCopy: () => void | Promise<unknown>;
+  onRefresh: () => void | Promise<unknown>;
+  report: string;
+  status: string | null;
+}) {
+  return (
+    <div className="testing-health command-report">
+      <div className="command-report-header">
+        <div>
+          <strong>Testing Health Report</strong>
+          <span>GitHub issue payload</span>
+        </div>
+        <div className="panel-actions">
+          <button
+            className="secondary-button"
+            onClick={() => void onRefresh()}
+            type="button"
+          >
+            <RefreshCw size={16} />
+            Refresh
+          </button>
+          <button
+            className="secondary-button"
+            onClick={() => void onCopy()}
+            type="button"
+          >
+            {status === "Copied" ? <Check size={16} /> : <Copy size={16} />}
+            {status ?? "Copy"}
+          </button>
+        </div>
+      </div>
+      <textarea
+        aria-label="Testing health report"
+        className="testing-health-report"
+        readOnly
+        value={report}
+      />
+    </div>
+  );
+}
+
+function buildTestingHealthReport({
+  audioActionReport,
+  diagnostics,
+  elgatoDeviceError,
+  elgatoDevices,
+  graphReport,
+  report,
+  state,
+  streamerDeviceError,
+  streamerDevices,
+}: {
+  audioActionReport: AudioActionReport | null;
+  diagnostics: Diagnostic[];
+  elgatoDeviceError: string | null;
+  elgatoDevices: ElgatoDeviceSummary[];
+  graphReport: GraphDebugReport | null;
+  report: SoundCheckReport | null;
+  state: AppStateSnapshot;
+  streamerDeviceError: string | null;
+  streamerDevices: StreamerDeviceSummary[];
+}) {
+  const settings = state.config.settings;
+  const missingEffects =
+    report?.missing_effects ??
+    state.graph.effect_availability
+      .filter((effect) => !effect.available)
+      .map((effect) => `${effect.effect_id}: ${effect.detail}`);
+  const lines = [
+    "# WaveLinux Testing Health Report",
+    "",
+    `Generated: ${new Date().toISOString()}`,
+    `Config version: ${state.config.version}`,
+    `Release channel: ${settings.release_channel}`,
+    `Auto check updates: ${yesNo(settings.auto_check_updates)}`,
+    `Auto install updates: ${yesNo(settings.auto_install_updates)}`,
+    "",
+    "## Engine",
+    `Healthy: ${yesNo(state.engine.healthy)}`,
+    `Audio graph running: ${yesNo(state.engine.audio_graph_running)}`,
+    `Dry run: ${yesNo(state.engine.dry_run)}`,
+    `Message: ${state.engine.message || "none"}`,
+    `Last refresh unix: ${state.engine.last_refresh_unix}`,
+    "",
+    "## Audio Settings",
+    `Sample rate: ${state.config.audio.sample_rate_hz}`,
+    `Bit depth: ${state.config.audio.bit_depth}`,
+    `Channel layout: ${state.config.audio.channel_layout}`,
+    `Mono inputs to stereo: ${yesNo(state.config.audio.mono_inputs_to_stereo)}`,
+    `Low-latency monitoring: ${yesNo(settings.low_latency_mic_monitoring)}`,
+    `Stream sync delay: ${settings.stream_sync_delay_msec} ms`,
+    `Monitor sync delay: ${settings.monitor_sync_delay_msec} ms`,
+    "",
+    "## Graph Counts",
+    `Mixes: ${state.config.mixes.length}`,
+    `Channels: ${state.config.channels.length}`,
+    `Inputs: ${state.graph.inputs.length}`,
+    `Outputs: ${state.graph.outputs.length}`,
+    `App streams: ${state.graph.app_streams.length}`,
+    `Meters: ${state.graph.meters.length}`,
+    `Managed modules: ${graphReport?.managed_modules.length ?? "not loaded"}`,
+    `Routes: ${graphReport ? graphReport.sink_input_routes.length + graphReport.source_output_routes.length : "not loaded"}`,
+    `Stale processes: ${graphReport?.stale_processes.length ?? "not loaded"}`,
+    "",
+    "## Devices",
+    "Inputs:",
+    ...reportDeviceList(state.graph.inputs),
+    "Outputs:",
+    ...reportDeviceList(state.graph.outputs),
+    "",
+    "## Streamer Devices",
+    ...(streamerDeviceError ? [`Detection error: ${streamerDeviceError}`] : reportStreamerDevices(streamerDevices)),
+    "",
+    "## Elgato Devices",
+    ...(elgatoDeviceError ? [`Detection error: ${elgatoDeviceError}`] : reportElgatoDevices(elgatoDevices)),
+    "",
+    "## Diagnostics",
+    ...reportDiagnostics(diagnostics),
+    "",
+    "## Effects",
+    ...(missingEffects.length ? missingEffects.map((effect) => `- Missing: ${effect}`) : ["- Missing: none"]),
+    "",
+    "## Sound Check",
+    report
+      ? `Active streams: ${report.active_stream_count}; virtual mixes: ${report.virtual_mix_count}; debug log: ${report.debug_log_path || "none"}`
+      : "Not run",
+    "",
+    "## Last Audio Action",
+    audioActionReport
+      ? `${audioActionReport.title}; commands: ${audioActionReport.commands.length}; planned: ${audioActionReport.plannedCount ?? "unknown"}; finished: ${new Date(audioActionReport.finishedAt).toISOString()}`
+      : "None",
+    "",
+    "## Recent Debug Log",
+    ...reportRecentLog(report, graphReport),
+  ];
+  return lines.join("\n");
+}
+
+function reportDeviceList(devices: DeviceInfo[]): string[] {
+  if (devices.length === 0) return ["- none"];
+  return devices.slice(0, 20).map((device) => {
+    const usb = device.vendor_id || device.product_id ? ` usb=${valueOrNone(device.vendor_id)}:${valueOrNone(device.product_id)}` : "";
+    const profile = device.matched_profile_id || device.active_profile || "none";
+    const defaultState = device.is_default ? " default" : "";
+    const virtualState = device.is_virtual ? " virtual" : "";
+    return `- ${device.description || device.name} | id=${device.id} | available=${yesNo(device.is_available)}${defaultState}${virtualState} | bus=${valueOrNone(device.bus)}${usb} | profile=${profile}`;
+  });
+}
+
+function reportStreamerDevices(devices: StreamerDeviceSummary[]): string[] {
+  if (devices.length === 0) return ["- none detected"];
+  return devices.map((device) => {
+    const usb = device.vendor_id || device.product_id ? ` | usb=${valueOrNone(device.vendor_id)}:${valueOrNone(device.product_id)}` : "";
+    return `- ${device.name} | ${device.family}/${device.transport} | enabled=${yesNo(device.enabled)} | status=${device.permission_status}${usb} | caps=${formatStreamerCaps(device)} | ${device.message || "no message"}`;
+  });
+}
+
+function reportElgatoDevices(devices: ElgatoDeviceSummary[]): string[] {
+  if (devices.length === 0) return ["- none detected"];
+  return devices.map((device) => {
+    const usb = device.vendor_id || device.product_id ? ` | usb=${valueOrNone(device.vendor_id)}:${valueOrNone(device.product_id)}` : "";
+    return `- ${device.name} | ${device.kind} | controls=${yesNo(device.controls_supported)} | bus=${valueOrNone(device.bus)}${usb} | alsa_card=${valueOrNone(device.alsa_card)} | ${device.message || "no message"}`;
+  });
+}
+
+function reportDiagnostics(diagnostics: Diagnostic[]): string[] {
+  if (diagnostics.length === 0) return ["- none"];
+  return diagnostics.map((item) => `- [${item.severity}] ${item.code}: ${item.message}${item.action ? ` (${item.action})` : ""}`);
+}
+
+function reportRecentLog(report: SoundCheckReport | null, graphReport: GraphDebugReport | null): string[] {
+  const lines = graphReport?.recent_log_lines.length
+    ? graphReport.recent_log_lines
+    : report?.recent_log_lines ?? [];
+  if (lines.length === 0) return ["No recent log lines captured."];
+  return ["```text", ...lines.slice(-25), "```"];
+}
+
+function formatStreamerCaps(device: StreamerDeviceSummary): string {
+  const caps = Object.entries(device.capabilities)
+    .filter(([, enabled]) => enabled)
+    .map(([key]) => key);
+  return caps.length ? caps.join(",") : "none";
+}
+
+function yesNo(value: boolean): string {
+  return value ? "yes" : "no";
+}
+
+function valueOrNone(value: string | null | undefined): string {
+  return value && value.trim() ? value : "none";
 }
 
 function LatencySummary({ state }: { state: AppStateSnapshot }) {
@@ -5375,7 +5619,6 @@ function SettingsView({
   setSettings,
   updateBusy,
   updateInfo,
-  onCleanup,
   onCheckUpdates,
   onInstallUpdate,
   onInstallEffectPlugins,
@@ -5394,7 +5637,6 @@ function SettingsView({
   setSettings: (settings: MixerSettings) => Promise<void>;
   updateBusy: boolean;
   updateInfo: UpdateInfo | null;
-  onCleanup: () => void | Promise<unknown>;
   onCheckUpdates: () => void;
   onInstallUpdate: () => void;
   onInstallEffectPlugins: () => void;
@@ -5404,6 +5646,50 @@ function SettingsView({
 }) {
   const updateSettings = (settings: MixerSettings) => void setSettings(settings);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
+  const [streamerDevices, setStreamerDevices] = useState<StreamerDeviceSummary[]>([]);
+  const [streamerDeviceError, setStreamerDeviceError] = useState<string | null>(null);
+  const visibleUpdateInfo =
+    updateInfo?.channel === state.config.settings.release_channel ? updateInfo : null;
+  const betaUpdatesEnabled = state.config.settings.release_channel === "beta";
+  const hasStreamerDevices = streamerDevices.length > 0;
+  const hasElgatoDevices = useMemo(
+    () => [...state.graph.inputs, ...state.graph.outputs].some(isElgatoAudioDevice),
+    [state.graph.inputs, state.graph.outputs],
+  );
+
+  const loadStreamerDevices = useCallback(async () => {
+    try {
+      const devices = await invoke<StreamerDeviceSummary[]>("list_streamer_devices");
+      setStreamerDevices(devices);
+      setStreamerDeviceError(null);
+    } catch (error) {
+      setStreamerDevices([]);
+      setStreamerDeviceError(String(error));
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      void loadStreamerDevices();
+    };
+    tick();
+    const interval = window.setInterval(tick, STREAMER_DEVICE_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [loadStreamerDevices]);
+
+  useEffect(() => {
+    if (!hasElgatoDevices && settingsTab === "elgato") {
+      setSettingsTab("general");
+    }
+    if (!hasStreamerDevices && settingsTab === "streamers") {
+      setSettingsTab("general");
+    }
+  }, [hasElgatoDevices, hasStreamerDevices, settingsTab]);
 
   return (
     <section className={settingsTab === "health" ? "settings-view wide" : "settings-view"}>
@@ -5431,6 +5717,28 @@ function SettingsView({
             <Cable size={16} />
             Profiles
           </button>
+          {hasStreamerDevices && (
+            <button
+              className={settingsTab === "streamers" ? "settings-tab active" : "settings-tab"}
+              onClick={() => setSettingsTab("streamers")}
+              role="tab"
+              type="button"
+            >
+              <Keyboard size={16} />
+              Streamers
+            </button>
+          )}
+          {hasElgatoDevices && (
+            <button
+              className={settingsTab === "elgato" ? "settings-tab active" : "settings-tab"}
+              onClick={() => setSettingsTab("elgato")}
+              role="tab"
+              type="button"
+            >
+              <Mic size={16} />
+              Elgato
+            </button>
+          )}
           <button
             className={settingsTab === "health" ? "settings-tab active" : "settings-tab"}
             onClick={() => setSettingsTab("health")}
@@ -5517,23 +5825,6 @@ function SettingsView({
               }
               value={state.config.settings.auto_install_updates}
             />
-            <div className="settings-control">
-              <span>Release channel</span>
-              <AppSelect
-                ariaLabel="Release channel"
-                onChange={(value) =>
-                  void updateSettings({
-                    ...state.config.settings,
-                    release_channel: value === "beta" ? "beta" : "stable",
-                  })
-                }
-                options={[
-                  { value: "stable", label: "Stable" },
-                  { value: "beta", label: "Pre-release" },
-                ]}
-                value={state.config.settings.release_channel}
-              />
-            </div>
           </div>
           <div className="settings-section">
             <div className="panel-header compact">
@@ -5542,12 +5833,25 @@ function SettingsView({
             </div>
             <div className="update-card">
               <div>
-                <strong>{updateInfo?.message ?? "Update status has not been checked"}</strong>
+                <strong>{visibleUpdateInfo?.message ?? "Update status has not been checked"}</strong>
                 <span>
-                  {updateInfo
-                    ? `${updateInfo.channel} · current ${updateInfo.current_version}${updateInfo.version ? ` · latest ${updateInfo.version}` : ""}`
+                  {visibleUpdateInfo
+                    ? `${visibleUpdateInfo.channel} · current ${visibleUpdateInfo.current_version}${visibleUpdateInfo.version ? ` · latest ${visibleUpdateInfo.version}` : ""}`
                     : "Signed AppImage updates, plus deb/rpm/AUR package releases"}
                 </span>
+                <label className="updater-checkbox">
+                  <input
+                    checked={betaUpdatesEnabled}
+                    onChange={(event) =>
+                      updateSettings({
+                        ...state.config.settings,
+                        release_channel: event.currentTarget.checked ? "beta" : "stable",
+                      })
+                    }
+                    type="checkbox"
+                  />
+                  <span>Beta updates</span>
+                </label>
               </div>
               <div className="panel-actions">
                 <button className="secondary-button" disabled={updateBusy} onClick={onCheckUpdates} type="button">
@@ -5556,10 +5860,10 @@ function SettingsView({
                 </button>
                 <button
                   className="secondary-button"
-                  disabled={updateBusy || !updateInfo?.available || !updateInfo.install_supported}
+                  disabled={updateBusy || !visibleUpdateInfo?.available || !visibleUpdateInfo.install_supported}
                   onClick={onInstallUpdate}
                   title={
-                    updateInfo?.install_supported === false
+                    visibleUpdateInfo?.install_supported === false
                       ? "Install through your package manager or use the AppImage"
                       : "Download, verify, install, and restart"
                   }
@@ -5617,7 +5921,7 @@ function SettingsView({
             </div>
           </div>
           <div className="system-grid">
-            <Stat icon={Cpu} label="Engine" value={state.engine.audio_graph_running ? "Running" : "Stopped"} />
+            <Stat icon={Cpu} label="Engine" value={state.engine.audio_graph_running ? "Running" : "Inactive"} />
             <Stat icon={Radio} label="Rate" value={`${state.config.audio.sample_rate_hz / 1000} kHz`} />
             <Stat icon={AudioLines} label="Format" value={`${state.config.audio.bit_depth}-bit`} />
           </div>
@@ -5626,17 +5930,556 @@ function SettingsView({
 
       {settingsTab === "profiles" && <HardwareProfilesView state={state} />}
 
+      {settingsTab === "streamers" && hasStreamerDevices && (
+        <StreamerDevicesView
+          devices={streamerDevices}
+          deviceError={streamerDeviceError}
+          onDevicesChange={setStreamerDevices}
+          onRefresh={loadStreamerDevices}
+          state={state}
+        />
+      )}
+
+      {settingsTab === "elgato" && hasElgatoDevices && <ElgatoDevicesView />}
+
       {settingsTab === "health" && (
         <DiagnosticsView
           audioActionReport={audioActionReport}
           onInstallEffectPlugins={onInstallEffectPlugins}
-          onCleanup={onCleanup}
           onPrune={onPrune}
           pluginInstallBusy={pluginInstallBusy}
           state={state}
           run={run}
         />
       )}
+    </section>
+  );
+}
+
+function StreamerDevicesView({
+  devices,
+  deviceError,
+  onDevicesChange,
+  onRefresh,
+  state,
+}: {
+  devices: StreamerDeviceSummary[];
+  deviceError: string | null;
+  onDevicesChange: (devices: StreamerDeviceSummary[]) => void;
+  onRefresh: () => Promise<void>;
+  state: AppStateSnapshot;
+}) {
+  const [bindings, setBindings] = useState<StreamerDevicesConfig | null>(state.config.streamer_devices);
+  const [selectedDeviceId, setSelectedDeviceId] = useState(devices[0]?.id ?? "");
+  const [selectedBindingIndex, setSelectedBindingIndex] = useState(0);
+  const [streamerError, setStreamerError] = useState<string | null>(null);
+  const [streamerMessage, setStreamerMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const actionOptions = useMemo(() => streamerActionOptions(state), [state]);
+
+  const loadBindings = useCallback(async () => {
+    try {
+      const next = await invoke<StreamerDevicesConfig>("get_streamer_bindings");
+      setBindings(next);
+      setStreamerError(null);
+    } catch (error) {
+      setStreamerError(String(error));
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadBindings();
+  }, [loadBindings, devices]);
+
+  useEffect(() => {
+    if (devices.length === 0) {
+      setSelectedDeviceId("");
+      return;
+    }
+    if (!selectedDeviceId || !devices.some((device) => device.id === selectedDeviceId)) {
+      setSelectedDeviceId(devices[0].id);
+    }
+  }, [devices, selectedDeviceId]);
+
+  const selectedDevice =
+    devices.find((device) => device.id === selectedDeviceId) ?? devices[0] ?? null;
+  const profile = selectedDevice
+    ? bindings?.profiles[selectedDevice.id] ?? emptyStreamerProfile(selectedDevice)
+    : null;
+  const selectedBinding = profile?.bindings[selectedBindingIndex] ?? profile?.bindings[0] ?? null;
+
+  useEffect(() => {
+    if (!profile) return;
+    if (selectedBindingIndex >= profile.bindings.length) {
+      setSelectedBindingIndex(Math.max(0, profile.bindings.length - 1));
+    }
+  }, [profile, selectedBindingIndex]);
+
+  const saveProfile = async (nextProfile: StreamerBindingProfile) => {
+    setBusy(true);
+    try {
+      const saved = await invoke<StreamerBindingProfile>("set_streamer_binding_profile", {
+        profile: nextProfile,
+      });
+      setBindings((current) => ({
+        version: current?.version ?? 1,
+        profiles: {
+          ...(current?.profiles ?? {}),
+          [saved.device_id]: saved,
+        },
+      }));
+      setStreamerError(null);
+    } catch (error) {
+      setStreamerError(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const setDeviceEnabled = async (device: StreamerDeviceSummary, enabled: boolean) => {
+    setBusy(true);
+    try {
+      const next = await invoke<StreamerDevicesConfig>("set_streamer_device_enabled", {
+        deviceId: device.id,
+        device_id: device.id,
+        enabled,
+      });
+      setBindings(next);
+      onDevicesChange(
+        devices.map((item) => (item.id === device.id ? { ...item, enabled } : item)),
+      );
+      setStreamerError(null);
+    } catch (error) {
+      setStreamerError(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const updateBinding = (index: number, patch: Partial<StreamerBinding>) => {
+    if (!profile) return;
+    const bindings = profile.bindings.map((binding, bindingIndex) =>
+      bindingIndex === index ? { ...binding, ...patch } : binding,
+    );
+    void saveProfile({ ...profile, safe_preset: false, bindings });
+  };
+
+  const addBinding = () => {
+    if (!profile) return;
+    const nextBinding: StreamerBinding = {
+      control_id: `manual:${profile.bindings.length + 1}`,
+      label: "New binding",
+      control_kind: "button",
+      action: { kind: "noop" },
+    };
+    setSelectedBindingIndex(profile.bindings.length);
+    void saveProfile({
+      ...profile,
+      safe_preset: false,
+      bindings: [...profile.bindings, nextBinding],
+    });
+  };
+
+  const removeBinding = (index: number) => {
+    if (!profile) return;
+    const nextBindings = profile.bindings.filter((_, bindingIndex) => bindingIndex !== index);
+    setSelectedBindingIndex(Math.max(0, Math.min(index, nextBindings.length - 1)));
+    void saveProfile({ ...profile, safe_preset: false, bindings: nextBindings });
+  };
+
+  const learnBinding = async (index: number) => {
+    if (!selectedDevice || !profile) return;
+    setBusy(true);
+    try {
+      const result = await invoke<StreamerLearnResult>("learn_streamer_control", {
+        deviceId: selectedDevice.id,
+        device_id: selectedDevice.id,
+      });
+      setStreamerMessage(result.message);
+      if (result.control_id) {
+        updateBinding(index, {
+          control_id: result.control_id,
+          control_kind: result.control_kind,
+        });
+      }
+    } catch (error) {
+      setStreamerError(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const testBinding = async (binding: StreamerBinding) => {
+    setBusy(true);
+    try {
+      const result = await invoke<StreamerActionResult>("run_streamer_action_test", {
+        action: binding.action,
+      });
+      setStreamerMessage(result.message);
+      setStreamerError(null);
+    } catch (error) {
+      setStreamerError(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="panel single-panel">
+      <div className="panel-header">
+        <h2>Streamer Devices</h2>
+        <div className="panel-actions">
+          <button
+            className="secondary-button"
+            disabled={busy}
+            onClick={() => void onRefresh()}
+            type="button"
+          >
+            <RefreshCw size={16} />
+            Refresh
+          </button>
+        </div>
+      </div>
+      {(deviceError || streamerError || streamerMessage) && (
+        <div className={streamerError || deviceError ? "effect-warning" : "latency-note info"}>
+          {streamerError || deviceError ? <CircleAlert size={15} /> : <Info size={15} />}
+          <span>{streamerError ?? deviceError ?? streamerMessage}</span>
+        </div>
+      )}
+      <div className="streamer-grid">
+        <div className="streamer-device-list">
+          {devices.map((device) => (
+            <button
+              className={device.id === selectedDevice?.id ? "streamer-device-row active" : "streamer-device-row"}
+              key={device.id}
+              onClick={() => setSelectedDeviceId(device.id)}
+              type="button"
+            >
+              <div>
+                <strong>{device.name}</strong>
+                <span>{device.description}</span>
+              </div>
+              <div className="elgato-device-meta">
+                <span>{streamerFamilyLabel(device.family)}</span>
+                <span>{device.transport}</span>
+                <span>{streamerPermissionLabel(device.permission_status)}</span>
+              </div>
+              <small>{device.message}</small>
+            </button>
+          ))}
+        </div>
+
+        <div className="streamer-binding-panel">
+          {selectedDevice && profile ? (
+            <>
+              <div className="panel-header compact">
+                <div>
+                  <h2>{profile.name}</h2>
+                  <span>{profile.safe_preset ? "Safe preset" : "Custom bindings"}</span>
+                </div>
+                <Keyboard size={18} />
+              </div>
+              <Toggle
+                disabled={busy}
+                label="Enabled"
+                onChange={(enabled) => void setDeviceEnabled(selectedDevice, enabled)}
+                value={selectedDevice.enabled}
+              />
+              <div className="streamer-binding-actions">
+                <button className="secondary-button" disabled={busy} onClick={addBinding} type="button">
+                  <CirclePlus size={16} />
+                  Binding
+                </button>
+                <button
+                  className="secondary-button"
+                  disabled={busy || !selectedBinding}
+                  onClick={() => selectedBinding && void testBinding(selectedBinding)}
+                  type="button"
+                >
+                  <Activity size={16} />
+                  Test
+                </button>
+              </div>
+              <div className="streamer-binding-list">
+                {profile.bindings.map((binding, index) => (
+                  <div
+                    className={index === selectedBindingIndex ? "streamer-binding-row active" : "streamer-binding-row"}
+                    key={`${binding.control_id}-${index}`}
+                    onClick={() => setSelectedBindingIndex(index)}
+                  >
+                    <input
+                      aria-label="Binding label"
+                      className="text-field"
+                      disabled={busy}
+                      onBlur={(event) => updateBinding(index, { label: event.currentTarget.value })}
+                      onChange={() => undefined}
+                      defaultValue={binding.label}
+                    />
+                    <input
+                      aria-label="Control id"
+                      className="text-field"
+                      disabled={busy}
+                      onBlur={(event) => updateBinding(index, { control_id: event.currentTarget.value })}
+                      onChange={() => undefined}
+                      defaultValue={binding.control_id}
+                    />
+                    <AppSelect
+                      ariaLabel="Binding action"
+                      disabled={busy}
+                      onChange={(value) => updateBinding(index, { action: parseStreamerAction(value) })}
+                      options={actionOptions}
+                      value={streamerActionKey(binding.action)}
+                    />
+                    <div className="streamer-binding-buttons">
+                      <button
+                        className="mini-icon-button"
+                        disabled={busy}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setSelectedBindingIndex(index);
+                          void learnBinding(index);
+                        }}
+                        title="Learn control"
+                        type="button"
+                      >
+                        <Keyboard size={14} />
+                      </button>
+                      <button
+                        className="mini-icon-button"
+                        disabled={busy}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void testBinding(binding);
+                        }}
+                        title="Test action"
+                        type="button"
+                      >
+                        <Activity size={14} />
+                      </button>
+                      <button
+                        className="mini-icon-button danger"
+                        disabled={busy}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          removeBinding(index);
+                        }}
+                        title="Remove binding"
+                        type="button"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {profile.bindings.length === 0 && <EmptyState label="No bindings" />}
+              </div>
+            </>
+          ) : (
+            <EmptyState label="No streamer device selected" />
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ElgatoDevicesView() {
+  const [devices, setDevices] = useState<ElgatoDeviceSummary[]>([]);
+  const [waveXlr, setWaveXlr] = useState<ElgatoWaveXlrState | null>(null);
+  const [elgatoError, setElgatoError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const commandBusy = useRef(false);
+  const loadBusy = useRef(false);
+
+  const loadElgato = useCallback(async (showBusy = false) => {
+    if (commandBusy.current || loadBusy.current) return;
+    loadBusy.current = true;
+    if (showBusy) setBusy(true);
+    try {
+      const nextDevices = await invoke<ElgatoDeviceSummary[]>("list_elgato_devices");
+      setDevices(nextDevices);
+      if (nextDevices.some((device) => device.controls_supported)) {
+        try {
+          const nextState = await invoke<ElgatoWaveXlrState>("read_elgato_wave_xlr");
+          setWaveXlr(nextState);
+          setElgatoError(null);
+        } catch (error) {
+          setWaveXlr(null);
+          setElgatoError(String(error));
+        }
+      } else {
+        setWaveXlr(null);
+        setElgatoError(null);
+      }
+    } catch (error) {
+      setDevices([]);
+      setWaveXlr(null);
+      setElgatoError(String(error));
+    } finally {
+      loadBusy.current = false;
+      if (showBusy) setBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      void loadElgato(false);
+    };
+    tick();
+    const interval = window.setInterval(tick, ELGATO_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [loadElgato]);
+
+  const waitForElgatoRefresh = async () => {
+    while (loadBusy.current) {
+      await new Promise((resolve) => window.setTimeout(resolve, 25));
+    }
+  };
+
+  const runWaveCommand = async (command: string, args: Record<string, unknown>) => {
+    if (commandBusy.current) return;
+    commandBusy.current = true;
+    setBusy(true);
+    try {
+      await waitForElgatoRefresh();
+      const nextState = await invoke<ElgatoWaveXlrState>(command, args);
+      setWaveXlr(nextState);
+      setElgatoError(null);
+    } catch (error) {
+      setWaveXlr(null);
+      setElgatoError(String(error));
+    } finally {
+      commandBusy.current = false;
+      setBusy(false);
+    }
+  };
+
+  const controllableDevice = devices.find((device) => device.controls_supported);
+
+  return (
+    <section className="panel single-panel">
+      <div className="panel-header">
+        <h2>Elgato Devices</h2>
+        <div className="panel-actions">
+          <button
+            className="secondary-button"
+            disabled={busy}
+            onClick={() => void loadElgato(true)}
+            type="button"
+          >
+            <RefreshCw size={16} />
+            Refresh
+          </button>
+        </div>
+      </div>
+      {elgatoError && (
+        <div className="effect-warning">
+          <CircleAlert size={15} />
+          <span>{elgatoError}</span>
+        </div>
+      )}
+      <div className="elgato-grid">
+        <div className="elgato-device-list">
+          {devices.map((device) => (
+            <div
+              className={device.controls_supported ? "elgato-device-row active" : "elgato-device-row"}
+              key={device.id}
+            >
+              <div>
+                <strong>{device.name}</strong>
+                <span>{device.description}</span>
+              </div>
+              <div className="elgato-device-meta">
+                <span>{elgatoKindLabel(device.kind)}</span>
+                <span>{device.bus ?? "unknown"}</span>
+                {device.product_id && <span>{device.vendor_id ?? "usb"}:{device.product_id}</span>}
+              </div>
+              <small>{device.message}</small>
+            </div>
+          ))}
+          {devices.length === 0 && <EmptyState label="No Elgato audio devices detected" />}
+        </div>
+
+        <div className="elgato-control-card">
+          <div className="panel-header compact">
+            <h2>{controllableDevice?.name ?? "Wave XLR"}</h2>
+            <Mic size={18} />
+          </div>
+          {waveXlr ? (
+            <>
+              <div className="elgato-state-grid">
+                <Stat icon={Gauge} label="Gain" value={formatHexGain(waveXlr.gain_raw)} />
+                <Stat icon={Headphones} label="Headphones" value={`${waveXlr.hp_volume_db.toFixed(1)} dB`} />
+                <Stat icon={SlidersHorizontal} label="Knob" value={waveXlr.volume_select === "headphones" ? "Headphones" : "Gain"} />
+              </div>
+              <div className="elgato-info-grid">
+                <span>Firmware</span>
+                <strong>{waveXlr.firmware_version ?? "Unknown"}</strong>
+                <span>API</span>
+                <strong>{waveXlr.api_version ?? "Unknown"}</strong>
+                <span>Serial</span>
+                <strong>{waveXlr.serial ?? "Unknown"}</strong>
+              </div>
+              <Toggle
+                disabled={busy}
+                label="Mute microphone"
+                onChange={(muted) =>
+                  void runWaveCommand("set_elgato_wave_xlr_mute", { muted })
+                }
+                value={waveXlr.muted}
+              />
+              <VolumeFader
+                compact
+                disabled={busy}
+                formatValue={(value) => formatHexGain(Math.round(value))}
+                label="Gain"
+                max={waveXlr.gain_max_raw}
+                min={0}
+                step={64}
+                unit=""
+                value={waveXlr.gain_raw}
+                onChange={(value) => {
+                  const gainRaw = Math.round(value);
+                  void runWaveCommand("set_elgato_wave_xlr_gain", {
+                    gainRaw,
+                    gain_raw: gainRaw,
+                  });
+                }}
+              />
+              <VolumeFader
+                compact
+                disabled={busy}
+                label="Headphones"
+                max={waveXlr.hp_max_db}
+                min={waveXlr.hp_min_db}
+                step={0.5}
+                unit=" dB"
+                value={waveXlr.hp_volume_db}
+                onChange={(db) =>
+                  void runWaveCommand("set_elgato_wave_xlr_hp_volume_db", { db })
+                }
+              />
+              <Toggle
+                disabled={busy}
+                label="Low impedance"
+                onChange={(enabled) =>
+                  void runWaveCommand("set_elgato_wave_xlr_low_impedance", { enabled })
+                }
+                value={waveXlr.low_impedance}
+              />
+            </>
+          ) : controllableDevice ? (
+            <EmptyState label={elgatoError ? "Wave XLR controls unavailable" : "Reading Wave XLR controls"} />
+          ) : (
+            <EmptyState label="No controllable Wave XLR found" />
+          )}
+        </div>
+      </div>
     </section>
   );
 }
@@ -5946,6 +6789,9 @@ function VolumeFader({
   max = 1,
   unit = "%",
   compact = false,
+  disabled = false,
+  step,
+  formatValue,
   onChange,
 }: {
   label: string;
@@ -5954,6 +6800,9 @@ function VolumeFader({
   max?: number;
   unit?: string;
   compact?: boolean;
+  disabled?: boolean;
+  step?: number;
+  formatValue?: (value: number) => string;
   onChange: (value: number) => void | Promise<unknown>;
 }) {
   const normalizedPercent = unit === "%" && min === 0 && max === 1;
@@ -5963,6 +6812,7 @@ function VolumeFader({
   const [draft, setDraft] = useState(incomingSliderValue);
   const lastCommitted = useRef(incomingSliderValue);
   const display = normalizedPercent ? Math.round(draft) : Math.round(draft * 10) / 10;
+  const displayText = formatValue ? formatValue(draft) : `${display}${unit}`;
 
   useEffect(() => {
     const next = normalizedPercent ? value * 100 : value;
@@ -5971,17 +6821,22 @@ function VolumeFader({
   }, [normalizedPercent, value]);
 
   const commit = useCallback((raw: number) => {
+    if (disabled) return;
     const next = Number.isFinite(raw) ? Math.max(sliderMin, Math.min(sliderMax, raw)) : incomingSliderValue;
     setDraft(next);
     if (lastCommitted.current === next) return;
     lastCommitted.current = next;
     void onChange(normalizedPercent ? next / 100 : next);
-  }, [incomingSliderValue, normalizedPercent, onChange, sliderMax, sliderMin]);
+  }, [disabled, incomingSliderValue, normalizedPercent, onChange, sliderMax, sliderMin]);
 
   return (
-    <label className={compact ? "fader-row compact" : "fader-row"}>
+    <label
+      aria-disabled={disabled}
+      className={`${compact ? "fader-row compact" : "fader-row"}${disabled ? " disabled" : ""}`}
+    >
       <span>{label}</span>
       <input
+        disabled={disabled}
         max={sliderMax}
         min={sliderMin}
         onBlur={(event) => commit(Number(event.currentTarget.value))}
@@ -5990,11 +6845,11 @@ function VolumeFader({
           if (shouldCommitSliderKey(event)) commit(Number(event.currentTarget.value));
         }}
         onPointerUp={(event) => commit(Number(event.currentTarget.value))}
-        step={unit === "%" ? 1 : 0.1}
+        step={step ?? (unit === "%" ? 1 : 0.1)}
         type="range"
         value={draft}
       />
-      <strong>{display}{unit}</strong>
+      <strong>{displayText}</strong>
     </label>
   );
 }
@@ -6002,14 +6857,21 @@ function VolumeFader({
 function Toggle({
   label,
   value,
+  disabled = false,
   onChange,
 }: {
   label: string;
   value: boolean;
+  disabled?: boolean;
   onChange: (value: boolean) => void | Promise<unknown>;
 }) {
   return (
-    <button className="toggle-row" onClick={() => onChange(!value)} type="button">
+    <button
+      className="toggle-row"
+      disabled={disabled}
+      onClick={() => onChange(!value)}
+      type="button"
+    >
       <span>{label}</span>
       <span className={value ? "toggle on" : "toggle"} />
     </button>
@@ -6043,6 +6905,121 @@ function hardwareProfileOptionLabel(profile: HardwareProfileSummary): string {
   return `${profile.name} · ${profile.source}`;
 }
 
+function elgatoKindLabel(kind: ElgatoDeviceSummary["kind"]): string {
+  return {
+    wave_xlr: "Wave XLR",
+    wave_microphone: "Wave microphone",
+    capture_audio: "Capture audio",
+    audio_endpoint: "Audio endpoint",
+  }[kind];
+}
+
+function emptyStreamerProfile(device: StreamerDeviceSummary): StreamerBindingProfile {
+  return {
+    device_id: device.id,
+    family: device.family,
+    name: device.name,
+    enabled: device.enabled,
+    safe_preset: true,
+    bindings: [],
+  };
+}
+
+function streamerFamilyLabel(family: StreamerDeviceSummary["family"]): string {
+  return {
+    stream_deck: "Stream Deck",
+    rode: "RODE",
+    go_xlr: "GoXLR",
+    midi_surface: "MIDI surface",
+    loupedeck: "Loupedeck",
+    x_keys: "X-keys",
+    unknown_supported: "Hardware",
+  }[family];
+}
+
+function streamerPermissionLabel(status: StreamerDeviceSummary["permission_status"]): string {
+  return {
+    ready: "Ready",
+    permission_denied: "Permission",
+    busy: "Busy",
+    missing_runtime: "Missing runtime",
+    unsupported_protocol: "Unsupported",
+  }[status];
+}
+
+function streamerActionOptions(state: AppStateSnapshot): SelectOption[] {
+  const actions: Array<{ label: string; action: StreamerAction }> = [
+    { label: "No action", action: { kind: "noop" } },
+    { label: "Prune stale audio", action: { kind: "cleanup_stale_audio_graph" } },
+  ];
+  for (const mix of state.config.mixes) {
+    actions.push({
+      label: `${mix.name}: mute`,
+      action: { kind: "mix_mute_toggle", mix_id: mix.id },
+    });
+    actions.push({
+      label: `${mix.name}: volume +10`,
+      action: { kind: "mix_volume_adjust", mix_id: mix.id, delta: 0.1 },
+    });
+    actions.push({
+      label: `${mix.name}: volume -10`,
+      action: { kind: "mix_volume_adjust", mix_id: mix.id, delta: -0.1 },
+    });
+    actions.push({
+      label: `${mix.name}: volume from control`,
+      action: { kind: "mix_volume_set_from_control", mix_id: mix.id },
+    });
+  }
+  for (const channel of state.config.channels) {
+    for (const mix of primaryBusMixes(state.config.mixes)) {
+      actions.push({
+        label: `${channelDisplayName(channel)} ${mix.name}: mute`,
+        action: { kind: "channel_mute_toggle", channel_id: channel.id, mix_id: mix.id },
+      });
+      actions.push({
+        label: `${channelDisplayName(channel)} ${mix.name}: enable`,
+        action: { kind: "channel_bus_enabled_toggle", channel_id: channel.id, mix_id: mix.id },
+      });
+      actions.push({
+        label: `${channelDisplayName(channel)} ${mix.name}: +10`,
+        action: { kind: "channel_volume_adjust", channel_id: channel.id, mix_id: mix.id, delta: 0.1 },
+      });
+      actions.push({
+        label: `${channelDisplayName(channel)} ${mix.name}: -10`,
+        action: { kind: "channel_volume_adjust", channel_id: channel.id, mix_id: mix.id, delta: -0.1 },
+      });
+      actions.push({
+        label: `${channelDisplayName(channel)} ${mix.name}: from control`,
+        action: { kind: "channel_volume_set_from_control", channel_id: channel.id, mix_id: mix.id },
+      });
+    }
+    for (const effect of channel.effects) {
+      actions.push({
+        label: `${channelDisplayName(channel)}: ${effect.name || effect.effect_id}`,
+        action: { kind: "effect_bypass_toggle", channel_id: channel.id, instance_id: effect.instance_id },
+      });
+    }
+  }
+  return actions.map(({ label, action }) => ({ label, value: streamerActionKey(action) }));
+}
+
+function streamerActionKey(action: StreamerAction): string {
+  return JSON.stringify(action);
+}
+
+function parseStreamerAction(value: string): StreamerAction {
+  try {
+    const parsed = JSON.parse(value) as StreamerAction;
+    return parsed && typeof parsed === "object" && "kind" in parsed ? parsed : { kind: "noop" };
+  } catch {
+    return { kind: "noop" };
+  }
+}
+
+function formatHexGain(value: number): string {
+  return `0x${Math.max(0, Math.round(value)).toString(16).toUpperCase().padStart(4, "0")}`;
+}
+
 function hardwareProfileSummaryFromFallback(profile: FallbackHardwareProfile): HardwareProfileSummary {
   return {
     id: profile.id,
@@ -6061,6 +7038,29 @@ function isHardwareProfileDevice(device: DeviceInfo): boolean {
   if (text.includes("wavelinux")) return false;
   if (text.includes(".monitor") || text.includes("monitor of")) return false;
   return true;
+}
+
+function isElgatoAudioDevice(device: DeviceInfo): boolean {
+  if (device.is_virtual || device.bus === "virtual") return false;
+  const vendorId = normalizeUsbId(device.vendor_id);
+  const profileId = device.matched_profile_id?.toLowerCase() ?? "";
+  const text = [device.id, device.name, device.description].join(" ").toLowerCase();
+  return (
+    vendorId === "0fd9" ||
+    profileId.startsWith("elgato.") ||
+    text.includes("elgato") ||
+    text.includes("wave xlr") ||
+    text.includes("wave:3")
+  );
+}
+
+function normalizeUsbId(value?: string | null): string {
+  const normalized = (value ?? "")
+    .trim()
+    .replace(/^0x/i, "")
+    .toLowerCase()
+    .replace(/[^0-9a-f]/g, "");
+  return normalized ? normalized.padStart(4, "0") : "";
 }
 
 function primaryBusMixes(mixes: Mix[]): Mix[] {
@@ -6562,6 +7562,10 @@ function meterLevelMapsEqual(left: Record<string, number>, right: Record<string,
   const rightKeys = Object.keys(right);
   if (leftKeys.length !== rightKeys.length) return false;
   return leftKeys.every((key) => Math.abs((left[key] ?? 0) - (right[key] ?? 0)) < 0.001);
+}
+
+function documentHasActiveFocus(): boolean {
+  return document.visibilityState === "visible" && document.hasFocus();
 }
 
 function channelBusMeterId(channelId: string, mixId: string): string {

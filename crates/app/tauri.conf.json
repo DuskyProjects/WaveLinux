@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "WaveLinux",
-  "version": "4.2.1",
+  "version": "4.3.0",
   "identifier": "io.github.duskyprojects.WaveLinux",
   "build": {
     "beforeDevCommand": "cd .. && node node_modules/.bin/vite --port 1420",
@@ -13,7 +13,7 @@
     "enableGTKAppId": true,
     "windows": [
       {
-        "title": "WaveLinux 4.2.1",
+        "title": "WaveLinux 4.3.0",
         "width": 1280,
         "height": 820,
         "minWidth": 960,
@@ -40,6 +40,12 @@
     "shortDescription": "Linux creator audio mixer",
     "longDescription": "WaveLinux is a Rust and PipeWire creator audio mixer for Linux.",
     "linux": {
+      "appimage": {
+        "bundleMediaFramework": true,
+        "files": {
+          "/usr/wavelinux-runtime": "appimage-extra/usr/wavelinux-runtime"
+        }
+      },
       "deb": {
         "depends": [
           "pipewire",
@@ -47,7 +53,20 @@
           "pipewire-pulse",
           "pulseaudio-utils",
           "libwebkit2gtk-4.1-0",
-          "libayatana-appindicator3-1"
+          "libayatana-appindicator3-1",
+          "libusb-1.0-0",
+          "bubblewrap",
+          "xdg-dbus-proxy",
+          "xwayland",
+          "libegl1",
+          "libgl1",
+          "libgbm1",
+          "libdrm2",
+          "gstreamer1.0-plugins-base",
+          "gstreamer1.0-plugins-good",
+          "fonts-dejavu-core",
+          "xdg-desktop-portal",
+          "xdg-desktop-portal-gtk"
         ],
         "recommends": ["swh-plugins", "librnnoise-ladspa"]
       },
@@ -57,7 +76,20 @@
           "wireplumber",
           "pipewire-pulseaudio",
           "pulseaudio-utils",
-          "webkit2gtk4.1"
+          "webkit2gtk4.1",
+          "libusb1",
+          "bubblewrap",
+          "xdg-dbus-proxy",
+          "xorg-x11-server-Xwayland",
+          "mesa-libEGL",
+          "mesa-libGL",
+          "mesa-libgbm",
+          "libdrm",
+          "gstreamer1-plugins-base",
+          "gstreamer1-plugins-good",
+          "google-noto-sans-fonts",
+          "xdg-desktop-portal",
+          "xdg-desktop-portal-gtk"
         ],
         "recommends": ["ladspa-swh-plugins", "lsp-plugins-ladspa", "rnnoise"]
       }

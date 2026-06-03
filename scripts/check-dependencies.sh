@@ -53,6 +53,22 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+library_available() {
+  local soname="$1"
+  shift
+
+  if command_exists ldconfig && ldconfig -p 2>/dev/null | grep -q "$soname"; then
+    return 0
+  fi
+
+  local path
+  for path in "$@"; do
+    [[ -e "$path" ]] && return 0
+  done
+
+  return 1
+}
+
 detect_manager() {
   if command_exists apt-get; then
     echo apt
@@ -133,7 +149,7 @@ install_packages() {
       $sudo_cmd dnf install -y "${packages[@]}"
       ;;
     pacman)
-      $sudo_cmd pacman -S --needed --noconfirm "${packages[@]}"
+      $sudo_cmd pacman -Syu --needed --noconfirm "${packages[@]}"
       ;;
     zypper)
       $sudo_cmd zypper --non-interactive install --no-recommends "${packages[@]}"
@@ -203,6 +219,42 @@ for program in pipewire pactl wpctl pw-cli pw-dump; do
     missing_commands+=("$program")
   fi
 done
+missing_webkit_helpers=()
+for program in bwrap xdg-dbus-proxy; do
+  if ! command_exists "$program"; then
+    missing_webkit_helpers+=("$program")
+  fi
+done
+if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] && ! command_exists Xwayland; then
+  missing_webkit_helpers+=("Xwayland")
+fi
+missing_streamer_commands=()
+if ! command_exists aseqdump; then
+  missing_streamer_commands+=("aseqdump")
+fi
+missing_libraries=()
+if ! library_available 'libusb-1\.0\.so\.0' /usr/lib/libusb-1.0.so.0 /usr/lib64/libusb-1.0.so.0 /usr/lib/x86_64-linux-gnu/libusb-1.0.so.0; then
+  missing_libraries+=("libusb-1.0")
+fi
+if ! library_available 'libEGL\.so\.1' /usr/lib/libEGL.so.1 /usr/lib64/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libEGL.so.1; then
+  missing_libraries+=("libEGL")
+fi
+if ! library_available 'libGL\.so\.1' /usr/lib/libGL.so.1 /usr/lib64/libGL.so.1 /usr/lib/x86_64-linux-gnu/libGL.so.1; then
+  missing_libraries+=("libGL")
+fi
+if ! library_available 'libgbm\.so\.1' /usr/lib/libgbm.so.1 /usr/lib64/libgbm.so.1 /usr/lib/x86_64-linux-gnu/libgbm.so.1; then
+  missing_libraries+=("libgbm")
+fi
+if ! library_available 'libdrm\.so\.2' /usr/lib/libdrm.so.2 /usr/lib64/libdrm.so.2 /usr/lib/x86_64-linux-gnu/libdrm.so.2; then
+  missing_libraries+=("libdrm")
+fi
+streamer_discovery_notes=()
+if [[ ! -d /sys/class/hidraw ]]; then
+  streamer_discovery_notes+=("hidraw sysfs unavailable")
+fi
+if [[ ! -r /proc/asound/seq/clients ]]; then
+  streamer_discovery_notes+=("ALSA sequencer client list unavailable")
+fi
 
 runtime_candidates=()
 effect_candidates=()
@@ -210,20 +262,20 @@ aur_effect_candidates=()
 
 case "$manager" in
   apt)
-    runtime_candidates=(pipewire wireplumber pipewire-pulse pipewire-bin pulseaudio-utils libwebkit2gtk-4.1-0 libayatana-appindicator3-1)
+    runtime_candidates=(pipewire wireplumber pipewire-pulse pipewire-bin pulseaudio-utils alsa-utils libwebkit2gtk-4.1-0 libayatana-appindicator3-1 libusb-1.0-0 bubblewrap xdg-dbus-proxy xwayland libegl1 libgl1 libgbm1 libdrm2 gstreamer1.0-plugins-base gstreamer1.0-plugins-good fonts-dejavu-core xdg-desktop-portal xdg-desktop-portal-gtk)
     effect_candidates=(swh-plugins lsp-plugins-ladspa librnnoise-ladspa deepfilternet-ladspa deepfilternet)
     ;;
   dnf)
-    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils webkit2gtk4.1 libappindicator-gtk3)
+    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils alsa-utils webkit2gtk4.1 libappindicator-gtk3 libusb1 bubblewrap xdg-dbus-proxy xorg-x11-server-Xwayland mesa-libEGL mesa-libGL mesa-libgbm libdrm gstreamer1-plugins-base gstreamer1-plugins-good google-noto-sans-fonts xdg-desktop-portal xdg-desktop-portal-gtk)
     effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise noise-suppression-for-voice deepfilternet)
     ;;
   pacman)
-    runtime_candidates=(pipewire wireplumber pipewire-pulse libpulse webkit2gtk-4.1 gtk3 libayatana-appindicator)
+    runtime_candidates=(pipewire wireplumber pipewire-pulse libpulse alsa-utils webkit2gtk-4.1 gtk3 libayatana-appindicator libusb bubblewrap xdg-dbus-proxy xorg-xwayland mesa libglvnd gstreamer gst-plugins-base-libs gst-plugins-good noto-fonts xdg-desktop-portal xdg-desktop-portal-gtk)
     effect_candidates=(swh-plugins noise-suppression-for-voice)
     aur_effect_candidates=(deepfilternet-plugin-pipewire-bin noise-suppression-for-voice deepfilternet deepfilternet-ladspa)
     ;;
   zypper)
-    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils libwebkit2gtk-4_1-0 typelib-1_0-AyatanaAppIndicator3-0_1)
+    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils alsa libwebkit2gtk-4_1-0 typelib-1_0-AyatanaAppIndicator3-0_1 libusb-1_0-0 bubblewrap xdg-dbus-proxy xwayland libwebkit2gtk-4_1-0 Mesa-libEGL1 Mesa-libGL1 libgbm1 libdrm2 gstreamer-plugins-base gstreamer-plugins-good google-noto-sans-fonts xdg-desktop-portal xdg-desktop-portal-gtk)
     effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise deepfilternet)
     ;;
 esac
@@ -264,13 +316,35 @@ else
   echo "Runtime tools missing: ${missing_commands[*]}"
 fi
 
+if (( ${#missing_libraries[@]} == 0 )); then
+  echo "Runtime libraries: ok"
+else
+  echo "Runtime libraries missing: ${missing_libraries[*]}"
+fi
+
+if (( ${#missing_webkit_helpers[@]} == 0 )); then
+  echo "WebKit/AppImage helpers: ok"
+else
+  echo "WebKit/AppImage helpers missing: ${missing_webkit_helpers[*]}"
+fi
+
 if (( ${#missing_effects[@]} == 0 )); then
   echo "Optional effects: ok"
 else
   echo "Optional effects missing: ${missing_effects[*]}"
 fi
+if (( ${#streamer_discovery_notes[@]} == 0 )); then
+  echo "Streamer device discovery: ok"
+else
+  echo "Streamer device discovery notes: ${streamer_discovery_notes[*]}"
+fi
+if (( ${#missing_streamer_commands[@]} == 0 )); then
+  echo "Streamer device runtime: ok"
+else
+  echo "Streamer device runtime missing: ${missing_streamer_commands[*]}"
+fi
 
-if (( INSTALL == 1 && ${#missing_commands[@]} > 0 )); then
+if (( INSTALL == 1 && ( ${#missing_commands[@]} > 0 || ${#missing_streamer_commands[@]} > 0 || ${#missing_libraries[@]} > 0 || ${#missing_webkit_helpers[@]} > 0 ) )); then
   mapfile -t packages < <(resolve_packages "$manager" "${runtime_candidates[@]}")
   if (( ${#packages[@]} > 0 )); then
     echo "Installing runtime packages: ${packages[*]}"
@@ -301,6 +375,6 @@ if (( INSTALL_EFFECTS == 1 && ${#missing_effects[@]} > 0 )); then
   fi
 fi
 
-if (( STRICT == 1 && ( ${#missing_commands[@]} > 0 || ${#missing_effects[@]} > 0 ) )); then
+if (( STRICT == 1 && ( ${#missing_commands[@]} > 0 || ${#missing_streamer_commands[@]} > 0 || ${#missing_libraries[@]} > 0 || ${#missing_webkit_helpers[@]} > 0 || ${#missing_effects[@]} > 0 ) )); then
   exit 1
 fi

@@ -125,6 +125,57 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return demoHardwareProfileState();
   }
 
+  if (command === "list_elgato_devices") {
+    return [];
+  }
+
+  if (command === "list_streamer_devices") {
+    return [];
+  }
+
+  if (command === "get_streamer_bindings") {
+    return structuredClone(demoState.config.streamer_devices);
+  }
+
+  if (command === "set_streamer_device_enabled") {
+    const deviceId = stringArg(args, "deviceId") || stringArg(args, "device_id");
+    const enabled = boolArg(args, "enabled", true);
+    if (deviceId) {
+      demoState.config.streamer_devices.profiles[deviceId] = {
+        device_id: deviceId,
+        family: null,
+        name: "Streamer Device",
+        enabled,
+        safe_preset: false,
+        bindings: demoState.config.streamer_devices.profiles[deviceId]?.bindings ?? [],
+      };
+    }
+    return structuredClone(demoState.config.streamer_devices);
+  }
+
+  if (command === "set_streamer_binding_profile") {
+    const profile = args?.profile;
+    if (profile && typeof profile === "object" && "device_id" in profile) {
+      const next = structuredClone(profile) as typeof demoState.config.streamer_devices.profiles[string];
+      demoState.config.streamer_devices.profiles[next.device_id] = next;
+      return next;
+    }
+    return {};
+  }
+
+  if (command === "learn_streamer_control") {
+    return {
+      device_id: stringArg(args, "deviceId") || stringArg(args, "device_id"),
+      control_id: null,
+      control_kind: "unknown",
+      message: "No streamer device is connected in demo mode",
+    };
+  }
+
+  if (command === "run_streamer_action_test") {
+    return { performed: false, message: "No streamer device is connected in demo mode" };
+  }
+
   if (command === "create_mix") {
     const name = String(args?.name ?? "New Mix");
     const id = slug(name);
@@ -337,6 +388,10 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
   }
 
   if (command === "check_for_updates") {
+    const releaseChannel =
+      stringArg(args, "releaseChannel") ||
+      stringArg(args, "release_channel") ||
+      demoState.config.settings.release_channel;
     return {
       available: false,
       install_supported: false,
@@ -346,8 +401,11 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       body: null,
       url: null,
       release_url: "https://github.com/DuskyProjects/WaveLinux/releases",
-      channel: demoState.config.settings.release_channel,
-      endpoint: "https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json",
+      channel: releaseChannel,
+      endpoint:
+        releaseChannel === "beta"
+          ? "https://github.com/DuskyProjects/WaveLinux/releases/download/prerelease/latest.json"
+          : "https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json",
       message: "WaveLinux is up to date",
     };
   }
@@ -383,18 +441,6 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
 
   if (command === "open_release_page") {
     return null;
-  }
-
-  if (command === "repair_audio_graph") {
-    demoState.engine.audio_graph_running = true;
-    demoState.engine.message = "Audio graph running";
-    return { dry_run: true, planned: { commands: [], managed_nodes: [] }, outputs: [] };
-  }
-
-  if (command === "cleanup_audio_graph") {
-    demoState.engine.audio_graph_running = false;
-    demoState.engine.message = "Audio graph stopped";
-    return [];
   }
 
   if (command === "cleanup_stale_audio_graph") {
@@ -1368,6 +1414,10 @@ export const demoState: AppStateSnapshot = {
       active_output_fallback: false,
       hardware_profile_assignments: {},
       fallback_hardware_profile: defaultDemoFallbackProfile(),
+    },
+    streamer_devices: {
+      version: 1,
+      profiles: {},
     },
   },
   graph: {

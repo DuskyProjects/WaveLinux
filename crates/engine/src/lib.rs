@@ -25,7 +25,7 @@ use wavelinux_model::{
     ChannelInputMode, ChannelKind, DeviceInfo, Diagnostic, DiagnosticSeverity, EffectAvailability,
     EffectCatalog, EffectInstance, EngineStatus, FallbackHardwareProfile, HardwareProfile,
     HardwareProfileUiState, KnownApp, LatencyPolicy, LevelMeter, Mix, MixerConfig, MixerSettings,
-    ModelError, RoutingPolicy, RuntimeGraph,
+    ModelError, RoutingPolicy, RuntimeGraph, StreamerBindingProfile, StreamerDevicesConfig,
 };
 use wavelinux_pw::{
     channel_has_active_effects, channel_mix_route_revision, channel_mix_source_name,
@@ -59,6 +59,7 @@ const EFFECT_AVAILABILITY_TTL: Duration = Duration::from_secs(30);
 const HARDWARE_PROFILE_TTL: Duration = Duration::from_secs(15);
 const REMOTE_PROFILE_SYNC_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const METER_RESTART_BACKOFF: Duration = Duration::from_secs(5);
+const METER_IDLE_STOP_AFTER: Duration = Duration::from_millis(750);
 const METER_NOISE_FLOOR: f32 = 0.008;
 const METER_STALE_AFTER: Duration = Duration::from_millis(120);
 const METER_STALE_RELEASE_PER_SECOND: f32 = 0.08;
@@ -67,6 +68,42 @@ const METER_DISPLAY_CEILING_DB: f32 = 0.0;
 const METER_DISPLAY_EXPONENT: f32 = 1.15;
 const EFFECT_GRAPH_SYNC_DEBOUNCE: Duration = Duration::from_millis(500);
 const GRAPH_REPAIR_DEBOUNCE: Duration = Duration::from_millis(650);
+const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
+    "APPDIR",
+    "APPIMAGE",
+    "ARGV0",
+    "CEF_PATH",
+    "CEF_ROOT",
+    "GDK_BACKEND",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GIO_EXTRA_MODULES",
+    "GIO_MODULE_DIR",
+    "GI_TYPELIB_PATH",
+    "GSETTINGS_SCHEMA_DIR",
+    "GST_PLUGIN_PATH",
+    "GST_PLUGIN_PATH_1_0",
+    "GST_PLUGIN_SCANNER",
+    "GST_PLUGIN_SCANNER_1_0",
+    "GST_PLUGIN_SYSTEM_PATH",
+    "GST_PLUGIN_SYSTEM_PATH_1_0",
+    "GST_PTP_HELPER_1_0",
+    "GST_REGISTRY_REUSE_PLUGIN_SCANNER",
+    "GTK_DATA_PREFIX",
+    "GTK_EXE_PREFIX",
+    "GTK_IM_MODULE_FILE",
+    "GTK_PATH",
+    "GTK_THEME",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LIBRARY_PATH",
+    "PERLLIB",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "QT_PLUGIN_PATH",
+    "WEBKIT_EXEC_PATH",
+    "XDG_DATA_DIRS",
+];
 const FX_LOG_WARNING_WINDOW: Duration = Duration::from_secs(10 * 60);
 const AUDIO_COMMAND_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
 const CAPTURE_MOVE_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
@@ -329,6 +366,7 @@ struct MeterSupervisor {
     handles: BTreeMap<String, MeterProcess>,
     targets: BTreeMap<String, MeterTarget>,
     last_attempts: BTreeMap<String, Instant>,
+    last_requested_at: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -361,11 +399,19 @@ impl MeterSupervisor {
             handles: BTreeMap::new(),
             targets: BTreeMap::new(),
             last_attempts: BTreeMap::new(),
+            last_requested_at: None,
         }
     }
 
-    fn reconcile(&mut self, targets: Vec<MeterTarget>) -> MeterSupervisorUpdate {
+    fn reconcile(
+        &mut self,
+        targets: Vec<MeterTarget>,
+        mark_requested: bool,
+    ) -> MeterSupervisorUpdate {
         let mut update = MeterSupervisorUpdate::default();
+        if mark_requested {
+            self.last_requested_at = Some(Instant::now());
+        }
         if self.dry_run || !meter_sampling_enabled() {
             update.stopped += self.handles.len();
             self.stop_all();
@@ -427,6 +473,26 @@ impl MeterSupervisor {
         update
     }
 
+    fn snapshot_or_stop_idle(&mut self) -> MeterSupervisorUpdate {
+        let now = Instant::now();
+        if self.requested_recently_at(now) {
+            return MeterSupervisorUpdate {
+                meters: self.snapshot(),
+                ..MeterSupervisorUpdate::default()
+            };
+        }
+        self.reconcile(Vec::new(), false)
+    }
+
+    fn requested_recently(&self) -> bool {
+        self.requested_recently_at(Instant::now())
+    }
+
+    fn requested_recently_at(&self, now: Instant) -> bool {
+        self.last_requested_at
+            .is_some_and(|requested_at| now.duration_since(requested_at) <= METER_IDLE_STOP_AFTER)
+    }
+
     fn snapshot(&self) -> Vec<LevelMeter> {
         self.targets
             .values()
@@ -442,6 +508,7 @@ impl MeterSupervisor {
         self.handles.clear();
         self.targets.clear();
         self.last_attempts.clear();
+        self.last_requested_at = None;
     }
 }
 
@@ -545,6 +612,8 @@ fn run_pipewire_meter_stream_inner(
         *pw::keys::MEDIA_NAME => "WaveLinux VU Meter",
         *pw::keys::NODE_NAME => format!("wavelinux-meter-{}", safe_file_id(&endpoint.source_name)),
         *pw::keys::NODE_DESCRIPTION => format!("WaveLinux meter for {}", endpoint.source_name),
+        *pw::keys::NODE_VIRTUAL => "true",
+        *pw::keys::NODE_PASSIVE => "true",
         *pw::keys::TARGET_OBJECT => endpoint.target_object.clone(),
     };
     if endpoint.dont_remix {
@@ -554,6 +623,9 @@ fn run_pipewire_meter_stream_inner(
         props.insert(*pw::keys::NODE_DONT_RECONNECT, "true");
     }
     props.insert("application.name", "WaveLinux");
+    props.insert("node.dont-move", "true");
+    props.insert("state.restore-props", "false");
+    props.insert("state.restore-target", "false");
     props.insert("wavelinux.managed", "1");
     props.insert("wavelinux.role", "meter");
     if endpoint.capture_sink_monitor {
@@ -1022,11 +1094,22 @@ impl WaveLinuxEngine {
     }
 
     pub fn observe_meters(&self) -> Result<Vec<LevelMeter>, EngineError> {
-        let supervisor = self
-            .meter_supervisor
-            .lock()
-            .map_err(|_| EngineError::LockPoisoned)?;
-        Ok(supervisor.snapshot())
+        let config = self.read_config()?.clone();
+        let (graph, audio_graph_running) = {
+            let runtime = self.read_runtime()?;
+            (
+                runtime.graph.clone(),
+                runtime.status.audio_graph_running && !self.stop.load(Ordering::SeqCst),
+            )
+        };
+        let meters = self.refresh_meter_supervisor(&config, &graph, audio_graph_running, true)?;
+        let mut runtime = self.write_runtime()?;
+        if runtime.status.audio_graph_running {
+            runtime.graph.meters = meters.clone();
+        } else if !runtime.graph.meters.is_empty() {
+            runtime.graph.meters.clear();
+        }
+        Ok(meters)
     }
 
     fn cached_state(&self) -> Result<AppStateSnapshot, EngineError> {
@@ -1254,7 +1337,7 @@ impl WaveLinuxEngine {
         graph.meters = if self.stop.load(Ordering::SeqCst) {
             Vec::new()
         } else {
-            self.refresh_meter_supervisor(&audio_config, &graph, audio_graph_running)?
+            self.meter_snapshot_or_stop_idle()?
         };
         record_refresh_phase(&mut refresh_phases, &mut phase_started, "meters");
         self.remember_observed_apps(&graph.app_streams)?;
@@ -1715,7 +1798,7 @@ impl WaveLinuxEngine {
         let planned = plan_ensure_graph(&config);
         let mut graph = self.snapshot_for_config(Some(&config))?;
         let audio_graph_running = graph_has_wavelinux_nodes(&graph);
-        graph.meters = self.refresh_meter_supervisor(&config, &graph, audio_graph_running)?;
+        graph.meters = self.meter_snapshot_or_stop_idle()?;
         let mut diagnostics = self.host_diagnostics()?;
         let managed_modules = self.pw.managed_modules().unwrap_or_default();
         diagnostics.extend(graph_diagnostics(&config, &graph));
@@ -1977,6 +2060,32 @@ impl WaveLinuxEngine {
         let catalog = self.hardware_profiles()?;
         let config = self.read_config()?.clone();
         Ok(hardware_profile_ui_state(&catalog, &config.device_policy))
+    }
+
+    pub fn streamer_devices_config(&self) -> Result<StreamerDevicesConfig, EngineError> {
+        Ok(self.read_config()?.streamer_devices.clone())
+    }
+
+    pub fn ensure_streamer_binding_profiles(
+        &self,
+        profiles: Vec<StreamerBindingProfile>,
+    ) -> Result<StreamerDevicesConfig, EngineError> {
+        self.update_config(|config| Ok(config.ensure_streamer_binding_profiles(profiles)))?
+    }
+
+    pub fn set_streamer_device_enabled(
+        &self,
+        device_id: String,
+        enabled: bool,
+    ) -> Result<StreamerDevicesConfig, EngineError> {
+        self.update_config(|config| config.set_streamer_device_enabled(device_id, enabled))?
+    }
+
+    pub fn set_streamer_binding_profile(
+        &self,
+        profile: StreamerBindingProfile,
+    ) -> Result<StreamerBindingProfile, EngineError> {
+        self.update_config(|config| config.set_streamer_binding_profile(profile))?
     }
 
     pub fn set_device_hardware_profile(
@@ -3118,7 +3227,7 @@ impl WaveLinuxEngine {
             let stderr = OpenOptions::new().create(true).append(true).open(&log_path);
             match (stdout, stderr) {
                 (Ok(stdout), Ok(stderr)) => {
-                    let mut child = Command::new("pipewire");
+                    let mut child = host_command("pipewire");
                     child
                         .arg("-c")
                         .arg(&path)
@@ -4011,6 +4120,7 @@ impl WaveLinuxEngine {
         config: &MixerConfig,
         graph: &RuntimeGraph,
         audio_graph_running: bool,
+        mark_requested: bool,
     ) -> Result<Vec<LevelMeter>, EngineError> {
         let targets = if audio_graph_running {
             meter_targets_for_config_with_devices(config, &graph.inputs)
@@ -4022,7 +4132,11 @@ impl WaveLinuxEngine {
                 .meter_supervisor
                 .lock()
                 .map_err(|_| EngineError::LockPoisoned)?;
-            supervisor.reconcile(targets)
+            if mark_requested || supervisor.requested_recently() {
+                supervisor.reconcile(targets, mark_requested)
+            } else {
+                supervisor.snapshot_or_stop_idle()
+            }
         };
 
         if update.started > 0 || update.stopped > 0 || !update.failed.is_empty() {
@@ -4045,13 +4159,7 @@ impl WaveLinuxEngine {
     }
 
     fn refresh_cached_meters(&self) -> Result<(), EngineError> {
-        let meters = {
-            let supervisor = self
-                .meter_supervisor
-                .lock()
-                .map_err(|_| EngineError::LockPoisoned)?;
-            supervisor.snapshot()
-        };
+        let meters = self.meter_snapshot_or_stop_idle()?;
         let mut runtime = self.write_runtime()?;
         if runtime.status.audio_graph_running {
             runtime.graph.meters = meters;
@@ -4059,6 +4167,25 @@ impl WaveLinuxEngine {
             runtime.graph.meters.clear();
         }
         Ok(())
+    }
+
+    fn meter_snapshot_or_stop_idle(&self) -> Result<Vec<LevelMeter>, EngineError> {
+        let update = {
+            let mut supervisor = self
+                .meter_supervisor
+                .lock()
+                .map_err(|_| EngineError::LockPoisoned)?;
+            supervisor.snapshot_or_stop_idle()
+        };
+
+        if update.stopped > 0 {
+            self.log_engine_event(
+                "meters.supervisor",
+                format!("stopped={} idle=true", update.stopped),
+            );
+        }
+
+        Ok(update.meters)
     }
 
     fn refresh_meter_targets_after_level_change(&self) {
@@ -4071,7 +4198,8 @@ impl WaveLinuxEngine {
                     runtime.status.audio_graph_running && !self.stop.load(Ordering::SeqCst),
                 )
             };
-            let meters = self.refresh_meter_supervisor(&config, &graph, audio_graph_running)?;
+            let meters =
+                self.refresh_meter_supervisor(&config, &graph, audio_graph_running, false)?;
             let mut runtime = self.write_runtime()?;
             if runtime.status.audio_graph_running {
                 runtime.graph.meters = meters;
@@ -4094,7 +4222,8 @@ impl WaveLinuxEngine {
                 .snapshot_for_config_with_effect_availability(None, Vec::new());
             let audio_graph_running =
                 graph_has_wavelinux_nodes(&graph) && !self.stop.load(Ordering::SeqCst);
-            let meters = self.refresh_meter_supervisor(&config, &graph, audio_graph_running)?;
+            let meters =
+                self.refresh_meter_supervisor(&config, &graph, audio_graph_running, false)?;
             let mut runtime = self.write_runtime()?;
             if runtime.status.audio_graph_running {
                 runtime.graph.meters = meters;
@@ -6384,7 +6513,7 @@ fn graph_diagnostics(config: &MixerConfig, graph: &RuntimeGraph) -> Vec<Diagnost
             code: "graph.stopped".into(),
             severity: DiagnosticSeverity::Info,
             message: "WaveLinux audio graph is stopped".into(),
-            action: Some("Use Start Audio when you want to create virtual devices".into()),
+            action: Some("Quit and reopen WaveLinux to recreate virtual devices".into()),
         });
         return diagnostics;
     }
@@ -6689,6 +6818,18 @@ fn latency_diagnostics(config: &MixerConfig) -> Vec<Diagnostic> {
     diagnostics
 }
 
+fn host_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    sanitize_host_command_env(&mut command);
+    command
+}
+
+fn sanitize_host_command_env(command: &mut Command) {
+    for key in HOST_COMMAND_ENV_REMOVE {
+        command.env_remove(key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6976,7 +7117,7 @@ mod tests {
     }
 
     fn spawn_silent_route_test_stream(app_id: &str) -> Option<ChildProcessCleanup> {
-        let paplay_available = Command::new("paplay")
+        let paplay_available = host_command("paplay")
             .arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -6988,7 +7129,7 @@ mod tests {
             return None;
         }
 
-        let child = Command::new("paplay")
+        let child = host_command("paplay")
             .args([
                 "--raw",
                 "--rate=48000",
@@ -7013,14 +7154,14 @@ mod tests {
     }
 
     fn spawn_tone_route_test_stream(root: &Path, app_id: &str) -> Option<ChildProcessCleanup> {
-        let paplay_available = Command::new("paplay")
+        let paplay_available = host_command("paplay")
             .arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok();
-        let ffmpeg_available = Command::new("ffmpeg")
+        let ffmpeg_available = host_command("ffmpeg")
             .arg("-version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -7033,7 +7174,7 @@ mod tests {
         }
 
         let tone_path = root.join("wavelinux-tone.raw");
-        let ffmpeg_status = Command::new("ffmpeg")
+        let ffmpeg_status = host_command("ffmpeg")
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -7061,7 +7202,7 @@ mod tests {
             return None;
         }
 
-        let child = Command::new("paplay")
+        let child = host_command("paplay")
             .args([
                 "--raw",
                 "--rate=48000",
@@ -7294,12 +7435,15 @@ mod tests {
     #[test]
     fn meter_supervisor_does_not_spawn_in_dry_run() {
         let mut supervisor = MeterSupervisor::new(true);
-        let update = supervisor.reconcile(vec![MeterTarget {
-            node_id: "stream".into(),
-            source_name: "wavelinux_mix_stream.monitor".into(),
-            gain: 1.0,
-            muted: false,
-        }]);
+        let update = supervisor.reconcile(
+            vec![MeterTarget {
+                node_id: "stream".into(),
+                source_name: "wavelinux_mix_stream.monitor".into(),
+                gain: 1.0,
+                muted: false,
+            }],
+            true,
+        );
 
         assert!(update.meters.is_empty());
         assert!(supervisor.handles.is_empty());

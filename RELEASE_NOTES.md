@@ -1,3 +1,25 @@
+# WaveLinux 4.3.0
+
+WaveLinux 4.3.0 adds optional Elgato hardware control support while keeping the
+main mixer path device-neutral.
+
+## Features
+
+- Adds an Elgato Settings tab only when Elgato audio hardware is detected.
+- Adds Wave XLR gain, mute, headphone volume, low-impedance, firmware, API, and
+  serial controls using the OpenWave USB control-transfer approach.
+- Loads libusb only inside the detected Wave XLR control path so systems without
+  Elgato hardware do not load the extra shared library during normal startup.
+- Adds AppImage startup preflight for missing host runtime pieces before WebKit
+  starts, with copyable install commands and native package-manager installs
+  through apt, dnf, pacman, or zypper.
+- Bundles more safe AppImage-side runtime pieces: GStreamer media support,
+  WebKit sandbox helpers, and libusb for optional Elgato controls.
+- Adds libusb and WebKit/AppImage runtime pieces to release packaging and
+  dependency checks.
+- Adds a Beta updates checkbox in the updater that tracks the testing branch
+  prerelease feed without changing stable update checks.
+
 # WaveLinux 4.2.1
 
 WaveLinux 4.2.1 is a follow-up stability and polish release for the new

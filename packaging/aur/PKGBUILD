@@ -1,6 +1,6 @@
 # Maintainer: WaveLinux contributors <https://github.com/DuskyProjects/WaveLinux>
 pkgname=wavelinux
-pkgver=4.1.3
+pkgver=4.3.0
 pkgrel=1
 pkgdesc="Rust and PipeWire creator audio mixer for Linux"
 arch=('x86_64')
@@ -12,9 +12,11 @@ depends=(
   'pipewire-pulse'
   'wireplumber'
   'libpulse'
+  'alsa-utils'
   'webkit2gtk-4.1'
   'gtk3'
   'libayatana-appindicator'
+  'libusb'
 )
 makedepends=(
   'git'
@@ -52,6 +54,7 @@ package() {
   install -Dm755 target/release/wavelinux-app "$pkgdir/usr/bin/wavelinux"
   install -Dm644 crates/app/icons/icon.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/wavelinux.png"
   install -Dm644 crates/app/icons/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/wavelinux.svg"
+  install -Dm644 packaging/udev/70-wavelinux-streamer-devices.rules "$pkgdir/usr/lib/udev/rules.d/70-wavelinux-streamer-devices.rules"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 
   install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/wavelinux.desktop" <<'DESKTOP'

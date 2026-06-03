@@ -17,5 +17,13 @@ fi
 
 cd "$ROOT_DIR/crates/app"
 export NO_STRIP="${NO_STRIP:-0}"
+"$ROOT_DIR/scripts/stage-appimage-runtime.sh"
+if [[ -z "${WAVELINUX_RELEASE_TAG:-}" ]]; then
+  WAVELINUX_RELEASE_TAG="${GITHUB_REF_NAME:-}"
+fi
+if [[ -z "${WAVELINUX_RELEASE_TAG:-}" ]]; then
+  WAVELINUX_RELEASE_TAG="$(git -C "$ROOT_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)"
+fi
+export WAVELINUX_RELEASE_TAG
 exec "$ROOT_DIR/node_modules/.bin/tauri" build \
   --config '{"bundle":{"createUpdaterArtifacts":true}}'

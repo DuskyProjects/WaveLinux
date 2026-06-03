@@ -952,6 +952,14 @@ input[type="range"] {
   font-variant-numeric: tabular-nums;
 }
 
+.fader-row.disabled {
+  opacity: 0.62;
+}
+
+.fader-row.disabled input[type="range"] {
+  cursor: not-allowed;
+}
+
 .master-stats {
   margin-top: 18px;
   align-items: stretch;
@@ -1077,7 +1085,9 @@ input[type="range"] {
 .graph-debug,
 .graph-debug-grid,
 .latency-card,
-.fx-availability {
+.fx-availability,
+.testing-health,
+.testing-health-report {
   box-sizing: border-box;
   width: 100%;
   min-width: 0;
@@ -1858,6 +1868,47 @@ input[type="range"] {
   white-space: nowrap;
 }
 
+.updater-checkbox {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--wl-text, #dbe5ef);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.updater-checkbox input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--wl-accent, #45bacb);
+}
+
+.testing-health .panel-actions {
+  flex: 0 0 auto;
+}
+
+.testing-health-report {
+  min-height: 280px;
+  resize: vertical;
+  border: 1px solid #28313a;
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(12, 18, 24, 0.72);
+  color: var(--wl-text, #dbe5ef);
+  font: 12px/1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  scrollbar-width: thin;
+}
+
+.update-card .updater-checkbox span {
+  color: inherit;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
 .settings-section {
   display: grid;
   gap: 10px;
@@ -1945,6 +1996,172 @@ input[type="range"] {
 .profile-device-row span {
   margin-top: 4px;
   color: #9aa7b3;
+  font-size: 12px;
+}
+
+.elgato-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.9fr) minmax(320px, 1.1fr);
+  gap: 12px;
+  min-width: 0;
+}
+
+.streamer-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.8fr) minmax(420px, 1.2fr);
+  gap: 12px;
+  min-width: 0;
+}
+
+.streamer-device-list,
+.streamer-binding-panel,
+.streamer-binding-list {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  align-content: start;
+}
+
+.streamer-device-row,
+.streamer-binding-panel,
+.streamer-binding-row {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #28313a;
+  border-radius: 8px;
+  background: #10151b;
+}
+
+.streamer-device-row {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  color: inherit;
+  text-align: left;
+}
+
+.streamer-device-row.active,
+.streamer-binding-row.active {
+  border-color: #48d7e6;
+  background: #12222a;
+}
+
+.streamer-device-row strong,
+.streamer-device-row span,
+.streamer-device-row small,
+.streamer-binding-panel h2,
+.streamer-binding-panel span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.streamer-device-row span,
+.streamer-device-row small,
+.streamer-binding-panel .panel-header span {
+  color: #9aa7b3;
+  font-size: 12px;
+}
+
+.streamer-binding-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.streamer-binding-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(120px, 0.8fr) minmax(180px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.streamer-binding-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.elgato-device-list,
+.elgato-control-card,
+.elgato-info-grid {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  align-content: start;
+}
+
+.elgato-control-card,
+.elgato-device-row {
+  padding: 12px;
+  border: 1px solid #28313a;
+  border-radius: 8px;
+  background: #10151b;
+}
+
+.elgato-device-row {
+  display: grid;
+  gap: 8px;
+}
+
+.elgato-device-row.active {
+  border-color: #48d7e6;
+  background: #12222a;
+}
+
+.elgato-device-row strong,
+.elgato-device-row span,
+.elgato-device-row small,
+.elgato-info-grid strong,
+.elgato-info-grid span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.elgato-device-row span,
+.elgato-device-row small,
+.elgato-info-grid span {
+  color: #9aa7b3;
+  font-size: 12px;
+}
+
+.elgato-device-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.elgato-device-meta span {
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid #2d3944;
+  border-radius: 999px;
+  background: #151c23;
+  color: #d5e3eb;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.elgato-state-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+
+.elgato-info-grid {
+  grid-template-columns: minmax(84px, auto) minmax(0, 1fr);
+  padding: 10px 0;
+  border-top: 1px solid #28313a;
+  border-bottom: 1px solid #28313a;
+}
+
+.elgato-info-grid strong {
+  text-align: right;
   font-size: 12px;
 }
 
@@ -3348,7 +3565,9 @@ button:disabled {
 .wl-shell.dark .wl-workspace:not(.mixer) .diagnostic-row,
 .wl-shell.dark .wl-workspace:not(.mixer) .hardware-source-card,
 .wl-shell.dark .wl-workspace:not(.mixer) .profile-editor,
-.wl-shell.dark .wl-workspace:not(.mixer) .profile-device-row {
+.wl-shell.dark .wl-workspace:not(.mixer) .profile-device-row,
+.wl-shell.dark .wl-workspace:not(.mixer) .elgato-control-card,
+.wl-shell.dark .wl-workspace:not(.mixer) .elgato-device-row {
   border-color: var(--wl-border, #2a333d);
   background: var(--wl-panel, #181f27);
   color: var(--wl-text, #e8edf2);
@@ -3574,7 +3793,17 @@ button:disabled {
   }
 
   .hardware-profile-grid,
+  .elgato-grid,
+  .streamer-grid,
   .profile-device-row {
+    grid-template-columns: 1fr;
+  }
+
+  .streamer-binding-row {
+    grid-template-columns: 1fr;
+  }
+
+  .elgato-state-grid {
     grid-template-columns: 1fr;
   }
 
