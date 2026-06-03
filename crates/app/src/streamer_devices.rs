@@ -23,6 +23,42 @@ const HID_READ_SLEEP_MS: u64 = 35;
 const HID_EVENT_DEBOUNCE_MS: u64 = 180;
 const MIDI_EVENT_DEBOUNCE_MS: u64 = 80;
 const LEARN_TIMEOUT: Duration = Duration::from_secs(7);
+const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
+    "APPDIR",
+    "APPIMAGE",
+    "ARGV0",
+    "CEF_PATH",
+    "CEF_ROOT",
+    "GDK_BACKEND",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GIO_EXTRA_MODULES",
+    "GIO_MODULE_DIR",
+    "GI_TYPELIB_PATH",
+    "GSETTINGS_SCHEMA_DIR",
+    "GST_PLUGIN_PATH",
+    "GST_PLUGIN_PATH_1_0",
+    "GST_PLUGIN_SCANNER",
+    "GST_PLUGIN_SCANNER_1_0",
+    "GST_PLUGIN_SYSTEM_PATH",
+    "GST_PLUGIN_SYSTEM_PATH_1_0",
+    "GST_PTP_HELPER_1_0",
+    "GST_REGISTRY_REUSE_PLUGIN_SCANNER",
+    "GTK_DATA_PREFIX",
+    "GTK_EXE_PREFIX",
+    "GTK_IM_MODULE_FILE",
+    "GTK_PATH",
+    "GTK_THEME",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LIBRARY_PATH",
+    "PERLLIB",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "QT_PLUGIN_PATH",
+    "WEBKIT_EXEC_PATH",
+    "XDG_DATA_DIRS",
+];
 
 pub struct StreamerDeviceRuntime {
     stop: Arc<AtomicBool>,
@@ -533,7 +569,7 @@ struct MidiCapture {
 
 impl MidiCapture {
     fn spawn(port: &str, thread_name: &str) -> io::Result<Self> {
-        let mut child = Command::new("aseqdump")
+        let mut child = host_command("aseqdump")
             .args(["-p", port])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1429,10 +1465,22 @@ fn command_exists(program: &str) -> bool {
 
 #[allow(dead_code)]
 fn run_command_status(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
+    host_command(program)
         .args(args)
         .status()
         .is_ok_and(|status| status.success())
+}
+
+fn host_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    sanitize_host_command_env(&mut command);
+    command
+}
+
+fn sanitize_host_command_env(command: &mut Command) {
+    for key in HOST_COMMAND_ENV_REMOVE {
+        command.env_remove(key);
+    }
 }
 
 #[cfg(test)]

@@ -68,6 +68,42 @@ const METER_DISPLAY_CEILING_DB: f32 = 0.0;
 const METER_DISPLAY_EXPONENT: f32 = 1.15;
 const EFFECT_GRAPH_SYNC_DEBOUNCE: Duration = Duration::from_millis(500);
 const GRAPH_REPAIR_DEBOUNCE: Duration = Duration::from_millis(650);
+const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
+    "APPDIR",
+    "APPIMAGE",
+    "ARGV0",
+    "CEF_PATH",
+    "CEF_ROOT",
+    "GDK_BACKEND",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GIO_EXTRA_MODULES",
+    "GIO_MODULE_DIR",
+    "GI_TYPELIB_PATH",
+    "GSETTINGS_SCHEMA_DIR",
+    "GST_PLUGIN_PATH",
+    "GST_PLUGIN_PATH_1_0",
+    "GST_PLUGIN_SCANNER",
+    "GST_PLUGIN_SCANNER_1_0",
+    "GST_PLUGIN_SYSTEM_PATH",
+    "GST_PLUGIN_SYSTEM_PATH_1_0",
+    "GST_PTP_HELPER_1_0",
+    "GST_REGISTRY_REUSE_PLUGIN_SCANNER",
+    "GTK_DATA_PREFIX",
+    "GTK_EXE_PREFIX",
+    "GTK_IM_MODULE_FILE",
+    "GTK_PATH",
+    "GTK_THEME",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LIBRARY_PATH",
+    "PERLLIB",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "QT_PLUGIN_PATH",
+    "WEBKIT_EXEC_PATH",
+    "XDG_DATA_DIRS",
+];
 const FX_LOG_WARNING_WINDOW: Duration = Duration::from_secs(10 * 60);
 const AUDIO_COMMAND_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
 const CAPTURE_MOVE_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
@@ -3191,7 +3227,7 @@ impl WaveLinuxEngine {
             let stderr = OpenOptions::new().create(true).append(true).open(&log_path);
             match (stdout, stderr) {
                 (Ok(stdout), Ok(stderr)) => {
-                    let mut child = Command::new("pipewire");
+                    let mut child = host_command("pipewire");
                     child
                         .arg("-c")
                         .arg(&path)
@@ -6782,6 +6818,18 @@ fn latency_diagnostics(config: &MixerConfig) -> Vec<Diagnostic> {
     diagnostics
 }
 
+fn host_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    sanitize_host_command_env(&mut command);
+    command
+}
+
+fn sanitize_host_command_env(command: &mut Command) {
+    for key in HOST_COMMAND_ENV_REMOVE {
+        command.env_remove(key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7069,7 +7117,7 @@ mod tests {
     }
 
     fn spawn_silent_route_test_stream(app_id: &str) -> Option<ChildProcessCleanup> {
-        let paplay_available = Command::new("paplay")
+        let paplay_available = host_command("paplay")
             .arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -7081,7 +7129,7 @@ mod tests {
             return None;
         }
 
-        let child = Command::new("paplay")
+        let child = host_command("paplay")
             .args([
                 "--raw",
                 "--rate=48000",
@@ -7106,14 +7154,14 @@ mod tests {
     }
 
     fn spawn_tone_route_test_stream(root: &Path, app_id: &str) -> Option<ChildProcessCleanup> {
-        let paplay_available = Command::new("paplay")
+        let paplay_available = host_command("paplay")
             .arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok();
-        let ffmpeg_available = Command::new("ffmpeg")
+        let ffmpeg_available = host_command("ffmpeg")
             .arg("-version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -7126,7 +7174,7 @@ mod tests {
         }
 
         let tone_path = root.join("wavelinux-tone.raw");
-        let ffmpeg_status = Command::new("ffmpeg")
+        let ffmpeg_status = host_command("ffmpeg")
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -7154,7 +7202,7 @@ mod tests {
             return None;
         }
 
-        let child = Command::new("paplay")
+        let child = host_command("paplay")
             .args([
                 "--raw",
                 "--rate=48000",

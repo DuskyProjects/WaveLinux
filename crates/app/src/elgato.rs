@@ -26,6 +26,42 @@ const WINDEX: u16 = 0x3303;
 const CONFIG_LEN: usize = 34;
 const DEVICE_INFO_LEN: usize = 51;
 const USB_TIMEOUT: Duration = Duration::from_millis(1_000);
+const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
+    "APPDIR",
+    "APPIMAGE",
+    "ARGV0",
+    "CEF_PATH",
+    "CEF_ROOT",
+    "GDK_BACKEND",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GIO_EXTRA_MODULES",
+    "GIO_MODULE_DIR",
+    "GI_TYPELIB_PATH",
+    "GSETTINGS_SCHEMA_DIR",
+    "GST_PLUGIN_PATH",
+    "GST_PLUGIN_PATH_1_0",
+    "GST_PLUGIN_SCANNER",
+    "GST_PLUGIN_SCANNER_1_0",
+    "GST_PLUGIN_SYSTEM_PATH",
+    "GST_PLUGIN_SYSTEM_PATH_1_0",
+    "GST_PTP_HELPER_1_0",
+    "GST_REGISTRY_REUSE_PLUGIN_SCANNER",
+    "GTK_DATA_PREFIX",
+    "GTK_EXE_PREFIX",
+    "GTK_IM_MODULE_FILE",
+    "GTK_PATH",
+    "GTK_THEME",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LIBRARY_PATH",
+    "PERLLIB",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "QT_PLUGIN_PATH",
+    "WEBKIT_EXEC_PATH",
+    "XDG_DATA_DIRS",
+];
 
 const OFF_GAIN: usize = 0;
 const OFF_MUTE: usize = 4;
@@ -628,7 +664,7 @@ fn fw_hp_to_alsa(raw: i16) -> i32 {
 }
 
 fn detect_wave_xlr_alsa_card() -> Option<String> {
-    let output = Command::new("aplay").arg("-l").output().ok()?;
+    let output = host_command("aplay").arg("-l").output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let lower = line.to_ascii_lowercase();
@@ -647,7 +683,7 @@ fn sync_alsa_mute(muted: bool) {
     let Some(card) = detect_wave_xlr_alsa_card() else {
         return;
     };
-    let _ = Command::new("amixer")
+    let _ = host_command("amixer")
         .args([
             "-c",
             &card,
@@ -663,9 +699,21 @@ fn sync_alsa_hp_volume(raw: i16) {
         return;
     };
     let value = fw_hp_to_alsa(raw).to_string();
-    let _ = Command::new("amixer")
+    let _ = host_command("amixer")
         .args(["-c", &card, "cset", "numid=4", &value])
         .output();
+}
+
+fn host_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    sanitize_host_command_env(&mut command);
+    command
+}
+
+fn sanitize_host_command_env(command: &mut Command) {
+    for key in HOST_COMMAND_ENV_REMOVE {
+        command.env_remove(key);
+    }
 }
 
 #[cfg(test)]

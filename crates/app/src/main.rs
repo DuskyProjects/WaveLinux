@@ -71,6 +71,42 @@ const WEBKIT_SANDBOX_KEEP_ENV: &str = "WAVELINUX_KEEP_WEBKIT_SANDBOX";
 const RUNTIME_INSTALL_SKIP_ENV: &str = "WAVELINUX_SKIP_RUNTIME_INSTALL";
 const RUNTIME_INSTALL_FORCE_ENV: &str = "WAVELINUX_INSTALL_RUNTIME_ON_START";
 const RUNTIME_DEPS_ASSUME_ENV: &str = "WAVELINUX_ASSUME_RUNTIME_DEPS";
+const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
+    "APPDIR",
+    "APPIMAGE",
+    "ARGV0",
+    "CEF_PATH",
+    "CEF_ROOT",
+    "GDK_BACKEND",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GIO_EXTRA_MODULES",
+    "GIO_MODULE_DIR",
+    "GI_TYPELIB_PATH",
+    "GSETTINGS_SCHEMA_DIR",
+    "GST_PLUGIN_PATH",
+    "GST_PLUGIN_PATH_1_0",
+    "GST_PLUGIN_SCANNER",
+    "GST_PLUGIN_SCANNER_1_0",
+    "GST_PLUGIN_SYSTEM_PATH",
+    "GST_PLUGIN_SYSTEM_PATH_1_0",
+    "GST_PTP_HELPER_1_0",
+    "GST_REGISTRY_REUSE_PLUGIN_SCANNER",
+    "GTK_DATA_PREFIX",
+    "GTK_EXE_PREFIX",
+    "GTK_IM_MODULE_FILE",
+    "GTK_PATH",
+    "GTK_THEME",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LIBRARY_PATH",
+    "PERLLIB",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "QT_PLUGIN_PATH",
+    "WEBKIT_EXEC_PATH",
+    "XDG_DATA_DIRS",
+];
 const APT_RUNTIME_PACKAGES: &[&str] = &[
     "pipewire",
     "wireplumber",
@@ -348,7 +384,7 @@ fn missing_webkit_sandbox_helpers() -> Vec<&'static str> {
 }
 
 fn bwrap_can_create_minimal_sandbox() -> bool {
-    Command::new("bwrap")
+    host_command("bwrap")
         .args(["--ro-bind", "/", "/", "/usr/bin/true"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -376,7 +412,7 @@ fn is_arch_like_system() -> bool {
 }
 
 fn pacman_package_installed(package: &str) -> bool {
-    Command::new("pacman")
+    host_command("pacman")
         .args(["-Qq", package])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -619,7 +655,7 @@ fn confirm_runtime_dependency_install(message: &str) -> bool {
     }
 
     if command_exists("zenity") {
-        return Command::new("zenity")
+        return host_command("zenity")
             .args([
                 "--question",
                 "--title",
@@ -638,14 +674,14 @@ fn confirm_runtime_dependency_install(message: &str) -> bool {
     }
 
     if command_exists("kdialog") {
-        return Command::new("kdialog")
+        return host_command("kdialog")
             .args(["--title", "WaveLinux setup", "--yesno", message])
             .status()
             .is_ok_and(|status| status.success());
     }
 
     if command_exists("xmessage") {
-        return Command::new("xmessage")
+        return host_command("xmessage")
             .args([
                 "-center",
                 "-buttons",
@@ -670,7 +706,7 @@ fn show_runtime_setup_message(title: &str, message: &str, kind: RuntimeSetupMess
             RuntimeSetupMessageKind::Info => "--info",
             RuntimeSetupMessageKind::Error => "--error",
         };
-        let _ = Command::new("zenity")
+        let _ = host_command("zenity")
             .args([
                 dialog_kind,
                 "--title",
@@ -689,21 +725,21 @@ fn show_runtime_setup_message(title: &str, message: &str, kind: RuntimeSetupMess
             RuntimeSetupMessageKind::Info => "--msgbox",
             RuntimeSetupMessageKind::Error => "--error",
         };
-        let _ = Command::new("kdialog")
+        let _ = host_command("kdialog")
             .args(["--title", title, dialog_kind, message])
             .status();
         return;
     }
 
     if command_exists("xmessage") {
-        let _ = Command::new("xmessage")
+        let _ = host_command("xmessage")
             .args(["-center", "-title", title, message])
             .status();
         return;
     }
 
     if command_exists("notify-send") {
-        let _ = Command::new("notify-send").args([title, message]).status();
+        let _ = host_command("notify-send").args([title, message]).status();
     }
 }
 
@@ -1902,7 +1938,7 @@ fn runtime_package_available(manager: PackageManager, package: &str) -> bool {
 
 fn package_installed(manager: PackageManager, package: &str) -> bool {
     match manager {
-        PackageManager::Apt => Command::new("dpkg-query")
+        PackageManager::Apt => host_command("dpkg-query")
             .args(["-W", "-f=${Status}", package])
             .output()
             .is_ok_and(|output| {
@@ -2051,7 +2087,7 @@ fn run_privileged_command(program: &str, args: &[String]) -> Result<Output, Stri
 }
 
 fn run_command_capture(program: &str, args: &[String]) -> Result<Output, String> {
-    let output = Command::new(program)
+    let output = host_command(program)
         .args(args)
         .output()
         .map_err(|err| format!("{program} failed to start: {err}"))?;
@@ -2069,12 +2105,24 @@ fn run_command_capture(program: &str, args: &[String]) -> Result<Output, String>
 }
 
 fn command_status_success(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
+    host_command(program)
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+fn host_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    sanitize_host_command_env(&mut command);
+    command
+}
+
+fn sanitize_host_command_env(command: &mut Command) {
+    for key in HOST_COMMAND_ENV_REMOVE {
+        command.env_remove(key);
+    }
 }
 
 fn running_as_root() -> bool {
