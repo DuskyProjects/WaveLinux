@@ -76,6 +76,8 @@ pub struct MixerSettings {
     #[serde(default)]
     pub low_latency_mic_monitoring: bool,
     #[serde(default)]
+    pub hardware_direct_mic_monitoring: bool,
+    #[serde(default)]
     pub stream_sync_delay_msec: u16,
     #[serde(default)]
     pub monitor_sync_delay_msec: u16,
@@ -99,6 +101,7 @@ impl Default for MixerSettings {
             lock_default_input: false,
             lock_default_output: false,
             low_latency_mic_monitoring: false,
+            hardware_direct_mic_monitoring: false,
             stream_sync_delay_msec: 0,
             monitor_sync_delay_msec: 0,
             auto_check_updates: true,
@@ -909,7 +912,8 @@ impl MixerConfig {
             .label_for_matcher(&matcher)
             .or_else(|| clean_app_display_name(&stream.display_name))
             .unwrap_or_else(|| matcher_display_name(&matcher));
-        let media_name = clean_optional_label(stream.media_name.clone());
+        let media_name = clean_optional_label(stream.media_name.clone())
+            .filter(|value| !is_generic_media_name(value));
         let Some(existing) = self
             .app_history
             .iter_mut()
@@ -3030,8 +3034,19 @@ fn matcher_should_keep_media_name(matcher: &AppMatcher) -> bool {
 }
 
 fn is_generic_media_name(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    if value == "stream" {
+        return true;
+    }
+    if value
+        .strip_prefix("stream ")
+        .is_some_and(|suffix| suffix.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return true;
+    }
+
     matches!(
-        value.trim().to_ascii_lowercase().as_str(),
+        value.as_str(),
         "audio-src" | "audio src" | "audio" | "playback" | "output" | "input"
     )
 }
@@ -3784,6 +3799,32 @@ mod tests {
         assert!(config.app_volume_presets.is_empty());
         assert!(config.restore_app(remembered.matcher).is_some());
         assert!(!config.app_history[0].forgotten);
+    }
+
+    #[test]
+    fn app_history_ignores_generic_numbered_stream_media_names() {
+        let mut config = MixerConfig::default();
+        let mut stream = AppStream {
+            id: "chrome-1".into(),
+            app_id: Some("chromium".into()),
+            binary: Some("chromium".into()),
+            process_name: Some("chromium".into()),
+            window_class: Some("chromium".into()),
+            display_name: "Chromium".into(),
+            media_name: Some("Stream 701".into()),
+            routed_channel_id: None,
+            volume: 1.0,
+            muted: false,
+        };
+
+        let remembered = config.remember_app_stream(&stream, 100).unwrap().unwrap();
+        assert!(remembered.matcher.media_name.is_none());
+        assert!(config.app_history[0].media_name.is_none());
+
+        stream.media_name = Some("Stream 702".into());
+        assert!(config.remember_app_stream(&stream, 120).unwrap().is_none());
+        assert_eq!(config.app_history.len(), 1);
+        assert!(config.app_history[0].media_name.is_none());
     }
 
     #[test]

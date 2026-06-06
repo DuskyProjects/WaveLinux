@@ -28,7 +28,8 @@ use wavelinux_model::{
     ModelError, RoutingPolicy, RuntimeGraph, StreamerBindingProfile, StreamerDevicesConfig,
 };
 use wavelinux_pw::{
-    channel_has_active_effects, channel_mix_route_revision, channel_mix_source_name,
+    channel_has_active_effects, channel_mix_route_revision,
+    channel_mix_route_uses_hardware_direct_monitoring, channel_mix_source_name,
     effect_chain_input_name, effect_chain_source_name, effect_route_revision, input_route_revision,
     meter_sampling_enabled, meter_targets_for_config_with_devices,
     mix_monitor_route_revision_for_sink, plan_bluetooth_a2dp_profiles, plan_ensure_graph,
@@ -5766,6 +5767,7 @@ fn channel_route_ready(
                 .mix_buses
                 .get(&mix.id)
                 .is_some_and(|bus| bus.enabled)
+                && !channel_mix_route_uses_hardware_direct_monitoring(channel, mix, settings)
         })
         .all(|mix| {
             managed_modules.iter().any(|module| {
@@ -5857,6 +5859,7 @@ fn settings_affect_audio_graph(previous: &MixerSettings, next: &MixerSettings) -
         || previous.lock_default_input != next.lock_default_input
         || previous.lock_default_output != next.lock_default_output
         || previous.low_latency_mic_monitoring != next.low_latency_mic_monitoring
+        || previous.hardware_direct_mic_monitoring != next.hardware_direct_mic_monitoring
         || previous.stream_sync_delay_msec != next.stream_sync_delay_msec
         || previous.monitor_sync_delay_msec != next.monitor_sync_delay_msec
         || previous.optimization_mode != next.optimization_mode
@@ -5987,6 +5990,9 @@ fn module_is_stale_for_config(module: &ManagedModule, config: &MixerConfig) -> b
             let Some(mix) = config.mixes.iter().find(|mix| mix.id == mix_id) else {
                 return true;
             };
+            if channel_mix_route_uses_hardware_direct_monitoring(channel, mix, &config.settings) {
+                return true;
+            }
             if module.route_revision.as_deref()
                 != Some(channel_mix_route_revision(&config.settings, channel, mix).as_str())
             {
@@ -6706,6 +6712,11 @@ fn route_diagnostics(
                 .mix_buses
                 .get(&mix.id)
                 .is_some_and(|bus| bus.enabled)
+                && !channel_mix_route_uses_hardware_direct_monitoring(
+                    channel,
+                    mix,
+                    &config.settings,
+                )
         }) {
             if !output_names.contains(mix.virtual_sink_name.as_str()) {
                 continue;
@@ -9337,6 +9348,23 @@ mod tests {
             diagnostic.code == "graph.route_mix.hardware_in.stream"
                 && diagnostic.severity == DiagnosticSeverity::Warning
         }));
+    }
+
+    #[test]
+    fn route_diagnostics_accept_hardware_direct_monitoring_skip() {
+        let mut config = MixerConfig::default();
+        config.settings.hardware_direct_mic_monitoring = true;
+        config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("limiter")])
+            .unwrap();
+        let graph = running_graph_for_config(&config);
+        let modules = routing_modules_for_config(&config);
+
+        let diagnostics = route_diagnostics(&config, &graph, &modules);
+
+        assert!(!diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "graph.route_mix.hardware_in.monitor"));
     }
 
     #[test]

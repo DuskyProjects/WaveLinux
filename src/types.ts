@@ -22,6 +22,7 @@ export interface MixerSettings {
   lock_default_input: boolean;
   lock_default_output: boolean;
   low_latency_mic_monitoring: boolean;
+  hardware_direct_mic_monitoring: boolean;
   stream_sync_delay_msec: number;
   monitor_sync_delay_msec: number;
   auto_check_updates: boolean;

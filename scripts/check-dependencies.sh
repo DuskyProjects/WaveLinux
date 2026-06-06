@@ -4,17 +4,18 @@ set -euo pipefail
 INSTALL=0
 INSTALL_EFFECTS=0
 STRICT=0
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 usage() {
   cat <<'HELP'
-Check WaveLinux runtime and optional effect dependencies.
+Check WaveLinux runtime and effect dependencies.
 
 Usage:
   bash scripts/check-dependencies.sh [--install] [--install-effects] [--strict]
 
 Environment:
   WAVELINUX_INSTALL_DEPS=1      Install missing runtime dependencies.
-  WAVELINUX_INSTALL_EFFECTS=1   Install missing optional effect packages.
+  WAVELINUX_INSTALL_EFFECTS=1   Install missing effect packages.
 HELP
 }
 
@@ -183,7 +184,11 @@ existing_ladspa_paths() {
     /usr/lib/ladspa
     /usr/lib64/ladspa
     /usr/local/lib/ladspa
+    /usr/local/lib64/ladspa
     /usr/lib/x86_64-linux-gnu/ladspa
+    /usr/lib/aarch64-linux-gnu/ladspa
+    /usr/lib/arm-linux-gnueabihf/ladspa
+    "$ROOT_DIR/crates/app/appimage-extra/usr/wavelinux-runtime/lib/ladspa"
   )
   printf '%s\n' "${paths[@]}" | awk 'NF && !seen[$0]++'
 }
@@ -329,9 +334,9 @@ else
 fi
 
 if (( ${#missing_effects[@]} == 0 )); then
-  echo "Optional effects: ok"
+  echo "Effect plugins: ok"
 else
-  echo "Optional effects missing: ${missing_effects[*]}"
+  echo "Effect plugins missing: ${missing_effects[*]}"
 fi
 if (( ${#streamer_discovery_notes[@]} == 0 )); then
   echo "Streamer device discovery: ok"
@@ -357,7 +362,7 @@ fi
 if (( INSTALL_EFFECTS == 1 && ${#missing_effects[@]} > 0 )); then
   mapfile -t packages < <(resolve_packages "$manager" "${effect_candidates[@]}")
   if (( ${#packages[@]} > 0 )); then
-    echo "Installing optional effect packages: ${packages[*]}"
+    echo "Installing effect packages: ${packages[*]}"
     install_packages "$manager" "${packages[@]}"
   fi
 
@@ -369,7 +374,7 @@ if (( INSTALL_EFFECTS == 1 && ${#missing_effects[@]} > 0 )); then
       fi
     done
     if (( ${#aur_packages[@]} > 0 )); then
-      echo "Installing optional AUR effect packages: ${aur_packages[*]}"
+      echo "Installing AUR effect packages: ${aur_packages[*]}"
       install_aur_packages "${aur_packages[@]}"
     fi
   fi

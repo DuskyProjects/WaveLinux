@@ -400,7 +400,10 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       date: null,
       body: null,
       url: null,
-      release_url: "https://github.com/DuskyProjects/WaveLinux/releases",
+      release_url:
+        releaseChannel === "beta"
+          ? "https://github.com/DuskyProjects/WaveLinux/releases/tag/prerelease"
+          : "https://github.com/DuskyProjects/WaveLinux/releases/latest",
       channel: releaseChannel,
       endpoint:
         releaseChannel === "beta"
@@ -1324,6 +1327,7 @@ export const demoState: AppStateSnapshot = {
       lock_default_input: false,
       lock_default_output: false,
       low_latency_mic_monitoring: false,
+      hardware_direct_mic_monitoring: false,
       stream_sync_delay_msec: 0,
       monitor_sync_delay_msec: 0,
       auto_check_updates: true,

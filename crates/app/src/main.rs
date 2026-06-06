@@ -27,6 +27,7 @@ use wavelinux_model::{
     HardwareProfileUiState, KnownApp, LatencyPolicy, LevelMeter, Mix, MixBus, MixerConfig,
     MixerSettings, ReleaseChannel, RoutingPolicy, StreamerAction, StreamerActionResult,
     StreamerBindingProfile, StreamerDeviceSummary, StreamerDevicesConfig, StreamerLearnResult,
+    StreamerPermissionStatus,
 };
 
 mod elgato;
@@ -57,6 +58,8 @@ struct UiThemeDefinition {
 }
 
 const RELEASES_URL: &str = "https://github.com/DuskyProjects/WaveLinux/releases";
+const STABLE_RELEASE_URL: &str = "https://github.com/DuskyProjects/WaveLinux/releases/latest";
+const BETA_RELEASE_URL: &str = "https://github.com/DuskyProjects/WaveLinux/releases/tag/prerelease";
 const STABLE_UPDATE_ENDPOINT: &str =
     "https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json";
 const BETA_UPDATE_ENDPOINT: &str =
@@ -273,6 +276,18 @@ const ZYPPER_PORTAL_BACKENDS: &[&str] = &[
     "xdg-desktop-portal-gnome",
     "xdg-desktop-portal-wlr",
 ];
+const DEEPFILTERNET_LADSPA_NAMES: &[&str] = &[
+    "libdeep_filter_ladspa.so",
+    "deep_filter_ladspa.so",
+    "libdeepfilternet_ladspa.so",
+    "deepfilternet_ladspa.so",
+    "libdeep_filter_net_ladspa.so",
+    "deep_filter_net_ladspa.so",
+];
+const RNNOISE_LADSPA_NAMES: &[&str] = &["librnnoise_ladspa.so", "rnnoise_ladspa.so"];
+const COMPRESSOR_LADSPA_NAMES: &[&str] = &["sc4_1882.so", "compressor.so"];
+const GATE_LADSPA_NAMES: &[&str] = &["gate_1410.so"];
+const LIMITER_LADSPA_NAMES: &[&str] = &["fast_lookahead_limiter_1913.so", "hard_limiter_1413.so"];
 
 fn prepare_appimage_bundled_runtime() {
     let Some(runtime_dir) = appimage_bundled_runtime_dir() else {
@@ -281,6 +296,7 @@ fn prepare_appimage_bundled_runtime() {
 
     prepend_env_path("PATH", runtime_dir.join("bin"));
     prepend_env_path("LD_LIBRARY_PATH", runtime_dir.join("lib"));
+    prepend_env_path("LADSPA_PATH", runtime_dir.join("lib/ladspa"));
 }
 
 fn appimage_bundled_runtime_dir() -> Option<PathBuf> {
@@ -316,6 +332,81 @@ fn prepend_env_path(key: &str, path: PathBuf) {
     if let Ok(joined) = std::env::join_paths(paths) {
         std::env::set_var(key, joined);
     }
+}
+
+fn existing_ladspa_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(value) = std::env::var_os("LADSPA_PATH") {
+        paths.extend(std::env::split_paths(&value));
+    }
+    paths.extend([
+        PathBuf::from("/usr/lib/ladspa"),
+        PathBuf::from("/usr/lib64/ladspa"),
+        PathBuf::from("/usr/local/lib/ladspa"),
+        PathBuf::from("/usr/local/lib64/ladspa"),
+        PathBuf::from("/usr/lib/x86_64-linux-gnu/ladspa"),
+        PathBuf::from("/usr/lib/aarch64-linux-gnu/ladspa"),
+        PathBuf::from("/usr/lib/arm-linux-gnueabihf/ladspa"),
+    ]);
+
+    let mut seen = BTreeSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
+fn ladspa_has_any(names: &[&str]) -> bool {
+    existing_ladspa_paths()
+        .into_iter()
+        .any(|root| root.is_dir() && names.iter().any(|name| root.join(name).is_file()))
+}
+
+fn ladspa_file_has_marker(marker: &[u8], names: &[&str]) -> bool {
+    existing_ladspa_paths().into_iter().any(|root| {
+        if !root.is_dir() {
+            return false;
+        }
+        names.iter().any(|name| {
+            fs::read(root.join(name))
+                .ok()
+                .is_some_and(|bytes| bytes.windows(marker.len()).any(|window| window == marker))
+        })
+    })
+}
+
+fn missing_ladspa_effect_ids() -> Vec<String> {
+    let mut missing = Vec::new();
+    if !ladspa_file_has_marker(b"DeepFilterNet3", DEEPFILTERNET_LADSPA_NAMES) {
+        push_unique(&mut missing, "deepfilternet");
+    }
+    if !ladspa_has_any(RNNOISE_LADSPA_NAMES) {
+        push_unique(&mut missing, "rnnoise");
+    }
+    if !ladspa_has_any(COMPRESSOR_LADSPA_NAMES) {
+        push_unique(&mut missing, "compressor");
+    }
+    if !ladspa_has_any(GATE_LADSPA_NAMES) {
+        push_unique(&mut missing, "gate");
+    }
+    if !ladspa_has_any(LIMITER_LADSPA_NAMES) {
+        push_unique(&mut missing, "limiter");
+    }
+    missing
+}
+
+fn effect_names_from_ids(ids: &[String]) -> Vec<String> {
+    let catalog = EffectCatalog::default();
+    ids.iter()
+        .map(|id| {
+            catalog
+                .effects
+                .iter()
+                .find(|definition| &definition.id == id)
+                .map(|definition| definition.name.clone())
+                .unwrap_or_else(|| id.clone())
+        })
+        .collect()
 }
 
 fn apply_webkit_runtime_defaults() {
@@ -449,6 +540,10 @@ fn print_runtime_dependency_report() -> i32 {
     let missing_arch = missing_arch_runtime_packages();
     let missing_helpers = missing_webkit_sandbox_helpers();
     let session_bus = session_bus_path_status();
+    let missing_effect_ids = missing_ladspa_effect_ids();
+    let missing_effect_names = effect_names_from_ids(&missing_effect_ids);
+    let (effect_packages, aur_effect_packages) =
+        resolve_effect_plugin_packages(manager, &missing_effect_ids);
 
     println!("WaveLinux runtime dependency check");
     println!("Package manager: {}", manager.id());
@@ -485,6 +580,10 @@ fn print_runtime_dependency_report() -> i32 {
         WEBKIT_SANDBOX_DISABLE_ENV,
         std::env::var(WEBKIT_SANDBOX_DISABLE_ENV).unwrap_or_default()
     );
+    println!(
+        "LADSPA_PATH: {}",
+        std::env::var("LADSPA_PATH").unwrap_or_default()
+    );
 
     if manager == PackageManager::Unknown {
         println!("Runtime packages: package manager unsupported");
@@ -506,6 +605,30 @@ fn print_runtime_dependency_report() -> i32 {
             "Install on Arch/CachyOS: sudo pacman -Syu --needed {}",
             missing_arch.join(" ")
         );
+    }
+
+    if missing_effect_names.is_empty() {
+        println!("Effect plugins: ok");
+    } else {
+        println!(
+            "Effect plugins missing: {}",
+            missing_effect_names.join(", ")
+        );
+        if !effect_packages.is_empty() {
+            println!(
+                "Effect install command: {}",
+                install_command_for_user(manager, &effect_packages)
+            );
+        }
+        if !aur_effect_packages.is_empty() {
+            println!(
+                "AUR effect install command: {}",
+                install_aur_command_for_user(&aur_effect_packages)
+            );
+        }
+        if effect_packages.is_empty() && aur_effect_packages.is_empty() {
+            println!("Effect install command: no known package candidates were available");
+        }
     }
 
     if !missing_helpers.is_empty() {
@@ -533,23 +656,67 @@ fn install_runtime_dependencies_from_cli() -> i32 {
         return 1;
     }
 
-    let missing = missing_runtime_packages_for_manager(manager);
-    if missing.is_empty() {
-        println!("WaveLinux runtime packages are already installed.");
+    let missing_runtime = missing_runtime_packages_for_manager(manager);
+    let missing_effect_ids = missing_ladspa_effect_ids();
+    let missing_effect_names = effect_names_from_ids(&missing_effect_ids);
+    let (effect_packages, aur_effect_packages) =
+        resolve_effect_plugin_packages(manager, &missing_effect_ids);
+    let mut packages = missing_runtime.clone();
+    for package in &effect_packages {
+        push_unique(&mut packages, package);
+    }
+
+    if packages.is_empty() && aur_effect_packages.is_empty() {
+        if missing_effect_names.is_empty() {
+            println!("WaveLinux runtime packages and effect plugins are already installed.");
+        } else {
+            println!(
+                "WaveLinux runtime packages are installed, but these effect plugins are still missing: {}",
+                missing_effect_names.join(", ")
+            );
+            println!("No known package candidates were available for automatic install.");
+        }
         return 0;
     }
 
     println!(
-        "Installing WaveLinux runtime packages with {}: {}",
+        "Installing WaveLinux setup packages with {}: {}",
         manager.id(),
-        missing.join(" ")
+        packages.join(" ")
     );
-    println!("Command: {}", install_command_for_user(manager, &missing));
-    match install_system_packages(manager, &missing) {
+    if !packages.is_empty() {
+        println!("Command: {}", install_command_for_user(manager, &packages));
+    }
+    if !aur_effect_packages.is_empty() {
+        println!(
+            "AUR command: {}",
+            install_aur_command_for_user(&aur_effect_packages)
+        );
+    }
+
+    let system_install = if packages.is_empty() {
+        Ok(Vec::new())
+    } else {
+        install_system_packages(manager, &packages)
+    };
+    match system_install {
         Ok(_) => {
+            if !aur_effect_packages.is_empty() {
+                if let Err(err) = install_aur_packages(&aur_effect_packages) {
+                    eprintln!("WaveLinux setup: effect plugin AUR install failed: {err}");
+                }
+            }
             let missing_after = missing_runtime_packages_for_manager(manager);
+            let missing_effects_after = effect_names_from_ids(&missing_ladspa_effect_ids());
             if missing_after.is_empty() {
-                println!("WaveLinux runtime dependency install completed.");
+                if missing_effects_after.is_empty() {
+                    println!("WaveLinux runtime dependency and effect plugin install completed.");
+                } else {
+                    println!(
+                        "WaveLinux runtime dependency install completed. Missing effect plugins after install: {}",
+                        missing_effects_after.join(", ")
+                    );
+                }
                 0
             } else {
                 eprintln!(
@@ -560,7 +727,7 @@ fn install_runtime_dependencies_from_cli() -> i32 {
             }
         }
         Err(err) => {
-            eprintln!("WaveLinux setup: runtime dependency install failed: {err}");
+            eprintln!("WaveLinux setup: dependency install failed: {err}");
             1
         }
     }
@@ -582,39 +749,97 @@ fn ensure_runtime_dependencies_before_ui() {
         return;
     }
 
-    let missing = missing_runtime_packages_for_manager(manager);
-    if missing.is_empty() {
+    let missing_runtime = missing_runtime_packages_for_manager(manager);
+    let missing_effect_ids = missing_ladspa_effect_ids();
+    let missing_effect_names = effect_names_from_ids(&missing_effect_ids);
+    let (effect_packages, aur_effect_packages) =
+        resolve_effect_plugin_packages(manager, &missing_effect_ids);
+    let mut packages = missing_runtime.clone();
+    for package in &effect_packages {
+        push_unique(&mut packages, package);
+    }
+
+    if packages.is_empty() && aur_effect_packages.is_empty() {
         return;
     }
 
-    let command = install_command_for_user(manager, &missing);
+    let mut package_lines = Vec::new();
+    if !missing_runtime.is_empty() {
+        package_lines.push(format!("Runtime: {}", missing_runtime.join(" ")));
+    }
+    if !missing_effect_names.is_empty() {
+        package_lines.push(format!(
+            "Effect plugins: {}",
+            missing_effect_names.join(", ")
+        ));
+    }
+    let mut command_lines = Vec::new();
+    if !packages.is_empty() {
+        command_lines.push(install_command_for_user(manager, &packages));
+    }
+    if !aur_effect_packages.is_empty() {
+        command_lines.push(install_aur_command_for_user(&aur_effect_packages));
+    }
+    let commands = command_lines.join("\n");
     let prompt = format!(
-        "WaveLinux needs a few system packages before this AppImage can start safely on this Linux install.\n\nPackages:\n{}\n\nWaveLinux will ask for administrator permission and run:\n\n{}",
-        missing.join(" "),
-        command
+        "WaveLinux needs setup packages for this Linux install.\n\nPackages:\n{}\n\nWaveLinux will ask for administrator permission and run:\n\n{}",
+        package_lines.join("\n"),
+        commands
     );
 
     if !confirm_runtime_dependency_install(&prompt) {
-        let message = format!(
-            "WaveLinux setup was cancelled. Install these packages, then open WaveLinux again:\n\n{command}"
-        );
-        show_runtime_setup_message(
-            "WaveLinux setup cancelled",
-            &message,
-            RuntimeSetupMessageKind::Error,
-        );
-        std::process::exit(1);
+        if missing_runtime.is_empty() {
+            show_runtime_setup_message(
+                "WaveLinux effect setup skipped",
+                "WaveLinux will continue launching, but missing LADSPA effect plugins will stay unavailable until installed.",
+                RuntimeSetupMessageKind::Info,
+            );
+            return;
+        } else {
+            let message = format!(
+                "WaveLinux setup was cancelled. Install these packages, then open WaveLinux again:\n\n{commands}"
+            );
+            show_runtime_setup_message(
+                "WaveLinux setup cancelled",
+                &message,
+                RuntimeSetupMessageKind::Error,
+            );
+            std::process::exit(1);
+        }
     }
 
-    match install_system_packages(manager, &missing) {
+    let system_install = if packages.is_empty() {
+        Ok(Vec::new())
+    } else {
+        install_system_packages(manager, &packages)
+    };
+    match system_install {
         Ok(_) => {
+            if !aur_effect_packages.is_empty() {
+                if let Err(err) = install_aur_packages(&aur_effect_packages) {
+                    eprintln!("WaveLinux setup: effect plugin AUR install failed: {err}");
+                }
+            }
             let missing_after = missing_runtime_packages_for_manager(manager);
+            let missing_effects_after = effect_names_from_ids(&missing_ladspa_effect_ids());
             if missing_after.is_empty() {
-                show_runtime_setup_message(
-                    "WaveLinux setup complete",
-                    "Required runtime packages were installed. WaveLinux will continue launching now.",
-                    RuntimeSetupMessageKind::Info,
-                );
+                if missing_effects_after.is_empty() {
+                    show_runtime_setup_message(
+                        "WaveLinux setup complete",
+                        "Runtime packages and LADSPA effect plugins were installed. WaveLinux will continue launching now.",
+                        RuntimeSetupMessageKind::Info,
+                    );
+                } else if !missing_effects_after.is_empty() && !missing_effect_ids.is_empty() {
+                    let message = format!(
+                        "WaveLinux will continue launching, but these effect plugins are still missing:\n\n{}",
+                        missing_effects_after.join(", ")
+                    );
+                    show_runtime_setup_message(
+                        "WaveLinux effect setup incomplete",
+                        &message,
+                        RuntimeSetupMessageKind::Info,
+                    );
+                }
             } else {
                 let message = format!(
                     "WaveLinux tried to install required packages, but these still look missing:\n\n{}\n\nManual command:\n{}",
@@ -630,8 +855,19 @@ fn ensure_runtime_dependencies_before_ui() {
             }
         }
         Err(err) => {
+            if missing_runtime.is_empty() {
+                let message = format!(
+                    "WaveLinux could not install missing effect plugins.\n\n{err}\n\nWaveLinux will continue launching, but those effects will stay unavailable."
+                );
+                show_runtime_setup_message(
+                    "WaveLinux effect setup failed",
+                    &message,
+                    RuntimeSetupMessageKind::Info,
+                );
+                return;
+            }
             let message = format!(
-                "WaveLinux could not install required runtime packages.\n\n{err}\n\nManual command:\n{command}"
+                "WaveLinux could not install required runtime packages.\n\n{err}\n\nManual command:\n{commands}"
             );
             show_runtime_setup_message(
                 "WaveLinux setup failed",
@@ -1058,7 +1294,7 @@ fn list_streamer_devices(
     };
     for device in &mut devices {
         if let Some(profile) = bindings.profiles.get(&device.id) {
-            device.enabled = profile.enabled;
+            device.enabled = streamer_devices::native_bindings_available(device) && profile.enabled;
         }
     }
     Ok(devices)
@@ -1078,6 +1314,19 @@ fn set_streamer_device_enabled(
     device_id: String,
     enabled: bool,
 ) -> Result<StreamerDevicesConfig, String> {
+    if enabled {
+        let state = engine.engine.get_state().map_err(|err| err.to_string())?;
+        let devices = streamer_devices::discover_devices(&state);
+        if let Some(device) = devices.iter().find(|device| device.id == device_id) {
+            if !streamer_devices::native_bindings_available(device) {
+                return Err(format!(
+                    "{} is detected, but bindings are unavailable while status is {}",
+                    device.name,
+                    streamer_permission_status_label(&device.permission_status)
+                ));
+            }
+        }
+    }
     engine
         .engine
         .set_streamer_device_enabled(device_id, enabled)
@@ -1449,6 +1698,7 @@ async fn check_for_updates(
         settings.release_channel = release_channel;
     }
     let endpoint = update_endpoint(&settings);
+    let release_url = release_url_for_settings(&settings).to_string();
     let endpoint_url = endpoint
         .parse::<url::Url>()
         .map_err(|err| err.to_string())?;
@@ -1479,7 +1729,7 @@ async fn check_for_updates(
                 date: None,
                 body: None,
                 url: None,
-                release_url: RELEASES_URL.to_string(),
+                release_url,
                 channel,
                 endpoint,
                 message: "No signed update metadata has been published for this channel yet".into(),
@@ -1499,7 +1749,7 @@ async fn check_for_updates(
                 date,
                 body: update.body,
                 url: Some(update.download_url.to_string()),
-                release_url: RELEASES_URL.to_string(),
+                release_url,
                 channel,
                 endpoint,
                 message: if install_supported {
@@ -1519,7 +1769,7 @@ async fn check_for_updates(
             date: None,
             body: None,
             url: None,
-            release_url: RELEASES_URL.to_string(),
+            release_url,
             channel,
             endpoint,
             message: "WaveLinux is up to date".into(),
@@ -1578,7 +1828,6 @@ async fn install_update(
         });
     };
 
-    let _ = engine.engine.cleanup_audio_graph();
     update
         .download_and_install(|_, _| {}, || {})
         .await
@@ -1587,9 +1836,16 @@ async fn install_update(
 }
 
 #[tauri::command]
-fn open_release_page(app: AppHandle) -> Result<(), String> {
+fn open_release_page(
+    app: AppHandle,
+    release_channel: Option<ReleaseChannel>,
+) -> Result<(), String> {
+    let url = release_channel
+        .as_ref()
+        .map(release_url_for_channel)
+        .unwrap_or(RELEASES_URL);
     app.opener()
-        .open_url(RELEASES_URL, None::<String>)
+        .open_url(url, None::<String>)
         .map_err(|err| err.to_string())
 }
 
@@ -1613,7 +1869,7 @@ fn install_effect_plugins(
             missing_after: Vec::new(),
             stdout: String::new(),
             stderr: String::new(),
-            message: "All optional effect plugins are already installed and detected".into(),
+            message: "All effect plugins are already installed and detected".into(),
         });
     }
 
@@ -1995,6 +2251,17 @@ fn install_command_for_user(manager: PackageManager, packages: &[String]) -> Str
     }
 }
 
+fn install_aur_command_for_user(packages: &[String]) -> String {
+    let package_list = packages.join(" ");
+    if command_exists("paru") {
+        format!("paru -S --needed {package_list}")
+    } else if command_exists("yay") {
+        format!("yay -S --needed {package_list}")
+    } else {
+        format!("install manually from AUR: {package_list}")
+    }
+}
+
 fn package_available(manager: PackageManager, package: &str) -> bool {
     let (program, args): (&str, Vec<&str>) = match manager {
         PackageManager::Apt => ("apt-cache", vec!["show", package]),
@@ -2245,7 +2512,11 @@ fn valid_theme_token_key(value: &str) -> bool {
 }
 
 fn update_endpoint(settings: &MixerSettings) -> String {
-    match release_channel_name(settings) {
+    update_endpoint_for_channel(&settings.release_channel)
+}
+
+fn update_endpoint_for_channel(release_channel: &ReleaseChannel) -> String {
+    match release_channel_name_value(release_channel) {
         "beta" => std::env::var("WAVELINUX_BETA_UPDATE_ENDPOINT")
             .or_else(|_| std::env::var("WAVELINUX_UPDATE_ENDPOINT"))
             .unwrap_or_else(|_| BETA_UPDATE_ENDPOINT.into()),
@@ -2255,14 +2526,31 @@ fn update_endpoint(settings: &MixerSettings) -> String {
     }
 }
 
-fn current_update_version() -> semver::Version {
-    let version = build_release_tag()
-        .map(|tag| tag.trim_start_matches('v'))
-        .unwrap_or(env!("CARGO_PKG_VERSION"));
+fn release_url_for_settings(settings: &MixerSettings) -> &'static str {
+    release_url_for_channel(&settings.release_channel)
+}
 
-    semver::Version::parse(version)
-        .or_else(|_| semver::Version::parse(env!("CARGO_PKG_VERSION")))
+fn release_url_for_channel(release_channel: &ReleaseChannel) -> &'static str {
+    match release_channel {
+        ReleaseChannel::Beta => BETA_RELEASE_URL,
+        ReleaseChannel::Stable => STABLE_RELEASE_URL,
+    }
+}
+
+fn current_update_version() -> semver::Version {
+    option_env!("WAVELINUX_UPDATE_VERSION")
+        .and_then(release_tag_update_version)
+        .or_else(|| build_release_tag().and_then(release_tag_update_version))
+        .or_else(|| semver::Version::parse(env!("CARGO_PKG_VERSION")).ok())
         .expect("package version is valid semver")
+}
+
+fn release_tag_update_version(tag: &str) -> Option<semver::Version> {
+    let version = tag.trim().trim_start_matches('v');
+    if version.is_empty() || version.eq_ignore_ascii_case("prerelease") {
+        return None;
+    }
+    semver::Version::parse(version).ok()
 }
 
 fn build_release_tag() -> Option<&'static str> {
@@ -2272,7 +2560,21 @@ fn build_release_tag() -> Option<&'static str> {
 }
 
 fn release_channel_name(settings: &MixerSettings) -> &'static str {
-    match &settings.release_channel {
+    release_channel_name_value(&settings.release_channel)
+}
+
+fn streamer_permission_status_label(status: &StreamerPermissionStatus) -> &'static str {
+    match status {
+        StreamerPermissionStatus::Ready => "ready",
+        StreamerPermissionStatus::PermissionDenied => "permission denied",
+        StreamerPermissionStatus::Busy => "busy",
+        StreamerPermissionStatus::MissingRuntime => "missing runtime",
+        StreamerPermissionStatus::UnsupportedProtocol => "unsupported protocol",
+    }
+}
+
+fn release_channel_name_value(release_channel: &ReleaseChannel) -> &'static str {
+    match release_channel {
         ReleaseChannel::Beta => "beta",
         ReleaseChannel::Stable => "stable",
     }
@@ -2295,6 +2597,46 @@ fn is_missing_update_metadata_error(message: &str) -> bool {
     message.contains("Could not fetch a valid release JSON")
         || message.contains("ReleaseNotFound")
         || message.contains("status code 404")
+}
+
+#[cfg(test)]
+mod updater_tests {
+    use super::*;
+
+    #[test]
+    fn release_urls_follow_selected_channel() {
+        assert_eq!(
+            release_url_for_channel(&ReleaseChannel::Stable),
+            STABLE_RELEASE_URL
+        );
+        assert_eq!(
+            release_url_for_channel(&ReleaseChannel::Beta),
+            BETA_RELEASE_URL
+        );
+    }
+
+    #[test]
+    fn update_endpoints_follow_selected_channel() {
+        assert_eq!(
+            update_endpoint_for_channel(&ReleaseChannel::Stable),
+            STABLE_UPDATE_ENDPOINT
+        );
+        assert_eq!(
+            update_endpoint_for_channel(&ReleaseChannel::Beta),
+            BETA_UPDATE_ENDPOINT
+        );
+    }
+
+    #[test]
+    fn moving_prerelease_tag_is_not_treated_as_a_version() {
+        assert_eq!(release_tag_update_version("prerelease"), None);
+        assert_eq!(
+            release_tag_update_version(" v4.3.0-testing.7 ")
+                .unwrap()
+                .to_string(),
+            "4.3.0-testing.7"
+        );
+    }
 }
 
 fn shutdown_audio_graph(engine: &WaveLinuxEngine, shutdown_started: &AtomicBool) {

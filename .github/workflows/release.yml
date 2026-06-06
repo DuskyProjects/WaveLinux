@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   linux-bundles:
+    if: ${{ github.event_name != 'push' || github.event.deleted != true }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -46,6 +47,12 @@ jobs:
             gstreamer1.0-plugins-good \
             libpipewire-0.3-dev \
             libspa-0.2-dev
+
+      - name: Install LADSPA effect plugins for AppImage staging
+        run: |
+          sudo apt-get install -y swh-plugins || true
+          sudo apt-get install -y librnnoise-ladspa || true
+          sudo apt-get install -y deepfilternet-ladspa || true
 
       - run: corepack enable
       - run: corepack prepare yarn@1.22.22 --activate
@@ -139,4 +146,8 @@ jobs:
               --title "$TITLE" \
               --notes-file RELEASE_NOTES.md \
               --prerelease
+          fi
+
+          if [[ "$GITHUB_REF_NAME" != "prerelease" ]]; then
+            git push origin ":refs/tags/${GITHUB_REF_NAME}" || true
           fi

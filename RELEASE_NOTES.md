@@ -15,10 +15,26 @@ main mixer path device-neutral.
   through apt, dnf, pacman, or zypper.
 - Bundles more safe AppImage-side runtime pieces: GStreamer media support,
   WebKit sandbox helpers, and libusb for optional Elgato controls.
+- Bundles supported LADSPA effect plugins into AppImage releases when present on
+  the release builder, exposes the bundle through `LADSPA_PATH`, and includes
+  distro effect packages in setup/install flows.
+- Recognizes legacy `OpenWave_*` virtual audio nodes during managed graph
+  cleanup so old testing graphs can be removed cleanly.
+- Adds Hardware direct mic monitor mode so Wave XLR users can monitor through
+  the interface hardware while WaveLinux keeps the mic in stream/record mixes
+  and skips the delayed software Monitor copy.
+- Ignores generic numbered `Stream 123` media labels when remembering apps so
+  browser streams do not churn app history.
 - Adds libusb and WebKit/AppImage runtime pieces to release packaging and
   dependency checks.
-- Adds a Beta updates checkbox in the updater that tracks the testing branch
-  prerelease feed without changing stable update checks.
+- Adds a Beta updates checkbox in the updater that tracks the single moving
+  `prerelease` testing feed without changing stable update checks.
+- Keeps unsupported, busy, permission-blocked, or missing-runtime streamer
+  devices status-only so they do not expose non-working binding controls.
+- Avoids tearing down the audio graph before a self-update has actually
+  installed; restart shutdown handles cleanup after a successful update.
+- Expands the Testing Health Report with update endpoint, release URL, current
+  version, latest version, and install-support status for tester issue reports.
 
 # WaveLinux 4.2.1
 

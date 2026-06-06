@@ -957,7 +957,8 @@ export default function App() {
               .finally(() => setUpdateBusy(false));
           }}
           onOpenReleases={() => {
-            void invoke("open_release_page").catch((error) => setToast(String(error)));
+            const releaseChannel = state.config.settings.release_channel;
+            void invoke("open_release_page", { releaseChannel }).catch((error) => setToast(String(error)));
           }}
           onPrune={() => runAudioCommandList("cleanup_stale_audio_graph", "Prune Stale Audio")}
           onInstallEffectPlugins={() => void installEffectPlugins()}
@@ -5034,6 +5035,7 @@ function DiagnosticsView({
   onPrune,
   pluginInstallBusy,
   state,
+  updateInfo,
   run,
 }: {
   audioActionReport: AudioActionReport | null;
@@ -5041,6 +5043,7 @@ function DiagnosticsView({
   onPrune: () => void | Promise<unknown>;
   pluginInstallBusy: boolean;
   state: AppStateSnapshot;
+  updateInfo: UpdateInfo | null;
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
 }) {
   const [report, setReport] = useState<SoundCheckReport | null>(null);
@@ -5084,6 +5087,7 @@ function DiagnosticsView({
         state,
         streamerDeviceError,
         streamerDevices,
+        updateInfo,
       }),
     [
       audioActionReport,
@@ -5095,6 +5099,7 @@ function DiagnosticsView({
       state,
       streamerDeviceError,
       streamerDevices,
+      updateInfo,
     ],
   );
   const copyTestingHealthReport = async () => {
@@ -5262,6 +5267,7 @@ function buildTestingHealthReport({
   state,
   streamerDeviceError,
   streamerDevices,
+  updateInfo,
 }: {
   audioActionReport: AudioActionReport | null;
   diagnostics: Diagnostic[];
@@ -5272,6 +5278,7 @@ function buildTestingHealthReport({
   state: AppStateSnapshot;
   streamerDeviceError: string | null;
   streamerDevices: StreamerDeviceSummary[];
+  updateInfo: UpdateInfo | null;
 }) {
   const settings = state.config.settings;
   const missingEffects =
@@ -5287,6 +5294,12 @@ function buildTestingHealthReport({
     `Release channel: ${settings.release_channel}`,
     `Auto check updates: ${yesNo(settings.auto_check_updates)}`,
     `Auto install updates: ${yesNo(settings.auto_install_updates)}`,
+    `Update status: ${updateInfo?.message ?? "not checked"}`,
+    `Update current version: ${updateInfo?.current_version ?? "unknown"}`,
+    `Update latest version: ${updateInfo?.version ?? "none"}`,
+    `Update install supported: ${updateInfo ? yesNo(updateInfo.install_supported) : "unknown"}`,
+    `Update endpoint: ${updateInfo?.endpoint ?? "not checked"}`,
+    `Update release URL: ${updateInfo?.release_url ?? "not checked"}`,
     "",
     "## Engine",
     `Healthy: ${yesNo(state.engine.healthy)}`,
@@ -5301,6 +5314,7 @@ function buildTestingHealthReport({
     `Channel layout: ${state.config.audio.channel_layout}`,
     `Mono inputs to stereo: ${yesNo(state.config.audio.mono_inputs_to_stereo)}`,
     `Low-latency monitoring: ${yesNo(settings.low_latency_mic_monitoring)}`,
+    `Hardware direct mic monitoring: ${yesNo(settings.hardware_direct_mic_monitoring)}`,
     `Stream sync delay: ${settings.stream_sync_delay_msec} ms`,
     `Monitor sync delay: ${settings.monitor_sync_delay_msec} ms`,
     "",
@@ -5574,7 +5588,7 @@ function EffectAvailabilitySummary({
               className="secondary-button"
               disabled={installBusy}
               onClick={onInstallMissing}
-              title="Install missing optional LADSPA effect plugins with the system package manager"
+              title="Install missing LADSPA effect plugins with the system package manager"
               type="button"
             >
               <Download size={16} />
@@ -5651,6 +5665,7 @@ function SettingsView({
   const visibleUpdateInfo =
     updateInfo?.channel === state.config.settings.release_channel ? updateInfo : null;
   const betaUpdatesEnabled = state.config.settings.release_channel === "beta";
+  const updateChannelLabel = betaUpdatesEnabled ? "Testing" : "Stable";
   const hasStreamerDevices = streamerDevices.length > 0;
   const hasElgatoDevices = useMemo(
     () => [...state.graph.inputs, ...state.graph.outputs].some(isElgatoAudioDevice),
@@ -5836,10 +5851,12 @@ function SettingsView({
                 <strong>{visibleUpdateInfo?.message ?? "Update status has not been checked"}</strong>
                 <span>
                   {visibleUpdateInfo
-                    ? `${visibleUpdateInfo.channel} · current ${visibleUpdateInfo.current_version}${visibleUpdateInfo.version ? ` · latest ${visibleUpdateInfo.version}` : ""}`
-                    : "Signed AppImage updates, plus deb/rpm/AUR package releases"}
+                    ? `${updateChannelLabel} · current ${visibleUpdateInfo.current_version}${visibleUpdateInfo.version ? ` · latest ${visibleUpdateInfo.version}` : ""}`
+                    : betaUpdatesEnabled
+                      ? "Testing updates use the moving prerelease feed"
+                      : "Signed AppImage updates, plus deb/rpm/AUR package releases"}
                 </span>
-                <label className="updater-checkbox">
+                <label className="updater-checkbox" title="Use the WaveLinux Testing prerelease feed">
                   <input
                     checked={betaUpdatesEnabled}
                     onChange={(event) =>
@@ -5891,6 +5908,13 @@ function SettingsView({
                   updateSettings({ ...state.config.settings, low_latency_mic_monitoring: value })
                 }
                 value={state.config.settings.low_latency_mic_monitoring}
+              />
+              <Toggle
+                label="Hardware direct mic monitor"
+                onChange={(value) =>
+                  updateSettings({ ...state.config.settings, hardware_direct_mic_monitoring: value })
+                }
+                value={state.config.settings.hardware_direct_mic_monitoring}
               />
               <VolumeFader
                 label="Stream source delay"
@@ -5949,6 +5973,7 @@ function SettingsView({
           onPrune={onPrune}
           pluginInstallBusy={pluginInstallBusy}
           state={state}
+          updateInfo={updateInfo}
           run={run}
         />
       )}
@@ -6007,6 +6032,7 @@ function StreamerDevicesView({
     ? bindings?.profiles[selectedDevice.id] ?? emptyStreamerProfile(selectedDevice)
     : null;
   const selectedBinding = profile?.bindings[selectedBindingIndex] ?? profile?.bindings[0] ?? null;
+  const selectedDeviceBindable = selectedDevice ? streamerDeviceBindingsAvailable(selectedDevice) : false;
 
   useEffect(() => {
     if (!profile) return;
@@ -6180,19 +6206,25 @@ function StreamerDevicesView({
                 <Keyboard size={18} />
               </div>
               <Toggle
-                disabled={busy}
+                disabled={busy || !selectedDeviceBindable}
                 label="Enabled"
                 onChange={(enabled) => void setDeviceEnabled(selectedDevice, enabled)}
                 value={selectedDevice.enabled}
               />
+              {!selectedDeviceBindable && (
+                <div className="latency-note info">
+                  <Info size={15} />
+                  <span>{streamerBindingUnavailableMessage(selectedDevice)}</span>
+                </div>
+              )}
               <div className="streamer-binding-actions">
-                <button className="secondary-button" disabled={busy} onClick={addBinding} type="button">
+                <button className="secondary-button" disabled={busy || !selectedDeviceBindable} onClick={addBinding} type="button">
                   <CirclePlus size={16} />
                   Binding
                 </button>
                 <button
                   className="secondary-button"
-                  disabled={busy || !selectedBinding}
+                  disabled={busy || !selectedDeviceBindable || !selectedBinding}
                   onClick={() => selectedBinding && void testBinding(selectedBinding)}
                   type="button"
                 >
@@ -6210,7 +6242,7 @@ function StreamerDevicesView({
                     <input
                       aria-label="Binding label"
                       className="text-field"
-                      disabled={busy}
+                      disabled={busy || !selectedDeviceBindable}
                       onBlur={(event) => updateBinding(index, { label: event.currentTarget.value })}
                       onChange={() => undefined}
                       defaultValue={binding.label}
@@ -6218,14 +6250,14 @@ function StreamerDevicesView({
                     <input
                       aria-label="Control id"
                       className="text-field"
-                      disabled={busy}
+                      disabled={busy || !selectedDeviceBindable}
                       onBlur={(event) => updateBinding(index, { control_id: event.currentTarget.value })}
                       onChange={() => undefined}
                       defaultValue={binding.control_id}
                     />
                     <AppSelect
                       ariaLabel="Binding action"
-                      disabled={busy}
+                      disabled={busy || !selectedDeviceBindable}
                       onChange={(value) => updateBinding(index, { action: parseStreamerAction(value) })}
                       options={actionOptions}
                       value={streamerActionKey(binding.action)}
@@ -6233,7 +6265,7 @@ function StreamerDevicesView({
                     <div className="streamer-binding-buttons">
                       <button
                         className="mini-icon-button"
-                        disabled={busy}
+                        disabled={busy || !selectedDeviceBindable}
                         onClick={(event) => {
                           event.stopPropagation();
                           setSelectedBindingIndex(index);
@@ -6246,7 +6278,7 @@ function StreamerDevicesView({
                       </button>
                       <button
                         className="mini-icon-button"
-                        disabled={busy}
+                        disabled={busy || !selectedDeviceBindable}
                         onClick={(event) => {
                           event.stopPropagation();
                           void testBinding(binding);
@@ -6258,7 +6290,7 @@ function StreamerDevicesView({
                       </button>
                       <button
                         className="mini-icon-button danger"
-                        disabled={busy}
+                        disabled={busy || !selectedDeviceBindable}
                         onClick={(event) => {
                           event.stopPropagation();
                           removeBinding(index);
@@ -6945,6 +6977,29 @@ function streamerPermissionLabel(status: StreamerDeviceSummary["permission_statu
     missing_runtime: "Missing runtime",
     unsupported_protocol: "Unsupported",
   }[status];
+}
+
+function streamerDeviceBindingsAvailable(device: StreamerDeviceSummary): boolean {
+  return (
+    device.permission_status === "ready" &&
+    (device.transport === "hid" || device.transport === "midi")
+  );
+}
+
+function streamerBindingUnavailableMessage(device: StreamerDeviceSummary): string {
+  if (device.transport === "audio_profile" || device.permission_status === "unsupported_protocol") {
+    return "WaveLinux detected this hardware, but no native control protocol is available for bindings yet.";
+  }
+  if (device.permission_status === "permission_denied") {
+    return "WaveLinux needs hidraw or MIDI permissions before bindings can run.";
+  }
+  if (device.permission_status === "busy") {
+    return "Another app appears to own this device, so WaveLinux will not retry aggressively.";
+  }
+  if (device.permission_status === "missing_runtime") {
+    return "A required runtime tool is missing before bindings can run.";
+  }
+  return "Bindings become available when the device status is Ready.";
 }
 
 function streamerActionOptions(state: AppStateSnapshot): SelectOption[] {
