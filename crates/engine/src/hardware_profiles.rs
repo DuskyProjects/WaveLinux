@@ -95,6 +95,7 @@ pub fn load_hardware_profile_catalog(paths: &EnginePaths) -> HardwareProfileCata
         ProfileSource::Local,
         &mut catalog,
     );
+    dedupe_profile_ids(&mut catalog);
     catalog
 }
 
@@ -531,6 +532,28 @@ fn load_bundle(
             )),
         }
     }
+}
+
+fn dedupe_profile_ids(catalog: &mut HardwareProfileCatalog) {
+    let mut profiles_by_id: BTreeMap<String, ProfileEntry> = BTreeMap::new();
+    for entry in std::mem::take(&mut catalog.profiles) {
+        let key = profile_entry_dedupe_key(&entry);
+        match profiles_by_id.get(&entry.profile.id) {
+            Some(existing) if profile_entry_dedupe_key(existing) >= key => {}
+            _ => {
+                profiles_by_id.insert(entry.profile.id.clone(), entry);
+            }
+        }
+    }
+    catalog.profiles = profiles_by_id.into_values().collect();
+}
+
+fn profile_entry_dedupe_key(entry: &ProfileEntry) -> (u32, u8, u8) {
+    (
+        entry.profile.revision,
+        entry.source.priority(),
+        confidence_priority(entry.profile.confidence),
+    )
 }
 
 fn verify_remote_profile_signature(path: &Path, data: &[u8]) -> Result<(), String> {
@@ -1692,6 +1715,86 @@ mod tests {
             devices[0].active_bluetooth_mic_policy,
             Some(BluetoothMicPolicy::NeverIfHfp)
         );
+    }
+
+    #[test]
+    fn stale_same_id_local_override_does_not_hide_newer_profile() {
+        let root = tempdir().unwrap();
+        let paths = EnginePaths::for_tests(root.path());
+        fs::create_dir_all(paths.local_hardware_profiles_dir()).unwrap();
+        fs::write(
+            paths.local_hardware_profiles_dir().join("stale-xm4.json"),
+            r#"{
+              "id": "sony.wh-1000xm4",
+              "name": "Sony WH-1000XM4",
+              "revision": 7,
+              "matches": [{"bus": "bluetooth", "description_contains": ["WH-1000XM4"]}],
+              "capabilities": {"input": true, "output": true, "bluetooth_a2dp": true, "bluetooth_hfp": true},
+              "latency_policy": {"stable_msec": 160, "low_latency_msec": 20, "bluetooth_floor_msec": 240},
+              "routing_policy": {"output_priority": 70, "allow_auto_select_input": false, "allow_auto_select_output": true},
+              "confidence": "high"
+            }"#,
+        )
+        .unwrap();
+        let catalog = load_hardware_profile_catalog(&paths);
+        let ui_state = hardware_profile_ui_state(&catalog, &DevicePolicy::default());
+        let profile = ui_state
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "sony.wh-1000xm4")
+            .unwrap();
+        let mut devices = vec![device(
+            "bluez_output.AC_80_0A_72_BD_10.1",
+            "WH-1000XM4",
+            DeviceBus::Bluetooth,
+        )];
+
+        apply_profiles_to_devices(&mut devices, &catalog);
+
+        assert_eq!(profile.latency_policy.stable_msec, Some(45));
+        assert_eq!(profile.latency_policy.low_latency_msec, Some(25));
+        assert_eq!(profile.latency_policy.bluetooth_floor_msec, Some(70));
+        assert_eq!(
+            devices[0]
+                .active_latency_policy
+                .as_ref()
+                .and_then(|policy| policy.stable_msec),
+            Some(45)
+        );
+    }
+
+    #[test]
+    fn newer_same_id_local_override_remains_selectable() {
+        let root = tempdir().unwrap();
+        let paths = EnginePaths::for_tests(root.path());
+        fs::create_dir_all(paths.local_hardware_profiles_dir()).unwrap();
+        fs::write(
+            paths.local_hardware_profiles_dir().join("newer-xm4.json"),
+            r#"{
+              "id": "sony.wh-1000xm4",
+              "name": "Sony WH-1000XM4 Tuned",
+              "revision": 10,
+              "matches": [{"bus": "bluetooth", "description_contains": ["WH-1000XM4"]}],
+              "capabilities": {"input": true, "output": true, "bluetooth_a2dp": true, "bluetooth_hfp": true},
+              "latency_policy": {"stable_msec": 90, "low_latency_msec": 40, "bluetooth_floor_msec": 120},
+              "routing_policy": {"output_priority": 90, "allow_auto_select_input": false, "allow_auto_select_output": true},
+              "confidence": "high"
+            }"#,
+        )
+        .unwrap();
+        let catalog = load_hardware_profile_catalog(&paths);
+        let ui_state = hardware_profile_ui_state(&catalog, &DevicePolicy::default());
+        let profile = ui_state
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "sony.wh-1000xm4")
+            .unwrap();
+
+        assert_eq!(profile.source, "local");
+        assert_eq!(profile.name, "Sony WH-1000XM4 Tuned");
+        assert_eq!(profile.latency_policy.stable_msec, Some(90));
+        assert_eq!(profile.latency_policy.low_latency_msec, Some(40));
+        assert_eq!(profile.latency_policy.bluetooth_floor_msec, Some(120));
     }
 
     #[test]

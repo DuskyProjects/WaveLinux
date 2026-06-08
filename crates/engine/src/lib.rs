@@ -75,6 +75,7 @@ const METER_DISPLAY_CEILING_DB: f32 = 0.0;
 const METER_DISPLAY_EXPONENT: f32 = 1.15;
 const EFFECT_GRAPH_SYNC_DEBOUNCE: Duration = Duration::from_millis(500);
 const GRAPH_REPAIR_DEBOUNCE: Duration = Duration::from_millis(650);
+const UI_STATE_REFRESH_MAX_AGE: Duration = Duration::from_millis(1_600);
 const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
     "APPDIR",
     "APPIMAGE",
@@ -306,6 +307,7 @@ struct RuntimeCache {
     diagnostics: Vec<Diagnostic>,
     status: EngineStatus,
     bluetooth_monitor_routes: BTreeMap<String, BluetoothMonitorRouteSignature>,
+    refreshed_at: Option<Instant>,
 }
 
 impl RuntimeCache {
@@ -314,6 +316,7 @@ impl RuntimeCache {
             graph: RuntimeGraph::default(),
             diagnostics: Vec::new(),
             bluetooth_monitor_routes: BTreeMap::new(),
+            refreshed_at: None,
             status: EngineStatus {
                 dry_run,
                 healthy: true,
@@ -1105,7 +1108,7 @@ impl WaveLinuxEngine {
     }
 
     pub fn get_state(&self) -> Result<AppStateSnapshot, EngineError> {
-        let _ = self.refresh_runtime();
+        let _ = self.refresh_runtime_if_stale(UI_STATE_REFRESH_MAX_AGE);
         self.cached_state()
     }
 
@@ -1147,6 +1150,17 @@ impl WaveLinuxEngine {
 
     pub fn refresh_runtime(&self) -> Result<(), EngineError> {
         let _runtime_refresh = self.lock_runtime_refresh()?;
+        self.refresh_runtime_unlocked()
+    }
+
+    fn refresh_runtime_if_stale(&self, max_age: Duration) -> Result<(), EngineError> {
+        if self.runtime_refreshed_within(max_age)? {
+            return Ok(());
+        }
+        let _runtime_refresh = self.lock_runtime_refresh()?;
+        if self.runtime_refreshed_within(max_age)? {
+            return Ok(());
+        }
         self.refresh_runtime_unlocked()
     }
 
@@ -1380,6 +1394,7 @@ impl WaveLinuxEngine {
         runtime.status.healthy = healthy;
         runtime.status.audio_graph_running = audio_graph_running;
         runtime.status.last_refresh_unix = OffsetDateTime::now_utc().unix_timestamp();
+        runtime.refreshed_at = Some(Instant::now());
         runtime.status.message = if healthy {
             if self.options.dry_run {
                 "Dry-run mode".into()
@@ -3910,6 +3925,13 @@ impl WaveLinuxEngine {
 
     fn write_runtime(&self) -> Result<std::sync::RwLockWriteGuard<'_, RuntimeCache>, EngineError> {
         self.runtime.write().map_err(|_| EngineError::LockPoisoned)
+    }
+
+    fn runtime_refreshed_within(&self, max_age: Duration) -> Result<bool, EngineError> {
+        Ok(self
+            .read_runtime()?
+            .refreshed_at
+            .is_some_and(|refreshed_at| refreshed_at.elapsed() <= max_age))
     }
 
     fn lock_audio_commands(&self) -> Result<MutexGuard<'_, ()>, EngineError> {
@@ -7257,6 +7279,18 @@ mod tests {
         assert_eq!(default_profile.name, "Default Generic Audio");
         assert_eq!(default_profile.latency_policy.stable_msec, Some(80));
         assert_eq!(default_profile.routing_policy.output_priority, Some(30));
+    }
+
+    #[test]
+    fn get_state_reuses_recent_runtime_refresh() {
+        let engine = test_engine();
+        engine.refresh_runtime().unwrap();
+        let first_refresh = engine.read_runtime().unwrap().refreshed_at.unwrap();
+
+        let _ = engine.get_state().unwrap();
+        let second_refresh = engine.read_runtime().unwrap().refreshed_at.unwrap();
+
+        assert_eq!(first_refresh, second_refresh);
     }
 
     #[test]
