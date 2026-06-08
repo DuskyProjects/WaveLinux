@@ -2894,7 +2894,9 @@ fn main() {
         return;
     };
 
-    let engine = WaveLinuxEngine::from_xdg().expect("failed to start WaveLinux engine");
+    let app_log_version = current_update_version().to_string();
+    let engine = WaveLinuxEngine::from_xdg_for_app_version(&app_log_version)
+        .expect("failed to start WaveLinux engine");
     let background = engine.spawn_background();
     let streamer_runtime = streamer_devices::StreamerDeviceRuntime::start(Arc::clone(&engine));
     let run_engine = Arc::clone(&engine);

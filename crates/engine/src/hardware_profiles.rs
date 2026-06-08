@@ -1325,22 +1325,24 @@ mod tests {
             profile.codec_policy.preferred_a2dp_codecs,
             ["aac", "sbc_xq", "sbc", "ldac"]
         );
-        assert_eq!(profile.latency_policy.bluetooth_floor_msec, Some(240));
+        assert_eq!(profile.latency_policy.stable_msec, Some(45));
+        assert_eq!(profile.latency_policy.low_latency_msec, Some(25));
+        assert_eq!(profile.latency_policy.bluetooth_floor_msec, Some(70));
         assert_eq!(
             profile.codec_policy.latency_floor_msec.get("aac"),
-            Some(&280)
+            Some(&80)
         );
         assert_eq!(
             profile.codec_policy.latency_floor_msec.get("sbc_xq"),
-            Some(&300)
+            Some(&100)
         );
         assert_eq!(
             profile.codec_policy.latency_floor_msec.get("sbc"),
-            Some(&240)
+            Some(&70)
         );
         assert_eq!(
             profile.codec_policy.latency_floor_msec.get("ldac"),
-            Some(&300)
+            Some(&120)
         );
         assert_eq!(profile.codec_policy.ldac_quality.as_deref(), Some("sq"));
         assert!(profile
@@ -1373,10 +1375,10 @@ mod tests {
                 .and_then(|policy| policy.bluetooth_floor_msec)
         };
 
-        assert_eq!(latency_for_codec("aac"), Some(280));
-        assert_eq!(latency_for_codec("sbc_xq"), Some(300));
-        assert_eq!(latency_for_codec("sbc"), Some(240));
-        assert_eq!(latency_for_codec("ldac"), Some(300));
+        assert_eq!(latency_for_codec("aac"), Some(80));
+        assert_eq!(latency_for_codec("sbc_xq"), Some(100));
+        assert_eq!(latency_for_codec("sbc"), Some(70));
+        assert_eq!(latency_for_codec("ldac"), Some(120));
     }
 
     #[test]
@@ -1391,8 +1393,8 @@ mod tests {
             .filter(|entry| entry.profile.capabilities.bluetooth_a2dp)
         {
             assert!(
-                entry.profile.latency_policy.bluetooth_floor_msec >= Some(240),
-                "{} should keep a conservative Bluetooth floor",
+                entry.profile.latency_policy.bluetooth_floor_msec >= Some(50),
+                "{} should keep an explicit Bluetooth floor",
                 entry.profile.id
             );
             for codec in &entry.profile.codec_policy.preferred_a2dp_codecs {
@@ -1406,9 +1408,15 @@ mod tests {
                         "{} should define a safe latency floor for {codec}",
                         entry.profile.id
                     );
+                    let floor = entry.profile.codec_policy.latency_floor_msec[codec];
                     assert!(
-                        entry.profile.codec_policy.latency_floor_msec[codec] <= 300,
+                        floor <= 300,
                         "{} {codec} floor should stay under PipeWire's common 16-buffer link budget",
+                        entry.profile.id
+                    );
+                    assert!(
+                        floor >= 50,
+                        "{} {codec} floor should stay explicit enough to avoid zero-buffer churn",
                         entry.profile.id
                     );
                 }

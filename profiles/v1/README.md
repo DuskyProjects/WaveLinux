@@ -45,22 +45,24 @@ Use `examples/local-usb-microphone.json` as a starting point. Prefer exact `vend
 
 ## Bluetooth Latency Floors
 
-Bluetooth profiles should preserve the best stable A2DP codec before falling
-back to lower-quality codecs. Do not use SBC as the first crackle fix when AAC,
-SBC-XQ, or LDAC is available; raise the codec latency floor first.
+Bluetooth profiles should preserve the best stable A2DP codec without adding so
+much WaveLinux loopback buffering that video and gameplay become visibly
+delayed. Do not use SBC as the first crackle fix when AAC, SBC-XQ, or LDAC is
+available; raise the codec latency floor only as much as that endpoint needs.
 
-Use these stability-first floors unless a device-specific trace proves another
-value is reliable. Keep floors below PipeWire's common 48 kHz/1024-quantum,
-16-buffer link ceiling so extra buffering does not cause `out of buffers`
-dropouts:
+Use these performance-first floors unless a device-specific trace proves another
+value is required. Keep floors low enough that routed browser/video audio is not
+obviously out of sync:
 
-- `aac`: 280 ms
-- `sbc_xq`: 300 ms
-- `sbc`: 240 ms
-- `ldac`: 300 ms
+- `aac`: 80-140 ms
+- `sbc_xq`: 100-160 ms
+- `sbc`: 70-120 ms
+- `ldac`: 120-180 ms
 
 LDAC is quality-first, not latency-first. Profiles should avoid maximum-bitrate
-LDAC modes on unstable links and should keep HFP/HSP out of music playback.
+LDAC modes on unstable links and should keep HFP/HSP out of music playback. If
+an endpoint still crackles under desktop load, prefer a small profile-specific
+floor increase over broad 240-300 ms defaults.
 
 ## Guardrails
 

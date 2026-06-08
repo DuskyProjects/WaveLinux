@@ -970,6 +970,10 @@ pub fn channel_mix_route_uses_hardware_direct_monitoring(
     settings.hardware_direct_mic_monitoring
         && channel.kind.uses_hardware_slot()
         && mix.id == "monitor"
+        && channel
+            .source_device
+            .as_deref()
+            .is_some_and(source_name_looks_like_wave_xlr)
 }
 
 pub fn channel_mix_source_name(channel: &Channel) -> String {
@@ -978,6 +982,15 @@ pub fn channel_mix_source_name(channel: &Channel) -> String {
     } else {
         format!("{}.monitor", channel.virtual_sink_name)
     }
+}
+
+fn source_name_looks_like_wave_xlr(source_name: &str) -> bool {
+    let compact = source_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    compact.contains("wavexlr") || compact.contains("0fd9007d")
 }
 
 pub fn channel_has_active_effects(channel: &Channel) -> bool {
@@ -1091,6 +1104,11 @@ pub fn hardware_route_latency_msec(channel: &Channel, settings: &MixerSettings) 
 pub fn channel_mix_latency_msec(channel: &Channel, mix: &Mix, settings: &MixerSettings) -> u16 {
     let base = if channel.kind.uses_hardware_slot() {
         hardware_route_latency_msec(channel, settings)
+    } else if mix.id == "monitor"
+        && (settings.low_latency_mic_monitoring
+            || settings.optimization_mode == OptimizationMode::Performance)
+    {
+        low_latency_loopback_msec(settings)
     } else {
         stable_loopback_latency_msec(settings)
     };
@@ -4169,7 +4187,7 @@ mod tests {
             .contains(&"latency_msec=160".into()));
         assert!(route("music", "monitor")
             .args
-            .contains(&"latency_msec=110".into()));
+            .contains(&"latency_msec=90".into()));
         assert!(plan.commands.iter().any(|command| {
             command.args.contains(&"latency_msec=60".into())
                 && command
@@ -4183,6 +4201,12 @@ mod tests {
     fn hardware_direct_mic_monitoring_skips_software_monitor_route() {
         let mut config = MixerConfig::default();
         config.settings.hardware_direct_mic_monitoring = true;
+        config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap()
+            .source_device = Some("alsa_input.usb-Elgato_Wave_XLR.analog-stereo".into());
 
         let plan = plan_ensure_graph(&config);
         let has_route = |channel_id: &str, mix_id: &str| {
@@ -4198,6 +4222,25 @@ mod tests {
         assert!(has_route("hardware_in", "stream"));
         assert!(!has_route("hardware_in", "monitor"));
         assert!(has_route("music", "monitor"));
+    }
+
+    #[test]
+    fn hardware_direct_mic_monitoring_keeps_software_route_without_wave_xlr_source() {
+        let mut config = MixerConfig::default();
+        config.settings.hardware_direct_mic_monitoring = true;
+
+        let plan = plan_ensure_graph(&config);
+        let has_route = |channel_id: &str, mix_id: &str| {
+            plan.commands.iter().any(|command| {
+                command.args.iter().any(|arg| {
+                    arg.contains("wavelinux.role=channel_to_mix")
+                        && arg.contains(&format!("wavelinux.channel_id={channel_id}"))
+                        && arg.contains(&format!("wavelinux.mix_id={mix_id}"))
+                })
+            })
+        };
+
+        assert!(has_route("hardware_in", "monitor"));
     }
 
     #[test]
@@ -4243,7 +4286,7 @@ mod tests {
         let monitor = Mix::new_fixed("monitor", "Monitor");
 
         assert_eq!(hardware_route_latency_msec(&channel, &settings), 35);
-        assert_eq!(channel_mix_latency_msec(&music, &monitor, &settings), 60);
+        assert_eq!(channel_mix_latency_msec(&music, &monitor, &settings), 35);
         assert_eq!(
             mix_monitor_latency_msec_for_sink(
                 &monitor,

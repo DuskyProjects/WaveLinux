@@ -1,7 +1,7 @@
 {
   "id": "sony.wh-1000xm4",
   "name": "Sony WH-1000XM4",
-  "revision": 8,
+  "revision": 9,
   "matches": [
     {
       "bus": "bluetooth",
@@ -23,8 +23,9 @@
     "sample_rates_hz": [48000]
   },
   "latency_policy": {
-    "stable_msec": 160,
-    "bluetooth_floor_msec": 240
+    "stable_msec": 45,
+    "low_latency_msec": 25,
+    "bluetooth_floor_msec": 70
   },
   "routing_policy": {
     "output_priority": 70,
@@ -37,10 +38,10 @@
     "preferred_a2dp_codecs": ["aac", "sbc_xq", "sbc", "ldac"],
     "avoid_codecs": ["ldac_hq", "ldac_990", "hsp", "hfp", "cvsd", "msbc"],
     "latency_floor_msec": {
-      "aac": 280,
-      "ldac": 300,
-      "sbc_xq": 300,
-      "sbc": 240
+      "aac": 80,
+      "ldac": 120,
+      "sbc_xq": 100,
+      "sbc": 70
     },
     "ldac_quality": "sq"
   },
@@ -50,8 +51,8 @@
     "For latency and stability, prefer AAC or SBC-XQ A2DP before LDAC. LDAC should be limited to stable/standard quality and high-bitrate LDAC should be avoided unless link quality is excellent.",
     "If playback crackles on LDAC auto, switch the card profile to AAC first; do not drop below AAC automatically unless AAC is unavailable.",
     "When multiple A2DP profiles are exposed, WaveLinux should restore the preferred stable A2DP profile instead of leaving the headset on LDAC merely because LDAC is also A2DP.",
-    "Codec-specific latency floors keep AAC as the preferred automatic profile while giving AAC, SBC-XQ, SBC, and LDAC enough Bluetooth buffer to avoid clicking, skips, and BlueZ transport churn on PipeWire stacks that expose each codec as a separate A2DP card profile.",
-    "Local testing showed AAC at 180 ms could still crackle or drop out under desktop load, while 320 ms could exhaust PipeWire's default 16-buffer link budget on 48 kHz/1024-quantum graphs. Revision 8 keeps AAC buffered at 280 ms and caps higher-bitrate codec floors at 300 ms to avoid mini dropouts without falling below AAC."
+    "Codec-specific latency floors keep AAC as the preferred automatic profile while avoiding monitor desync from stacking large WaveLinux loopback buffers on top of the headset's own Bluetooth delay.",
+    "Revision 9 lowers the WaveLinux-added loopback floors for sync-sensitive monitoring. If a host still crackles under heavy load, prefer raising the local Bluetooth floor slightly over falling back to HFP/HSP."
   ],
   "source_notes": [
     "Sony documents WH-1000XM4 A2DP playback codecs as SBC, AAC, and LDAC, with HFP/HSP as separate headset profiles.",
