@@ -68,7 +68,7 @@ Required host services and tools:
 - Linux hidraw/sysfs access for Stream Deck-style streamer device detection
 - ALSA sequencer client listing and `aseqdump` for MIDI streamer device binding
 
-Recommended optional effect packages:
+Recommended effect packages:
 
 - SWH LADSPA plugins for compressor, gate, and limiter support
 - RNNoise LADSPA/noise-suppression-for-voice
@@ -117,13 +117,15 @@ signed remote profile bundles for detected audio devices when release assets
 are available.
 
 AppImage releases bundle WebKitGTK/GTK, GStreamer media support, WebKit sandbox
-helpers, and libusb for optional Elgato controls. First launch still runs a
-runtime preflight before WebKit starts for host-bound pieces such as PipeWire,
-desktop display/GL libraries, fonts, and portals. If a fresh Linux install is
-missing those packages, WaveLinux prompts for admin permission through the
-desktop and installs the distro packages it can verify with apt, dnf, pacman, or
-zypper. If setup cannot complete, it exits with a copyable manual command
-instead of opening a half-broken WebKit process.
+helpers, libusb for optional Elgato controls, and any supported LADSPA effect
+plugins present on the release builder. First launch still runs a runtime
+preflight before WebKit starts for host-bound pieces such as PipeWire, desktop
+display/GL libraries, fonts, portals, and distro-provided effect packages. If a
+fresh Linux install is missing those packages, WaveLinux prompts for admin
+permission through the desktop and installs the distro packages it can verify
+with apt, dnf, pacman, or zypper. If core runtime setup cannot complete, it exits
+with a copyable manual command instead of opening a half-broken WebKit process;
+missing effect plugins are reported and can be installed later.
 
 ## Run
 
@@ -143,20 +145,20 @@ from the tray menu to exit fully and remove WaveLinux-managed PipeWire nodes.
 
 ## Dependency Checks
 
-Check runtime dependencies and optional effect plugins:
+Check runtime dependencies and effect plugins:
 
 ```bash
 yarn deps:check
 ```
 
-Install missing runtime dependencies and optional effect packages when a
+Install missing runtime dependencies and effect packages when a
 supported package manager is available:
 
 ```bash
 yarn deps:install
 ```
 
-Install only optional effect packages:
+Install only effect packages:
 
 ```bash
 yarn effects:install
@@ -175,10 +177,10 @@ preflight manually:
 
 Use `WAVELINUX_SKIP_RUNTIME_INSTALL=1` to skip the AppImage preflight, or
 `WAVELINUX_ASSUME_RUNTIME_DEPS=1` when a packager has already provided all host
-runtime dependencies. The desktop app also exposes the optional plugin flow in
+runtime dependencies. The desktop app also exposes the plugin flow in
 Settings -> Health -> Effect Availability. Use Install FX to install missing
-optional LADSPA plugins through the detected package manager, then WaveLinux
-re-checks that DeepFilterNet3, RNNoise, and SWH dynamics are actually available.
+LADSPA plugins through the detected package manager, then WaveLinux re-checks
+that DeepFilterNet3, RNNoise, and SWH dynamics are actually available.
 
 ## ALSA-Only Apps
 
@@ -234,6 +236,12 @@ detected Elgato hardware, and the libusb control path is loaded only after a
 supported Wave XLR is detected. The Wave XLR USB protocol details are based on
 the OpenWave project: https://github.com/rikkichy/openwave
 
+For zero-latency self monitoring on a Wave XLR, enable Hardware direct mic
+monitor in Settings -> Sync and listen through the Wave XLR headphone output.
+WaveLinux keeps routing the microphone to stream/record mixes, but skips the
+software mic route into the Monitor mix so hardware sidetone is not doubled with
+a delayed software copy.
+
 ## Streamer Device Bindings
 
 When WaveLinux detects supported streamer hardware, Settings shows a Streamers
@@ -244,9 +252,10 @@ WaveLinux only keeps hidraw devices open or starts `aseqdump` MIDI capture when
 a detected device has enabled bindings.
 
 Bindings can target mixer mute and volume controls, source-to-mix controls, and
-audio graph repair or cleanup actions. A safe preset is created the first time a
-device is seen, and hardware access reports permission, busy, missing runtime, or
-unsupported protocol states instead of showing inactive controls.
+the safer stale-audio prune action. Full audio graph start and shutdown stay tied
+to opening and quitting WaveLinux. A safe preset is created the first time a
+bindable device is seen, and hardware access reports permission, busy, missing
+runtime, or unsupported protocol states instead of showing inactive controls.
 
 For hidraw permissions, packaged installs may include:
 
@@ -262,8 +271,8 @@ the device.
 
 For beta testing and GitHub issues, use `Settings -> Health -> Testing Health
 Report`. It creates one copyable Markdown block with engine state, update
-channel, diagnostics, audio device summaries, Elgato detection, streamer-device
-detection, and recent debug-log lines.
+channel/feed/status, diagnostics, audio device summaries, Elgato detection,
+streamer-device detection, and recent debug-log lines.
 
 ## Interface Themes
 
@@ -296,8 +305,9 @@ notes.
 ## Updates
 
 AppImage installs can check signed release metadata from inside Settings.
-The updater includes a Beta updates checkbox for testing-branch prereleases;
-leave it unchecked to stay on stable releases.
+The updater includes a Beta updates checkbox that tracks the single moving
+`prerelease` feed for WaveLinux Testing; leave it unchecked to stay on stable
+releases.
 Package-managed installs should update through their package manager.
 
 ## Development
@@ -418,14 +428,14 @@ Direct code, protocol, and runtime dependencies:
 | Rust support crate: `include_dir` | MIT | Embeds packaged hardware profile assets. |
 | Rust support crate: `libloading` | ISC | Lazy runtime loading for the optional libusb control path. |
 
-Optional open-source integrations that WaveLinux can detect or configure, but
-does not bundle in normal release artifacts:
+Open-source integrations that WaveLinux can detect, configure, bundle when
+available from the release builder, or install from distro packages:
 
 | Project | License | Notes |
 | --- | --- | --- |
-| [SWH LADSPA plugins](https://github.com/swh/ladspa) | GPL-2.0 | Optional compressor, gate, and limiter plugin support installed from the user's distro packages. |
-| [noise-suppression-for-voice](https://github.com/werman/noise-suppression-for-voice) / RNNoise | GPL-3.0 | Optional RNNoise LADSPA noise suppression support installed from the user's distro packages. |
-| [DeepFilterNet3 LADSPA/PipeWire plugins](https://github.com/Rikorose/DeepFilterNet) | MIT OR Apache-2.0 | Optional DeepFilterNet noise suppression support installed from the user's distro packages when available. |
+| [SWH LADSPA plugins](https://github.com/swh/ladspa) | GPL-2.0 | Compressor, gate, and limiter plugin support bundled in AppImage releases when present on the builder, otherwise installed from distro packages. |
+| [noise-suppression-for-voice](https://github.com/werman/noise-suppression-for-voice) / RNNoise | GPL-3.0 | RNNoise LADSPA noise suppression support bundled in AppImage releases when present on the builder, otherwise installed from distro packages. |
+| [DeepFilterNet3 LADSPA/PipeWire plugins](https://github.com/Rikorose/DeepFilterNet) | MIT OR Apache-2.0 | DeepFilterNet noise suppression support bundled or installed when a distro package is available. |
 | [OpenDeck](https://github.com/nekename/OpenDeck) | GPL-3.0-or-later | Open-source Linux Stream Deck implementation used as a compatibility and udev-permission reference. |
 | [Bitfocus Companion](https://github.com/bitfocus/companion) | MIT | Open-source streamer surface ecosystem reference for Stream Deck, Loupedeck, X-keys, and similar devices. |
 | [GoXLR Utility](https://github.com/GoXLR-on-Linux/goxlr-utility) | MIT | Open-source GoXLR control software reference for Linux behavior and control-surface expectations. |

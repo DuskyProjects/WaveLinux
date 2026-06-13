@@ -95,6 +95,7 @@ pub fn load_hardware_profile_catalog(paths: &EnginePaths) -> HardwareProfileCata
         ProfileSource::Local,
         &mut catalog,
     );
+    dedupe_profile_ids(&mut catalog);
     catalog
 }
 
@@ -531,6 +532,28 @@ fn load_bundle(
             )),
         }
     }
+}
+
+fn dedupe_profile_ids(catalog: &mut HardwareProfileCatalog) {
+    let mut profiles_by_id: BTreeMap<String, ProfileEntry> = BTreeMap::new();
+    for entry in std::mem::take(&mut catalog.profiles) {
+        let key = profile_entry_dedupe_key(&entry);
+        match profiles_by_id.get(&entry.profile.id) {
+            Some(existing) if profile_entry_dedupe_key(existing) >= key => {}
+            _ => {
+                profiles_by_id.insert(entry.profile.id.clone(), entry);
+            }
+        }
+    }
+    catalog.profiles = profiles_by_id.into_values().collect();
+}
+
+fn profile_entry_dedupe_key(entry: &ProfileEntry) -> (u32, u8, u8) {
+    (
+        entry.profile.revision,
+        entry.source.priority(),
+        confidence_priority(entry.profile.confidence),
+    )
 }
 
 fn verify_remote_profile_signature(path: &Path, data: &[u8]) -> Result<(), String> {
@@ -1325,22 +1348,24 @@ mod tests {
             profile.codec_policy.preferred_a2dp_codecs,
             ["aac", "sbc_xq", "sbc", "ldac"]
         );
-        assert_eq!(profile.latency_policy.bluetooth_floor_msec, Some(240));
+        assert_eq!(profile.latency_policy.stable_msec, Some(45));
+        assert_eq!(profile.latency_policy.low_latency_msec, Some(25));
+        assert_eq!(profile.latency_policy.bluetooth_floor_msec, Some(70));
         assert_eq!(
             profile.codec_policy.latency_floor_msec.get("aac"),
-            Some(&280)
+            Some(&80)
         );
         assert_eq!(
             profile.codec_policy.latency_floor_msec.get("sbc_xq"),
-            Some(&300)
+            Some(&100)
         );
         assert_eq!(
             profile.codec_policy.latency_floor_msec.get("sbc"),
-            Some(&240)
+            Some(&70)
         );
         assert_eq!(
             profile.codec_policy.latency_floor_msec.get("ldac"),
-            Some(&300)
+            Some(&120)
         );
         assert_eq!(profile.codec_policy.ldac_quality.as_deref(), Some("sq"));
         assert!(profile
@@ -1373,10 +1398,10 @@ mod tests {
                 .and_then(|policy| policy.bluetooth_floor_msec)
         };
 
-        assert_eq!(latency_for_codec("aac"), Some(280));
-        assert_eq!(latency_for_codec("sbc_xq"), Some(300));
-        assert_eq!(latency_for_codec("sbc"), Some(240));
-        assert_eq!(latency_for_codec("ldac"), Some(300));
+        assert_eq!(latency_for_codec("aac"), Some(80));
+        assert_eq!(latency_for_codec("sbc_xq"), Some(100));
+        assert_eq!(latency_for_codec("sbc"), Some(70));
+        assert_eq!(latency_for_codec("ldac"), Some(120));
     }
 
     #[test]
@@ -1391,8 +1416,8 @@ mod tests {
             .filter(|entry| entry.profile.capabilities.bluetooth_a2dp)
         {
             assert!(
-                entry.profile.latency_policy.bluetooth_floor_msec >= Some(240),
-                "{} should keep a conservative Bluetooth floor",
+                entry.profile.latency_policy.bluetooth_floor_msec >= Some(50),
+                "{} should keep an explicit Bluetooth floor",
                 entry.profile.id
             );
             for codec in &entry.profile.codec_policy.preferred_a2dp_codecs {
@@ -1406,9 +1431,15 @@ mod tests {
                         "{} should define a safe latency floor for {codec}",
                         entry.profile.id
                     );
+                    let floor = entry.profile.codec_policy.latency_floor_msec[codec];
                     assert!(
-                        entry.profile.codec_policy.latency_floor_msec[codec] <= 300,
+                        floor <= 300,
                         "{} {codec} floor should stay under PipeWire's common 16-buffer link budget",
+                        entry.profile.id
+                    );
+                    assert!(
+                        floor >= 50,
+                        "{} {codec} floor should stay explicit enough to avoid zero-buffer churn",
                         entry.profile.id
                     );
                 }
@@ -1684,6 +1715,86 @@ mod tests {
             devices[0].active_bluetooth_mic_policy,
             Some(BluetoothMicPolicy::NeverIfHfp)
         );
+    }
+
+    #[test]
+    fn stale_same_id_local_override_does_not_hide_newer_profile() {
+        let root = tempdir().unwrap();
+        let paths = EnginePaths::for_tests(root.path());
+        fs::create_dir_all(paths.local_hardware_profiles_dir()).unwrap();
+        fs::write(
+            paths.local_hardware_profiles_dir().join("stale-xm4.json"),
+            r#"{
+              "id": "sony.wh-1000xm4",
+              "name": "Sony WH-1000XM4",
+              "revision": 7,
+              "matches": [{"bus": "bluetooth", "description_contains": ["WH-1000XM4"]}],
+              "capabilities": {"input": true, "output": true, "bluetooth_a2dp": true, "bluetooth_hfp": true},
+              "latency_policy": {"stable_msec": 160, "low_latency_msec": 20, "bluetooth_floor_msec": 240},
+              "routing_policy": {"output_priority": 70, "allow_auto_select_input": false, "allow_auto_select_output": true},
+              "confidence": "high"
+            }"#,
+        )
+        .unwrap();
+        let catalog = load_hardware_profile_catalog(&paths);
+        let ui_state = hardware_profile_ui_state(&catalog, &DevicePolicy::default());
+        let profile = ui_state
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "sony.wh-1000xm4")
+            .unwrap();
+        let mut devices = vec![device(
+            "bluez_output.AC_80_0A_72_BD_10.1",
+            "WH-1000XM4",
+            DeviceBus::Bluetooth,
+        )];
+
+        apply_profiles_to_devices(&mut devices, &catalog);
+
+        assert_eq!(profile.latency_policy.stable_msec, Some(45));
+        assert_eq!(profile.latency_policy.low_latency_msec, Some(25));
+        assert_eq!(profile.latency_policy.bluetooth_floor_msec, Some(70));
+        assert_eq!(
+            devices[0]
+                .active_latency_policy
+                .as_ref()
+                .and_then(|policy| policy.stable_msec),
+            Some(45)
+        );
+    }
+
+    #[test]
+    fn newer_same_id_local_override_remains_selectable() {
+        let root = tempdir().unwrap();
+        let paths = EnginePaths::for_tests(root.path());
+        fs::create_dir_all(paths.local_hardware_profiles_dir()).unwrap();
+        fs::write(
+            paths.local_hardware_profiles_dir().join("newer-xm4.json"),
+            r#"{
+              "id": "sony.wh-1000xm4",
+              "name": "Sony WH-1000XM4 Tuned",
+              "revision": 10,
+              "matches": [{"bus": "bluetooth", "description_contains": ["WH-1000XM4"]}],
+              "capabilities": {"input": true, "output": true, "bluetooth_a2dp": true, "bluetooth_hfp": true},
+              "latency_policy": {"stable_msec": 90, "low_latency_msec": 40, "bluetooth_floor_msec": 120},
+              "routing_policy": {"output_priority": 90, "allow_auto_select_input": false, "allow_auto_select_output": true},
+              "confidence": "high"
+            }"#,
+        )
+        .unwrap();
+        let catalog = load_hardware_profile_catalog(&paths);
+        let ui_state = hardware_profile_ui_state(&catalog, &DevicePolicy::default());
+        let profile = ui_state
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "sony.wh-1000xm4")
+            .unwrap();
+
+        assert_eq!(profile.source, "local");
+        assert_eq!(profile.name, "Sony WH-1000XM4 Tuned");
+        assert_eq!(profile.latency_policy.stable_msec, Some(90));
+        assert_eq!(profile.latency_policy.low_latency_msec, Some(40));
+        assert_eq!(profile.latency_policy.bluetooth_floor_msec, Some(120));
     }
 
     #[test]

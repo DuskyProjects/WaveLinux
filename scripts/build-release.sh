@@ -25,5 +25,13 @@ if [[ -z "${WAVELINUX_RELEASE_TAG:-}" ]]; then
   WAVELINUX_RELEASE_TAG="$(git -C "$ROOT_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)"
 fi
 export WAVELINUX_RELEASE_TAG
+if [[ -z "${WAVELINUX_UPDATE_VERSION:-}" ]]; then
+  if [[ "${GITHUB_REF_NAME:-}" == v* ]]; then
+    WAVELINUX_UPDATE_VERSION="${GITHUB_REF_NAME#v}"
+  elif [[ "${WAVELINUX_RELEASE_TAG:-}" == v* ]]; then
+    WAVELINUX_UPDATE_VERSION="${WAVELINUX_RELEASE_TAG#v}"
+  fi
+fi
+export WAVELINUX_UPDATE_VERSION
 exec "$ROOT_DIR/node_modules/.bin/tauri" build \
   --config '{"bundle":{"createUpdaterArtifacts":true}}'

@@ -111,6 +111,13 @@ pub fn default_profiles_for_devices(
         .collect()
 }
 
+pub fn native_bindings_available(device: &StreamerDeviceSummary) -> bool {
+    matches!(
+        device.transport,
+        StreamerTransport::Hid | StreamerTransport::Midi
+    ) && device.permission_status == StreamerPermissionStatus::Ready
+}
+
 pub fn learn_control(
     devices: &[StreamerDeviceSummary],
     device_id: &str,
@@ -716,7 +723,7 @@ fn apply_config_to_devices(
 ) {
     for device in devices.values_mut() {
         if let Some(profile) = config.profiles.get(&device.id) {
-            device.enabled = profile.enabled;
+            device.enabled = native_bindings_available(device) && profile.enabled;
         }
     }
 }
@@ -898,6 +905,7 @@ fn default_profile_for_device(
     device: &StreamerDeviceSummary,
     config: &MixerConfig,
 ) -> StreamerBindingProfile {
+    let bindable = native_bindings_available(device);
     let mut bindings = Vec::new();
     let monitor = config
         .mixes
@@ -910,64 +918,66 @@ fn default_profile_for_device(
         .find(|mix| mix.id == "stream")
         .or_else(|| config.mixes.get(1))
         .or(monitor);
-    if let Some(mix) = monitor {
-        bindings.push(button_binding(
-            default_control_id(device, 0),
-            "Monitor mute",
-            StreamerAction::MixMuteToggle {
-                mix_id: mix.id.clone(),
-            },
-        ));
-    }
-    if let Some(mix) = stream {
-        bindings.push(button_binding(
-            default_control_id(device, 1),
-            "Stream mute",
-            StreamerAction::MixMuteToggle {
-                mix_id: mix.id.clone(),
-            },
-        ));
-    }
-    bindings.push(button_binding(
-        default_control_id(device, 2),
-        "Prune stale audio",
-        StreamerAction::CleanupStaleAudioGraph,
-    ));
-
-    let mix_id = stream
-        .or(monitor)
-        .map(|mix| mix.id.clone())
-        .unwrap_or_else(|| "stream".into());
-    for (index, channel) in config.channels.iter().take(4).enumerate() {
-        bindings.push(button_binding(
-            default_control_id(device, index + 3),
-            format!("{} mute", channel.name),
-            StreamerAction::ChannelMuteToggle {
-                channel_id: channel.id.clone(),
-                mix_id: mix_id.clone(),
-            },
-        ));
-    }
-    if device.transport == StreamerTransport::Midi
-        && (device.capabilities.faders || device.capabilities.dials)
-    {
+    if bindable {
         if let Some(mix) = monitor {
-            bindings.push(fader_binding(
-                "midi:cc:7",
-                format!("{} volume", mix.name),
-                StreamerAction::MixVolumeSetFromControl {
+            bindings.push(button_binding(
+                default_control_id(device, 0),
+                "Monitor mute",
+                StreamerAction::MixMuteToggle {
                     mix_id: mix.id.clone(),
                 },
             ));
         }
         if let Some(mix) = stream {
-            bindings.push(fader_binding(
-                "midi:cc:8",
-                format!("{} volume", mix.name),
-                StreamerAction::MixVolumeSetFromControl {
+            bindings.push(button_binding(
+                default_control_id(device, 1),
+                "Stream mute",
+                StreamerAction::MixMuteToggle {
                     mix_id: mix.id.clone(),
                 },
             ));
+        }
+        bindings.push(button_binding(
+            default_control_id(device, 2),
+            "Prune stale audio",
+            StreamerAction::CleanupStaleAudioGraph,
+        ));
+
+        let mix_id = stream
+            .or(monitor)
+            .map(|mix| mix.id.clone())
+            .unwrap_or_else(|| "stream".into());
+        for (index, channel) in config.channels.iter().take(4).enumerate() {
+            bindings.push(button_binding(
+                default_control_id(device, index + 3),
+                format!("{} mute", channel.name),
+                StreamerAction::ChannelMuteToggle {
+                    channel_id: channel.id.clone(),
+                    mix_id: mix_id.clone(),
+                },
+            ));
+        }
+        if device.transport == StreamerTransport::Midi
+            && (device.capabilities.faders || device.capabilities.dials)
+        {
+            if let Some(mix) = monitor {
+                bindings.push(fader_binding(
+                    "midi:cc:7",
+                    format!("{} volume", mix.name),
+                    StreamerAction::MixVolumeSetFromControl {
+                        mix_id: mix.id.clone(),
+                    },
+                ));
+            }
+            if let Some(mix) = stream {
+                bindings.push(fader_binding(
+                    "midi:cc:8",
+                    format!("{} volume", mix.name),
+                    StreamerAction::MixVolumeSetFromControl {
+                        mix_id: mix.id.clone(),
+                    },
+                ));
+            }
         }
     }
 
@@ -975,7 +985,7 @@ fn default_profile_for_device(
         device_id: device.id.clone(),
         family: Some(device.family.clone()),
         name: device.name.clone(),
-        enabled: true,
+        enabled: bindable,
         safe_preset: true,
         bindings,
     }
@@ -1542,6 +1552,61 @@ Client 24 : "RODECaster Pro II" [Kernel]
             .bindings
             .iter()
             .any(|binding| matches!(binding.action, StreamerAction::CleanupStaleAudioGraph)));
+    }
+
+    #[test]
+    fn unsupported_devices_get_status_only_profiles() {
+        let config = MixerConfig::default();
+        let device = StreamerDeviceSummary {
+            id: "audio-rode".into(),
+            name: "RODE audio endpoint".into(),
+            family: StreamerDeviceFamily::Rode,
+            transport: StreamerTransport::AudioProfile,
+            connected: true,
+            permission_status: StreamerPermissionStatus::UnsupportedProtocol,
+            source: "pipewire:rode".into(),
+            ..StreamerDeviceSummary::default()
+        };
+
+        let profile = default_profile_for_device(&device, &config);
+
+        assert!(!profile.enabled);
+        assert!(profile.bindings.is_empty());
+        assert!(!native_bindings_available(&device));
+    }
+
+    #[test]
+    fn saved_enabled_flag_does_not_enable_unbindable_device() {
+        let device = StreamerDeviceSummary {
+            id: "audio-rode".into(),
+            name: "RODE audio endpoint".into(),
+            family: StreamerDeviceFamily::Rode,
+            transport: StreamerTransport::AudioProfile,
+            connected: true,
+            enabled: true,
+            permission_status: StreamerPermissionStatus::UnsupportedProtocol,
+            source: "pipewire:rode".into(),
+            ..StreamerDeviceSummary::default()
+        };
+        let mut devices = BTreeMap::from([(device.id.clone(), device)]);
+        let config = StreamerDevicesConfig {
+            profiles: BTreeMap::from([(
+                "audio-rode".into(),
+                StreamerBindingProfile {
+                    device_id: "audio-rode".into(),
+                    family: Some(StreamerDeviceFamily::Rode),
+                    name: "RODE audio endpoint".into(),
+                    enabled: true,
+                    safe_preset: false,
+                    bindings: Vec::new(),
+                },
+            )]),
+            ..StreamerDevicesConfig::default()
+        };
+
+        apply_config_to_devices(&mut devices, &config);
+
+        assert!(!devices["audio-rode"].enabled);
     }
 
     #[test]

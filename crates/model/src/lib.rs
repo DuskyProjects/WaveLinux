@@ -76,6 +76,8 @@ pub struct MixerSettings {
     #[serde(default)]
     pub low_latency_mic_monitoring: bool,
     #[serde(default)]
+    pub hardware_direct_mic_monitoring: bool,
+    #[serde(default)]
     pub stream_sync_delay_msec: u16,
     #[serde(default)]
     pub monitor_sync_delay_msec: u16,
@@ -99,6 +101,7 @@ impl Default for MixerSettings {
             lock_default_input: false,
             lock_default_output: false,
             low_latency_mic_monitoring: false,
+            hardware_direct_mic_monitoring: false,
             stream_sync_delay_msec: 0,
             monitor_sync_delay_msec: 0,
             auto_check_updates: true,
@@ -324,7 +327,7 @@ impl MixerConfig {
     }
 
     fn normalize_app_history(&mut self) {
-        let mut seen = BTreeSet::new();
+        let mut by_key: BTreeMap<String, KnownApp> = BTreeMap::new();
         self.app_history = self
             .app_history
             .drain(..)
@@ -334,9 +337,19 @@ impl MixerConfig {
                     .unwrap_or_else(|| matcher_display_name(&app.matcher));
                 app.media_name = clean_optional_label(app.media_name);
                 let key = app_matcher_key(&app.matcher);
-                seen.insert(key).then_some(app)
+                match by_key.get_mut(&key) {
+                    Some(existing) if existing.last_seen_unix <= app.last_seen_unix => {
+                        *existing = app;
+                    }
+                    Some(_) => {}
+                    None => {
+                        by_key.insert(key, app);
+                    }
+                }
+                None
             })
             .collect();
+        self.app_history = by_key.into_values().collect();
         self.app_history.sort_by(|left, right| {
             right
                 .last_seen_unix
@@ -909,11 +922,12 @@ impl MixerConfig {
             .label_for_matcher(&matcher)
             .or_else(|| clean_app_display_name(&stream.display_name))
             .unwrap_or_else(|| matcher_display_name(&matcher));
-        let media_name = clean_optional_label(stream.media_name.clone());
+        let media_name = clean_optional_label(stream.media_name.clone())
+            .filter(|value| !is_generic_media_name(value));
         let Some(existing) = self
             .app_history
             .iter_mut()
-            .find(|app| app.matcher == matcher)
+            .find(|app| saved_matchers_conflict(&app.matcher, &matcher))
         else {
             let app = KnownApp {
                 matcher,
@@ -960,12 +974,17 @@ impl MixerConfig {
             !app_matchers_overlap(&preset.matcher, &matcher)
                 && !app_matchers_overlap(&preset.matcher, &resolved)
         });
-        let app = self.app_history.iter_mut().find(|app| {
-            app_matchers_overlap(&app.matcher, &matcher)
+        let mut forgotten = None;
+        for app in &mut self.app_history {
+            if app_matchers_overlap(&app.matcher, &matcher)
                 || app_matchers_overlap(&app.matcher, &resolved)
-        })?;
-        app.forgotten = true;
-        Some(app.clone())
+            {
+                app.forgotten = true;
+                forgotten.get_or_insert_with(|| app.clone());
+            }
+        }
+        self.normalize_app_history();
+        forgotten
     }
 
     pub fn restore_app(&mut self, matcher: AppMatcher) -> Option<KnownApp> {
@@ -2786,6 +2805,40 @@ pub struct LevelMeter {
     pub peak_right: f32,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoDeviceKind {
+    Input,
+    Output,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoDeviceReason {
+    Priority,
+    SystemDefault,
+    ActiveOutput,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedAutoDevice {
+    pub kind: AutoDeviceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<ChannelId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix_id: Option<MixId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<DeviceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+    pub reason: AutoDeviceReason,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EffectAvailability {
     pub effect_id: String,
@@ -2799,6 +2852,8 @@ pub struct RuntimeGraph {
     pub outputs: Vec<DeviceInfo>,
     pub app_streams: Vec<AppStream>,
     pub meters: Vec<LevelMeter>,
+    #[serde(default)]
+    pub auto_devices: Vec<ResolvedAutoDevice>,
     pub effect_availability: Vec<EffectAvailability>,
 }
 
@@ -3030,8 +3085,19 @@ fn matcher_should_keep_media_name(matcher: &AppMatcher) -> bool {
 }
 
 fn is_generic_media_name(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    if value == "stream" {
+        return true;
+    }
+    if value
+        .strip_prefix("stream ")
+        .is_some_and(|suffix| suffix.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return true;
+    }
+
     matches!(
-        value.trim().to_ascii_lowercase().as_str(),
+        value.as_str(),
         "audio-src" | "audio src" | "audio" | "playback" | "output" | "input"
     )
 }
@@ -3039,11 +3105,31 @@ fn is_generic_media_name(value: &str) -> bool {
 fn app_matcher_key(matcher: &AppMatcher) -> String {
     format!(
         "{}\n{}\n{}\n{}\n{}",
-        matcher.app_id.as_deref().unwrap_or_default(),
-        matcher.binary.as_deref().unwrap_or_default(),
-        matcher.process_name.as_deref().unwrap_or_default(),
-        matcher.window_class.as_deref().unwrap_or_default(),
-        matcher.media_name.as_deref().unwrap_or_default()
+        matcher
+            .app_id
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        matcher
+            .binary
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        matcher
+            .process_name
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        matcher
+            .window_class
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        matcher
+            .media_name
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
     )
 }
 
@@ -3784,6 +3870,161 @@ mod tests {
         assert!(config.app_volume_presets.is_empty());
         assert!(config.restore_app(remembered.matcher).is_some());
         assert!(!config.app_history[0].forgotten);
+    }
+
+    #[test]
+    fn app_history_normalizes_case_variant_identities() {
+        let matcher_lower = AppMatcher {
+            app_id: Some("retroarch".into()),
+            binary: Some("retroarch".into()),
+            process_name: Some("retroarch".into()),
+            window_class: None,
+            media_name: None,
+        };
+        let matcher_mixed = AppMatcher {
+            app_id: Some("RetroArch".into()),
+            binary: Some("retroarch".into()),
+            process_name: Some("retroarch".into()),
+            window_class: None,
+            media_name: None,
+        };
+        let mut config = MixerConfig::default();
+        config.app_history = vec![
+            KnownApp {
+                matcher: matcher_lower,
+                display_name: "RetroArch".into(),
+                media_name: Some("audio".into()),
+                last_seen_unix: 200,
+                forgotten: true,
+            },
+            KnownApp {
+                matcher: matcher_mixed,
+                display_name: "RetroArch".into(),
+                media_name: Some("RetroArch".into()),
+                last_seen_unix: 100,
+                forgotten: false,
+            },
+        ];
+
+        let config = config.normalized().unwrap();
+        let retroarch = config
+            .app_history
+            .iter()
+            .filter(|app| {
+                app.matcher
+                    .app_id
+                    .as_deref()
+                    .is_some_and(|app_id| app_id.eq_ignore_ascii_case("retroarch"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retroarch.len(), 1);
+        assert!(retroarch[0].forgotten);
+    }
+
+    #[test]
+    fn forget_app_forgets_case_variant_duplicates_and_clears_saved_state() {
+        let matcher_lower = AppMatcher {
+            app_id: Some("retroarch".into()),
+            binary: Some("retroarch".into()),
+            process_name: Some("retroarch".into()),
+            window_class: None,
+            media_name: None,
+        };
+        let matcher_mixed = AppMatcher {
+            app_id: Some("RetroArch".into()),
+            binary: Some("RetroArch".into()),
+            process_name: Some("RetroArch".into()),
+            window_class: None,
+            media_name: None,
+        };
+        let mut config = MixerConfig::default();
+        config.app_history = vec![
+            KnownApp {
+                matcher: matcher_lower.clone(),
+                display_name: "RetroArch".into(),
+                media_name: None,
+                last_seen_unix: 100,
+                forgotten: false,
+            },
+            KnownApp {
+                matcher: matcher_mixed.clone(),
+                display_name: "RetroArch".into(),
+                media_name: None,
+                last_seen_unix: 90,
+                forgotten: false,
+            },
+        ];
+        config
+            .assign_app_to_channel("game", matcher_mixed.clone())
+            .unwrap();
+        config
+            .set_app_volume_preset(matcher_mixed.clone(), 0.5)
+            .unwrap();
+
+        assert!(config.forget_app(matcher_lower).is_some());
+        assert!(config.app_history.iter().all(|app| app.forgotten));
+        assert!(config.app_routes.is_empty());
+        assert!(config.app_volume_presets.is_empty());
+    }
+
+    #[test]
+    fn remembered_stream_updates_case_variant_identity() {
+        let mut config = MixerConfig::default();
+        let first = AppStream {
+            id: "1".into(),
+            app_id: Some("RetroArch".into()),
+            binary: Some("retroarch".into()),
+            process_name: Some("retroarch".into()),
+            window_class: None,
+            display_name: "RetroArch".into(),
+            media_name: Some("audio".into()),
+            routed_channel_id: None,
+            volume: 1.0,
+            muted: false,
+        };
+        let second = AppStream {
+            id: "2".into(),
+            app_id: Some("retroarch".into()),
+            binary: Some("retroarch".into()),
+            process_name: Some("retroarch".into()),
+            window_class: None,
+            display_name: "RetroArch".into(),
+            media_name: Some("RetroArch".into()),
+            routed_channel_id: None,
+            volume: 1.0,
+            muted: false,
+        };
+
+        assert!(config.remember_app_stream(&first, 100).unwrap().is_some());
+        assert!(config.remember_app_stream(&second, 200).unwrap().is_some());
+        assert_eq!(config.app_history.len(), 1);
+        assert_eq!(config.app_history[0].last_seen_unix, 200);
+    }
+
+    #[test]
+    fn app_history_ignores_generic_numbered_stream_media_names() {
+        let mut config = MixerConfig::default();
+        let mut stream = AppStream {
+            id: "chrome-1".into(),
+            app_id: Some("chromium".into()),
+            binary: Some("chromium".into()),
+            process_name: Some("chromium".into()),
+            window_class: Some("chromium".into()),
+            display_name: "Chromium".into(),
+            media_name: Some("Stream 701".into()),
+            routed_channel_id: None,
+            volume: 1.0,
+            muted: false,
+        };
+
+        let remembered = config.remember_app_stream(&stream, 100).unwrap().unwrap();
+        assert!(remembered.matcher.media_name.is_none());
+        assert!(config.app_history[0].media_name.is_none());
+
+        stream.media_name = Some("Stream 702".into());
+        assert!(config.remember_app_stream(&stream, 120).unwrap().is_none());
+        assert_eq!(config.app_history.len(), 1);
+        assert!(config.app_history[0].media_name.is_none());
     }
 
     #[test]

@@ -2,3 +2,6 @@
 /usr/wavelinux-runtime/lib/*
 !/usr/wavelinux-runtime/bin/.gitkeep
 !/usr/wavelinux-runtime/lib/.gitkeep
+!/usr/wavelinux-runtime/lib/ladspa/
+/usr/wavelinux-runtime/lib/ladspa/*
+!/usr/wavelinux-runtime/lib/ladspa/.gitkeep

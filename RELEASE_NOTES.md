@@ -1,7 +1,8 @@
 # WaveLinux 4.3.0
 
-WaveLinux 4.3.0 adds optional Elgato hardware control support while keeping the
-main mixer path device-neutral.
+WaveLinux 4.3.0 promotes the recent testing work to stable with optional Elgato
+hardware control support, stronger PipeWire route health repair, priority-based
+auto hot-swap, and cleanup for stale remembered app entries.
 
 ## Features
 
@@ -15,10 +16,55 @@ main mixer path device-neutral.
   through apt, dnf, pacman, or zypper.
 - Bundles more safe AppImage-side runtime pieces: GStreamer media support,
   WebKit sandbox helpers, and libusb for optional Elgato controls.
+- Bundles supported LADSPA effect plugins into AppImage releases when present on
+  the release builder, exposes the bundle through `LADSPA_PATH`, and includes
+  distro effect packages in setup/install flows.
+- Recognizes legacy `OpenWave_*` virtual audio nodes during managed graph
+  cleanup so old testing graphs can be removed cleanly.
+- Adds Hardware direct mic monitor mode so Wave XLR users can monitor through
+  the interface hardware while WaveLinux keeps the mic in stream/record mixes
+  and skips the delayed software Monitor copy.
+- Ignores generic numbered `Stream 123` media labels when remembering apps so
+  browser streams do not churn app history.
 - Adds libusb and WebKit/AppImage runtime pieces to release packaging and
   dependency checks.
-- Adds a Beta updates checkbox in the updater that tracks the testing branch
-  prerelease feed without changing stable update checks.
+- Adds a Beta updates checkbox in the updater that tracks the single moving
+  `prerelease` testing feed without changing stable update checks.
+- Keeps unsupported, busy, permission-blocked, or missing-runtime streamer
+  devices status-only so they do not expose non-working binding controls.
+- Avoids tearing down the audio graph before a self-update has actually
+  installed; restart shutdown handles cleanup after a successful update.
+- Expands the Testing Health Report with update endpoint, release URL, current
+  version, latest version, and install-support status for tester issue reports.
+
+## Stability
+
+- Repairs managed loopback routes when a route is stale, duplicated, missing its
+  live source or sink endpoint, or missing either side of the PipeWire loopback.
+- Adds route-health details to graph reports and diagnostics so missing,
+  duplicated, or stale managed routes are visible instead of silently lingering.
+- Keeps route repair focused on unsatisfied routes and rate-limits identical
+  route-health repairs to reduce graph churn.
+- Shows the resolved live Auto input/output device in the UI while keeping the
+  saved setting as Auto, and keeps meters tied to the effective live source.
+- Preserves priority-based Auto routing for hot-plugged microphones and outputs,
+  including repair when the selected source disappears or a higher-priority
+  valid device appears.
+- Avoids selecting Bluetooth headset microphones while matching A2DP headphone
+  output is available.
+- Normalizes remembered app identities case-insensitively, collapses duplicate
+  offline entries such as `RetroArch` / `retroarch`, and makes forget cleanup
+  remove overlapping routes and volume presets.
+- Falls back to the raw hardware mic route when a live mic effects helper is
+  unhealthy, preventing stale effect processes from leaving app-facing mic
+  capture silent until reboot.
+- Refuses to reuse a graph that still has stale WaveLinux audio helper
+  processes, so restart can cleanly recover without a full system reboot.
+- Adds PipeWire health hints for recent underrun, buffer, and resync log
+  clusters to help diagnose crackle without changing system PipeWire latency
+  configuration.
+- Rotates WaveLinux logs on update/startup and cleans old rotated logs so local
+  logs do not grow indefinitely.
 
 # WaveLinux 4.2.1
 

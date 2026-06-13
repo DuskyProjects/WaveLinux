@@ -22,6 +22,7 @@ export interface MixerSettings {
   lock_default_input: boolean;
   lock_default_output: boolean;
   low_latency_mic_monitoring: boolean;
+  hardware_direct_mic_monitoring: boolean;
   stream_sync_delay_msec: number;
   monitor_sync_delay_msec: number;
   auto_check_updates: boolean;
@@ -362,6 +363,21 @@ export interface LevelMeter {
   peak_right: number;
 }
 
+export type AutoDeviceKind = "input" | "output";
+
+export type AutoDeviceReason = "priority" | "system_default" | "active_output" | "unavailable";
+
+export interface ResolvedAutoDevice {
+  kind: AutoDeviceKind;
+  channel_id?: string | null;
+  mix_id?: string | null;
+  device_id?: string | null;
+  device_name?: string | null;
+  device_description?: string | null;
+  priority?: number | null;
+  reason: AutoDeviceReason;
+}
+
 export interface EffectAvailability {
   effect_id: string;
   available: boolean;
@@ -373,6 +389,7 @@ export interface RuntimeGraph {
   outputs: DeviceInfo[];
   app_streams: AppStream[];
   meters: LevelMeter[];
+  auto_devices: ResolvedAutoDevice[];
   effect_availability: EffectAvailability[];
 }
 
@@ -468,6 +485,8 @@ export interface SinkInputRoute {
   channel_id?: string | null;
   mix_id?: string | null;
   sink?: string | null;
+  sink_name?: string | null;
+  target_object?: string | null;
 }
 
 export interface SourceOutputRoute {
@@ -489,6 +508,24 @@ export interface StaleProcess {
   command: string;
 }
 
+export type RouteHealthReason =
+  | "missing_source"
+  | "missing_sink"
+  | "missing_source_output"
+  | "missing_sink_input"
+  | "stale_config"
+  | "duplicate";
+
+export interface RouteHealthIssue {
+  module_id?: string | null;
+  role: string;
+  channel_id?: string | null;
+  mix_id?: string | null;
+  source_name?: string | null;
+  sink_name?: string | null;
+  reason: RouteHealthReason;
+}
+
 export interface RepairReport {
   dry_run: boolean;
   planned: {
@@ -505,6 +542,7 @@ export interface GraphDebugReport {
   managed_modules: ManagedModule[];
   sink_input_routes: SinkInputRoute[];
   source_output_routes: SourceOutputRoute[];
+  route_health: RouteHealthIssue[];
   stale_processes: StaleProcess[];
   graph: RuntimeGraph;
   diagnostics: Diagnostic[];

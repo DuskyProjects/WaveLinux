@@ -400,7 +400,10 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       date: null,
       body: null,
       url: null,
-      release_url: "https://github.com/DuskyProjects/WaveLinux/releases",
+      release_url:
+        releaseChannel === "beta"
+          ? "https://github.com/DuskyProjects/WaveLinux/releases/tag/prerelease"
+          : "https://github.com/DuskyProjects/WaveLinux/releases/latest",
       channel: releaseChannel,
       endpoint:
         releaseChannel === "beta"
@@ -612,9 +615,13 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
       demoState.config.app_volume_presets = demoState.config.app_volume_presets.filter(
         (preset) => matcherKey(preset.matcher) !== key && matcherKey(preset.matcher) !== rawKey,
       );
-      const app = demoState.config.app_history.find((item) => matcherKey(item.matcher) === key || matcherKey(item.matcher) === rawKey);
+      let app = null;
+      for (const item of demoState.config.app_history) {
+        if (matcherKey(item.matcher) !== key && matcherKey(item.matcher) !== rawKey) continue;
+        item.forgotten = true;
+        app ??= item;
+      }
       if (app) {
-        app.forgotten = true;
         return app;
       }
     }
@@ -825,6 +832,7 @@ function demoGraphDebugReport(): GraphDebugReport {
       : [],
     sink_input_routes: [],
     source_output_routes: [],
+    route_health: [],
     stale_processes: [],
     graph: structuredClone(demoState.graph),
     diagnostics: structuredClone(demoState.diagnostics),
@@ -1324,6 +1332,7 @@ export const demoState: AppStateSnapshot = {
       lock_default_input: false,
       lock_default_output: false,
       low_latency_mic_monitoring: false,
+      hardware_direct_mic_monitoring: false,
       stream_sync_delay_msec: 0,
       monitor_sync_delay_msec: 0,
       auto_check_updates: true,
@@ -1437,6 +1446,26 @@ export const demoState: AppStateSnapshot = {
       { id: "81", app_id: "spotify", binary: "spotify", process_name: "spotify", window_class: "spotify", display_name: "Spotify", media_name: "Playback", routed_channel_id: "music", volume: 0.66, muted: false },
     ],
     meters: [],
+    auto_devices: [
+      {
+        kind: "input",
+        channel_id: "input",
+        device_id: "alsa_input.usb_interface",
+        device_name: "alsa_input.usb_interface",
+        device_description: "USB Interface Line In",
+        priority: 60,
+        reason: "system_default",
+      },
+      {
+        kind: "output",
+        mix_id: "monitor",
+        device_id: "alsa_output.usb",
+        device_name: "alsa_output.usb",
+        device_description: "USB Headphones",
+        priority: 40,
+        reason: "system_default",
+      },
+    ],
     effect_availability: catalog.effects.map((effect) => ({
       effect_id: effect.id,
       available: effect.id !== "gate",

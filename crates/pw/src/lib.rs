@@ -230,6 +230,7 @@ impl PwClient {
                 outputs,
                 app_streams,
                 meters: Vec::new(),
+                auto_devices: Vec::new(),
                 effect_availability,
             },
             timings,
@@ -308,12 +309,13 @@ impl PwClient {
 
     pub fn sink_input_routes(&self) -> Result<Vec<SinkInputRoute>, PwError> {
         let json = self.pactl_json(["list", "sink-inputs"])?;
+        let sinks_json = self.pactl_json(["list", "sinks"])?;
         let modules = self.pactl_text(["list", "modules", "short"])?;
         let modules = parse_managed_modules_short(&modules);
-        Ok(hydrate_sink_input_routes_from_modules(
-            parse_sink_input_routes_json(&json),
-            &modules,
-        ))
+        let sink_names = parse_device_names_by_index_json(&sinks_json);
+        let routes =
+            hydrate_sink_input_routes_from_sinks(parse_sink_input_routes_json(&json), &sink_names);
+        Ok(hydrate_sink_input_routes_from_modules(routes, &modules))
     }
 
     pub fn find_channel_bus_source_output(
@@ -830,6 +832,7 @@ pub fn plan_ensure_graph(config: &MixerConfig) -> PlannedGraph {
                 .mix_buses
                 .get(&mix.id)
                 .is_some_and(|bus| bus.enabled)
+                && !channel_mix_route_uses_hardware_direct_monitoring(channel, mix, &route_settings)
             {
                 commands.extend(plan_route_channel_to_mix(channel, mix, &route_settings));
             }
@@ -961,12 +964,35 @@ pub fn plan_route_channel_to_mix(
     )]
 }
 
+pub fn channel_mix_route_uses_hardware_direct_monitoring(
+    channel: &Channel,
+    mix: &Mix,
+    settings: &MixerSettings,
+) -> bool {
+    settings.hardware_direct_mic_monitoring
+        && channel.kind.uses_hardware_slot()
+        && mix.id == "monitor"
+        && channel
+            .source_device
+            .as_deref()
+            .is_some_and(source_name_looks_like_wave_xlr)
+}
+
 pub fn channel_mix_source_name(channel: &Channel) -> String {
     if channel_has_active_effects(channel) {
         effect_chain_source_name(channel)
     } else {
         format!("{}.monitor", channel.virtual_sink_name)
     }
+}
+
+fn source_name_looks_like_wave_xlr(source_name: &str) -> bool {
+    let compact = source_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    compact.contains("wavexlr") || compact.contains("0fd9007d")
 }
 
 pub fn channel_has_active_effects(channel: &Channel) -> bool {
@@ -1080,6 +1106,11 @@ pub fn hardware_route_latency_msec(channel: &Channel, settings: &MixerSettings) 
 pub fn channel_mix_latency_msec(channel: &Channel, mix: &Mix, settings: &MixerSettings) -> u16 {
     let base = if channel.kind.uses_hardware_slot() {
         hardware_route_latency_msec(channel, settings)
+    } else if mix.id == "monitor"
+        && (settings.low_latency_mic_monitoring
+            || settings.optimization_mode == OptimizationMode::Performance)
+    {
+        low_latency_loopback_msec(settings)
     } else {
         stable_loopback_latency_msec(settings)
     };
@@ -1907,6 +1938,8 @@ pub struct SinkInputRoute {
     pub channel_id: Option<String>,
     pub mix_id: Option<String>,
     pub sink: Option<String>,
+    pub sink_name: Option<String>,
+    pub target_object: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2016,9 +2049,9 @@ pub fn parse_devices_json(json: &str, fallback_prefix: &str) -> Vec<DeviceInfo> 
                 .get("node.default")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let is_virtual = looks_like_wavelinux_node(&id)
-                || looks_like_wavelinux_node(&device.name)
-                || looks_like_wavelinux_node(&description)
+            let is_virtual = looks_like_wavelinux_family_node(&id)
+                || looks_like_wavelinux_family_node(&device.name)
+                || looks_like_wavelinux_family_node(&description)
                 || device
                     .properties
                     .get("wavelinux.managed")
@@ -2390,6 +2423,8 @@ pub fn parse_sink_input_routes_json(json: &str) -> Vec<SinkInputRoute> {
             channel_id: property_string(&input.properties, "wavelinux.channel_id"),
             mix_id: property_string(&input.properties, "wavelinux.mix_id"),
             sink: Some(input.sink.to_string()).filter(|value| !value.is_empty()),
+            sink_name: property_string(&input.properties, "sink.name"),
+            target_object: property_string(&input.properties, "target.object"),
         })
         .collect()
 }
@@ -2404,7 +2439,7 @@ fn active_playback_sink_from_sink_inputs_json(
             return None;
         }
         let sink = sink_names_by_index.get(&input.sink.to_string())?;
-        (!looks_like_wavelinux_node(sink)).then(|| sink.clone())
+        (!looks_like_wavelinux_family_node(sink)).then(|| sink.clone())
     })
 }
 
@@ -2546,7 +2581,9 @@ fn managed_module_from_module_line(
     let route_revision =
         property_value_from_arg(argument, "wavelinux.route_revision=").map(ToOwned::to_owned);
     let managed_flag = argument_has_wavelinux_managed_flag(argument);
-    let managed = node_name.as_deref().is_some_and(looks_like_wavelinux_node)
+    let managed = node_name
+        .as_deref()
+        .is_some_and(looks_like_wavelinux_family_node)
         || managed_flag
         || role.is_some()
         || channel_id.is_some()
@@ -2595,7 +2632,7 @@ fn wavelinux_node_name_from_module_argument(argument: &str) -> Option<String> {
         .collect::<Vec<_>>();
     values
         .iter()
-        .find(|value| looks_like_wavelinux_node(value))
+        .find(|value| looks_like_wavelinux_family_node(value))
         .cloned()
         .or_else(|| values.into_iter().next())
 }
@@ -2617,7 +2654,9 @@ fn managed_module_from_parts(
         .or(argument_node_name);
     let managed = property_string(properties, "wavelinux.managed").as_deref() == Some("1")
         || role.is_some()
-        || node_name.as_deref().is_some_and(looks_like_wavelinux_node);
+        || node_name
+            .as_deref()
+            .is_some_and(looks_like_wavelinux_family_node);
 
     if !managed {
         return None;
@@ -2716,24 +2755,86 @@ fn hydrate_sink_input_routes_from_modules(
         if route.mix_id.is_none() {
             route.mix_id = module.mix_id.clone();
         }
+        if route.target_object.is_none() {
+            route.target_object = module.sink_name.clone();
+        }
+    }
+
+    routes
+}
+
+fn hydrate_sink_input_routes_from_sinks(
+    mut routes: Vec<SinkInputRoute>,
+    sink_names_by_id: &BTreeMap<String, String>,
+) -> Vec<SinkInputRoute> {
+    for route in &mut routes {
+        if route.sink_name.is_some() {
+            continue;
+        }
+        let Some(sink_id) = route.sink.as_deref() else {
+            continue;
+        };
+        if let Some(sink_name) = sink_names_by_id.get(sink_id) {
+            route.sink_name = Some(sink_name.clone());
+        } else if sink_id.contains('.') || sink_id.starts_with("wavelinux_") {
+            route.sink_name = Some(sink_id.to_owned());
+        }
     }
 
     routes
 }
 
 fn looks_like_wavelinux_node(value: &str) -> bool {
-    let value = value
+    let value = normalized_node_leaf(value);
+    let compact = compact_node_name(&value);
+    value == "wavelinux"
+        || compact == "wavelinux"
+        || value.starts_with("wavelinux_")
+        || value.starts_with("wavelinux-")
+        || value.starts_with("wavelinux.")
+        || compact.starts_with("wavelinux_")
+        || value.starts_with("output.wavelinux.fx.")
+}
+
+fn looks_like_wavelinux_family_node(value: &str) -> bool {
+    looks_like_wavelinux_node(value) || looks_like_legacy_openwave_node(value)
+}
+
+fn looks_like_legacy_openwave_node(value: &str) -> bool {
+    let value = normalized_node_leaf(value);
+    let compact = compact_node_name(&value);
+    value == "openwave"
+        || compact == "openwave"
+        || value.starts_with("openwave_")
+        || value.starts_with("openwave-")
+        || value.starts_with("openwave.")
+        || compact.starts_with("openwave_")
+        || value.starts_with("output.openwave.fx.")
+}
+
+fn normalized_node_leaf(value: &str) -> String {
+    value
         .trim()
         .trim_matches('"')
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or_default()
-        .to_ascii_lowercase();
-    value == "wavelinux"
-        || value.starts_with("wavelinux_")
-        || value.starts_with("wavelinux-")
-        || value.starts_with("wavelinux.")
-        || value.starts_with("output.wavelinux.fx.")
+        .to_ascii_lowercase()
+}
+
+fn compact_node_name(value: &str) -> String {
+    let mut compact = String::with_capacity(value.len());
+    let mut last_was_separator = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            compact.push(ch);
+            last_was_separator = false;
+        } else if !last_was_separator {
+            compact.push('_');
+            last_was_separator = true;
+        }
+    }
+    compact.trim_matches('_').to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -4116,7 +4217,7 @@ mod tests {
             .contains(&"latency_msec=160".into()));
         assert!(route("music", "monitor")
             .args
-            .contains(&"latency_msec=110".into()));
+            .contains(&"latency_msec=90".into()));
         assert!(plan.commands.iter().any(|command| {
             command.args.contains(&"latency_msec=60".into())
                 && command
@@ -4124,6 +4225,52 @@ mod tests {
                     .iter()
                     .any(|arg| arg.contains("wavelinux.role=mix_monitor"))
         }));
+    }
+
+    #[test]
+    fn hardware_direct_mic_monitoring_skips_software_monitor_route() {
+        let mut config = MixerConfig::default();
+        config.settings.hardware_direct_mic_monitoring = true;
+        config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap()
+            .source_device = Some("alsa_input.usb-Elgato_Wave_XLR.analog-stereo".into());
+
+        let plan = plan_ensure_graph(&config);
+        let has_route = |channel_id: &str, mix_id: &str| {
+            plan.commands.iter().any(|command| {
+                command.args.iter().any(|arg| {
+                    arg.contains("wavelinux.role=channel_to_mix")
+                        && arg.contains(&format!("wavelinux.channel_id={channel_id}"))
+                        && arg.contains(&format!("wavelinux.mix_id={mix_id}"))
+                })
+            })
+        };
+
+        assert!(has_route("hardware_in", "stream"));
+        assert!(!has_route("hardware_in", "monitor"));
+        assert!(has_route("music", "monitor"));
+    }
+
+    #[test]
+    fn hardware_direct_mic_monitoring_keeps_software_route_without_wave_xlr_source() {
+        let mut config = MixerConfig::default();
+        config.settings.hardware_direct_mic_monitoring = true;
+
+        let plan = plan_ensure_graph(&config);
+        let has_route = |channel_id: &str, mix_id: &str| {
+            plan.commands.iter().any(|command| {
+                command.args.iter().any(|arg| {
+                    arg.contains("wavelinux.role=channel_to_mix")
+                        && arg.contains(&format!("wavelinux.channel_id={channel_id}"))
+                        && arg.contains(&format!("wavelinux.mix_id={mix_id}"))
+                })
+            })
+        };
+
+        assert!(has_route("hardware_in", "monitor"));
     }
 
     #[test]
@@ -4169,7 +4316,7 @@ mod tests {
         let monitor = Mix::new_fixed("monitor", "Monitor");
 
         assert_eq!(hardware_route_latency_msec(&channel, &settings), 35);
-        assert_eq!(channel_mix_latency_msec(&music, &monitor, &settings), 60);
+        assert_eq!(channel_mix_latency_msec(&music, &monitor, &settings), 35);
         assert_eq!(
             mix_monitor_latency_msec_for_sink(
                 &monitor,
@@ -4453,7 +4600,9 @@ mod tests {
             "properties": {
               "wavelinux.role": "channel_to_mix",
               "wavelinux.channel_id": "music",
-              "wavelinux.mix_id": "stream"
+              "wavelinux.mix_id": "stream",
+              "sink.name": "wavelinux_mix_stream",
+              "target.object": "wavelinux_mix_stream"
             }
           }
         ]
@@ -4465,6 +4614,11 @@ mod tests {
         assert_eq!(inputs[0].channel_id.as_deref(), Some("music"));
         assert_eq!(inputs[0].mix_id.as_deref(), Some("stream"));
         assert_eq!(inputs[0].sink.as_deref(), Some("2"));
+        assert_eq!(inputs[0].sink_name.as_deref(), Some("wavelinux_mix_stream"));
+        assert_eq!(
+            inputs[0].target_object.as_deref(),
+            Some("wavelinux_mix_stream")
+        );
     }
 
     #[test]
@@ -4564,6 +4718,44 @@ mod tests {
         assert_eq!(inputs[0].role.as_deref(), Some("channel_to_mix"));
         assert_eq!(inputs[0].channel_id.as_deref(), Some("music"));
         assert_eq!(inputs[0].mix_id.as_deref(), Some("stream"));
+        assert_eq!(
+            inputs[0].target_object.as_deref(),
+            Some("wavelinux_mix_stream")
+        );
+    }
+
+    #[test]
+    fn sink_input_routes_hydrate_sink_name_from_sink_index() {
+        let routes_json = r#"
+        [
+          {
+            "index": 73,
+            "owner_module": 102,
+            "sink": 2,
+            "properties": {
+              "wavelinux.role": "channel_to_mix",
+              "wavelinux.channel_id": "music",
+              "wavelinux.mix_id": "stream"
+            }
+          }
+        ]
+        "#;
+        let sinks_json = r#"
+        [
+          {
+            "index": 2,
+            "name": "wavelinux_mix_stream",
+            "properties": {}
+          }
+        ]
+        "#;
+        let sink_names = parse_device_names_by_index_json(sinks_json);
+        let inputs = hydrate_sink_input_routes_from_sinks(
+            parse_sink_input_routes_json(routes_json),
+            &sink_names,
+        );
+
+        assert_eq!(inputs[0].sink_name.as_deref(), Some("wavelinux_mix_stream"));
     }
 
     #[test]
@@ -4936,6 +5128,36 @@ mod tests {
         assert!(!modules.iter().any(|module| module.module_id == "300"));
         assert!(modules.iter().any(|module| module.module_id == "301"));
         assert!(modules.iter().any(|module| module.module_id == "302"));
+    }
+
+    #[test]
+    fn managed_module_detection_catches_legacy_openwave_nodes() {
+        let listed_modules = "\
+701\tmodule-null-sink\tsink_name=openwave_chat_mix sink_properties=device.description=\"OpenWave Chat Mix\"\t\n";
+        let sinks = r#"
+        [
+          {
+            "index": 7,
+            "owner_module": 702,
+            "name": "openwave_record_mix",
+            "properties": {"node.description": "OpenWave Record Mix"}
+          }
+        ]
+        "#;
+
+        let modules = parse_managed_modules_json(listed_modules, sinks, "[]", "[]", "[]");
+
+        assert!(modules.iter().any(|module| {
+            module.module_id == "701" && module.node_name.as_deref() == Some("openwave_chat_mix")
+        }));
+        assert!(modules.iter().any(|module| {
+            module.module_id == "702" && module.node_name.as_deref() == Some("openwave_record_mix")
+        }));
+
+        let commands = plan_unload_modules(&modules);
+        assert_eq!(commands.len(), 2);
+        assert!(commands.iter().any(|command| command.args[1] == "701"));
+        assert!(commands.iter().any(|command| command.args[1] == "702"));
     }
 
     #[test]
