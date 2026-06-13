@@ -1,7 +1,8 @@
 # WaveLinux 4.3.0
 
-WaveLinux 4.3.0 adds optional Elgato hardware control support while keeping the
-main mixer path device-neutral.
+WaveLinux 4.3.0 promotes the recent testing work to stable with optional Elgato
+hardware control support, stronger PipeWire route health repair, priority-based
+auto hot-swap, and cleanup for stale remembered app entries.
 
 ## Features
 
@@ -35,6 +36,35 @@ main mixer path device-neutral.
   installed; restart shutdown handles cleanup after a successful update.
 - Expands the Testing Health Report with update endpoint, release URL, current
   version, latest version, and install-support status for tester issue reports.
+
+## Stability
+
+- Repairs managed loopback routes when a route is stale, duplicated, missing its
+  live source or sink endpoint, or missing either side of the PipeWire loopback.
+- Adds route-health details to graph reports and diagnostics so missing,
+  duplicated, or stale managed routes are visible instead of silently lingering.
+- Keeps route repair focused on unsatisfied routes and rate-limits identical
+  route-health repairs to reduce graph churn.
+- Shows the resolved live Auto input/output device in the UI while keeping the
+  saved setting as Auto, and keeps meters tied to the effective live source.
+- Preserves priority-based Auto routing for hot-plugged microphones and outputs,
+  including repair when the selected source disappears or a higher-priority
+  valid device appears.
+- Avoids selecting Bluetooth headset microphones while matching A2DP headphone
+  output is available.
+- Normalizes remembered app identities case-insensitively, collapses duplicate
+  offline entries such as `RetroArch` / `retroarch`, and makes forget cleanup
+  remove overlapping routes and volume presets.
+- Falls back to the raw hardware mic route when a live mic effects helper is
+  unhealthy, preventing stale effect processes from leaving app-facing mic
+  capture silent until reboot.
+- Refuses to reuse a graph that still has stale WaveLinux audio helper
+  processes, so restart can cleanly recover without a full system reboot.
+- Adds PipeWire health hints for recent underrun, buffer, and resync log
+  clusters to help diagnose crackle without changing system PipeWire latency
+  configuration.
+- Rotates WaveLinux logs on update/startup and cleans old rotated logs so local
+  logs do not grow indefinitely.
 
 # WaveLinux 4.2.1
 

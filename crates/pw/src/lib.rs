@@ -230,6 +230,7 @@ impl PwClient {
                 outputs,
                 app_streams,
                 meters: Vec::new(),
+                auto_devices: Vec::new(),
                 effect_availability,
             },
             timings,
@@ -308,12 +309,13 @@ impl PwClient {
 
     pub fn sink_input_routes(&self) -> Result<Vec<SinkInputRoute>, PwError> {
         let json = self.pactl_json(["list", "sink-inputs"])?;
+        let sinks_json = self.pactl_json(["list", "sinks"])?;
         let modules = self.pactl_text(["list", "modules", "short"])?;
         let modules = parse_managed_modules_short(&modules);
-        Ok(hydrate_sink_input_routes_from_modules(
-            parse_sink_input_routes_json(&json),
-            &modules,
-        ))
+        let sink_names = parse_device_names_by_index_json(&sinks_json);
+        let routes =
+            hydrate_sink_input_routes_from_sinks(parse_sink_input_routes_json(&json), &sink_names);
+        Ok(hydrate_sink_input_routes_from_modules(routes, &modules))
     }
 
     pub fn find_channel_bus_source_output(
@@ -1936,6 +1938,8 @@ pub struct SinkInputRoute {
     pub channel_id: Option<String>,
     pub mix_id: Option<String>,
     pub sink: Option<String>,
+    pub sink_name: Option<String>,
+    pub target_object: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2419,6 +2423,8 @@ pub fn parse_sink_input_routes_json(json: &str) -> Vec<SinkInputRoute> {
             channel_id: property_string(&input.properties, "wavelinux.channel_id"),
             mix_id: property_string(&input.properties, "wavelinux.mix_id"),
             sink: Some(input.sink.to_string()).filter(|value| !value.is_empty()),
+            sink_name: property_string(&input.properties, "sink.name"),
+            target_object: property_string(&input.properties, "target.object"),
         })
         .collect()
 }
@@ -2748,6 +2754,30 @@ fn hydrate_sink_input_routes_from_modules(
         }
         if route.mix_id.is_none() {
             route.mix_id = module.mix_id.clone();
+        }
+        if route.target_object.is_none() {
+            route.target_object = module.sink_name.clone();
+        }
+    }
+
+    routes
+}
+
+fn hydrate_sink_input_routes_from_sinks(
+    mut routes: Vec<SinkInputRoute>,
+    sink_names_by_id: &BTreeMap<String, String>,
+) -> Vec<SinkInputRoute> {
+    for route in &mut routes {
+        if route.sink_name.is_some() {
+            continue;
+        }
+        let Some(sink_id) = route.sink.as_deref() else {
+            continue;
+        };
+        if let Some(sink_name) = sink_names_by_id.get(sink_id) {
+            route.sink_name = Some(sink_name.clone());
+        } else if sink_id.contains('.') || sink_id.starts_with("wavelinux_") {
+            route.sink_name = Some(sink_id.to_owned());
         }
     }
 
@@ -4570,7 +4600,9 @@ mod tests {
             "properties": {
               "wavelinux.role": "channel_to_mix",
               "wavelinux.channel_id": "music",
-              "wavelinux.mix_id": "stream"
+              "wavelinux.mix_id": "stream",
+              "sink.name": "wavelinux_mix_stream",
+              "target.object": "wavelinux_mix_stream"
             }
           }
         ]
@@ -4582,6 +4614,11 @@ mod tests {
         assert_eq!(inputs[0].channel_id.as_deref(), Some("music"));
         assert_eq!(inputs[0].mix_id.as_deref(), Some("stream"));
         assert_eq!(inputs[0].sink.as_deref(), Some("2"));
+        assert_eq!(inputs[0].sink_name.as_deref(), Some("wavelinux_mix_stream"));
+        assert_eq!(
+            inputs[0].target_object.as_deref(),
+            Some("wavelinux_mix_stream")
+        );
     }
 
     #[test]
@@ -4681,6 +4718,44 @@ mod tests {
         assert_eq!(inputs[0].role.as_deref(), Some("channel_to_mix"));
         assert_eq!(inputs[0].channel_id.as_deref(), Some("music"));
         assert_eq!(inputs[0].mix_id.as_deref(), Some("stream"));
+        assert_eq!(
+            inputs[0].target_object.as_deref(),
+            Some("wavelinux_mix_stream")
+        );
+    }
+
+    #[test]
+    fn sink_input_routes_hydrate_sink_name_from_sink_index() {
+        let routes_json = r#"
+        [
+          {
+            "index": 73,
+            "owner_module": 102,
+            "sink": 2,
+            "properties": {
+              "wavelinux.role": "channel_to_mix",
+              "wavelinux.channel_id": "music",
+              "wavelinux.mix_id": "stream"
+            }
+          }
+        ]
+        "#;
+        let sinks_json = r#"
+        [
+          {
+            "index": 2,
+            "name": "wavelinux_mix_stream",
+            "properties": {}
+          }
+        ]
+        "#;
+        let sink_names = parse_device_names_by_index_json(sinks_json);
+        let inputs = hydrate_sink_input_routes_from_sinks(
+            parse_sink_input_routes_json(routes_json),
+            &sink_names,
+        );
+
+        assert_eq!(inputs[0].sink_name.as_deref(), Some("wavelinux_mix_stream"));
     }
 
     #[test]

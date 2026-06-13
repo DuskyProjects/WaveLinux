@@ -82,6 +82,7 @@ import type {
   Mix,
   MixBus,
   MixerSettings,
+  RouteHealthIssue,
   SoundCheckReport,
   StreamerAction,
   StreamerActionResult,
@@ -173,6 +174,8 @@ type OfflineRoutingEntry = {
   channel_id?: string;
   volumePreset?: AppVolumePreset;
 };
+
+type AutoDevices = AppStateSnapshot["graph"]["auto_devices"];
 
 type LatestNumberQueue = {
   inFlight: boolean;
@@ -1231,6 +1234,7 @@ function MixerView({
             {state.config.channels.map((channel) => {
               return (
                 <ChannelStrip
+                  autoDevices={state.graph.auto_devices}
                   channel={channel}
                   key={channel.id}
                   levelFor={levelFor}
@@ -1567,6 +1571,7 @@ function WaveLinkMixerView({
               </div>
               {state.config.mixes.map((mix) => (
                 <WaveLinkMixHeader
+                  autoDevices={state.graph.auto_devices}
                   key={mix.id}
                   mix={mix}
                   outputs={outputs}
@@ -1582,6 +1587,7 @@ function WaveLinkMixerView({
                 <WaveLinkSourceRow
                   channel={channel}
                   appStreams={streamsByChannelId.get(channel.id) ?? []}
+                  autoDevices={state.graph.auto_devices}
                   isSelected={channel.id === selectedChannelId}
                   key={channel.id}
                   microphoneInputs={microphoneInputs}
@@ -1698,6 +1704,7 @@ function WaveLinkMixerView({
             if (!mix) return null;
             return (
               <WaveLinkMixSettingsDrawer
+                autoDevices={state.graph.auto_devices}
                 canDelete={state.config.mixes.length > 1}
                 canMoveDown={mixIndex < state.config.mixes.length - 1}
                 canMoveUp={mixIndex > 0}
@@ -1721,6 +1728,7 @@ function WaveLinkMixerView({
             if (!channel) return null;
             return (
               <WaveLinkSourceSettingsDrawer
+                autoDevices={state.graph.auto_devices}
                 canMoveDown={channelIndex < state.config.channels.length - 1}
                 canMoveUp={channelIndex > 0}
                 channel={channel}
@@ -2003,6 +2011,7 @@ function WaveLinkCreateMixDialog({
 }
 
 function WaveLinkMixHeader({
+  autoDevices,
   mix,
   onOpenSettings,
   outputs,
@@ -2011,6 +2020,7 @@ function WaveLinkMixHeader({
   settings,
   vuLevel,
 }: {
+  autoDevices: AutoDevices;
   mix: Mix;
   onOpenSettings: () => void;
   outputs: DeviceInfo[];
@@ -2021,7 +2031,7 @@ function WaveLinkMixHeader({
 }) {
   const MixIcon = mixIconComponent(mixIconId(mix));
   const selectedOutputs = mixOutputDevices(mix);
-  const outputSummary = mixOutputSummary(mix, outputs, settings);
+  const outputSummary = mixOutputSummary(mix, outputs, settings, autoDevices);
   return (
     <div className="wl-mix-header">
       <div className="wl-mix-title">
@@ -2068,6 +2078,7 @@ function WaveLinkMixHeader({
 }
 
 function WaveLinkMixSettingsDrawer({
+  autoDevices,
   canDelete,
   canMoveDown,
   canMoveUp,
@@ -2083,6 +2094,7 @@ function WaveLinkMixSettingsDrawer({
   settings,
   vuLevel,
 }: {
+  autoDevices: AutoDevices;
   canDelete: boolean;
   canMoveDown: boolean;
   canMoveUp: boolean;
@@ -2134,7 +2146,7 @@ function WaveLinkMixSettingsDrawer({
             <MixIcon size={20} />
             <div>
               <strong>{mix.name}</strong>
-              <span>{mixOutputSummary(mix, outputs, settings)}</span>
+              <span>{mixOutputSummary(mix, outputs, settings, autoDevices)}</span>
             </div>
           </div>
           <label className="wl-dialog-field">
@@ -2413,6 +2425,7 @@ function WaveLinkMasterControl({
 
 function WaveLinkSourceRow({
   appStreams,
+  autoDevices,
   channel,
   isSelected,
   microphoneInputs,
@@ -2427,6 +2440,7 @@ function WaveLinkSourceRow({
   vuForBus,
 }: {
   appStreams: AppStream[];
+  autoDevices: AutoDevices;
   channel: Channel;
   isSelected: boolean;
   microphoneInputs: AppStateSnapshot["graph"]["inputs"];
@@ -2455,7 +2469,7 @@ function WaveLinkSourceRow({
           <Icon size={18} />
           <div>
             <strong>{displayName}</strong>
-            <span>{isHardware ? channelInputLabel(channel, microphoneInputs) : channel.virtual_sink_name}</span>
+            <span>{isHardware ? channelInputLabel(channel, microphoneInputs, autoDevices) : channel.virtual_sink_name}</span>
           </div>
         </div>
         <div className="wl-source-meter" aria-hidden="true">
@@ -2517,6 +2531,7 @@ function WaveLinkSourceRow({
 }
 
 function WaveLinkSourceSettingsDrawer({
+  autoDevices,
   canMoveDown,
   canMoveUp,
   channel,
@@ -2534,6 +2549,7 @@ function WaveLinkSourceSettingsDrawer({
   run: <T>(command: string, args?: Record<string, unknown>, message?: string) => Promise<T>;
   setChannelIcon: (channelId: string, icon: string | null) => Promise<void>;
   setChannelInput: (channelId: string, sourceDevice: string | null) => Promise<void>;
+  autoDevices: AutoDevices;
 }) {
   const [name, setName] = useState(channelDisplayName(channel));
   const [busy, setBusy] = useState(false);
@@ -2577,7 +2593,7 @@ function WaveLinkSourceSettingsDrawer({
             <Icon size={20} />
             <div>
               <strong>{displayName}</strong>
-              <span>{isHardware ? channelInputLabel(channel, microphoneInputs) : channel.virtual_sink_name}</span>
+              <span>{isHardware ? channelInputLabel(channel, microphoneInputs, autoDevices) : channel.virtual_sink_name}</span>
             </div>
           </div>
           <label className="wl-dialog-field">
@@ -2608,7 +2624,7 @@ function WaveLinkSourceSettingsDrawer({
                 className="wl-source-select"
                 onChange={(nextValue) => void setChannelInput(channel.id, nextValue || null).catch(() => undefined)}
                 options={[
-                  { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto mic") },
+                  { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto mic", autoDevices, channel.id) },
                   ...(selectedInputMissing
                     ? [{
                         value: channel.source_device ?? "",
@@ -2955,6 +2971,7 @@ function WaveLinkOfflineRuleCard({
 }
 
 function ChannelStrip({
+  autoDevices,
   channel,
   mixes,
   microphoneInputs,
@@ -2965,6 +2982,7 @@ function ChannelStrip({
   setChannelBusVolume,
   setChannelInput,
 }: {
+  autoDevices: AutoDevices;
   channel: Channel;
   mixes: Mix[];
   microphoneInputs: AppStateSnapshot["graph"]["inputs"];
@@ -3020,7 +3038,7 @@ function ChannelStrip({
             void setChannelInput(channel.id, value).catch(() => undefined);
           }}
           options={[
-            { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto mic") },
+            { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto mic", autoDevices, channel.id) },
             ...(selectedInputMissing
               ? [{
                   value: channel.source_device ?? "",
@@ -4442,7 +4460,7 @@ function WaveLinkEffectsEditor({
                 void setChannelInput(channel.id, value || null).catch(() => undefined)
               }
               options={[
-                { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto hardware input") },
+                { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto hardware input", state.graph.auto_devices, channel.id) },
                 ...microphoneInputs.map((input) => ({
                   value: input.id,
                   label: input.description,
@@ -4814,7 +4832,7 @@ function EffectsView({
                 void setChannelInput(selectedChannel.id, value || null).catch(() => undefined)
               }
               options={[
-                { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto hardware input") },
+                { value: "", label: autoMicrophoneLabel(microphoneInputs, "Auto hardware input", state.graph.auto_devices, selectedChannel.id) },
                 ...microphoneInputs.map((input) => ({
                   value: input.id,
                   label: input.description,
@@ -5327,6 +5345,7 @@ function buildTestingHealthReport({
     `Meters: ${state.graph.meters.length}`,
     `Managed modules: ${graphReport?.managed_modules.length ?? "not loaded"}`,
     `Routes: ${graphReport ? graphReport.sink_input_routes.length + graphReport.source_output_routes.length : "not loaded"}`,
+    `Route health issues: ${graphReport?.route_health.length ?? "not loaded"}`,
     `Stale processes: ${graphReport?.stale_processes.length ?? "not loaded"}`,
     "",
     "## Devices",
@@ -5466,7 +5485,9 @@ function LatencySummary({ state }: { state: AppStateSnapshot }) {
 function GraphDebugSummary({ report }: { report: GraphDebugReport }) {
   const visibleCommands = report.planned.commands.slice(0, 6);
   const visibleModules = report.managed_modules.slice(0, 6);
+  const visibleRouteHealth = report.route_health.slice(0, 6);
   const routeCount = report.sink_input_routes.length + report.source_output_routes.length;
+  const healthIssueCount = report.route_health.length + report.stale_processes.length;
 
   return (
     <div className="graph-debug command-report">
@@ -5475,14 +5496,15 @@ function GraphDebugSummary({ report }: { report: GraphDebugReport }) {
           <strong>Graph Debug</strong>
           <span>{report.audio_graph_running ? "Managed graph is present" : "Managed graph is stopped"}</span>
         </div>
-        <div className={report.stale_processes.length ? "command-pill warning" : "command-pill"}>
-          {report.stale_processes.length ? `${report.stale_processes.length} stale` : "Clean"}
+        <div className={healthIssueCount ? "command-pill warning" : "command-pill"}>
+          {healthIssueCount ? `${healthIssueCount} issue${healthIssueCount === 1 ? "" : "s"}` : "Clean"}
         </div>
       </div>
       <div className="command-stats">
         <Stat icon={WandSparkles} label="Planned" value={String(report.planned.commands.length)} />
         <Stat icon={Cable} label="Modules" value={String(report.managed_modules.length)} />
         <Stat icon={GitBranch} label="Routes" value={String(routeCount)} />
+        <Stat icon={Activity} label="Health" value={report.route_health.length ? String(report.route_health.length) : "OK"} />
       </div>
       <div className="graph-debug-grid">
         <div className="graph-debug-section">
@@ -5501,6 +5523,14 @@ function GraphDebugSummary({ report }: { report: GraphDebugReport }) {
           ))}
           {visibleCommands.length === 0 && <span>Graph already matches config</span>}
         </div>
+        {visibleRouteHealth.length > 0 && (
+          <div className="graph-debug-section">
+            <strong>Route Health</strong>
+            {visibleRouteHealth.map((issue, index) => (
+              <code key={`${issue.module_id ?? issue.role}-${index}`}>{routeHealthLabel(issue)}</code>
+            ))}
+          </div>
+        )}
       </div>
       <div className="debug-log">
         <div className="debug-log-header">
@@ -5515,6 +5545,33 @@ function GraphDebugSummary({ report }: { report: GraphDebugReport }) {
       </div>
     </div>
   );
+}
+
+function routeHealthLabel(issue: RouteHealthIssue) {
+  const scope = [issue.channel_id ? `channel ${issue.channel_id}` : "", issue.mix_id ? `mix ${issue.mix_id}` : ""]
+    .filter(Boolean)
+    .join(" ");
+  const module = issue.module_id ? `#${issue.module_id}` : "module";
+  return `${module} ${issue.role}${scope ? ` ${scope}` : ""}: ${routeHealthReasonLabel(issue.reason)}`;
+}
+
+function routeHealthReasonLabel(reason: RouteHealthIssue["reason"]) {
+  switch (reason) {
+    case "missing_source":
+      return "source missing";
+    case "missing_sink":
+      return "sink missing";
+    case "missing_source_output":
+      return "source-output missing";
+    case "missing_sink_input":
+      return "sink-input missing";
+    case "stale_config":
+      return "stale config";
+    case "duplicate":
+      return "duplicate";
+    default:
+      return reason;
+  }
 }
 
 function AudioActionSummary({ report }: { report: AudioActionReport }) {
@@ -7196,8 +7253,13 @@ function mixOutputDevices(mix: Mix): string[] {
   return outputs.length > 0 ? outputs : mix.monitor_output ? [mix.monitor_output] : [];
 }
 
-function mixOutputSummary(mix: Mix, outputs: DeviceInfo[], settings: MixerSettings): string {
-  if (mix.id === "monitor" && settings.monitor_follows_default_output) return "Auto output";
+function mixOutputSummary(mix: Mix, outputs: DeviceInfo[], settings: MixerSettings, autoDevices: AutoDevices = []): string {
+  if (mix.id === "monitor" && settings.monitor_follows_default_output) {
+    const resolved = resolvedAutoOutput(autoDevices, mix.id);
+    return resolved?.device_description || resolved?.device_id
+      ? `Auto: ${resolved.device_description ?? resolved.device_id}`
+      : "Auto output";
+  }
   const selectedOutputs = mixOutputDevices(mix);
   if (selectedOutputs.length === 0) return "No direct output";
   const labels = selectedOutputs.map((outputId) =>
@@ -7205,6 +7267,12 @@ function mixOutputSummary(mix: Mix, outputs: DeviceInfo[], settings: MixerSettin
   );
   if (labels.length <= 2) return labels.join(", ");
   return `${labels.slice(0, 2).join(", ")} +${labels.length - 2}`;
+}
+
+function resolvedAutoOutput(autoDevices: AutoDevices, mixId?: string) {
+  return autoDevices.find((device) =>
+    device.kind === "output" && (!mixId || device.mix_id === mixId)
+  );
 }
 
 function matcherForStream(stream: AppStream): AppMatcher {
@@ -7305,7 +7373,7 @@ function matcherTypeLabel(matcher: AppMatcher): string {
 function routeKey(matcher: AppMatcher): string {
   const entries = matcherEntries(matcher);
   if (entries.length === 0) return "empty";
-  return entries.map(([kind, value]) => `${kind}:${value}`).join("|");
+  return entries.map(([kind, value]) => `${kind}:${normalizedMatcherValue(value)}`).join("|");
 }
 
 function normalizedMatcherValue(value: string): string {
@@ -7477,7 +7545,13 @@ function isMicrophoneSource(device: AppStateSnapshot["graph"]["inputs"][number])
 function autoMicrophoneLabel(
   inputs: AppStateSnapshot["graph"]["inputs"],
   fallback: string,
+  autoDevices: AutoDevices = [],
+  channelId?: string,
 ): string {
+  const resolved = resolvedAutoInput(autoDevices, channelId);
+  if (resolved?.device_description || resolved?.device_id) {
+    return `Auto: ${resolved.device_description ?? resolved.device_id}`;
+  }
   const input = inputs[0];
   return input ? `Auto: ${input.description}` : fallback;
 }
@@ -7527,13 +7601,25 @@ function microphoneInputPriority(device: AppStateSnapshot["graph"]["inputs"][num
 }
 
 function channelInputLabel(
-  channel: Pick<Channel, "source_device">,
+  channel: Pick<Channel, "id" | "source_device">,
   inputs: AppStateSnapshot["graph"]["inputs"],
+  autoDevices: AutoDevices = [],
 ): string {
-  if (!channel.source_device) return "Auto input";
+  if (!channel.source_device) {
+    const resolved = resolvedAutoInput(autoDevices, channel.id);
+    return resolved?.device_description || resolved?.device_id
+      ? `Auto: ${resolved.device_description ?? resolved.device_id}`
+      : "Auto input";
+  }
   return (
     inputs.find((input) => input.id === channel.source_device)?.description ??
     channel.source_device
+  );
+}
+
+function resolvedAutoInput(autoDevices: AutoDevices, channelId?: string) {
+  return autoDevices.find((device) =>
+    device.kind === "input" && (!channelId || device.channel_id === channelId)
   );
 }
 
