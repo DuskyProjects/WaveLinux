@@ -1636,10 +1636,7 @@ impl AppMatcher {
 
     pub fn from_stream(stream: &AppStream) -> Option<Self> {
         let mut app_id = stream.app_id.clone();
-        let mut binary = stream
-            .binary
-            .clone()
-            .or_else(|| stream.process_name.clone());
+        let mut binary = stream.binary.clone();
         let mut process_name = stream.process_name.clone();
         let window_class = stream.window_class.clone();
         if app_id.is_none() && binary.is_none() && process_name.is_none() && window_class.is_none()
@@ -1815,7 +1812,7 @@ pub enum StreamerPermissionStatus {
     UnsupportedProtocol,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct StreamerDeviceCapabilities {
     pub buttons: bool,
@@ -1825,20 +1822,6 @@ pub struct StreamerDeviceCapabilities {
     pub display_feedback: bool,
     pub midi_feedback: bool,
     pub audio_endpoint: bool,
-}
-
-impl Default for StreamerDeviceCapabilities {
-    fn default() -> Self {
-        Self {
-            buttons: false,
-            dials: false,
-            faders: false,
-            pads: false,
-            display_feedback: false,
-            midi_feedback: false,
-            audio_endpoint: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1961,9 +1944,10 @@ impl Default for StreamerBinding {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StreamerAction {
+    #[default]
     Noop,
     MixMuteToggle {
         mix_id: MixId,
@@ -2010,12 +1994,6 @@ pub enum StreamerAction {
     CleanupStaleAudioGraph,
 }
 
-impl Default for StreamerAction {
-    fn default() -> Self {
-        Self::Noop
-    }
-}
-
 impl StreamerAction {
     fn without_audio_lifecycle(self) -> Self {
         match self {
@@ -2045,20 +2023,11 @@ impl Default for StreamerLearnResult {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct StreamerActionResult {
     pub performed: bool,
     pub message: String,
-}
-
-impl Default for StreamerActionResult {
-    fn default() -> Self {
-        Self {
-            performed: false,
-            message: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3000,6 +2969,7 @@ fn clean_output_devices(values: Vec<String>) -> Vec<String> {
     values
         .into_iter()
         .filter_map(|value| clean_optional_matcher(Some(value)))
+        .filter(|value| !value.starts_with("wavelinux_"))
         .filter(|value| seen.insert(value.clone()))
         .collect()
 }
@@ -3193,11 +3163,18 @@ fn app_matcher_specificity(matcher: &AppMatcher) -> usize {
 
 fn matcher_matches_matcher(pattern: &AppMatcher, candidate: &AppMatcher) -> bool {
     let fields = [
-        (&pattern.app_id, &candidate.app_id),
-        (&pattern.binary, &candidate.binary),
-        (&pattern.process_name, &candidate.process_name),
-        (&pattern.window_class, &candidate.window_class),
-        (&pattern.media_name, &candidate.media_name),
+        (&pattern.app_id, candidate.app_id.as_deref()),
+        (
+            &pattern.binary,
+            if candidate.binary.is_none() {
+                candidate.process_name.as_deref()
+            } else {
+                candidate.binary.as_deref()
+            },
+        ),
+        (&pattern.process_name, candidate.process_name.as_deref()),
+        (&pattern.window_class, candidate.window_class.as_deref()),
+        (&pattern.media_name, candidate.media_name.as_deref()),
     ];
     let mut has_pattern = false;
     for (pattern, candidate) in fields {
@@ -3205,7 +3182,7 @@ fn matcher_matches_matcher(pattern: &AppMatcher, candidate: &AppMatcher) -> bool
             continue;
         };
         has_pattern = true;
-        let Some(candidate) = candidate.as_deref() else {
+        let Some(candidate) = candidate else {
             return false;
         };
         if !pattern.eq_ignore_ascii_case(candidate) {
@@ -3888,23 +3865,25 @@ mod tests {
             window_class: None,
             media_name: None,
         };
-        let mut config = MixerConfig::default();
-        config.app_history = vec![
-            KnownApp {
-                matcher: matcher_lower,
-                display_name: "RetroArch".into(),
-                media_name: Some("audio".into()),
-                last_seen_unix: 200,
-                forgotten: true,
-            },
-            KnownApp {
-                matcher: matcher_mixed,
-                display_name: "RetroArch".into(),
-                media_name: Some("RetroArch".into()),
-                last_seen_unix: 100,
-                forgotten: false,
-            },
-        ];
+        let config = MixerConfig {
+            app_history: vec![
+                KnownApp {
+                    matcher: matcher_lower,
+                    display_name: "RetroArch".into(),
+                    media_name: Some("audio".into()),
+                    last_seen_unix: 200,
+                    forgotten: true,
+                },
+                KnownApp {
+                    matcher: matcher_mixed,
+                    display_name: "RetroArch".into(),
+                    media_name: Some("RetroArch".into()),
+                    last_seen_unix: 100,
+                    forgotten: false,
+                },
+            ],
+            ..Default::default()
+        };
 
         let config = config.normalized().unwrap();
         let retroarch = config
@@ -3937,23 +3916,25 @@ mod tests {
             window_class: None,
             media_name: None,
         };
-        let mut config = MixerConfig::default();
-        config.app_history = vec![
-            KnownApp {
-                matcher: matcher_lower.clone(),
-                display_name: "RetroArch".into(),
-                media_name: None,
-                last_seen_unix: 100,
-                forgotten: false,
-            },
-            KnownApp {
-                matcher: matcher_mixed.clone(),
-                display_name: "RetroArch".into(),
-                media_name: None,
-                last_seen_unix: 90,
-                forgotten: false,
-            },
-        ];
+        let mut config = MixerConfig {
+            app_history: vec![
+                KnownApp {
+                    matcher: matcher_lower.clone(),
+                    display_name: "RetroArch".into(),
+                    media_name: None,
+                    last_seen_unix: 100,
+                    forgotten: false,
+                },
+                KnownApp {
+                    matcher: matcher_mixed.clone(),
+                    display_name: "RetroArch".into(),
+                    media_name: None,
+                    last_seen_unix: 90,
+                    forgotten: false,
+                },
+            ],
+            ..Default::default()
+        };
         config
             .assign_app_to_channel("game", matcher_mixed.clone())
             .unwrap();
@@ -4084,6 +4065,28 @@ mod tests {
         assert_eq!(matcher.app_id.as_deref(), Some("Spotify"));
         assert_eq!(matcher.process_name.as_deref(), Some("Spotify"));
         assert!(matcher.media_name.is_none());
+    }
+
+    #[test]
+    fn legacy_binary_matchers_match_streams_that_only_report_process_name() {
+        let legacy_route_matcher = AppMatcher::from_binary("spotify");
+        let live_stream = AppStream {
+            id: "spotify-1".into(),
+            app_id: None,
+            binary: None,
+            process_name: Some("spotify".into()),
+            window_class: None,
+            display_name: "Spotify".into(),
+            media_name: Some("audio-src".into()),
+            routed_channel_id: None,
+            volume: 1.0,
+            muted: false,
+        };
+        let live_matcher = AppMatcher::from_stream(&live_stream).unwrap();
+
+        assert!(live_matcher.binary.is_none());
+        assert_eq!(live_matcher.process_name.as_deref(), Some("spotify"));
+        assert!(app_matchers_overlap(&legacy_route_matcher, &live_matcher));
     }
 
     #[test]

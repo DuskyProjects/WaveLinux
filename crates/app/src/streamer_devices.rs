@@ -585,7 +585,7 @@ impl MidiCapture {
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "aseqdump stdout unavailable"))?;
+            .ok_or_else(|| io::Error::other("aseqdump stdout unavailable"))?;
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -712,7 +712,7 @@ fn merge_device(existing: &mut StreamerDeviceSummary, incoming: &StreamerDeviceS
     existing.capabilities.midi_feedback |= incoming.capabilities.midi_feedback;
     existing.capabilities.audio_endpoint |= incoming.capabilities.audio_endpoint;
     if existing.permission_status == StreamerPermissionStatus::UnsupportedProtocol {
-        existing.permission_status = incoming.permission_status.clone();
+        existing.permission_status = incoming.permission_status;
         existing.message = incoming.message.clone();
     }
 }
@@ -745,7 +745,7 @@ fn discover_hidraw_devices() -> Vec<StreamerDeviceSummary> {
         let (vendor_id, product_id) = attrs
             .get("HID_ID")
             .and_then(|value| parse_hid_id(value))
-            .unwrap_or_else(|| (None, None));
+            .unwrap_or((None, None));
         let Some((family, capabilities, supported_message)) =
             classify_hid_device(vendor_id.as_deref(), product_id.as_deref(), &name)
         else {
@@ -983,7 +983,7 @@ fn default_profile_for_device(
 
     StreamerBindingProfile {
         device_id: device.id.clone(),
-        family: Some(device.family.clone()),
+        family: Some(device.family),
         name: device.name.clone(),
         enabled: bindable,
         safe_preset: true,

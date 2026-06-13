@@ -484,6 +484,8 @@ export interface SinkInputRoute {
   role?: string | null;
   channel_id?: string | null;
   mix_id?: string | null;
+  muted?: boolean | null;
+  volume_percent?: number | null;
   sink?: string | null;
   sink_name?: string | null;
   target_object?: string | null;
@@ -495,12 +497,15 @@ export interface SourceOutputRoute {
   role?: string | null;
   channel_id?: string | null;
   mix_id?: string | null;
+  muted?: boolean | null;
+  volume_percent?: number | null;
   source_id?: string | null;
   source_name?: string | null;
   target_object?: string | null;
   application_name?: string | null;
   node_name?: string | null;
   media_name?: string | null;
+  managed?: string | null;
 }
 
 export interface StaleProcess {
@@ -514,7 +519,8 @@ export type RouteHealthReason =
   | "missing_source_output"
   | "missing_sink_input"
   | "stale_config"
-  | "duplicate";
+  | "duplicate"
+  | "level_mismatch";
 
 export interface RouteHealthIssue {
   module_id?: string | null;

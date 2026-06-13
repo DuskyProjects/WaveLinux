@@ -29,7 +29,7 @@ use wavelinux_model::{
     RoutingPolicy, RuntimeGraph, StreamerBindingProfile, StreamerDevicesConfig,
 };
 use wavelinux_pw::{
-    channel_has_active_effects, channel_mix_route_revision,
+    a2dp_codec_rank_with_preferences, channel_has_active_effects, channel_mix_route_revision,
     channel_mix_route_uses_hardware_direct_monitoring, channel_mix_source_name,
     effect_chain_input_name, effect_chain_source_name, effect_route_revision, input_route_revision,
     meter_sampling_enabled, meter_targets_for_config_with_devices,
@@ -40,19 +40,21 @@ use wavelinux_pw::{
     plan_set_channel_bus_source_output_volume, plan_set_channel_bus_volume, plan_set_default_sink,
     plan_set_default_source, plan_set_managed_sink_mute, plan_set_managed_sink_volume,
     plan_set_mix_mute as plan_pw_set_mix_mute, plan_set_mix_volume as plan_pw_set_mix_volume,
-    plan_set_source_mute, plan_set_source_volume, plan_set_stream_mute, plan_set_stream_volume,
-    plan_unload_modules, probe_effect_availability, render_filter_chain, BluetoothAudioCard,
-    CommandDomain, CommandOutput, CommandSpec, ManagedModule, MeterTarget, PlannedGraph, PwClient,
-    PwError, SinkInputRoute, SnapshotCommandTiming, SourceOutputRoute, StaleProcess,
-    EFFECT_CONFIG_REVISION,
+    plan_set_route_sink_input_mute, plan_set_route_sink_input_volume,
+    plan_set_route_source_output_mute, plan_set_route_source_output_volume, plan_set_source_mute,
+    plan_set_source_volume, plan_set_stream_mute, plan_set_stream_volume, plan_unload_modules,
+    probe_effect_availability, render_filter_chain, BluetoothAudioCard, CommandDomain,
+    CommandOutput, CommandSpec, ManagedModule, MeterTarget, PlannedGraph, PwClient, PwError,
+    SinkInputRoute, SnapshotCommandTiming, SourceOutputRoute, StaleProcess, EFFECT_CONFIG_REVISION,
 };
 
 mod hardware_profiles;
 
 use hardware_profiles::{
-    apply_profile_policy_to_devices, apply_profile_policy_to_graph, hardware_profile_by_id,
-    hardware_profile_diagnostics, hardware_profile_ui_state, load_hardware_profile_catalog,
-    remote_profile_sync_needed, sync_remote_profiles_for_devices, HardwareProfileCatalog,
+    apply_profile_policy_to_devices, apply_profile_policy_to_graph, apply_profiles_to_devices,
+    hardware_profile_by_id, hardware_profile_diagnostics, hardware_profile_ui_state,
+    load_hardware_profile_catalog, remote_profile_sync_needed, sync_remote_profiles_for_devices,
+    HardwareProfileCatalog,
 };
 
 const DEBUG_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -325,6 +327,7 @@ pub enum RouteHealthReason {
     MissingSinkInput,
     StaleConfig,
     Duplicate,
+    LevelMismatch,
 }
 
 #[derive(Debug)]
@@ -334,6 +337,7 @@ struct RuntimeCache {
     status: EngineStatus,
     bluetooth_monitor_routes: BTreeMap<String, BluetoothMonitorRouteSignature>,
     refreshed_at: Option<Instant>,
+    initialized_bluetooth_cards: BTreeMap<String, String>,
 }
 
 impl RuntimeCache {
@@ -343,6 +347,7 @@ impl RuntimeCache {
             diagnostics: Vec::new(),
             bluetooth_monitor_routes: BTreeMap::new(),
             refreshed_at: None,
+            initialized_bluetooth_cards: BTreeMap::new(),
             status: EngineStatus {
                 dry_run,
                 healthy: true,
@@ -673,6 +678,7 @@ fn run_pipewire_meter_stream_inner(
         props.insert(*pw::keys::NODE_DONT_RECONNECT, "true");
     }
     props.insert("application.name", "WaveLinux");
+    props.insert("node.latency", "256/48000");
     props.insert("node.dont-move", "true");
     props.insert("state.restore-props", "false");
     props.insert("state.restore-target", "false");
@@ -955,6 +961,62 @@ fn plan_channel_bus_volume_commands(
     commands
 }
 
+fn managed_route_level_commands(
+    config: &MixerConfig,
+    source_outputs: &[SourceOutputRoute],
+    sink_inputs: &[SinkInputRoute],
+) -> Vec<CommandSpec> {
+    let mut commands = Vec::new();
+
+    for sink_input in sink_inputs {
+        let Some(expected) = expected_managed_route_level_for_parts(
+            config,
+            sink_input.role.as_deref(),
+            sink_input.channel_id.as_deref(),
+            sink_input.mix_id.as_deref(),
+        ) else {
+            continue;
+        };
+        if route_mute_mismatch(sink_input.muted, expected.muted) {
+            commands.push(plan_set_route_sink_input_mute(
+                &sink_input.id,
+                expected.muted,
+            ));
+        }
+        if route_volume_mismatch(sink_input.volume_percent, expected.sink_input_percent) {
+            commands.push(plan_set_route_sink_input_volume(
+                &sink_input.id,
+                f32::from(expected.sink_input_percent) / 100.0,
+            ));
+        }
+    }
+
+    for source_output in source_outputs {
+        let Some(expected) = expected_managed_route_level_for_parts(
+            config,
+            source_output.role.as_deref(),
+            source_output.channel_id.as_deref(),
+            source_output.mix_id.as_deref(),
+        ) else {
+            continue;
+        };
+        if route_mute_mismatch(source_output.muted, expected.muted) {
+            commands.push(plan_set_route_source_output_mute(
+                &source_output.id,
+                expected.muted,
+            ));
+        }
+        if route_volume_mismatch(source_output.volume_percent, expected.source_output_percent) {
+            commands.push(plan_set_route_source_output_volume(
+                &source_output.id,
+                f32::from(expected.source_output_percent) / 100.0,
+            ));
+        }
+    }
+
+    commands
+}
+
 #[derive(Debug)]
 pub struct WaveLinuxEngine {
     paths: EnginePaths,
@@ -1209,7 +1271,7 @@ impl WaveLinuxEngine {
         let (mut graph, mut snapshot_command_timings) =
             self.snapshot_for_config_timed(Some(&config))?;
         record_refresh_phase(&mut refresh_phases, &mut phase_started, "snapshot");
-        let mut bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
+        let mut bluetooth_cards = self.bluetooth_audio_cards().unwrap_or_default();
         let mut default_source = self.pw.default_source().ok().flatten();
         let mut default_sink = self.pw.default_sink().ok().flatten();
         let mut active_sink = self.pw.active_playback_sink().ok().flatten();
@@ -1230,14 +1292,14 @@ impl WaveLinuxEngine {
         record_refresh_phase(&mut refresh_phases, &mut phase_started, "devices");
         let mut audio_graph_running = graph_has_wavelinux_nodes(&graph);
         if !self.stop.load(Ordering::SeqCst)
-            && !plan_bluetooth_a2dp_profiles(&bluetooth_cards).is_empty()
+            && self.bluetooth_a2dp_repair_needed(&bluetooth_cards, false)?
         {
             self.log_engine_event(
                 "bluetooth.a2dp",
                 "restoring Bluetooth playback to A2DP before routing decisions",
             );
             let _audio_commands = self.lock_audio_commands()?;
-            let outputs = self.ensure_bluetooth_a2dp_profiles()?;
+            let outputs = self.ensure_bluetooth_a2dp_profiles(false)?;
             self.log_command_executions("bluetooth.a2dp", &outputs);
             if outputs
                 .iter()
@@ -1247,7 +1309,7 @@ impl WaveLinuxEngine {
                 let (next_graph, timings) = self.snapshot_for_config_timed(Some(&config))?;
                 graph = next_graph;
                 snapshot_command_timings.extend(timings);
-                bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
+                bluetooth_cards = self.bluetooth_audio_cards().unwrap_or_default();
                 default_source = self.pw.default_source().ok().flatten();
                 default_sink = self.pw.default_sink().ok().flatten();
                 active_sink = self.pw.active_playback_sink().ok().flatten();
@@ -1369,7 +1431,7 @@ impl WaveLinuxEngine {
                             self.snapshot_for_config_timed(Some(&config))?;
                         graph = next_graph;
                         snapshot_command_timings.extend(timings);
-                        bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
+                        bluetooth_cards = self.bluetooth_audio_cards().unwrap_or_default();
                         default_source = self.pw.default_source().ok().flatten();
                         default_sink = self.pw.default_sink().ok().flatten();
                         active_sink = self.pw.active_playback_sink().ok().flatten();
@@ -1600,7 +1662,7 @@ impl WaveLinuxEngine {
 
     fn repair_audio_graph_unlocked(&self) -> Result<RepairReport, EngineError> {
         let started = Instant::now();
-        let mut outputs = self.ensure_bluetooth_a2dp_profiles()?;
+        let mut outputs = self.ensure_bluetooth_a2dp_profiles(true)?;
         self.log_command_executions("repair.bluetooth", &outputs);
         if outputs
             .iter()
@@ -2597,8 +2659,9 @@ impl WaveLinuxEngine {
         stream_id: String,
         channel_id: String,
     ) -> Result<CommandExecution, EngineError> {
-        let channel = self
-            .read_config()?
+        let saved_config = self.read_config()?.clone();
+        let route_config = self.effective_config_for_audio_graph(&saved_config);
+        let channel = route_config
             .channels
             .iter()
             .find(|channel| channel.id == channel_id)
@@ -2611,7 +2674,12 @@ impl WaveLinuxEngine {
 
         let _audio_commands = self.lock_audio_commands()?;
         let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
-        Ok(ignore_stale_stream_command(output, &stream_id))
+        let output = ignore_stale_stream_command(output, &stream_id);
+        if output.error.is_none() && !output.skipped {
+            let level_outputs = self.apply_managed_route_levels(&route_config)?;
+            self.log_command_executions("route.levels", &level_outputs);
+        }
+        Ok(output)
     }
 
     pub fn move_app_stream_to_default(
@@ -2743,7 +2811,7 @@ impl WaveLinuxEngine {
             return Ok(false);
         }
 
-        let bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
+        let bluetooth_cards = self.bluetooth_audio_cards().unwrap_or_default();
         let default_source = self.pw.default_source().ok().flatten();
         let default_sink = self.pw.default_sink().ok().flatten();
         let active_sink = self.pw.active_playback_sink().ok().flatten();
@@ -2761,6 +2829,10 @@ impl WaveLinuxEngine {
         );
         let effective_config = config_with_unavailable_effects_bypassed(&effective_config, &graph);
         let effective_config = self.config_with_unhealthy_effects_bypassed(&effective_config);
+
+        if !plan_bluetooth_a2dp_profiles(&bluetooth_cards, &BTreeMap::new(), true).is_empty() {
+            return Ok(false);
+        }
 
         if auto_device_route_repair_needed_for_profiled_devices(
             &config,
@@ -2860,7 +2932,7 @@ impl WaveLinuxEngine {
                 return Ok(Vec::new());
             }
         };
-        let bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
+        let bluetooth_cards = self.bluetooth_audio_cards().unwrap_or_default();
         let commands = startup_microphone_level_reset_commands(&inputs, &bluetooth_cards);
         if commands.is_empty() {
             self.log_engine_event("startup.source-levels", "no hardware microphones to reset");
@@ -2891,7 +2963,7 @@ impl WaveLinuxEngine {
                 if self.app_stream_move_recently_failed(&stream.id) {
                     return None;
                 }
-                Some((stream.id.clone(), channel.clone()))
+                Some((stream.clone(), channel.clone()))
             })
             .collect::<Vec<_>>();
 
@@ -2906,25 +2978,39 @@ impl WaveLinuxEngine {
                 routes.len(),
                 routes
                     .iter()
-                    .map(|(stream_id, channel)| format!("{stream_id}->{}", channel.id))
+                    .map(|(stream, channel)| format!("{}->{}", stream.id, channel.id))
                     .collect::<Vec<_>>()
                     .join(","),
             ),
         );
         let _audio_commands = self.lock_audio_commands()?;
-        for (stream_id, channel) in routes {
-            let command = plan_move_app_stream(&stream_id, &channel);
+        for (stream, channel) in routes {
+            let command = plan_move_app_stream(&stream.id, &channel);
             let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
-            let output = ignore_stale_stream_command(output, &stream_id);
+            let output = ignore_stale_stream_command(output, &stream.id);
             if output.skipped && output.stderr.contains("disappeared") {
                 self.log_engine_event(
                     "route.streams",
-                    format!("stream {stream_id} disappeared before configured routing; ignoring stale state"),
+                    format!(
+                        "stream {} disappeared before configured routing; ignoring stale state",
+                        stream.id
+                    ),
                 );
                 continue;
             }
-            self.remember_app_stream_move_result(&stream_id, &output)?;
-            self.log_command_executions("route.streams", &[output]);
+
+            let move_succeeded = output.error.is_none() && !output.skipped;
+            self.remember_app_stream_move_result(&stream.id, &output)?;
+            self.log_command_executions("route.streams", std::slice::from_ref(&output));
+            if move_succeeded {
+                let target_volume = configured_volume_for_stream(config, &stream).unwrap_or(1.0);
+                let volume_command = plan_set_stream_volume(&stream.id, target_volume);
+                let volume_output = command_execution_with_spec(
+                    volume_command.clone(),
+                    self.pw.execute(volume_command),
+                );
+                self.log_command_executions("route.streams", std::slice::from_ref(&volume_output));
+            }
         }
         Ok(true)
     }
@@ -2954,7 +3040,7 @@ impl WaveLinuxEngine {
         config: &MixerConfig,
         source_outputs: &[SourceOutputRoute],
     ) -> Result<Vec<CommandExecution>, EngineError> {
-        let bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
+        let bluetooth_cards = self.bluetooth_audio_cards().unwrap_or_default();
         let profiled_inputs = self.profiled_inputs().unwrap_or_default();
         self.execute_capture_stream_moves_unlocked_with_devices(
             config,
@@ -3247,7 +3333,29 @@ impl WaveLinuxEngine {
                 ));
             }
         }
+        outputs.extend(self.apply_managed_route_levels(config)?);
         Ok(outputs)
+    }
+
+    fn apply_managed_route_levels(
+        &self,
+        config: &MixerConfig,
+    ) -> Result<Vec<CommandExecution>, EngineError> {
+        let source_outputs = self.pw.source_output_routes().unwrap_or_default();
+        let sink_inputs = self.pw.sink_input_routes().unwrap_or_default();
+        let commands = managed_route_level_commands(config, &source_outputs, &sink_inputs);
+        if !commands.is_empty() {
+            self.log_engine_event(
+                "route.levels",
+                format!("repairing {} managed route level(s)", commands.len()),
+            );
+        }
+        Ok(self
+            .pw
+            .execute_all(commands)
+            .into_iter()
+            .map(command_execution)
+            .collect())
     }
 
     fn apply_default_device_locks(
@@ -3279,8 +3387,12 @@ impl WaveLinuxEngine {
         restore_default_output: bool,
     ) -> Vec<CommandExecution> {
         let mut commands = Vec::new();
-        let bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
-        commands.extend(plan_bluetooth_a2dp_profiles(&bluetooth_cards));
+        let bluetooth_cards = self.bluetooth_audio_cards().unwrap_or_default();
+        commands.extend(plan_bluetooth_a2dp_profiles(
+            &bluetooth_cards,
+            &BTreeMap::new(),
+            true,
+        ));
         if restore_default_output {
             if let Some(sink) = self.startup_defaults.sink.as_deref() {
                 commands.push(CommandSpec::new(
@@ -3316,9 +3428,49 @@ impl WaveLinuxEngine {
             .collect()
     }
 
-    fn ensure_bluetooth_a2dp_profiles(&self) -> Result<Vec<CommandExecution>, EngineError> {
-        let cards = self.pw.bluetooth_audio_cards()?;
-        let commands = plan_bluetooth_a2dp_profiles(&cards);
+    fn bluetooth_a2dp_repair_needed(
+        &self,
+        bluetooth_cards: &[BluetoothAudioCard],
+        force_all_a2dp: bool,
+    ) -> Result<bool, EngineError> {
+        let mut runtime = self
+            .runtime
+            .write()
+            .map_err(|_| EngineError::LockPoisoned)?;
+        prune_initialized_bluetooth_cards(&mut runtime, bluetooth_cards);
+        Ok(!plan_bluetooth_a2dp_profiles(
+            bluetooth_cards,
+            &runtime.initialized_bluetooth_cards,
+            force_all_a2dp,
+        )
+        .is_empty())
+    }
+
+    fn ensure_bluetooth_a2dp_profiles(
+        &self,
+        force_all_a2dp: bool,
+    ) -> Result<Vec<CommandExecution>, EngineError> {
+        let bluetooth_cards = self.bluetooth_audio_cards()?;
+        let commands = {
+            let mut runtime = self
+                .runtime
+                .write()
+                .map_err(|_| EngineError::LockPoisoned)?;
+            prune_initialized_bluetooth_cards(&mut runtime, &bluetooth_cards);
+            let commands = plan_bluetooth_a2dp_profiles(
+                &bluetooth_cards,
+                &runtime.initialized_bluetooth_cards,
+                force_all_a2dp,
+            );
+            for card in &bluetooth_cards {
+                if let Some(pref) = &card.preferred_a2dp_profile {
+                    runtime
+                        .initialized_bluetooth_cards
+                        .insert(card.name.clone(), pref.clone());
+                }
+            }
+            commands
+        };
         Ok(self
             .pw
             .execute_all(commands)
@@ -3332,7 +3484,7 @@ impl WaveLinuxEngine {
         source_device: Option<String>,
     ) -> Option<String> {
         let source = source_device?;
-        let cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
+        let cards = self.bluetooth_audio_cards().unwrap_or_default();
         if bluetooth_input_would_force_hfp(&source, &cards) {
             self.log_engine_event(
                 "bluetooth.input",
@@ -3346,8 +3498,69 @@ impl WaveLinuxEngine {
         }
     }
 
+    fn bluetooth_audio_cards(&self) -> Result<Vec<BluetoothAudioCard>, EngineError> {
+        let mut cards = self.pw.bluetooth_audio_cards()?;
+        if let Ok(catalog) = self.hardware_profiles() {
+            let inputs = self.pw.list_inputs().unwrap_or_default();
+            let outputs = self.pw.list_outputs().unwrap_or_default();
+
+            let mut profiled_inputs = inputs.clone();
+            let mut profiled_outputs = outputs.clone();
+            if let Ok(config) = self.read_config() {
+                apply_profile_policy_to_devices(
+                    &mut profiled_inputs,
+                    &catalog,
+                    &config.device_policy,
+                );
+                apply_profile_policy_to_devices(
+                    &mut profiled_outputs,
+                    &catalog,
+                    &config.device_policy,
+                );
+            } else {
+                apply_profiles_to_devices(&mut profiled_inputs, &catalog);
+                apply_profiles_to_devices(&mut profiled_outputs, &catalog);
+            }
+
+            for card in &mut cards {
+                let preferred_codecs = find_preferred_codecs_for_card(
+                    card,
+                    &profiled_inputs,
+                    &profiled_outputs,
+                    &catalog,
+                );
+                if !preferred_codecs.is_empty() {
+                    if let Some(new_preferred) = card
+                        .profiles
+                        .iter()
+                        .filter(|p| {
+                            p.available
+                                && p.sinks > 0
+                                && (p.name.to_ascii_lowercase().contains("a2dp")
+                                    || p.description.to_ascii_lowercase().contains("a2dp"))
+                        })
+                        .max_by_key(|p| {
+                            (
+                                a2dp_codec_rank_with_preferences(
+                                    &p.name,
+                                    &p.description,
+                                    &preferred_codecs,
+                                ),
+                                p.priority,
+                            )
+                        })
+                        .map(|p| p.name.clone())
+                    {
+                        card.preferred_a2dp_profile = Some(new_preferred);
+                    }
+                }
+            }
+        }
+        Ok(cards)
+    }
+
     fn effective_config_for_audio_graph(&self, config: &MixerConfig) -> MixerConfig {
-        let bluetooth_cards = self.pw.bluetooth_audio_cards().unwrap_or_default();
+        let bluetooth_cards = self.bluetooth_audio_cards().unwrap_or_default();
         let inputs = self.profiled_inputs().unwrap_or_default();
         let outputs = self.profiled_outputs().unwrap_or_default();
         let default_sink = self.pw.default_sink().ok().flatten();
@@ -4319,7 +4532,7 @@ impl WaveLinuxEngine {
             }
             cache.value.clone()
         };
-        if !remote_profile_sync_needed(devices, policy, &catalog) {
+        if !remote_profile_sync_needed(&self.paths, devices, policy, &catalog) {
             return Ok(());
         }
 
@@ -5462,6 +5675,66 @@ fn bluetooth_input_would_force_hfp(source: &str, cards: &[BluetoothAudioCard]) -
     })
 }
 
+fn find_preferred_codecs_for_card(
+    card: &BluetoothAudioCard,
+    inputs: &[DeviceInfo],
+    outputs: &[DeviceInfo],
+    catalog: &HardwareProfileCatalog,
+) -> Vec<String> {
+    let card_key = normalize_bluetooth_device_key(&card.device_key);
+    let mut seen = BTreeSet::new();
+    let mut codecs = Vec::new();
+    for device in inputs
+        .iter()
+        .chain(outputs.iter())
+        .filter(|device| bluetooth_device_matches_card_key(device, &card_key))
+    {
+        let Some(profile) = device
+            .matched_profile_id
+            .as_deref()
+            .and_then(|profile_id| hardware_profile_by_id(catalog, profile_id))
+        else {
+            continue;
+        };
+        for codec in &profile.codec_policy.preferred_a2dp_codecs {
+            let codec = codec.trim().replace('-', "_").to_ascii_lowercase();
+            if !codec.is_empty() && seen.insert(codec.clone()) {
+                codecs.push(codec);
+            }
+        }
+    }
+    codecs
+}
+
+fn prune_initialized_bluetooth_cards(
+    runtime: &mut RuntimeCache,
+    bluetooth_cards: &[BluetoothAudioCard],
+) {
+    let live_card_names = bluetooth_cards
+        .iter()
+        .map(|card| card.name.clone())
+        .collect::<BTreeSet<_>>();
+    runtime
+        .initialized_bluetooth_cards
+        .retain(|card_name, _| live_card_names.contains(card_name));
+}
+
+fn bluetooth_device_matches_card_key(device: &DeviceInfo, card_key: &str) -> bool {
+    if card_key.is_empty() {
+        return false;
+    }
+    if bluetooth_endpoint_device_key(&device.id).as_deref() == Some(card_key) {
+        return true;
+    }
+    if bluetooth_endpoint_device_key(&device.name).as_deref() == Some(card_key) {
+        return true;
+    }
+    ["api.bluez5.address", "device.string", "bluez5.address"]
+        .iter()
+        .filter_map(|key| device.pipewire_properties.get(*key))
+        .any(|value| normalize_bluetooth_device_key(value) == card_key)
+}
+
 fn hardware_input_priority(input: &DeviceInfo) -> u8 {
     if let Some(priority) = input
         .active_routing_policy
@@ -5679,7 +5952,7 @@ fn resolved_auto_device(
         device_description: device.map(|device| device.description.clone()),
         priority: choice.map(|choice| choice.priority),
         reason: choice
-            .map(|choice| choice.reason.clone())
+            .map(|choice| choice.reason)
             .unwrap_or(AutoDeviceReason::Unavailable),
     }
 }
@@ -5895,9 +6168,6 @@ fn auto_device_route_repair_needed_for_profiled_devices(
     config: &MixerConfig,
     view: ProfiledDeviceRepairView<'_>,
 ) -> bool {
-    if !plan_bluetooth_a2dp_profiles(view.bluetooth_cards).is_empty() {
-        return true;
-    }
     let effective_config = effective_config_with_profiled_devices(
         config,
         view.inputs,
@@ -6022,7 +6292,26 @@ fn managed_loopback_has_live_source_output(
     source_name: Option<&str>,
     source_outputs: &[SourceOutputRoute],
 ) -> bool {
-    source_outputs.iter().any(|route| {
+    find_managed_loopback_source_output(
+        module,
+        role,
+        channel_id,
+        mix_id,
+        source_name,
+        source_outputs,
+    )
+    .is_some()
+}
+
+fn find_managed_loopback_source_output<'a>(
+    module: &ManagedModule,
+    role: Option<&str>,
+    channel_id: Option<&str>,
+    mix_id: Option<&str>,
+    source_name: Option<&str>,
+    source_outputs: &'a [SourceOutputRoute],
+) -> Option<&'a SourceOutputRoute> {
+    source_outputs.iter().find(|route| {
         source_output_matches_loopback(route, module, role, channel_id, mix_id, source_name)
     })
 }
@@ -6060,7 +6349,19 @@ fn managed_loopback_has_live_sink_input(
     sink_name: Option<&str>,
     sink_inputs: &[SinkInputRoute],
 ) -> bool {
-    sink_inputs.iter().any(|route| {
+    find_managed_loopback_sink_input(module, role, channel_id, mix_id, sink_name, sink_inputs)
+        .is_some()
+}
+
+fn find_managed_loopback_sink_input<'a>(
+    module: &ManagedModule,
+    role: Option<&str>,
+    channel_id: Option<&str>,
+    mix_id: Option<&str>,
+    sink_name: Option<&str>,
+    sink_inputs: &'a [SinkInputRoute],
+) -> Option<&'a SinkInputRoute> {
+    sink_inputs.iter().find(|route| {
         sink_input_matches_loopback(route, module, role, channel_id, mix_id, sink_name)
     })
 }
@@ -6090,6 +6391,84 @@ fn sink_input_matches_loopback(
     });
 
     (module_matches || route_matches) && sink_matches
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagedRouteLevel {
+    muted: bool,
+    sink_input_percent: u8,
+    source_output_percent: u8,
+}
+
+fn expected_managed_route_level(
+    config: &MixerConfig,
+    module: &ManagedModule,
+) -> Option<ManagedRouteLevel> {
+    expected_managed_route_level_for_parts(
+        config,
+        module.role.as_deref(),
+        module.channel_id.as_deref(),
+        module.mix_id.as_deref(),
+    )
+}
+
+fn expected_managed_route_level_for_parts(
+    config: &MixerConfig,
+    role: Option<&str>,
+    channel_id: Option<&str>,
+    mix_id: Option<&str>,
+) -> Option<ManagedRouteLevel> {
+    match role? {
+        "channel_to_mix" => {
+            let channel_id = channel_id?;
+            let mix_id = mix_id?;
+            let bus = config
+                .channels
+                .iter()
+                .find(|channel| channel.id == channel_id)?
+                .mix_buses
+                .get(mix_id)?;
+            bus.enabled.then(|| ManagedRouteLevel {
+                muted: bus.muted,
+                sink_input_percent: volume_to_percent(bus.volume),
+                source_output_percent: 100,
+            })
+        }
+        "input_to_channel" | "channel_to_effect" | "mix_monitor" => Some(ManagedRouteLevel {
+            muted: false,
+            sink_input_percent: 100,
+            source_output_percent: 100,
+        }),
+        _ => None,
+    }
+}
+
+fn managed_route_level_mismatch(
+    config: &MixerConfig,
+    module: &ManagedModule,
+    source_output: &SourceOutputRoute,
+    sink_input: &SinkInputRoute,
+) -> bool {
+    let Some(expected) = expected_managed_route_level(config, module) else {
+        return false;
+    };
+
+    route_mute_mismatch(source_output.muted, expected.muted)
+        || route_mute_mismatch(sink_input.muted, expected.muted)
+        || route_volume_mismatch(source_output.volume_percent, expected.source_output_percent)
+        || route_volume_mismatch(sink_input.volume_percent, expected.sink_input_percent)
+}
+
+fn route_mute_mismatch(actual: Option<bool>, expected: bool) -> bool {
+    actual.is_some_and(|actual| actual != expected)
+}
+
+fn route_volume_mismatch(actual: Option<u8>, expected: u8) -> bool {
+    actual.is_some_and(|actual| actual.abs_diff(expected) > 1)
+}
+
+fn volume_to_percent(volume: f32) -> u8 {
+    (volume.clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
 fn auto_device_route_repair_needed(
@@ -6272,7 +6651,8 @@ fn capture_stream_should_move_to_locked_default_input(
 }
 
 fn source_output_is_wavelinux_owned(route: &SourceOutputRoute) -> bool {
-    route.role.is_some()
+    route.managed.as_deref() == Some("1")
+        || route.role.is_some()
         || route.channel_id.is_some()
         || route.mix_id.is_some()
         || route_value_contains_wavelinux(route.application_name.as_deref())
@@ -7032,6 +7412,22 @@ fn route_health_issues(
         let source_name = module.source_name.as_deref();
         let sink_name = module.sink_name.as_deref();
         let role = module.role.as_deref();
+        let live_source_output = find_managed_loopback_source_output(
+            module,
+            role,
+            module.channel_id.as_deref(),
+            module.mix_id.as_deref(),
+            source_name,
+            source_outputs,
+        );
+        let live_sink_input = find_managed_loopback_sink_input(
+            module,
+            role,
+            module.channel_id.as_deref(),
+            module.mix_id.as_deref(),
+            sink_name,
+            sink_inputs,
+        );
         let reason = if module_is_stale_for_config(module, config) {
             Some(RouteHealthReason::StaleConfig)
         } else if duplicate {
@@ -7040,26 +7436,18 @@ fn route_health_issues(
             Some(RouteHealthReason::MissingSource)
         } else if sink_name.is_none_or(|sink| !route_endpoint_sink_available(sink, graph)) {
             Some(RouteHealthReason::MissingSink)
-        } else if !managed_loopback_has_live_source_output(
-            module,
-            role,
-            module.channel_id.as_deref(),
-            module.mix_id.as_deref(),
-            source_name,
-            source_outputs,
-        ) {
-            Some(RouteHealthReason::MissingSourceOutput)
-        } else if !managed_loopback_has_live_sink_input(
-            module,
-            role,
-            module.channel_id.as_deref(),
-            module.mix_id.as_deref(),
-            sink_name,
-            sink_inputs,
-        ) {
-            Some(RouteHealthReason::MissingSinkInput)
         } else {
-            None
+            match (live_source_output, live_sink_input) {
+                (None, _) => Some(RouteHealthReason::MissingSourceOutput),
+                (_, None) => Some(RouteHealthReason::MissingSinkInput),
+                (Some(source_output), Some(sink_input)) => {
+                    if managed_route_level_mismatch(config, module, source_output, sink_input) {
+                        Some(RouteHealthReason::LevelMismatch)
+                    } else {
+                        None
+                    }
+                }
+            }
         };
 
         if let Some(reason) = reason {
@@ -7133,6 +7521,7 @@ fn route_health_reason_label(reason: &RouteHealthReason) -> &'static str {
         RouteHealthReason::MissingSinkInput => "sink-input side is missing",
         RouteHealthReason::StaleConfig => "route no longer matches the current config",
         RouteHealthReason::Duplicate => "duplicate managed route",
+        RouteHealthReason::LevelMismatch => "route mute or volume drifted from the mixer config",
     }
 }
 
@@ -8234,12 +8623,15 @@ mod tests {
             role: module.role.clone(),
             channel_id: module.channel_id.clone(),
             mix_id: module.mix_id.clone(),
+            muted: Some(false),
+            volume_percent: Some(100),
             source_id: None,
             source_name: module.source_name.clone(),
             target_object: module.source_name.clone(),
             application_name: None,
             node_name: None,
             media_name: None,
+            managed: None,
         }
     }
 
@@ -8250,6 +8642,8 @@ mod tests {
             role: module.role.clone(),
             channel_id: module.channel_id.clone(),
             mix_id: module.mix_id.clone(),
+            muted: Some(false),
+            volume_percent: Some(100),
             sink: None,
             sink_name: module.sink_name.clone(),
             target_object: module.sink_name.clone(),
@@ -9033,12 +9427,15 @@ mod tests {
             role: Some("channel_to_mix".into()),
             channel_id: Some("game".into()),
             mix_id: Some("stream".into()),
+            muted: Some(false),
+            volume_percent: Some(100),
             source_id: Some("55".into()),
             source_name: Some("wavelinux_channel_game.monitor".into()),
             target_object: Some("wavelinux_channel_game".into()),
             application_name: None,
             node_name: None,
             media_name: None,
+            managed: None,
         };
         let wrong_sink_input = sink_input_for_module(&wrong_endpoint);
 
@@ -9287,6 +9684,93 @@ mod tests {
     }
 
     #[test]
+    fn route_health_reports_muted_mix_monitor_route() {
+        let mut config = MixerConfig::default();
+        config
+            .set_mix_monitor_output("monitor", Some("alsa_output.speakers".into()))
+            .unwrap();
+        let mut graph = running_graph_for_config(&config);
+        graph
+            .outputs
+            .push(device("alsa_output.speakers", "Speakers", false));
+        let route = routing_modules_for_config(&config)
+            .into_iter()
+            .find(|module| {
+                module.role.as_deref() == Some("mix_monitor")
+                    && module.mix_id.as_deref() == Some("monitor")
+            })
+            .unwrap();
+        let mut source_output = source_output_for_module(&route);
+        let mut sink_input = sink_input_for_module(&route);
+        source_output.muted = Some(true);
+        sink_input.muted = Some(true);
+
+        let issues = route_health_issues(
+            &config,
+            &graph,
+            std::slice::from_ref(&route),
+            std::slice::from_ref(&source_output),
+            std::slice::from_ref(&sink_input),
+        );
+
+        assert_eq!(issues.len(), 1, "issues={issues:?}");
+        assert_eq!(issues[0].reason, RouteHealthReason::LevelMismatch);
+        assert_eq!(issues[0].role, "mix_monitor");
+    }
+
+    #[test]
+    fn managed_route_level_commands_unmute_restored_monitor_route() {
+        let mut config = MixerConfig::default();
+        config
+            .set_mix_monitor_output("monitor", Some("alsa_output.speakers".into()))
+            .unwrap();
+        let route = routing_modules_for_config(&config)
+            .into_iter()
+            .find(|module| {
+                module.role.as_deref() == Some("mix_monitor")
+                    && module.mix_id.as_deref() == Some("monitor")
+            })
+            .unwrap();
+        let mut source_output = source_output_for_module(&route);
+        let mut sink_input = sink_input_for_module(&route);
+        source_output.muted = Some(true);
+        source_output.volume_percent = Some(82);
+        sink_input.muted = Some(true);
+        sink_input.volume_percent = Some(0);
+
+        let commands = managed_route_level_commands(
+            &config,
+            std::slice::from_ref(&source_output),
+            std::slice::from_ref(&sink_input),
+        );
+        let args = commands
+            .iter()
+            .map(|command| command.args.clone())
+            .collect::<Vec<_>>();
+
+        assert!(args.contains(&vec![
+            "set-sink-input-mute".into(),
+            sink_input.id.clone(),
+            "0".into()
+        ]));
+        assert!(args.contains(&vec![
+            "set-sink-input-volume".into(),
+            sink_input.id.clone(),
+            "100%".into()
+        ]));
+        assert!(args.contains(&vec![
+            "set-source-output-mute".into(),
+            source_output.id.clone(),
+            "0".into()
+        ]));
+        assert!(args.contains(&vec![
+            "set-source-output-volume".into(),
+            source_output.id.clone(),
+            "100%".into()
+        ]));
+    }
+
+    #[test]
     fn default_locks_choose_system_and_hardware_input_nodes() {
         let mut config = MixerConfig::default();
         assert_eq!(
@@ -9345,12 +9829,15 @@ mod tests {
             role: None,
             channel_id: None,
             mix_id: None,
+            muted: Some(false),
+            volume_percent: Some(100),
             source_id: Some("55".into()),
             source_name: Some("alsa_input.usb_mic".into()),
             target_object: None,
             application_name: Some("Discord".into()),
             node_name: Some("Discord input".into()),
             media_name: Some("RecordStream".into()),
+            managed: None,
         };
         let commands = capture_stream_move_commands_to_locked_default_input(
             &effective,
@@ -9427,12 +9914,15 @@ mod tests {
             role: None,
             channel_id: None,
             mix_id: None,
+            muted: Some(false),
+            volume_percent: Some(100),
             source_id: Some("55".into()),
             source_name: Some("alsa_input.usb_mic".into()),
             target_object: None,
             application_name: Some("Discord".into()),
             node_name: Some("Discord input".into()),
             media_name: Some("RecordStream".into()),
+            managed: None,
         };
 
         assert!(capture_stream_move_commands_to_locked_default_input(
@@ -9961,12 +10451,15 @@ mod tests {
             role: Some("mix_monitor".into()),
             channel_id: None,
             mix_id: Some("monitor".into()),
+            muted: Some(false),
+            volume_percent: Some(100),
             source_id: Some("55".into()),
             source_name: Some("wavelinux_mix_monitor.monitor".into()),
             target_object: Some("wavelinux_mix_monitor".into()),
             application_name: None,
             node_name: None,
             media_name: None,
+            managed: None,
         };
         let unrelated_live_route = SourceOutputRoute {
             id: "92".into(),
@@ -9974,12 +10467,15 @@ mod tests {
             role: Some("channel_to_mix".into()),
             channel_id: Some("music".into()),
             mix_id: Some("monitor".into()),
+            muted: Some(false),
+            volume_percent: Some(100),
             source_id: Some("56".into()),
             source_name: Some("wavelinux_channel_music.monitor".into()),
             target_object: Some("wavelinux_mix_monitor".into()),
             application_name: None,
             node_name: None,
             media_name: None,
+            managed: None,
         };
 
         assert!(auto_output_repair_needed(
@@ -10705,6 +11201,7 @@ mod tests {
             device_key: "AC_80_0A_72_BD_10".into(),
             active_profile: Some("headset-head-unit".into()),
             preferred_a2dp_profile: Some("a2dp-sink".into()),
+            profiles: Vec::new(),
         }];
         let inputs = vec![device(
             "bluez_input.AC:80:0A:72:BD:10",
@@ -10720,12 +11217,46 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_bluetooth_cards_are_reinitialized_on_reconnect() {
+        let mut runtime = RuntimeCache::new(true);
+        runtime.initialized_bluetooth_cards.insert(
+            "bluez_card.AC_80_0A_72_BD_10".into(),
+            "a2dp-sink-aac".into(),
+        );
+
+        prune_initialized_bluetooth_cards(&mut runtime, &[]);
+
+        assert!(runtime.initialized_bluetooth_cards.is_empty());
+
+        let cards = vec![BluetoothAudioCard {
+            name: "bluez_card.AC_80_0A_72_BD_10".into(),
+            device_key: "AC_80_0A_72_BD_10".into(),
+            active_profile: Some("a2dp-sink".into()),
+            preferred_a2dp_profile: Some("a2dp-sink-aac".into()),
+            profiles: Vec::new(),
+        }];
+        let commands =
+            plan_bluetooth_a2dp_profiles(&cards, &runtime.initialized_bluetooth_cards, false);
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].args,
+            [
+                "set-card-profile",
+                "bluez_card.AC_80_0A_72_BD_10",
+                "a2dp-sink-aac"
+            ]
+        );
+    }
+
+    #[test]
     fn bluetooth_protection_moves_capture_streams_off_hfp_source() {
         let cards = vec![BluetoothAudioCard {
             name: "bluez_card.AC_80_0A_72_BD_10".into(),
             device_key: "AC_80_0A_72_BD_10".into(),
             active_profile: Some("headset-head-unit".into()),
             preferred_a2dp_profile: Some("a2dp-sink".into()),
+            profiles: Vec::new(),
         }];
         let route = SourceOutputRoute {
             id: "77".into(),
@@ -10733,12 +11264,15 @@ mod tests {
             role: None,
             channel_id: None,
             mix_id: None,
+            muted: Some(false),
+            volume_percent: Some(100),
             source_id: Some("55".into()),
             source_name: Some("bluez_input.AC:80:0A:72:BD:10".into()),
             target_object: None,
             application_name: Some("Discord".into()),
             node_name: Some("Discord input".into()),
             media_name: Some("RecordStream".into()),
+            managed: None,
         };
 
         let commands = capture_stream_move_commands_for_bluetooth_protection(
@@ -10794,12 +11328,15 @@ mod tests {
             role: None,
             channel_id: None,
             mix_id: None,
+            muted: Some(false),
+            volume_percent: Some(100),
             source_id: Some("55".into()),
             source_name: Some("alsa_input.usb_mic".into()),
             target_object: None,
             application_name: Some("Browser capture".into()),
             node_name: Some("browser-capture".into()),
             media_name: Some("CaptureStream".into()),
+            managed: None,
         };
 
         let outputs = engine
@@ -10857,6 +11394,7 @@ mod tests {
             device_key: "AC_80_0A_72_BD_10".into(),
             active_profile: Some("headset-head-unit".into()),
             preferred_a2dp_profile: Some("a2dp-sink".into()),
+            profiles: Vec::new(),
         }];
         let mut usb = device("alsa_input.usb_mic", "USB Microphone", true);
         usb.bus = Some(wavelinux_model::DeviceBus::Usb);
@@ -10932,6 +11470,7 @@ mod tests {
             device_key: "AC_80_0A_72_BD_10".into(),
             active_profile: Some("headset-head-unit".into()),
             preferred_a2dp_profile: Some("a2dp-sink".into()),
+            profiles: Vec::new(),
         }];
         let effective = effective_config_with_auto_devices(&config, &[], &[], None, None, &cards);
         let hardware = effective

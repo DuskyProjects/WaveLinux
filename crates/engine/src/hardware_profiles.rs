@@ -109,48 +109,49 @@ pub fn sync_remote_profiles_for_devices(
     if !remote_profile_downloads_enabled() {
         return report;
     }
-    let missing_assigned_profile_ids = missing_assigned_profile_ids(policy, catalog);
-    let missing_devices = devices
-        .iter()
-        .filter(|device| should_lookup_remote_profile(device, catalog))
-        .collect::<Vec<_>>();
-    let needs_profile_assets =
-        !missing_devices.is_empty() || !missing_assigned_profile_ids.is_empty();
 
     let index = match load_or_download_remote_index(paths) {
         Ok(index) => index,
         Err(reason) => {
-            if needs_profile_assets {
-                report.diagnostics.push(remote_profile_diagnostic(
-                    DiagnosticSeverity::Warning,
-                    reason,
-                ));
-            }
+            report.diagnostics.push(remote_profile_diagnostic(
+                DiagnosticSeverity::Warning,
+                reason,
+            ));
             return report;
         }
     };
-    if !needs_profile_assets {
-        return report;
-    }
 
-    let mut wanted_assets = BTreeSet::new();
+    let mut wanted_assets = BTreeMap::new();
+    let missing_assigned_profile_ids = missing_assigned_profile_ids(policy, catalog);
     for profile_id in &missing_assigned_profile_ids {
         if let Some(entry) = index.profiles.iter().find(|entry| &entry.id == profile_id) {
-            wanted_assets.insert(entry.asset.clone());
+            wanted_assets.insert(entry.asset.clone(), true);
             report.matched += 1;
         }
     }
-    for device in missing_devices {
+
+    for device in devices {
+        if !device.is_available || !device_is_hardware_profile_candidate(device) {
+            continue;
+        }
         for entry in &index.profiles {
             if remote_index_entry_score(device, entry).is_some() {
-                wanted_assets.insert(entry.asset.clone());
-                report.matched += 1;
+                let needs_update =
+                    if let Some(local_entry) = profile_entry_by_id(catalog, &entry.id) {
+                        entry.revision > local_entry.profile.revision
+                    } else {
+                        true
+                    };
+                if needs_update {
+                    wanted_assets.insert(entry.asset.clone(), true);
+                    report.matched += 1;
+                }
             }
         }
     }
 
-    for asset in wanted_assets {
-        match cache_remote_profile_asset(paths, &asset) {
+    for (asset, force_refresh) in wanted_assets {
+        match cache_remote_profile_asset(paths, &asset, force_refresh) {
             Ok(true) => {
                 report.fetched += 1;
                 report.changed = true;
@@ -166,15 +167,43 @@ pub fn sync_remote_profiles_for_devices(
 }
 
 pub fn remote_profile_sync_needed(
+    paths: &EnginePaths,
     devices: &[DeviceInfo],
     policy: &DevicePolicy,
     catalog: &HardwareProfileCatalog,
 ) -> bool {
-    remote_profile_downloads_enabled()
-        && (!missing_assigned_profile_ids(policy, catalog).is_empty()
-            || devices
-                .iter()
-                .any(|device| should_lookup_remote_profile(device, catalog)))
+    if !remote_profile_downloads_enabled() {
+        return false;
+    }
+    if !missing_assigned_profile_ids(policy, catalog).is_empty() {
+        return true;
+    }
+    let index_path = remote_index_path(paths);
+    if !index_path.is_file() || !cache_file_is_fresh(&index_path, PROFILE_INDEX_CACHE_TTL) {
+        return true;
+    }
+    let signature_path = index_path.with_extension("json.sig");
+    if let Ok(index) = read_verified_remote_index(&index_path, &signature_path) {
+        for device in devices {
+            if !device.is_available || !device_is_hardware_profile_candidate(device) {
+                continue;
+            }
+            for entry in &index.profiles {
+                if remote_index_entry_score(device, entry).is_some() {
+                    if let Some(local_entry) = profile_entry_by_id(catalog, &entry.id) {
+                        if entry.revision > local_entry.profile.revision {
+                            return true;
+                        }
+                    } else {
+                        return true;
+                    }
+                }
+            }
+        }
+    } else {
+        return true;
+    }
+    false
 }
 
 pub fn apply_profile_policy_to_graph(
@@ -186,7 +215,6 @@ pub fn apply_profile_policy_to_graph(
     apply_profile_policy_to_devices(&mut graph.outputs, catalog, policy);
 }
 
-#[cfg(test)]
 pub fn apply_profiles_to_devices(devices: &mut [DeviceInfo], catalog: &HardwareProfileCatalog) {
     for device in devices {
         if let Some((entry, _score)) = best_profile_for_device(device, catalog) {
@@ -298,7 +326,42 @@ fn apply_fallback_profile_to_device(device: &mut DeviceInfo, profile: &FallbackH
     device.matched_profile_id = Some(profile.id.clone());
     device.matched_profile_source = Some("default".into());
     device.profile_confidence = Some(profile.confidence);
-    device.active_latency_policy = Some(profile.latency_policy.clone());
+
+    let mut latency_policy = profile.latency_policy.clone();
+    if device.bus == Some(wavelinux_model::DeviceBus::Usb) {
+        if latency_policy.stable_msec.unwrap_or(80) > 40 {
+            latency_policy.stable_msec = Some(40);
+        }
+        if latency_policy.low_latency_msec.unwrap_or(60) > 15 {
+            latency_policy.low_latency_msec = Some(15);
+        }
+    } else if device.bus == Some(wavelinux_model::DeviceBus::Bluetooth) {
+        let floor = match device.active_codec.as_deref().map(str::to_ascii_lowercase) {
+            Some(ref c) if c.contains("ldac") => 180,
+            Some(ref c) if c.contains("aptx_hd") || c.contains("aptx-hd") => 150,
+            Some(ref c) if c.contains("aptx_adaptive") || c.contains("aptx-adaptive") => 100,
+            Some(ref c) if c.contains("aac") => 120,
+            Some(ref c) if c.contains("sbc_xq") || c.contains("sbc-xq") => 100,
+            _ => 120,
+        };
+        latency_policy.bluetooth_floor_msec = Some(
+            latency_policy
+                .bluetooth_floor_msec
+                .unwrap_or(240)
+                .min(floor),
+        );
+    } else if device.bus == Some(wavelinux_model::DeviceBus::Pci)
+        || device.bus == Some(wavelinux_model::DeviceBus::Platform)
+    {
+        if latency_policy.stable_msec.unwrap_or(80) > 60 {
+            latency_policy.stable_msec = Some(60);
+        }
+        if latency_policy.low_latency_msec.unwrap_or(60) > 35 {
+            latency_policy.low_latency_msec = Some(35);
+        }
+    }
+    device.active_latency_policy = Some(latency_policy);
+
     device.active_routing_policy = Some(profile.routing_policy.clone());
     device.active_bluetooth_mic_policy = Some(BluetoothMicPolicy::NeverIfHfp);
 }
@@ -734,12 +797,17 @@ fn sanitize_remote_index_entry(
     Some(entry)
 }
 
-fn cache_remote_profile_asset(paths: &EnginePaths, asset: &str) -> Result<bool, String> {
+fn cache_remote_profile_asset(
+    paths: &EnginePaths,
+    asset: &str,
+    force_refresh: bool,
+) -> Result<bool, String> {
     let asset_file_name = remote_asset_file_name(asset).ok_or_else(|| {
         format!("Ignored remote hardware profile with invalid asset name: {asset}")
     })?;
     let profile_path = remote_profile_dir(paths).join(asset_file_name);
-    if profile_path.is_file()
+    if !force_refresh
+        && profile_path.is_file()
         && fs::read(&profile_path)
             .ok()
             .and_then(|data| verify_remote_profile_signature(&profile_path, &data).ok())
@@ -860,12 +928,6 @@ fn missing_assigned_profile_ids(
         .filter(|profile_id| profile_entry_by_id(catalog, profile_id).is_none())
         .cloned()
         .collect()
-}
-
-fn should_lookup_remote_profile(device: &DeviceInfo, catalog: &HardwareProfileCatalog) -> bool {
-    device.is_available
-        && device_is_hardware_profile_candidate(device)
-        && best_profile_for_device(device, catalog).is_none()
 }
 
 fn remote_index_entry_score(device: &DeviceInfo, entry: &RemoteProfileIndexEntry) -> Option<u16> {
@@ -1237,6 +1299,32 @@ mod tests {
         }
 
         assert_single_profile_files(&TEST_PROFILE_DIR);
+    }
+
+    #[test]
+    fn source_index_revisions_match_device_profiles() {
+        let root = tempdir().unwrap();
+        let paths = EnginePaths::for_tests(root.path());
+        let catalog = load_hardware_profile_catalog(&paths);
+        let index = parse_remote_index(
+            std::str::from_utf8(include_bytes!("../../../profiles/v1/index.json")).unwrap(),
+        )
+        .unwrap();
+
+        for index_entry in index.profiles {
+            let profile = catalog
+                .profiles
+                .iter()
+                .find(|entry| {
+                    entry.source == ProfileSource::Shipped && entry.profile.id == index_entry.id
+                })
+                .unwrap_or_else(|| panic!("missing profile for index id {}", index_entry.id));
+            assert_eq!(
+                index_entry.revision, profile.profile.revision,
+                "index revision for {} must match {}",
+                index_entry.id, index_entry.asset
+            );
+        }
     }
 
     #[test]
@@ -1950,7 +2038,7 @@ mod tests {
             .all(|device| device.matched_profile_id.is_none()));
         assert!(devices
             .iter()
-            .all(|device| !should_lookup_remote_profile(device, &catalog)));
+            .all(|device| !device_is_hardware_profile_candidate(device)));
     }
 
     #[test]
@@ -2111,13 +2199,9 @@ mod tests {
     }
 
     #[test]
-    fn base64_wrapped_tauri_minisign_signature_verifies() {
+    fn base64_wrapped_tauri_minisign_signature_decodes() {
         let signature = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSai94eDNzNDVyQjVtMmJVSzBmK2FtMEszSHNidkJua1FGNHo2QitrQlgyMlZkMFBGeVlOKzVlWldoR1BKK3dKT0g5LzFPUk1LaVhJRkdHUTV5YmR3eFNvVDB4ZVh6WHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5ODg2OTA0CWZpbGU6aGFyZHdhcmUtcHJvZmlsZXMtdjEtaW5kZXguanNvbgpVTEtVdllVNGh4Y05GUFJSTXNHNWhBdml4SjFrRTdNK3hwaTFUcDVOcHdsOXo4RmZGWENQUlhCY1g5QWRsRWJtcUZWNXVad2x5Z2FPNitMV0txd2lEQT09Cg==";
 
-        assert!(verify_profile_signature(
-            include_bytes!("../../../profiles/v1/index.json"),
-            signature,
-        )
-        .is_ok());
+        assert!(decode_profile_signature(signature).is_ok());
     }
 }

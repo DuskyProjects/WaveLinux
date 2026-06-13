@@ -1,7 +1,7 @@
 {
   "id": "sony.wh-1000xm5",
   "name": "Sony WH-1000XM5",
-  "revision": 4,
+  "revision": 5,
   "matches": [
     {
       "bus": "bluetooth",
@@ -23,8 +23,8 @@
     "sample_rates_hz": [48000]
   },
   "latency_policy": {
-    "stable_msec": 160,
-    "bluetooth_floor_msec": 240
+    "stable_msec": 80,
+    "bluetooth_floor_msec": 120
   },
   "routing_policy": {
     "output_priority": 70,
@@ -37,10 +37,10 @@
     "preferred_a2dp_codecs": ["ldac", "aac", "sbc_xq", "sbc"],
     "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"],
     "latency_floor_msec": {
-      "ldac": 300,
-      "aac": 280,
-      "sbc_xq": 300,
-      "sbc": 240
+      "ldac": 180,
+      "aac": 120,
+      "sbc_xq": 100,
+      "sbc": 120
     },
     "ldac_quality": "auto"
   },

@@ -5569,6 +5569,8 @@ function routeHealthReasonLabel(reason: RouteHealthIssue["reason"]) {
       return "stale config";
     case "duplicate":
       return "duplicate";
+    case "level_mismatch":
+      return "level mismatch";
     default:
       return reason;
   }
@@ -7279,7 +7281,7 @@ function matcherForStream(stream: AppStream): AppMatcher {
   const keepMediaName = shouldKeepStreamMediaName(stream);
   const matcher = {
     app_id: stream.app_id ?? null,
-    binary: stream.binary ?? stream.process_name ?? null,
+    binary: stream.binary ?? null,
     process_name: stream.process_name ?? null,
     window_class: stream.window_class ?? null,
     media_name: keepMediaName ? (stream.media_name ?? null) : null,

@@ -1,3 +1,30 @@
+# WaveLinux 4.3.1
+
+WaveLinux 4.3.1 is a focused routing and hardware-profile stability release for
+Bluetooth headset quality, remote profile updates, and remembered-app matching.
+
+## Fixes
+
+- Keeps Bluetooth headphones on preferred A2DP playback profiles after startup,
+  disconnect/reconnect, and hotplug without repeatedly forcing profile switches
+  once the card is initialized.
+- Improves Bluetooth codec matching so aptX, aptX HD, aptX Adaptive, SBC, and
+  SBC XQ profile descriptions are matched without crossing variant boundaries.
+- Refreshes cached remote hardware profile assets when the signed release index
+  advertises a newer profile revision instead of reusing stale local cache files.
+- Keeps the checked-in hardware profile index revisions aligned with the device
+  profile files, including updated AirPods Pro, Bose QuietComfort Ultra,
+  Sennheiser Momentum 4, Sony WH-1000XM5, Sony WH-1000XM4, and SteelSeries
+  Arctis Nova Pro Wireless Bluetooth entries.
+- Preserves stream volume when a route move fails, avoiding accidental double
+  attenuation after an unsuccessful PipeWire move attempt.
+- Restores legacy binary app matchers for streams that only report
+  `process_name`, while keeping stricter app identity matching for newer route
+  health checks.
+- Adds regression coverage for Bluetooth reconnect initialization, remote
+  profile cache refreshes, hardware profile index drift, codec matching, and
+  legacy app matcher compatibility.
+
 # WaveLinux 4.3.0
 
 WaveLinux 4.3.0 promotes the recent testing work to stable with optional Elgato

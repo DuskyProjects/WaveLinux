@@ -302,7 +302,7 @@ fn prepare_appimage_bundled_runtime() {
 fn appimage_bundled_runtime_dir() -> Option<PathBuf> {
     let appdir = std::env::var_os("APPDIR")
         .map(PathBuf::from)
-        .or_else(|| appdir_from_current_exe());
+        .or_else(appdir_from_current_exe);
     appdir
         .map(|path| path.join("usr/wavelinux-runtime"))
         .filter(|path| path.is_dir())
@@ -2598,47 +2598,6 @@ fn is_missing_update_metadata_error(message: &str) -> bool {
         || message.contains("ReleaseNotFound")
         || message.contains("status code 404")
 }
-
-#[cfg(test)]
-mod updater_tests {
-    use super::*;
-
-    #[test]
-    fn release_urls_follow_selected_channel() {
-        assert_eq!(
-            release_url_for_channel(&ReleaseChannel::Stable),
-            STABLE_RELEASE_URL
-        );
-        assert_eq!(
-            release_url_for_channel(&ReleaseChannel::Beta),
-            BETA_RELEASE_URL
-        );
-    }
-
-    #[test]
-    fn update_endpoints_follow_selected_channel() {
-        assert_eq!(
-            update_endpoint_for_channel(&ReleaseChannel::Stable),
-            STABLE_UPDATE_ENDPOINT
-        );
-        assert_eq!(
-            update_endpoint_for_channel(&ReleaseChannel::Beta),
-            BETA_UPDATE_ENDPOINT
-        );
-    }
-
-    #[test]
-    fn moving_prerelease_tag_is_not_treated_as_a_version() {
-        assert_eq!(release_tag_update_version("prerelease"), None);
-        assert_eq!(
-            release_tag_update_version(" v4.3.0-testing.7 ")
-                .unwrap()
-                .to_string(),
-            "4.3.0-testing.7"
-        );
-    }
-}
-
 fn shutdown_audio_graph(engine: &WaveLinuxEngine, shutdown_started: &AtomicBool) {
     if shutdown_started.swap(true, Ordering::SeqCst) {
         return;
@@ -2926,4 +2885,44 @@ fn main() {
     engine.stop_background();
     let _ = background.join();
     let _ = engine.cleanup_audio_graph();
+}
+
+#[cfg(test)]
+mod updater_tests {
+    use super::*;
+
+    #[test]
+    fn release_urls_follow_selected_channel() {
+        assert_eq!(
+            release_url_for_channel(&ReleaseChannel::Stable),
+            STABLE_RELEASE_URL
+        );
+        assert_eq!(
+            release_url_for_channel(&ReleaseChannel::Beta),
+            BETA_RELEASE_URL
+        );
+    }
+
+    #[test]
+    fn update_endpoints_follow_selected_channel() {
+        assert_eq!(
+            update_endpoint_for_channel(&ReleaseChannel::Stable),
+            STABLE_UPDATE_ENDPOINT
+        );
+        assert_eq!(
+            update_endpoint_for_channel(&ReleaseChannel::Beta),
+            BETA_UPDATE_ENDPOINT
+        );
+    }
+
+    #[test]
+    fn moving_prerelease_tag_is_not_treated_as_a_version() {
+        assert_eq!(release_tag_update_version("prerelease"), None);
+        assert_eq!(
+            release_tag_update_version(" v4.3.0-testing.7 ")
+                .unwrap()
+                .to_string(),
+            "4.3.0-testing.7"
+        );
+    }
 }

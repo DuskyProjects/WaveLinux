@@ -1,7 +1,7 @@
 {
   "id": "steelseries.arctis-nova-pro-wireless-bluetooth",
   "name": "SteelSeries Arctis Nova Pro Wireless Bluetooth",
-  "revision": 4,
+  "revision": 5,
   "matches": [
     {
       "bus": "bluetooth",
@@ -22,8 +22,8 @@
     "sample_rates_hz": [48000]
   },
   "latency_policy": {
-    "stable_msec": 160,
-    "bluetooth_floor_msec": 240
+    "stable_msec": 80,
+    "bluetooth_floor_msec": 100
   },
   "routing_policy": {
     "output_priority": 60,
@@ -36,8 +36,8 @@
     "preferred_a2dp_codecs": ["sbc_xq", "sbc"],
     "avoid_codecs": ["hsp", "hfp", "cvsd", "msbc"],
     "latency_floor_msec": {
-      "sbc_xq": 300,
-      "sbc": 240
+      "sbc_xq": 100,
+      "sbc": 120
     }
   },
   "confidence": "medium",
