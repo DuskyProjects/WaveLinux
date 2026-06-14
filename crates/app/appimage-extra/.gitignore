@@ -1,3 +1,4 @@
+/usr/lib/*
 /usr/wavelinux-runtime/bin/*
 /usr/wavelinux-runtime/lib/*
 !/usr/wavelinux-runtime/bin/.gitkeep

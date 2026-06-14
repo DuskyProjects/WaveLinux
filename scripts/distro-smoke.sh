@@ -156,6 +156,16 @@ run_runtime_check() {
   return "$status"
 }
 
+installed_wavelinux_command() {
+  if command -v wavelinux >/dev/null 2>&1; then
+    command -v wavelinux
+  elif command -v wavelinux-app >/dev/null 2>&1; then
+    command -v wavelinux-app
+  else
+    return 1
+  fi
+}
+
 smoke_appimage() {
   local tag version asset appimage
   tag="$(resolve_latest_tag)"
@@ -206,7 +216,12 @@ smoke_native() {
       ;;
   esac
 
-  run_runtime_check "native package $tag" wavelinux --check-runtime-dependencies
+  local command_path
+  command_path="$(installed_wavelinux_command)" || {
+    echo "No WaveLinux command was installed by the native package" >&2
+    return 1
+  }
+  run_runtime_check "native package $tag" "$command_path" --check-runtime-dependencies
 }
 
 smoke_source_helper() {
