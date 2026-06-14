@@ -5095,7 +5095,7 @@ dependencies = [
 
 [[package]]
 name = "wavelinux-app"
-version = "4.3.6"
+version = "4.3.7"
 dependencies = [
  "libc",
  "libloading 0.8.9",

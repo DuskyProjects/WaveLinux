@@ -125,6 +125,11 @@ stage_startup_library libexpat.so.1 \
   /usr/lib/libexpat.so.1 \
   /lib/libexpat.so.1
 
+stage_startup_library libgpg-error.so.0 \
+  /usr/lib/x86_64-linux-gnu/libgpg-error.so.0 \
+  /usr/lib64/libgpg-error.so.0 \
+  /usr/lib/libgpg-error.so.0
+
 stage_startup_library libfreetype.so.6 \
   /usr/lib/x86_64-linux-gnu/libfreetype.so.6 \
   /usr/lib64/libfreetype.so.6 \

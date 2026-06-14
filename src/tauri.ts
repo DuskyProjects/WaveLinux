@@ -395,7 +395,7 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return {
       available: false,
       install_supported: false,
-      current_version: "4.3.6",
+      current_version: "4.3.7",
       version: null,
       date: null,
       body: null,

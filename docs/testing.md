@@ -42,8 +42,8 @@ Release smoke tests run the published assets in clean containers for the main
 Linux families WaveLinux supports:
 
 ```sh
-bash scripts/distro-smoke.sh --all --target appimage --release-tag v4.3.6
-bash scripts/distro-smoke.sh --distro fedora --target native --release-tag v4.3.6
+bash scripts/distro-smoke.sh --all --target appimage --release-tag v4.3.7
+bash scripts/distro-smoke.sh --distro fedora --target native --release-tag v4.3.7
 ```
 
 The AppImage target downloads the release AppImage, runs

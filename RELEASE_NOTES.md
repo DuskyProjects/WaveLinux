@@ -1,3 +1,12 @@
+# WaveLinux 4.3.7
+
+WaveLinux 4.3.7 finishes the current Debian AppImage smoke path.
+
+## Fixes
+
+- Bundles `libgpg-error.so.0` with the AppImage startup libraries so the
+  runtime dependency installer can launch on clean Debian Trixie containers.
+
 # WaveLinux 4.3.6
 
 WaveLinux 4.3.6 finalizes clean-distro release smoke coverage.
