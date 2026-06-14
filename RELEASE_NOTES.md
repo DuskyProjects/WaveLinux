@@ -1,3 +1,16 @@
+# WaveLinux 4.3.5
+
+WaveLinux 4.3.5 follows the new clean-distro smoke tests through to the
+release artifacts.
+
+## Fixes
+
+- Builds release packages on Ubuntu 22.04 so the deb and rpm binaries keep a
+  glibc baseline that runs on Debian 12-class systems.
+- Bundles additional AppImage startup libraries needed on clean Debian, Ubuntu,
+  Fedora, and Arch containers before WaveLinux can run its dependency installer.
+- Adds the missing Fedora appindicator runtime dependency to the rpm metadata.
+
 # WaveLinux 4.3.4
 
 WaveLinux 4.3.4 hardens release packaging against clean Linux installs.

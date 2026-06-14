@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "WaveLinux",
   "mainBinaryName": "wavelinux",
-  "version": "4.3.4",
+  "version": "4.3.5",
   "identifier": "io.github.duskyprojects.WaveLinux",
   "build": {
     "beforeDevCommand": "cd .. && node node_modules/.bin/vite --port 1420",
@@ -14,7 +14,7 @@
     "enableGTKAppId": true,
     "windows": [
       {
-        "title": "WaveLinux 4.3.4",
+        "title": "WaveLinux 4.3.5",
         "width": 1280,
         "height": 820,
         "minWidth": 960,
@@ -82,6 +82,7 @@
           "pulseaudio-utils",
           "alsa-utils",
           "webkit2gtk4.1",
+          "libappindicator-gtk3",
           "libusb1",
           "bubblewrap",
           "xdg-dbus-proxy",

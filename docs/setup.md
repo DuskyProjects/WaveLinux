@@ -72,8 +72,8 @@ yarn effects:install
 Run AppImage preflight manually:
 
 ```bash
-./WaveLinux_4.3.4_amd64.AppImage --check-runtime-dependencies
-./WaveLinux_4.3.4_amd64.AppImage --install-runtime-dependencies
+./WaveLinux_4.3.5_amd64.AppImage --check-runtime-dependencies
+./WaveLinux_4.3.5_amd64.AppImage --install-runtime-dependencies
 ```
 
 Use `WAVELINUX_SKIP_RUNTIME_INSTALL=1` to skip the AppImage preflight, or

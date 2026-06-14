@@ -117,6 +117,14 @@ stage_startup_library libfontconfig.so.1 \
   /usr/lib64/libfontconfig.so.1 \
   /usr/lib/libfontconfig.so.1
 
+stage_startup_library libexpat.so.1 \
+  /usr/lib/x86_64-linux-gnu/libexpat.so.1 \
+  /lib/x86_64-linux-gnu/libexpat.so.1 \
+  /usr/lib64/libexpat.so.1 \
+  /lib64/libexpat.so.1 \
+  /usr/lib/libexpat.so.1 \
+  /lib/libexpat.so.1
+
 stage_startup_library libfreetype.so.6 \
   /usr/lib/x86_64-linux-gnu/libfreetype.so.6 \
   /usr/lib64/libfreetype.so.6 \
@@ -166,6 +174,11 @@ stage_startup_library libEGL.so.1 \
   /usr/lib/x86_64-linux-gnu/libEGL.so.1 \
   /usr/lib64/libEGL.so.1 \
   /usr/lib/libEGL.so.1
+
+stage_startup_library libGL.so.1 \
+  /usr/lib/x86_64-linux-gnu/libGL.so.1 \
+  /usr/lib64/libGL.so.1 \
+  /usr/lib/libGL.so.1
 
 stage_startup_library libGLX.so.0 \
   /usr/lib/x86_64-linux-gnu/libGLX.so.0 \
