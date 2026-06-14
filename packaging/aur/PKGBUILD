@@ -1,6 +1,6 @@
 # Maintainer: WaveLinux contributors <https://github.com/DuskyProjects/WaveLinux>
 pkgname=wavelinux
-pkgver=4.3.3
+pkgver=4.3.4
 pkgrel=1
 pkgdesc="Rust and PipeWire creator audio mixer for Linux"
 arch=('x86_64')

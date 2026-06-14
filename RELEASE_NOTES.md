@@ -1,3 +1,18 @@
+# WaveLinux 4.3.4
+
+WaveLinux 4.3.4 hardens release packaging against clean Linux installs.
+
+## Fixes
+
+- Adds clean Debian, Ubuntu, Fedora, and Arch container smoke tests for release
+  AppImage runtime dependency installs and native deb/rpm package installs.
+- Bundles startup font and graphics libraries needed for the AppImage runtime
+  dependency CLI to launch on minimal clean distro images.
+- Renames the packaged Tauri binary to `wavelinux` so native packages expose the
+  expected command.
+- Adds missing deb/rpm runtime dependencies for PipeWire CLI and ALSA MIDI
+  helper tools.
+
 # WaveLinux 4.3.3
 
 WaveLinux 4.3.3 moves hardware profiles out of GitHub release assets and into
