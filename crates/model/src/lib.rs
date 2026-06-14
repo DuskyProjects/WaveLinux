@@ -2277,11 +2277,11 @@ impl Default for EffectCatalog {
                     library_names: vec!["gate_1410.so".into()],
                 },
                 vec![
-                    param("threshold_db", "Threshold", -80.0, 0.0, -40.0, " dB"),
+                    param("threshold_db", "Threshold", -70.0, 0.0, -35.0, " dB"),
                     param("attack_ms", "Attack", 0.1, 100.0, 2.5, " ms"),
-                    param("hold_ms", "Hold", 0.0, 500.0, 10.0, " ms"),
-                    param("release_ms", "Release", 10.0, 2000.0, 200.0, " ms"),
-                    param("range_db", "Range", -80.0, 0.0, -40.0, " dB"),
+                    param("hold_ms", "Hold", 2.0, 500.0, 80.0, " ms"),
+                    param("release_ms", "Release", 2.0, 2000.0, 160.0, " ms"),
+                    param("range_db", "Range", -90.0, 0.0, -60.0, " dB"),
                 ],
             ),
             effect(
@@ -2468,30 +2468,30 @@ impl Default for EffectCatalog {
                     "Soft -60 dB",
                     &[
                         ("threshold_db", -60.0),
-                        ("range_db", -20.0),
+                        ("range_db", -30.0),
                         ("attack_ms", 5.0),
-                        ("hold_ms", 20.0),
-                        ("release_ms", 200.0),
+                        ("hold_ms", 120.0),
+                        ("release_ms", 220.0),
                     ],
                 ),
                 preset(
-                    "Room mic -40 dB",
+                    "Room mic -35 dB",
                     &[
-                        ("threshold_db", -40.0),
-                        ("range_db", -40.0),
+                        ("threshold_db", -35.0),
+                        ("range_db", -60.0),
                         ("attack_ms", 2.5),
-                        ("hold_ms", 10.0),
-                        ("release_ms", 120.0),
+                        ("hold_ms", 80.0),
+                        ("release_ms", 160.0),
                     ],
                 ),
                 preset(
                     "Noisy mic -30 dB",
                     &[
                         ("threshold_db", -30.0),
-                        ("range_db", -50.0),
+                        ("range_db", -70.0),
                         ("attack_ms", 1.0),
-                        ("hold_ms", 10.0),
-                        ("release_ms", 80.0),
+                        ("hold_ms", 60.0),
+                        ("release_ms", 120.0),
                     ],
                 ),
             ],
@@ -3319,6 +3319,7 @@ fn normalize_effect_params(
     definition: &EffectDefinition,
 ) -> BTreeMap<String, f32> {
     migrate_deepfilternet_capture_profile(&mut params, definition);
+    migrate_gate_room_mic_profile(&mut params, definition);
     definition
         .params
         .iter()
@@ -3364,6 +3365,40 @@ fn migrate_deepfilternet_capture_profile(
         ("max_df_processing_threshold_db", 20.0),
         ("min_processing_buffer_frames", 8.0),
         ("post_filter_beta", 0.0),
+    ] {
+        params.insert(id.into(), value);
+    }
+}
+
+fn migrate_gate_room_mic_profile(
+    params: &mut BTreeMap<String, f32>,
+    definition: &EffectDefinition,
+) {
+    if definition.id != "gate" {
+        return;
+    }
+
+    let old_room_mic_profile = [
+        ("threshold_db", -40.0),
+        ("range_db", -40.0),
+        ("attack_ms", 2.5),
+        ("hold_ms", 10.0),
+        ("release_ms", 200.0),
+    ];
+
+    if !old_room_mic_profile
+        .iter()
+        .all(|(id, expected)| param_matches(params, id, *expected))
+    {
+        return;
+    }
+
+    for (id, value) in [
+        ("threshold_db", -35.0),
+        ("range_db", -60.0),
+        ("attack_ms", 2.5),
+        ("hold_ms", 80.0),
+        ("release_ms", 160.0),
     ] {
         params.insert(id.into(), value);
     }
@@ -4441,6 +4476,18 @@ mod tests {
             .find(|param| param.id == "threshold_db")
             .unwrap();
         assert_eq!(threshold.min, -30.0);
+
+        let gate = catalog
+            .effects
+            .iter()
+            .find(|effect| effect.id == "gate")
+            .unwrap();
+        assert!(gate.params.iter().any(|param| param.id == "threshold_db"
+            && (param.min + 70.0).abs() < f32::EPSILON
+            && (param.default + 35.0).abs() < f32::EPSILON));
+        assert!(gate.params.iter().any(|param| param.id == "range_db"
+            && (param.min + 90.0).abs() < f32::EPSILON
+            && (param.default + 60.0).abs() < f32::EPSILON));
     }
 
     #[test]
@@ -4546,6 +4593,53 @@ mod tests {
     }
 
     #[test]
+    fn gate_room_mic_defaults_migrate_to_stronger_default() {
+        let mut config = MixerConfig::default();
+        let mut gate = EffectInstance::new("gate");
+        for (id, value) in [
+            ("threshold_db", -40.0),
+            ("range_db", -40.0),
+            ("attack_ms", 2.5),
+            ("hold_ms", 10.0),
+            ("release_ms", 200.0),
+        ] {
+            gate.params.insert(id.into(), value);
+        }
+
+        let channel = config.set_effect_chain("hardware_in", vec![gate]).unwrap();
+        let params = &channel.effects[0].params;
+
+        assert_eq!(params.get("threshold_db"), Some(&-35.0));
+        assert_eq!(params.get("range_db"), Some(&-60.0));
+        assert_eq!(params.get("attack_ms"), Some(&2.5));
+        assert_eq!(params.get("hold_ms"), Some(&80.0));
+        assert_eq!(params.get("release_ms"), Some(&160.0));
+    }
+
+    #[test]
+    fn gate_custom_settings_are_not_migrated() {
+        let mut config = MixerConfig::default();
+        let mut gate = EffectInstance::new("gate");
+        for (id, value) in [
+            ("threshold_db", -40.0),
+            ("range_db", -50.0),
+            ("attack_ms", 2.5),
+            ("hold_ms", 10.0),
+            ("release_ms", 200.0),
+        ] {
+            gate.params.insert(id.into(), value);
+        }
+
+        let channel = config.set_effect_chain("hardware_in", vec![gate]).unwrap();
+        let params = &channel.effects[0].params;
+
+        assert_eq!(params.get("threshold_db"), Some(&-40.0));
+        assert_eq!(params.get("range_db"), Some(&-50.0));
+        assert_eq!(params.get("hold_ms"), Some(&10.0));
+        assert_eq!(params.get("release_ms"), Some(&200.0));
+    }
+
+    #[test]
     fn unknown_effects_are_rejected_or_dropped_during_repair() {
         let mut config = MixerConfig::default();
         let err = config
@@ -4565,8 +4659,8 @@ mod tests {
         let effects = &config.channels[0].effects;
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].effect_id, "gate");
-        assert_eq!(effects[0].params.get("threshold_db"), Some(&-80.0));
-        assert_eq!(effects[0].params.get("release_ms"), Some(&200.0));
+        assert_eq!(effects[0].params.get("threshold_db"), Some(&-70.0));
+        assert_eq!(effects[0].params.get("release_ms"), Some(&160.0));
     }
 
     #[test]

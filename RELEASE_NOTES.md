@@ -1,3 +1,21 @@
+# WaveLinux 4.3.2
+
+WaveLinux 4.3.2 is a focused microphone processing and monitor-control release
+for stronger default noise gating and faster monitor input mute changes.
+
+## Fixes
+
+- Makes new Noise Gate instances more effective by default with a higher room
+  mic threshold, deeper closed-gate range, and smoother hold/release timing.
+- Migrates existing gates that still use the previous default profile to the
+  stronger room mic profile while preserving custom gate settings.
+- Expands the Noise Gate threshold and range controls to match the SWH LADSPA
+  gate plugin limits more closely.
+- Speeds up channel-to-monitor mute and volume changes by reusing cached route
+  IDs and falling back to a lighter live lookup when the cache is stale.
+- Keeps channel bus mute commands targeting both sides of the PipeWire loopback
+  route when both are present, preserving route health after mute/unmute.
+
 # WaveLinux 4.3.1
 
 WaveLinux 4.3.1 is a focused routing and hardware-profile stability release for

@@ -307,6 +307,31 @@ impl PwClient {
             .map(|input| input.id))
     }
 
+    pub fn find_channel_bus_route_ids(
+        &self,
+        channel_id: &str,
+        mix_id: &str,
+    ) -> Result<ChannelBusRouteIds, PwError> {
+        let sink_inputs_json = self.pactl_json(["list", "sink-inputs"])?;
+        let source_outputs_json = self.pactl_json(["list", "source-outputs"])?;
+        let sink_inputs = parse_sink_input_routes_json(&sink_inputs_json);
+        let source_outputs = parse_source_outputs_json(&source_outputs_json);
+        let direct =
+            channel_bus_route_ids_from_routes(channel_id, mix_id, &sink_inputs, &source_outputs);
+        if !direct.is_empty() {
+            return Ok(direct);
+        }
+
+        let modules = self.pactl_text(["list", "modules", "short"])?;
+        let modules = parse_managed_modules_short(&modules);
+        Ok(channel_bus_route_ids_from_routes(
+            channel_id,
+            mix_id,
+            &hydrate_sink_input_routes_from_modules(sink_inputs, &modules),
+            &hydrate_source_output_routes_from_modules(source_outputs, &modules),
+        ))
+    }
+
     pub fn sink_input_routes(&self) -> Result<Vec<SinkInputRoute>, PwError> {
         let json = self.pactl_json(["list", "sink-inputs"])?;
         let sinks_json = self.pactl_json(["list", "sinks"])?;
@@ -2113,6 +2138,18 @@ pub struct SinkInputRoute {
     pub target_object: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelBusRouteIds {
+    pub sink_input_id: Option<String>,
+    pub source_output_id: Option<String>,
+}
+
+impl ChannelBusRouteIds {
+    pub fn is_empty(&self) -> bool {
+        self.sink_input_id.is_none() && self.source_output_id.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedModule {
     pub module_id: String,
@@ -2720,6 +2757,32 @@ pub fn parse_source_outputs_json(json: &str) -> Vec<SourceOutputRoute> {
             managed: property_string(&output.properties, "wavelinux.managed"),
         })
         .collect()
+}
+
+pub fn channel_bus_route_ids_from_routes(
+    channel_id: &str,
+    mix_id: &str,
+    sink_inputs: &[SinkInputRoute],
+    source_outputs: &[SourceOutputRoute],
+) -> ChannelBusRouteIds {
+    ChannelBusRouteIds {
+        sink_input_id: sink_inputs
+            .iter()
+            .find(|input| {
+                input.role.as_deref() == Some("channel_to_mix")
+                    && input.channel_id.as_deref() == Some(channel_id)
+                    && input.mix_id.as_deref() == Some(mix_id)
+            })
+            .map(|input| input.id.clone()),
+        source_output_id: source_outputs
+            .iter()
+            .find(|output| {
+                output.role.as_deref() == Some("channel_to_mix")
+                    && output.channel_id.as_deref() == Some(channel_id)
+                    && output.mix_id.as_deref() == Some(mix_id)
+            })
+            .map(|output| output.id.clone()),
+    }
 }
 
 pub fn parse_managed_modules_json(
@@ -5193,6 +5256,50 @@ mod tests {
     }
 
     #[test]
+    fn channel_bus_route_ids_match_direct_route_properties() {
+        let sink_input_json = r#"
+        [
+          {
+            "index": 73,
+            "owner_module": 102,
+            "sink": 2,
+            "mute": false,
+            "properties": {
+              "wavelinux.role": "channel_to_mix",
+              "wavelinux.channel_id": "hardware_in",
+              "wavelinux.mix_id": "monitor"
+            }
+          }
+        ]
+        "#;
+        let source_output_json = r#"
+        [
+          {
+            "index": 91,
+            "owner_module": 102,
+            "source": 55,
+            "mute": false,
+            "properties": {
+              "wavelinux.role": "channel_to_mix",
+              "wavelinux.channel_id": "hardware_in",
+              "wavelinux.mix_id": "monitor"
+            }
+          }
+        ]
+        "#;
+
+        let route_ids = channel_bus_route_ids_from_routes(
+            "hardware_in",
+            "monitor",
+            &parse_sink_input_routes_json(sink_input_json),
+            &parse_source_outputs_json(source_output_json),
+        );
+
+        assert_eq!(route_ids.sink_input_id.as_deref(), Some("73"));
+        assert_eq!(route_ids.source_output_id.as_deref(), Some("91"));
+    }
+
+    #[test]
     fn source_output_routes_fall_back_to_module_arguments() {
         let modules_text = "\
 102\tmodule-loopback\tsource=wavelinux_channel_music.monitor sink=wavelinux_mix_stream source_output_properties=wavelinux.managed=1 wavelinux.role=channel_to_mix wavelinux.channel_id=music wavelinux.mix_id=stream\t\n";
@@ -5219,6 +5326,29 @@ mod tests {
             outputs[0].target_object.as_deref(),
             Some("wavelinux_channel_music")
         );
+    }
+
+    #[test]
+    fn channel_bus_route_ids_match_module_argument_fallback() {
+        let modules_text = "\
+102\tmodule-loopback\tsource=wavelinux_channel_music.monitor sink=wavelinux_mix_stream source_output_properties=wavelinux.managed=1 wavelinux.role=channel_to_mix wavelinux.channel_id=music wavelinux.mix_id=stream sink_input_properties=wavelinux.managed=1 wavelinux.role=channel_to_mix wavelinux.channel_id=music wavelinux.mix_id=stream\t\n";
+        let sink_input_json = r#"[{"index":73,"owner_module":102,"properties":{}}]"#;
+        let source_output_json = r#"[{"index":91,"owner_module":102,"properties":{}}]"#;
+        let modules = parse_managed_modules_short(modules_text);
+        let sink_inputs = hydrate_sink_input_routes_from_modules(
+            parse_sink_input_routes_json(sink_input_json),
+            &modules,
+        );
+        let source_outputs = hydrate_source_output_routes_from_modules(
+            parse_source_outputs_json(source_output_json),
+            &modules,
+        );
+
+        let route_ids =
+            channel_bus_route_ids_from_routes("music", "stream", &sink_inputs, &source_outputs);
+
+        assert_eq!(route_ids.sink_input_id.as_deref(), Some("73"));
+        assert_eq!(route_ids.source_output_id.as_deref(), Some("91"));
     }
 
     #[test]
@@ -5329,8 +5459,10 @@ mod tests {
         );
         assert!(rendered
             .contains("plugin = \"gate_1410\" label = \"gate\" name = \"voice_gate_right\""));
-        assert!(rendered.contains("\"Threshold (dB)\""));
-        assert!(rendered.contains("\"Decay (ms)\""));
+        assert!(rendered.contains("\"Threshold (dB)\" = -35.000"));
+        assert!(rendered.contains("\"Hold (ms)\" = 80.000"));
+        assert!(rendered.contains("\"Decay (ms)\" = 160.000"));
+        assert!(rendered.contains("\"Range (dB)\" = -60.000"));
         assert!(
             rendered.contains("inputs = [ \"voice_gate_left:Input\" \"voice_gate_right:Input\" ]")
         );

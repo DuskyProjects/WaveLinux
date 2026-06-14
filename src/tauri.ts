@@ -1219,24 +1219,24 @@ const catalog: EffectCatalog = {
       description: "Quiet-signal attenuation",
       plugin_hint: {},
       params: [
-        { id: "threshold_db", label: "Threshold", min: -80, max: 0, default: -40, unit: " dB" },
+        { id: "threshold_db", label: "Threshold", min: -70, max: 0, default: -35, unit: " dB" },
         { id: "attack_ms", label: "Attack", min: 0.1, max: 100, default: 2.5, unit: " ms" },
-        { id: "hold_ms", label: "Hold", min: 0, max: 500, default: 10, unit: " ms" },
-        { id: "release_ms", label: "Release", min: 10, max: 2000, default: 200, unit: " ms" },
-        { id: "range_db", label: "Range", min: -80, max: 0, default: -40, unit: " dB" },
+        { id: "hold_ms", label: "Hold", min: 2, max: 500, default: 80, unit: " ms" },
+        { id: "release_ms", label: "Release", min: 2, max: 2000, default: 160, unit: " ms" },
+        { id: "range_db", label: "Range", min: -90, max: 0, default: -60, unit: " dB" },
       ],
       presets: [
         {
           name: "Soft -60 dB",
-          values: { threshold_db: -60, range_db: -20, attack_ms: 5, hold_ms: 20, release_ms: 200 },
+          values: { threshold_db: -60, range_db: -30, attack_ms: 5, hold_ms: 120, release_ms: 220 },
         },
         {
-          name: "Room mic -40 dB",
-          values: { threshold_db: -40, range_db: -40, attack_ms: 2.5, hold_ms: 10, release_ms: 120 },
+          name: "Room mic -35 dB",
+          values: { threshold_db: -35, range_db: -60, attack_ms: 2.5, hold_ms: 80, release_ms: 160 },
         },
         {
           name: "Noisy mic -30 dB",
-          values: { threshold_db: -30, range_db: -50, attack_ms: 1, hold_ms: 10, release_ms: 80 },
+          values: { threshold_db: -30, range_db: -70, attack_ms: 1, hold_ms: 60, release_ms: 120 },
         },
       ],
     },

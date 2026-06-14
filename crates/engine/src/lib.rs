@@ -29,7 +29,8 @@ use wavelinux_model::{
     RoutingPolicy, RuntimeGraph, StreamerBindingProfile, StreamerDevicesConfig,
 };
 use wavelinux_pw::{
-    a2dp_codec_rank_with_preferences, channel_has_active_effects, channel_mix_route_revision,
+    a2dp_codec_rank_with_preferences, channel_bus_route_ids_from_routes,
+    channel_has_active_effects, channel_mix_route_revision,
     channel_mix_route_uses_hardware_direct_monitoring, channel_mix_source_name,
     effect_chain_input_name, effect_chain_source_name, effect_route_revision, input_route_revision,
     meter_sampling_enabled, meter_targets_for_config_with_devices,
@@ -43,9 +44,10 @@ use wavelinux_pw::{
     plan_set_route_sink_input_mute, plan_set_route_sink_input_volume,
     plan_set_route_source_output_mute, plan_set_route_source_output_volume, plan_set_source_mute,
     plan_set_source_volume, plan_set_stream_mute, plan_set_stream_volume, plan_unload_modules,
-    probe_effect_availability, render_filter_chain, BluetoothAudioCard, CommandDomain,
-    CommandOutput, CommandSpec, ManagedModule, MeterTarget, PlannedGraph, PwClient, PwError,
-    SinkInputRoute, SnapshotCommandTiming, SourceOutputRoute, StaleProcess, EFFECT_CONFIG_REVISION,
+    probe_effect_availability, render_filter_chain, BluetoothAudioCard, ChannelBusRouteIds,
+    CommandDomain, CommandOutput, CommandSpec, ManagedModule, MeterTarget, PlannedGraph, PwClient,
+    PwError, SinkInputRoute, SnapshotCommandTiming, SourceOutputRoute, StaleProcess,
+    EFFECT_CONFIG_REVISION,
 };
 
 mod hardware_profiles;
@@ -335,6 +337,8 @@ struct RuntimeCache {
     graph: RuntimeGraph,
     diagnostics: Vec<Diagnostic>,
     status: EngineStatus,
+    sink_input_routes: Vec<SinkInputRoute>,
+    source_output_routes: Vec<SourceOutputRoute>,
     bluetooth_monitor_routes: BTreeMap<String, BluetoothMonitorRouteSignature>,
     refreshed_at: Option<Instant>,
     initialized_bluetooth_cards: BTreeMap<String, String>,
@@ -346,6 +350,8 @@ impl RuntimeCache {
             graph: RuntimeGraph::default(),
             diagnostics: Vec::new(),
             bluetooth_monitor_routes: BTreeMap::new(),
+            sink_input_routes: Vec::new(),
+            source_output_routes: Vec::new(),
             refreshed_at: None,
             initialized_bluetooth_cards: BTreeMap::new(),
             status: EngineStatus {
@@ -961,6 +967,24 @@ fn plan_channel_bus_volume_commands(
     commands
 }
 
+fn plan_channel_bus_mute_commands(
+    sink_input_id: Option<&str>,
+    source_output_id: Option<&str>,
+    muted: bool,
+) -> Vec<CommandSpec> {
+    let mut commands = Vec::new();
+    if let Some(sink_input_id) = sink_input_id {
+        commands.push(plan_set_channel_bus_mute(sink_input_id, muted));
+    }
+    if let Some(source_output_id) = source_output_id {
+        commands.push(plan_set_channel_bus_source_output_mute(
+            source_output_id,
+            muted,
+        ));
+    }
+    commands
+}
+
 fn managed_route_level_commands(
     config: &MixerConfig,
     source_outputs: &[SourceOutputRoute],
@@ -1519,6 +1543,8 @@ impl WaveLinuxEngine {
         graph.auto_devices = auto_devices;
         runtime.graph = graph;
         runtime.diagnostics = diagnostics;
+        runtime.sink_input_routes = sink_inputs;
+        runtime.source_output_routes = source_outputs;
         runtime.bluetooth_monitor_routes =
             bluetooth_monitor_route_signatures(&audio_config, &runtime.graph.outputs);
         runtime.status.healthy = healthy;
@@ -3985,26 +4011,38 @@ impl WaveLinuxEngine {
         Ok(outputs)
     }
 
+    fn channel_bus_route_ids_unlocked(&self, channel_id: &str, mix_id: &str) -> ChannelBusRouteIds {
+        let cached = self.read_runtime().ok().and_then(|runtime| {
+            if !runtime.status.audio_graph_running {
+                return None;
+            }
+            let route_ids = channel_bus_route_ids_from_routes(
+                channel_id,
+                mix_id,
+                &runtime.sink_input_routes,
+                &runtime.source_output_routes,
+            );
+            (!route_ids.is_empty()).then_some(route_ids)
+        });
+
+        cached.unwrap_or_else(|| {
+            self.pw
+                .find_channel_bus_route_ids(channel_id, mix_id)
+                .unwrap_or_default()
+        })
+    }
+
     fn execute_channel_bus_volume_unlocked(
         &self,
         channel_id: &str,
         mix_id: &str,
         volume: f32,
     ) -> Vec<CommandExecution> {
-        let sink_input_id = self
-            .pw
-            .find_channel_bus_sink_input(channel_id, mix_id)
-            .ok()
-            .flatten();
-        let source_output_id = self
-            .pw
-            .find_channel_bus_source_output(channel_id, mix_id)
-            .ok()
-            .flatten();
+        let route_ids = self.channel_bus_route_ids_unlocked(channel_id, mix_id);
 
         plan_channel_bus_volume_commands(
-            sink_input_id.as_deref(),
-            source_output_id.as_deref(),
+            route_ids.sink_input_id.as_deref(),
+            route_ids.source_output_id.as_deref(),
             volume,
         )
         .into_iter()
@@ -4018,23 +4056,16 @@ impl WaveLinuxEngine {
         mix_id: &str,
         muted: bool,
     ) -> Vec<CommandExecution> {
-        let mut outputs = Vec::new();
-        if let Ok(Some(sink_input_id)) = self.pw.find_channel_bus_sink_input(channel_id, mix_id) {
-            outputs.push(command_execution(
-                self.pw
-                    .execute(plan_set_channel_bus_mute(&sink_input_id, muted)),
-            ));
-        }
+        let route_ids = self.channel_bus_route_ids_unlocked(channel_id, mix_id);
 
-        if let Ok(Some(source_output_id)) =
-            self.pw.find_channel_bus_source_output(channel_id, mix_id)
-        {
-            outputs.push(command_execution(self.pw.execute(
-                plan_set_channel_bus_source_output_mute(&source_output_id, muted),
-            )));
-        }
-
-        outputs
+        plan_channel_bus_mute_commands(
+            route_ids.sink_input_id.as_deref(),
+            route_ids.source_output_id.as_deref(),
+            muted,
+        )
+        .into_iter()
+        .map(|command| command_execution(self.pw.execute(command)))
+        .collect()
     }
 
     fn reap_effect_chain_processes(&self) {
@@ -9118,6 +9149,23 @@ mod tests {
     }
 
     #[test]
+    fn channel_bus_mute_targets_both_loopback_sides_when_available() {
+        let commands = plan_channel_bus_mute_commands(Some("73"), Some("91"), true);
+        let args = commands
+            .iter()
+            .map(|command| command.args.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(commands.len(), 2);
+        assert!(args.contains(&vec!["set-sink-input-mute".into(), "73".into(), "1".into()]));
+        assert!(args.contains(&vec![
+            "set-source-output-mute".into(),
+            "91".into(),
+            "1".into()
+        ]));
+    }
+
+    #[test]
     fn timed_cache_expiry_respects_ttl() {
         assert!(cache_expired(None, Duration::from_secs(30)));
         assert!(cache_expired(
@@ -12485,9 +12533,9 @@ mod tests {
                         "gate",
                         &[
                             ("attack_ms", 2.5),
-                            ("hold_ms", 10.0),
-                            ("release_ms", 200.0),
-                            ("threshold_db", -40.0),
+                            ("hold_ms", 80.0),
+                            ("release_ms", 160.0),
+                            ("threshold_db", -35.0),
                         ],
                     ),
                     test_effect(
