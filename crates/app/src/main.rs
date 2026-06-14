@@ -517,7 +517,13 @@ fn missing_arch_runtime_packages() -> Vec<&'static str> {
         return Vec::new();
     }
 
-    ARCH_RUNTIME_PACKAGES
+    let packages = if is_appimage_install() {
+        ARCH_APPIMAGE_HOST_PACKAGES
+    } else {
+        ARCH_RUNTIME_PACKAGES
+    };
+
+    packages
         .iter()
         .copied()
         .filter(|package| !pacman_package_installed(package))

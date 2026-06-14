@@ -17,7 +17,7 @@ Usage:
   bash scripts/distro-smoke.sh [--distro NAME|--all] [--target appimage|native|source-helper] [--release-tag vX.Y.Z]
 
 Distros:
-  debian12, ubuntu2404, fedora, arch
+  debian13, ubuntu2404, fedora, arch
 
 Targets:
   appimage       Download the release AppImage, run its dependency installer, then check runtime deps.
@@ -65,7 +65,7 @@ done
 
 image_for_distro() {
   case "$1" in
-    debian12) echo "debian:12-slim" ;;
+    debian13) echo "debian:trixie-slim" ;;
     ubuntu2404) echo "ubuntu:24.04" ;;
     fedora) echo "fedora:latest" ;;
     arch) echo "archlinux:latest" ;;
@@ -258,7 +258,7 @@ host_main() {
   local engine distros distro image
   engine="$(choose_container_engine)"
   if [[ "$DISTRO" == "all" ]]; then
-    distros=(debian12 ubuntu2404 fedora arch)
+    distros=(debian13 ubuntu2404 fedora arch)
   else
     distros=("$DISTRO")
   fi

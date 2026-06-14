@@ -1,6 +1,6 @@
 pkgbase = wavelinux
 	pkgdesc = Rust and PipeWire creator audio mixer for Linux
-	pkgver = 4.3.5
+	pkgver = 4.3.6
 	pkgrel = 1
 	url = https://github.com/DuskyProjects/WaveLinux
 	install = wavelinux.install
@@ -26,7 +26,7 @@ pkgbase = wavelinux
 	optdepends = swh-plugins: LADSPA compressor, gate, and limiter support
 	optdepends = noise-suppression-for-voice: RNNoise LADSPA noise suppression
 	optdepends = deepfilternet: DeepFilterNet noise suppression when packaged with LADSPA support
-	source = wavelinux-4.3.5.tar.gz::https://github.com/DuskyProjects/WaveLinux/archive/refs/tags/v4.3.5.tar.gz
+	source = wavelinux-4.3.6.tar.gz::https://github.com/DuskyProjects/WaveLinux/archive/refs/tags/v4.3.6.tar.gz
 	sha256sums = SKIP
 
 pkgname = wavelinux

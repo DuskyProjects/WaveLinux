@@ -1,3 +1,16 @@
+# WaveLinux 4.3.6
+
+WaveLinux 4.3.6 finalizes clean-distro release smoke coverage.
+
+## Fixes
+
+- Checks AppImage releases on current Debian, Ubuntu, Fedora, and Arch clean
+  containers, matching the glibc baseline of the published artifacts.
+- Fixes Arch AppImage runtime checks so they require the AppImage host package
+  set instead of native WebKit, GTK, appindicator, and GStreamer packages that
+  are bundled inside the AppImage.
+- Keeps native package smoke coverage on Ubuntu and Fedora.
+
 # WaveLinux 4.3.5
 
 WaveLinux 4.3.5 follows the new clean-distro smoke tests through to the
@@ -8,8 +21,7 @@ release artifacts.
 - Bundles additional AppImage startup libraries needed on clean Debian, Ubuntu,
   Fedora, and Arch containers before WaveLinux can run its dependency installer.
 - Adds the missing Fedora appindicator runtime dependency to the rpm metadata.
-- Keeps native package smoke coverage on Ubuntu and Fedora while using the
-  AppImage smoke path for Debian 12 compatibility.
+- Keeps native package smoke coverage on Ubuntu and Fedora.
 
 # WaveLinux 4.3.4
 
