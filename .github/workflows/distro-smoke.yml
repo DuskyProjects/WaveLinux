@@ -1,0 +1,88 @@
+name: Distro Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to test, such as v4.3.3. Use latest for the latest stable release."
+        required: false
+        default: latest
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-tag:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        startsWith(github.event.workflow_run.head_branch, 'v') &&
+        !contains(github.event.workflow_run.head_branch, 'pre') &&
+        !contains(github.event.workflow_run.head_branch, 'beta') &&
+        !contains(github.event.workflow_run.head_branch, 'rc') &&
+        !contains(github.event.workflow_run.head_branch, 'testing') &&
+        !contains(github.event.workflow_run.head_branch, 'Testing')
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          REPO: ${{ github.repository }}
+        run: |
+          tag="$INPUT_TAG"
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            tag="$WORKFLOW_RUN_HEAD_BRANCH"
+          fi
+          if [[ -z "$tag" || "$tag" == "latest" ]]; then
+            tag="$(gh release view --repo "$REPO" --json tagName --jq .tagName)"
+          fi
+          if [[ "$tag" != v* ]]; then
+            echo "Resolved smoke target is not a stable release tag: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  appimage-runtime:
+    needs: resolve-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian12, ubuntu2404, fedora, arch]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Smoke AppImage runtime installer on ${{ matrix.distro }}
+        run: |
+          bash scripts/distro-smoke.sh \
+            --distro "${{ matrix.distro }}" \
+            --target appimage \
+            --release-tag "${{ needs.resolve-tag.outputs.tag }}"
+
+  native-package:
+    needs: resolve-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian12, ubuntu2404, fedora]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Smoke native package install on ${{ matrix.distro }}
+        run: |
+          bash scripts/distro-smoke.sh \
+            --distro "${{ matrix.distro }}" \
+            --target native \
+            --release-tag "${{ needs.resolve-tag.outputs.tag }}"

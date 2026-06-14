@@ -35,3 +35,23 @@ WAVELINUX_RUN_LIVE_TESTS=1 bash scripts/test-all.sh
 The ignored live tests cover the parts that cannot be proven in CI: virtual node
 creation, volume/mute mutation, stale cleanup, per-channel music metering, and
 PipeWire filter-chain startup/cleanup.
+
+## Distro Smoke
+
+Release smoke tests run the published assets in clean containers for the main
+Linux families WaveLinux supports:
+
+```sh
+bash scripts/distro-smoke.sh --all --target appimage --release-tag v4.3.3
+bash scripts/distro-smoke.sh --distro fedora --target native --release-tag v4.3.3
+```
+
+The AppImage target downloads the release AppImage, runs
+`--install-runtime-dependencies`, and then verifies
+`--check-runtime-dependencies`. The native target installs the release deb or
+rpm with the distro package manager and then runs the same runtime check.
+
+Containers are not full desktop sessions, so the smoke harness accepts the
+container-only `bwrap usable sandbox` warning after package installation. It
+still fails if runtime packages, WebKit helpers, PipeWire tools, ALSA tools, or
+required graphics libraries are missing.

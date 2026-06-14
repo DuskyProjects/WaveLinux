@@ -4,6 +4,7 @@ set -euo pipefail
 INSTALL=0
 INSTALL_EFFECTS=0
 STRICT=0
+STRICT_RUNTIME=0
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 usage() {
@@ -11,7 +12,7 @@ usage() {
 Check WaveLinux runtime and effect dependencies.
 
 Usage:
-  bash scripts/check-dependencies.sh [--install] [--install-effects] [--strict]
+  bash scripts/check-dependencies.sh [--install] [--install-effects] [--strict] [--strict-runtime]
 
 Environment:
   WAVELINUX_INSTALL_DEPS=1      Install missing runtime dependencies.
@@ -29,6 +30,9 @@ for arg in "$@"; do
       ;;
     --strict)
       STRICT=1
+      ;;
+    --strict-runtime)
+      STRICT_RUNTIME=1
       ;;
     --help|-h)
       usage
@@ -380,6 +384,20 @@ if (( INSTALL_EFFECTS == 1 && ${#missing_effects[@]} > 0 )); then
   fi
 fi
 
-if (( STRICT == 1 && ( ${#missing_commands[@]} > 0 || ${#missing_streamer_commands[@]} > 0 || ${#missing_libraries[@]} > 0 || ${#missing_webkit_helpers[@]} > 0 || ${#missing_effects[@]} > 0 ) )); then
+runtime_missing=0
+if (( ${#missing_commands[@]} > 0 || ${#missing_streamer_commands[@]} > 0 || ${#missing_libraries[@]} > 0 || ${#missing_webkit_helpers[@]} > 0 )); then
+  runtime_missing=1
+fi
+
+effect_missing=0
+if (( ${#missing_effects[@]} > 0 )); then
+  effect_missing=1
+fi
+
+if (( STRICT_RUNTIME == 1 && runtime_missing == 1 )); then
+  exit 1
+fi
+
+if (( STRICT == 1 && ( runtime_missing == 1 || effect_missing == 1 ) )); then
   exit 1
 fi
