@@ -98,7 +98,7 @@ WaveLinux-owned aliases.
 Profile resolution prefers the safest local data first:
 
 - Local user profiles in `~/.config/wavelinux/hardware-profiles/v1/local`.
-- Signed remote profiles cached from the selected release feed.
+- Remote profiles cached from the GitHub repo profile feed.
 - The editable safe generic default profile, `default.generic-audio`.
 
 The Settings page includes Profiles under its tab bar. Editing a downloaded or
@@ -213,10 +213,11 @@ yarn release:key
 yarn desktop:release
 ```
 
-The GitHub release workflow builds AppImage, deb, rpm, updater metadata, signed
-hardware profile assets, and AUR package files when a `v*` tag is pushed. Stable
-tags publish only the matching section from `RELEASE_NOTES.md`, prune older
-GitHub release pages, and keep stable git tags for source history.
+The GitHub release workflow builds AppImage, deb, rpm, updater metadata, and AUR
+package files when a `v*` tag is pushed. Hardware profiles are fetched from
+`profiles/v1` in the repository instead of being uploaded as release assets.
+Stable tags publish only the matching section from `RELEASE_NOTES.md`, prune
+older GitHub release pages, and keep stable git tags for source history.
 
 Required GitHub Actions secrets:
 

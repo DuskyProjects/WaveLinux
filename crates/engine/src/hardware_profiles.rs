@@ -3,10 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 #[cfg(test)]
 use include_dir::{include_dir, Dir};
-use minisign_verify::{PublicKey, Signature};
 use serde::Deserialize;
 use wavelinux_model::{
     BluetoothMicPolicy, DeviceBus, DeviceInfo, DevicePolicy, Diagnostic, DiagnosticSeverity,
@@ -18,11 +16,11 @@ use crate::EnginePaths;
 
 #[cfg(test)]
 static TEST_PROFILE_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../profiles/v1/devices");
-const PROFILE_PUBLIC_KEY_BASE64: &str = "RWRj/xx3s45rB1rCnnFCqvj7OuTsjpHDBPc7G/aSTn8pQSVnWZVPyPjk";
-const PROFILE_RELEASE_BASE_URL: &str =
-    "https://github.com/DuskyProjects/WaveLinux/releases/latest/download";
-const PROFILE_INDEX_ASSET: &str = "hardware-profiles-v1-index.json";
-const PROFILE_INDEX_SIG_ASSET: &str = "hardware-profiles-v1-index.json.sig";
+const PROFILE_SOURCE_BASE_URL: &str =
+    "https://raw.githubusercontent.com/DuskyProjects/WaveLinux/master/profiles/v1";
+const PROFILE_INDEX_CACHE_FILE: &str = "hardware-profiles-v1-index.json";
+const PROFILE_INDEX_REMOTE_PATH: &str = "index.json";
+const PROFILE_DEVICE_REMOTE_DIR: &str = "devices";
 const PROFILE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const PROFILE_INDEX_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const PROFILE_INDEX_FAILURE_TTL: Duration = Duration::from_secs(30 * 60);
@@ -182,8 +180,7 @@ pub fn remote_profile_sync_needed(
     if !index_path.is_file() || !cache_file_is_fresh(&index_path, PROFILE_INDEX_CACHE_TTL) {
         return true;
     }
-    let signature_path = index_path.with_extension("json.sig");
-    if let Ok(index) = read_verified_remote_index(&index_path, &signature_path) {
+    if let Ok(index) = read_cached_remote_index(&index_path) {
         for device in devices {
             if !device.is_available || !device_is_hardware_profile_candidate(device) {
                 continue;
@@ -485,19 +482,6 @@ fn load_profile_dir(dir: &Path, source: ProfileSource, catalog: &mut HardwarePro
     for path in paths {
         match fs::read_to_string(&path) {
             Ok(data) => {
-                if source == ProfileSource::Remote {
-                    match verify_remote_profile_signature(&path, data.as_bytes()) {
-                        Ok(()) => {}
-                        Err(reason) => {
-                            catalog.diagnostics.push(profile_diagnostic(
-                                &path,
-                                DiagnosticSeverity::Warning,
-                                reason,
-                            ));
-                            continue;
-                        }
-                    }
-                }
                 load_bundle(&data, source, &path, catalog);
             }
             Err(err) => catalog.diagnostics.push(profile_diagnostic(
@@ -619,51 +603,6 @@ fn profile_entry_dedupe_key(entry: &ProfileEntry) -> (u32, u8, u8) {
     )
 }
 
-fn verify_remote_profile_signature(path: &Path, data: &[u8]) -> Result<(), String> {
-    let Some(signature_path) = remote_signature_path(path) else {
-        return Err("Ignored unsigned remote hardware profile cache".into());
-    };
-    let signature_text = fs::read_to_string(&signature_path).map_err(|err| {
-        format!("Ignored remote hardware profile with unreadable signature: {err}")
-    })?;
-    verify_profile_signature(data, &signature_text)
-}
-
-fn verify_profile_signature(data: &[u8], signature_text: &str) -> Result<(), String> {
-    let public_key = PublicKey::from_base64(PROFILE_PUBLIC_KEY_BASE64).map_err(|err| {
-        format!("Ignored remote hardware profile because the public key was invalid: {err}")
-    })?;
-    let signature = decode_profile_signature(signature_text)?;
-    public_key.verify(data, &signature, false).map_err(|err| {
-        format!("Ignored remote hardware profile because signature verification failed: {err}")
-    })
-}
-
-fn decode_profile_signature(signature_text: &str) -> Result<Signature, String> {
-    match Signature::decode(signature_text) {
-        Ok(signature) => Ok(signature),
-        Err(raw_err) => {
-            let decoded = BASE64_STANDARD.decode(signature_text.trim()).map_err(|_| {
-                format!("Ignored remote hardware profile with invalid signature data: {raw_err}")
-            })?;
-            let decoded_text = std::str::from_utf8(&decoded).map_err(|err| {
-                format!(
-                    "Ignored remote hardware profile with non-UTF-8 wrapped signature data: {err}"
-                )
-            })?;
-            Signature::decode(decoded_text).map_err(|err| {
-                format!("Ignored remote hardware profile with invalid signature data: {err}")
-            })
-        }
-    }
-}
-
-fn remote_signature_path(path: &Path) -> Option<PathBuf> {
-    [path.with_extension("json.sig"), path.with_extension("sig")]
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-}
-
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 struct RemoteProfileIndex {
@@ -683,27 +622,26 @@ struct RemoteProfileIndexEntry {
 
 fn load_or_download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileIndex, String> {
     let index_path = remote_index_path(paths);
-    let signature_path = index_path.with_extension("json.sig");
     if cache_file_is_fresh(&index_path, PROFILE_INDEX_CACHE_TTL) {
-        if let Ok(index) = read_verified_remote_index(&index_path, &signature_path) {
+        if let Ok(index) = read_cached_remote_index(&index_path) {
             return Ok(index);
         }
     }
     let failure_path = remote_index_failure_path(paths);
     if cache_file_is_fresh(&failure_path, PROFILE_INDEX_FAILURE_TTL) {
-        if let Ok(index) = read_verified_remote_index(&index_path, &signature_path) {
+        if let Ok(index) = read_cached_remote_index(&index_path) {
             return Ok(index);
         }
         let recent_failure = fs::read_to_string(&failure_path).unwrap_or_default();
-        let cache_missing = !index_path.is_file() || !signature_path.is_file();
+        let cache_missing = !index_path.is_file();
         let retry_stale_failure_without_cache = cache_missing
             && (recent_failure.contains("404")
-                || recent_failure.contains("invalid signature data")
-                || recent_failure.contains("signature verification failed"));
+                || recent_failure.contains("signature")
+                || recent_failure.contains("hardware-profiles-v1-index.json.sig"));
         if retry_stale_failure_without_cache {
             let _ = fs::remove_file(&failure_path);
         } else {
-            return read_verified_remote_index(&index_path, &signature_path).map_err(|cache_err| {
+            return read_cached_remote_index(&index_path).map_err(|cache_err| {
                 format!(
                     "Hardware profile index download is in backoff after a recent failure; cached index unavailable: {cache_err}"
                 )
@@ -720,7 +658,7 @@ fn load_or_download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileInd
         Err(download_err) => {
             let _ = fs::create_dir_all(failure_path.parent().unwrap_or_else(|| Path::new(".")));
             let _ = fs::write(&failure_path, download_err.as_bytes());
-            match read_verified_remote_index(&index_path, &signature_path) {
+            match read_cached_remote_index(&index_path) {
                 Ok(index) => Ok(index),
                 Err(cache_err) => Err(format!(
                     "Could not update hardware profile index from GitHub: {download_err}; cached index unavailable: {cache_err}"
@@ -732,13 +670,10 @@ fn load_or_download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileInd
 
 fn download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileIndex, String> {
     let base_url = remote_profile_base_url();
-    let data = download_remote_asset(&base_url, PROFILE_INDEX_ASSET, MAX_REMOTE_INDEX_BYTES)?;
-    let signature = download_remote_asset(&base_url, PROFILE_INDEX_SIG_ASSET, 32 * 1024)?;
-    verify_profile_signature(data.as_bytes(), &signature)?;
+    let data = download_remote_asset(&base_url, PROFILE_INDEX_REMOTE_PATH, MAX_REMOTE_INDEX_BYTES)?;
     let index = parse_remote_index(&data)?;
 
     let index_path = remote_index_path(paths);
-    let signature_path = index_path.with_extension("json.sig");
     fs::create_dir_all(
         index_path
             .parent()
@@ -747,20 +682,13 @@ fn download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileIndex, Stri
     .map_err(|err| format!("Could not create hardware profile index cache: {err}"))?;
     fs::write(&index_path, data)
         .map_err(|err| format!("Could not write hardware profile index cache: {err}"))?;
-    fs::write(&signature_path, signature)
-        .map_err(|err| format!("Could not write hardware profile index signature cache: {err}"))?;
+    let _ = fs::remove_file(index_path.with_extension("json.sig"));
     Ok(index)
 }
 
-fn read_verified_remote_index(
-    index_path: &Path,
-    signature_path: &Path,
-) -> Result<RemoteProfileIndex, String> {
+fn read_cached_remote_index(index_path: &Path) -> Result<RemoteProfileIndex, String> {
     let data = fs::read_to_string(index_path)
         .map_err(|err| format!("Could not read cached hardware profile index: {err}"))?;
-    let signature = fs::read_to_string(signature_path)
-        .map_err(|err| format!("Could not read cached hardware profile index signature: {err}"))?;
-    verify_profile_signature(data.as_bytes(), &signature)?;
     parse_remote_index(&data)
 }
 
@@ -806,29 +734,45 @@ fn cache_remote_profile_asset(
         format!("Ignored remote hardware profile with invalid asset name: {asset}")
     })?;
     let profile_path = remote_profile_dir(paths).join(asset_file_name);
-    if !force_refresh
-        && profile_path.is_file()
-        && fs::read(&profile_path)
-            .ok()
-            .and_then(|data| verify_remote_profile_signature(&profile_path, &data).ok())
-            .is_some()
-    {
+    if !force_refresh && cached_remote_profile_is_valid(&profile_path) {
         return Ok(false);
     }
 
     let base_url = remote_profile_base_url();
-    let data = download_remote_asset(&base_url, asset_file_name, MAX_REMOTE_PROFILE_BYTES)?;
-    let signature_asset = format!("{asset_file_name}.sig");
-    let signature = download_remote_asset(&base_url, &signature_asset, 32 * 1024)?;
-    verify_profile_signature(data.as_bytes(), &signature)?;
+    let remote_path = format!("{PROFILE_DEVICE_REMOTE_DIR}/{asset_file_name}");
+    let data = download_remote_asset(&base_url, &remote_path, MAX_REMOTE_PROFILE_BYTES)?;
+    validate_remote_profile_cache(&data)?;
 
     fs::create_dir_all(remote_profile_dir(paths))
         .map_err(|err| format!("Could not create remote hardware profile cache: {err}"))?;
     fs::write(&profile_path, data)
         .map_err(|err| format!("Could not write remote hardware profile cache: {err}"))?;
-    fs::write(profile_path.with_extension("json.sig"), signature)
-        .map_err(|err| format!("Could not write remote hardware profile signature cache: {err}"))?;
+    let _ = fs::remove_file(profile_path.with_extension("json.sig"));
     Ok(true)
+}
+
+fn cached_remote_profile_is_valid(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|data| validate_remote_profile_cache(&data).ok())
+        .is_some()
+}
+
+fn validate_remote_profile_cache(data: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(data)
+        .map_err(|err| format!("Ignored invalid remote hardware profile JSON: {err}"))?;
+    if forbidden_profile_keys(&value) {
+        return Err(
+            "Ignored remote hardware profile because it contained executable or host-write fields"
+                .into(),
+        );
+    }
+    let profiles = profiles_from_value(value)
+        .map_err(|err| format!("Ignored remote hardware profile bundle: {err}"))?;
+    if profiles.is_empty() {
+        return Err("Ignored empty remote hardware profile bundle".into());
+    }
+    Ok(())
 }
 
 fn download_remote_asset(base_url: &str, asset: &str, max_bytes: usize) -> Result<String, String> {
@@ -865,7 +809,7 @@ fn remote_profile_base_url() -> String {
     std::env::var("WAVELINUX_PROFILE_BASE_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| PROFILE_RELEASE_BASE_URL.into())
+        .unwrap_or_else(|| PROFILE_SOURCE_BASE_URL.into())
 }
 
 #[cfg(not(test))]
@@ -884,7 +828,7 @@ fn remote_index_path(paths: &EnginePaths) -> PathBuf {
         .join("hardware-profiles")
         .join("v1")
         .join("index")
-        .join(PROFILE_INDEX_ASSET)
+        .join(PROFILE_INDEX_CACHE_FILE)
 }
 
 fn remote_index_failure_path(paths: &EnginePaths) -> PathBuf {
@@ -1175,7 +1119,7 @@ fn remote_profile_diagnostic(
         code: "hardware.profile.remote".into(),
         severity,
         message: message.into(),
-        action: Some(PROFILE_RELEASE_BASE_URL.into()),
+        action: Some(PROFILE_SOURCE_BASE_URL.into()),
     }
 }
 
@@ -2126,7 +2070,7 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_remote_profile_cache_is_ignored() {
+    fn repo_backed_remote_profile_cache_loads_without_signature() {
         let root = tempdir().unwrap();
         let paths = EnginePaths::for_tests(root.path());
         let remote_dir = paths
@@ -2149,18 +2093,16 @@ mod tests {
 
         let catalog = load_hardware_profile_catalog(&paths);
 
-        assert!(catalog
+        let profile = catalog
             .profiles
             .iter()
-            .all(|entry| entry.profile.id != "remote.unsigned"));
-        assert!(catalog
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("unsigned remote")));
+            .find(|entry| entry.profile.id == "remote.unsigned")
+            .expect("repo-backed remote profile cache should load without generated signature");
+        assert_eq!(profile.source, ProfileSource::Remote);
     }
 
     #[test]
-    fn invalid_remote_profile_signature_is_ignored() {
+    fn remote_profile_cache_with_command_is_ignored() {
         let root = tempdir().unwrap();
         let paths = EnginePaths::for_tests(root.path());
         let remote_dir = paths
@@ -2172,17 +2114,13 @@ mod tests {
         fs::write(
             remote_dir.join("remote.json"),
             r#"{
-              "id": "remote.invalid-signature",
-              "name": "Invalid Remote Signature",
-              "matches": [{"bus": "usb", "description_contains": ["Invalid"]}],
+              "id": "remote.command",
+              "name": "Remote Command",
+              "matches": [{"bus": "usb", "description_contains": ["Command"]}],
               "capabilities": {"input": true},
-              "confidence": "high"
+              "confidence": "high",
+              "command": "pactl set-card-profile anything"
             }"#,
-        )
-        .unwrap();
-        fs::write(
-            remote_dir.join("remote.json.sig"),
-            "not a minisign signature",
         )
         .unwrap();
 
@@ -2191,17 +2129,10 @@ mod tests {
         assert!(catalog
             .profiles
             .iter()
-            .all(|entry| entry.profile.id != "remote.invalid-signature"));
+            .all(|entry| entry.profile.id != "remote.command"));
         assert!(catalog
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("invalid signature")));
-    }
-
-    #[test]
-    fn base64_wrapped_tauri_minisign_signature_decodes() {
-        let signature = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSai94eDNzNDVyQjVtMmJVSzBmK2FtMEszSHNidkJua1FGNHo2QitrQlgyMlZkMFBGeVlOKzVlWldoR1BKK3dKT0g5LzFPUk1LaVhJRkdHUTV5YmR3eFNvVDB4ZVh6WHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5ODg2OTA0CWZpbGU6aGFyZHdhcmUtcHJvZmlsZXMtdjEtaW5kZXguanNvbgpVTEtVdllVNGh4Y05GUFJSTXNHNWhBdml4SjFrRTdNK3hwaTFUcDVOcHdsOXo4RmZGWENQUlhCY1g5QWRsRWJtcUZWNXVad2x5Z2FPNitMV0txd2lEQT09Cg==";
-
-        assert!(decode_profile_signature(signature).is_ok());
+            .any(|diagnostic| diagnostic.message.contains("executable")));
     }
 }

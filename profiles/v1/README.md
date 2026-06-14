@@ -8,21 +8,26 @@ Profile source files live as one device per file in:
 profiles/v1/devices/*.json
 ```
 
-These files are source data for GitHub Release assets and local testing; they are not embedded into the app binary. Device files should contain a single profile object, not a `{ "profiles": [...] }` bundle. Remote release bundles and local experiments may still be loaded as bundles, but one-device files are preferred because they make review, ownership, and community fixes much easier.
+These files are the canonical GitHub-hosted profile feed and local testing data;
+they are not embedded into the app binary or uploaded as release assets. Device
+files should contain a single profile object, not a `{ "profiles": [...] }`
+bundle. Local experiments may still be loaded as bundles, but one-device files
+are preferred because they make review, ownership, and community fixes much
+easier.
 
-The app downloads a signed lightweight index when it sees an unmatched audio device:
+The app downloads the lightweight index from the repository when it sees an
+unmatched audio device:
 
 ```text
-hardware-profiles-v1-index.json
-hardware-profiles-v1-index.json.sig
+profiles/v1/index.json
 ```
 
 When an index entry matches detected hardware, WaveLinux downloads only that
-matching signed profile asset from the selected GitHub release feed and caches
-it in `~/.config/wavelinux/hardware-profiles/v1/remote/`. It does not ship or
-load a full built-in profile catalog.
+matching profile from `profiles/v1/devices/` over HTTPS and caches it in
+`~/.config/wavelinux/hardware-profiles/v1/remote/`. It does not ship or load a
+full built-in profile catalog.
 
-Installers may run `wavelinux --prewarm-hardware-profiles` after install. That command performs a read-only audio hardware check, downloads any signed matching remote profiles into the same cache, and exits without opening the UI or changing PipeWire routing. If hardware, PipeWire, or GitHub is unavailable during install, WaveLinux logs the reason and retries from the normal background detector when the app starts.
+Installers may run `wavelinux --prewarm-hardware-profiles` after install. That command performs a read-only audio hardware check, downloads any matching repo-hosted remote profiles into the same cache, and exits without opening the UI or changing PipeWire routing. If hardware, PipeWire, or GitHub is unavailable during install, WaveLinux logs the reason and retries from the normal background detector when the app starts.
 
 Local profiles go here:
 

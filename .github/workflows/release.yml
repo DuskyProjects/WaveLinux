@@ -84,12 +84,6 @@ jobs:
             --output target/release/bundle/latest.json \
             --notes "WaveLinux $VERSION"
 
-      - name: Build signed hardware profile assets
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: bash scripts/build-hardware-profile-assets.sh
-
       - name: Stage AUR package metadata
         run: bash scripts/build-aur.sh
 
@@ -102,7 +96,6 @@ jobs:
           cp target/release/bundle/latest.json target/release/upload/
           cp target/aur/wavelinux/PKGBUILD target/release/upload/
           cp target/aur/wavelinux/.SRCINFO target/release/upload/wavelinux.SRCINFO
-          cp target/hardware-profiles/v1/*.json* target/release/upload/
 
       - name: Prepare GitHub release notes
         run: |
