@@ -4,3 +4,48 @@ This project is licensed under the GNU General Public License version 3 only.
 See https://www.gnu.org/licenses/gpl-3.0-standalone.html for the full license
 text.
 
+Open Source Credits
+===================
+
+WaveLinux is built with and integrates with other open-source projects. This
+acknowledgement is intentionally human-readable; release builders should still
+preserve third-party license files for bundled Cargo and npm dependencies from
+Cargo.lock and yarn.lock.
+
+Direct code, protocol, and runtime dependencies:
+
+| Project | License | WaveLinux use |
+| --- | --- | --- |
+| [OpenWave](https://github.com/rikkichy/openwave) | MIT | Wave XLR USB control-transfer protocol notes and behavior used for optional Elgato controls. |
+| [Elgato Stream Deck HID documentation](https://docs.elgato.com/streamdeck/hid/intro) | Reference documentation | Stream Deck HID device model and packet behavior used to guide lazy HID detection and raw report binding IDs. |
+| [Tauri](https://tauri.app/) and Tauri plugins | MIT OR Apache-2.0 | Desktop shell, IPC, tray, updater, opener, shell, and single-instance support. |
+| [WebKitGTK](https://webkitgtk.org/) and [GTK](https://gtk.org/) | LGPL-2.1-or-later plus WebKit third-party notices | Linux webview/runtime stack used by Tauri desktop builds. |
+| [React](https://react.dev/) and React DOM | MIT | Frontend UI framework. |
+| [TypeScript](https://www.typescriptlang.org/) | Apache-2.0 | Frontend type system and compiler. |
+| [Vite](https://vite.dev/) and @vitejs/plugin-react | MIT | Frontend development server and production build tooling. |
+| [Lucide](https://lucide.dev/) / lucide-react | ISC | UI icon set. |
+| [PipeWire](https://pipewire.org/) and pipewire-rs / libspa bindings | MIT | Linux audio graph integration, device discovery, routing, and metering. |
+| [WirePlumber](https://pipewire.pages.freedesktop.org/wireplumber/) | MIT | Host session-manager integration target for PipeWire desktops. |
+| [bubblewrap](https://github.com/containers/bubblewrap) and [xdg-dbus-proxy](https://github.com/flatpak/xdg-dbus-proxy) | LGPL-2.0-or-later / LGPL-2.1-or-later | WebKitGTK sandbox helpers staged into AppImage releases when available from the build host. |
+| [xdg-desktop-portal](https://github.com/flatpak/xdg-desktop-portal) | LGPL-2.1-or-later | Host desktop portal integration used by Linux desktop sessions. |
+| [Mesa](https://www.mesa3d.org/), libdrm, libglvnd, and Xwayland | MIT/BSD/X11-style licenses | Host GL/EGL/GBM/DRM and Xwayland runtime pieces needed by WebKitGTK AppImage launches on common Linux desktops. |
+| [GStreamer](https://gstreamer.freedesktop.org/) base/good plugins | LGPL-2.1-or-later | Host media stack used by WebKitGTK and desktop audio/video runtime dependencies. |
+| [Noto Fonts](https://notofonts.github.io/) | OFL-1.1 | Host fallback fonts installed by dependency preflight on minimal desktops. |
+| [libusb](https://github.com/libusb/libusb) | LGPL-2.1-or-later | Dynamically loaded shared library for optional Elgato Wave XLR controls; staged into AppImage releases when available from the build host. |
+| [ALSA utilities](https://www.alsa-project.org/) (aseqdump) | GPL-2.0-or-later | Host MIDI event capture for connected streamer control surfaces, started only for enabled detected MIDI devices. |
+| Rust support crates: anyhow, base64, directories, libc, serde, serde_json, tempfile, thiserror, time, url, uuid | MIT OR Apache-2.0 | Serialization, errors, paths, test files, URLs, timestamps, identifiers, and libc bindings. |
+| Rust support crate: include_dir | MIT | Embeds packaged hardware profile assets. |
+| Rust support crate: libloading | ISC | Lazy runtime loading for the optional libusb control path. |
+
+Open-source integrations that WaveLinux can detect, configure, bundle when
+available from the release builder, or install from distro packages:
+
+| Project | License | Notes |
+| --- | --- | --- |
+| [SWH LADSPA plugins](https://github.com/swh/ladspa) | GPL-2.0 | Compressor, gate, and limiter plugin support bundled in AppImage releases when present on the builder, otherwise installed from distro packages. |
+| [noise-suppression-for-voice](https://github.com/werman/noise-suppression-for-voice) / RNNoise | GPL-3.0 | RNNoise LADSPA noise suppression support bundled in AppImage releases when present on the builder, otherwise installed from distro packages. |
+| [DeepFilterNet3 LADSPA/PipeWire plugins](https://github.com/Rikorose/DeepFilterNet) | MIT OR Apache-2.0 | DeepFilterNet noise suppression support bundled or installed when a distro package is available. |
+| [OpenDeck](https://github.com/nekename/OpenDeck) | GPL-3.0-or-later | Open-source Linux Stream Deck implementation used as a compatibility and udev-permission reference. |
+| [Bitfocus Companion](https://github.com/bitfocus/companion) | MIT | Open-source streamer surface ecosystem reference for Stream Deck, Loupedeck, X-keys, and similar devices. |
+| [GoXLR Utility](https://github.com/GoXLR-on-Linux/goxlr-utility) | MIT | Open-source GoXLR control software reference for Linux behavior and control-surface expectations. |
+| PulseAudio-compatible tools (pactl) and PipeWire tools (wpctl, pw-cli, pw-dump) | LGPL-2.1-or-later / MIT | Host command-line tools used for graph inspection, routing, and diagnostics. |
