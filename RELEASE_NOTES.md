@@ -1,3 +1,17 @@
+# WaveLinux 4.3.3
+
+WaveLinux 4.3.3 moves hardware profiles out of GitHub release assets and into
+the repository-backed profile feed.
+
+## Fixes
+
+- Downloads the remote hardware profile index from `profiles/v1/index.json` in
+  the GitHub repository instead of from release assets.
+- Downloads only matching device profiles from `profiles/v1/devices/` and
+  keeps validating cached remote profile JSON before loading it.
+- Stops building and uploading generated hardware profile JSON/signature assets,
+  reducing future stable releases to the app, package, updater, and AUR files.
+
 # WaveLinux 4.3.2
 
 WaveLinux 4.3.2 is a focused microphone processing and monitor-control release
