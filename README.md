@@ -38,7 +38,7 @@ Clipguard behavior remain out of scope.
   profiles that stay hidden until supported hardware is connected
 - Editable safe generic default profile plus per-device manual profile assignment
 - Local profile overrides that survive app updates without executable hooks
-- Signed remote hardware profile downloads from GitHub Releases
+- Signed remote hardware profile downloads from the current GitHub release feed
 - Hotplug recovery for inputs and outputs
 - Real channel/mix metering with stale-sample decay
 - Per-source effect chains through PipeWire filter-chain and LADSPA/open plugins
@@ -48,7 +48,9 @@ Clipguard behavior remain out of scope.
 - AppImage, deb, rpm, and AUR packaging
 - Signed in-app update checks for AppImage installs
 
-Release history lives in `RELEASE_NOTES.md`.
+Release history lives in `RELEASE_NOTES.md`. The GitHub Releases page is kept
+focused on the latest downloadable release, while stable git tags remain as
+source history.
 
 ## Requirements
 
@@ -76,13 +78,13 @@ Recommended effect packages:
 
 ## Install
 
-Download a release artifact from GitHub Releases:
+Download a release artifact from the latest GitHub Release:
 
 ```bash
-https://github.com/DuskyProjects/WaveLinux/releases
+https://github.com/DuskyProjects/WaveLinux/releases/latest
 ```
 
-Available formats:
+Available formats on the latest release page:
 
 - AppImage: portable desktop build and the primary self-update format
 - deb: Debian and Ubuntu-family package
@@ -200,7 +202,7 @@ only WaveLinux-owned aliases.
 Profile resolution prefers the safest local data first:
 
 - Local user profiles in `~/.config/wavelinux/hardware-profiles/v1/local`
-- Signed remote profiles cached from GitHub Releases
+- Signed remote profiles cached from the selected release feed
 - The editable safe generic default profile, `default.generic-audio`
 
 The Settings page includes Profiles under its tab bar. It lists real hardware
@@ -305,9 +307,9 @@ notes.
 ## Updates
 
 AppImage installs can check signed release metadata from inside Settings.
-The updater includes a Beta updates checkbox that tracks the single moving
-`prerelease` feed for WaveLinux Testing; leave it unchecked to stay on stable
-releases.
+Stable updates use the latest GitHub release feed. When maintainers publish a
+testing tag, the Beta updates checkbox tracks the single moving `prerelease`
+feed for WaveLinux Testing; leave it unchecked to stay on stable releases.
 Package-managed installs should update through their package manager.
 
 ## Development
@@ -363,7 +365,7 @@ Build local desktop bundles:
 yarn desktop:build
 ```
 
-Stage AUR files:
+Regenerate and stage AUR files:
 
 ```bash
 yarn aur:build
@@ -376,8 +378,16 @@ yarn release:key
 yarn desktop:release
 ```
 
-The GitHub release workflow builds AppImage, deb, rpm, updater metadata, and AUR
-package files when a `v*` tag is pushed.
+The GitHub release workflow builds AppImage, deb, rpm, updater metadata, signed
+hardware profile assets, and AUR package files when a `v*` tag is pushed. Stable
+tags publish only the matching section from `RELEASE_NOTES.md`, prune older
+GitHub release pages, and keep stable git tags for source history. Testing,
+beta, rc, or pre-release tags replace the moving `prerelease` feed and delete
+the temporary testing tag after upload.
+
+`scripts/build-aur.sh` regenerates `packaging/aur/.SRCINFO` with `makepkg` when
+available before staging `target/aur/wavelinux`, so version bumps keep the
+checked-in AUR metadata aligned with `packaging/aur/PKGBUILD`.
 
 Required GitHub Actions secrets:
 

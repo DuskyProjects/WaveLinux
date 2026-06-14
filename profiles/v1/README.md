@@ -17,7 +17,10 @@ hardware-profiles-v1-index.json
 hardware-profiles-v1-index.json.sig
 ```
 
-When an index entry matches detected hardware, WaveLinux downloads only that matching signed profile asset from GitHub Releases and caches it in `~/.config/wavelinux/hardware-profiles/v1/remote/`. It does not ship or load a full built-in profile catalog.
+When an index entry matches detected hardware, WaveLinux downloads only that
+matching signed profile asset from the selected GitHub release feed and caches
+it in `~/.config/wavelinux/hardware-profiles/v1/remote/`. It does not ship or
+load a full built-in profile catalog.
 
 Installers may run `wavelinux --prewarm-hardware-profiles` after install. That command performs a read-only audio hardware check, downloads any signed matching remote profiles into the same cache, and exits without opening the UI or changing PipeWire routing. If hardware, PipeWire, or GitHub is unavailable during install, WaveLinux logs the reason and retries from the normal background detector when the app starts.
 

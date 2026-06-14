@@ -131,6 +131,22 @@ jobs:
           prerelease: false
           files: target/release/upload/*
 
+      - name: Prune older GitHub release pages
+        if: startsWith(github.ref, 'refs/tags/') && !(contains(github.ref_name, 'pre') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'testing') || contains(github.ref_name, 'Testing'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CURRENT_TAG="$GITHUB_REF_NAME"
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' |
+            while IFS= read -r tag; do
+              [[ -z "$tag" || "$tag" == "$CURRENT_TAG" ]] && continue
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" -y
+            done
+
+          if git ls-remote --exit-code --tags origin refs/tags/prerelease >/dev/null 2>&1; then
+            git push origin ":refs/tags/prerelease"
+          fi
+
       - name: Publish moving testing update feed
         if: startsWith(github.ref, 'refs/tags/') && (contains(github.ref_name, 'pre') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'testing') || contains(github.ref_name, 'Testing'))
         env:
