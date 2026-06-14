@@ -104,6 +104,18 @@ jobs:
           cp target/aur/wavelinux/.SRCINFO target/release/upload/wavelinux.SRCINFO
           cp target/hardware-profiles/v1/*.json* target/release/upload/
 
+      - name: Prepare GitHub release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES_VERSION="${VERSION%%-*}"
+          mkdir -p target/release
+          awk -v version="$NOTES_VERSION" '
+            $0 == "# WaveLinux " version { in_section = 1; found = 1 }
+            in_section && /^# WaveLinux / && $0 != "# WaveLinux " version { exit }
+            in_section { print }
+            END { if (!found) exit 1 }
+          ' RELEASE_NOTES.md > target/release/release-notes.md
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -115,7 +127,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           name: WaveLinux ${{ github.ref_name }}
-          body_path: RELEASE_NOTES.md
+          body_path: target/release/release-notes.md
           prerelease: false
           files: target/release/upload/*
 
@@ -137,14 +149,14 @@ jobs:
               done
             gh release edit prerelease \
               --title "$TITLE" \
-              --notes-file RELEASE_NOTES.md \
+              --notes-file target/release/release-notes.md \
               --prerelease
             gh release upload prerelease target/release/upload/* --clobber
           else
             gh release create prerelease target/release/upload/* \
               --target "$GITHUB_SHA" \
               --title "$TITLE" \
-              --notes-file RELEASE_NOTES.md \
+              --notes-file target/release/release-notes.md \
               --prerelease
           fi
 
