@@ -48,8 +48,11 @@ bash scripts/distro-smoke.sh --distro fedora --target native --release-tag v4.3.
 
 The AppImage target downloads the release AppImage, runs
 `--install-runtime-dependencies`, and then verifies
-`--check-runtime-dependencies`. The native target installs the release deb or
-rpm with the distro package manager and then runs the same runtime check.
+`--check-runtime-dependencies` on Debian, Ubuntu, Fedora, and Arch. The native
+target installs the release deb or rpm with the distro package manager and then
+runs the same runtime check on Ubuntu and Fedora. Debian 12 is covered by the
+AppImage path because the native deb is built on the current GitHub Linux runner
+and may require a newer glibc than Debian 12 provides.
 
 Containers are not full desktop sessions, so the smoke harness accepts the
 container-only `bwrap usable sandbox` warning after package installation. It

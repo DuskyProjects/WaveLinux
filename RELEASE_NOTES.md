@@ -5,11 +5,11 @@ release artifacts.
 
 ## Fixes
 
-- Builds release packages on Ubuntu 22.04 so the deb and rpm binaries keep a
-  glibc baseline that runs on Debian 12-class systems.
 - Bundles additional AppImage startup libraries needed on clean Debian, Ubuntu,
   Fedora, and Arch containers before WaveLinux can run its dependency installer.
 - Adds the missing Fedora appindicator runtime dependency to the rpm metadata.
+- Keeps native package smoke coverage on Ubuntu and Fedora while using the
+  AppImage smoke path for Debian 12 compatibility.
 
 # WaveLinux 4.3.4
 

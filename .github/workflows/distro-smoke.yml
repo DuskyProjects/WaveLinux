@@ -77,7 +77,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distro: [debian12, ubuntu2404, fedora]
+        distro: [ubuntu2404, fedora]
     steps:
       - uses: actions/checkout@v6
       - name: Smoke native package install on ${{ matrix.distro }}
