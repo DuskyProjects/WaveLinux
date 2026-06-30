@@ -3724,7 +3724,17 @@ impl WaveLinuxEngine {
     }
 
     fn rebuild_effect_chain_configs(&self) -> Result<Vec<PathBuf>, EngineError> {
-        let config = self.read_config()?.clone();
+        self.rebuild_effect_chain_configs_for_runtime_prefix(&graph_prefix())
+    }
+
+    fn rebuild_effect_chain_configs_for_runtime_prefix(
+        &self,
+        runtime_prefix: &str,
+    ) -> Result<Vec<PathBuf>, EngineError> {
+        let config = self.config_with_unhealthy_effects_bypassed_for_runtime_prefix(
+            &self.read_config()?.clone(),
+            runtime_prefix,
+        );
         let dir = self.paths.effect_chains_dir();
         fs::create_dir_all(&dir)?;
 
@@ -4025,7 +4035,15 @@ impl WaveLinuxEngine {
     }
 
     fn config_with_unhealthy_effects_bypassed(&self, config: &MixerConfig) -> MixerConfig {
-        if graph_prefix() != "wavelinux5" {
+        self.config_with_unhealthy_effects_bypassed_for_runtime_prefix(config, &graph_prefix())
+    }
+
+    fn config_with_unhealthy_effects_bypassed_for_runtime_prefix(
+        &self,
+        config: &MixerConfig,
+        runtime_prefix: &str,
+    ) -> MixerConfig {
+        if runtime_prefix != "wavelinux5" {
             // Stable WaveLinux keeps the existing behavior: runtime FX warnings
             // remain diagnostic-only so user-selected processing is preserved.
             return config.clone();
@@ -12364,6 +12382,57 @@ mod tests {
         engine.rebuild_effect_chain_configs().unwrap();
         assert!(!path.exists());
         assert!(!dsp_path.exists());
+    }
+
+    #[test]
+    fn wavelinux5_effect_chain_configs_bypass_recent_underrun_heavy_effects() {
+        let engine = test_engine();
+        let mut deepfilter = EffectInstance::new("deepfilternet");
+        deepfilter.instance_id = "deepfilter".into();
+        let mut gate = EffectInstance::new("gate");
+        gate.instance_id = "gate".into();
+
+        engine
+            .set_effect_chain("hardware_in".into(), vec![deepfilter, gate])
+            .unwrap();
+        let saved_config = engine.read_config().unwrap().clone();
+        let channel = saved_config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        fs::write(
+            engine.effect_chain_log_path(channel),
+            "Underrun detected (RTF: 1.50). Processing too slow!\n",
+        )
+        .unwrap();
+
+        engine
+            .rebuild_effect_chain_configs_for_runtime_prefix("wavelinux5")
+            .unwrap();
+
+        let path = engine
+            .paths
+            .effect_chains_dir()
+            .join("wavelinux-chain-hardware_in.conf");
+        let rendered = fs::read_to_string(&path).unwrap();
+        assert!(!rendered.contains("libdeep_filter_ladspa"));
+        assert!(!rendered.contains("deepfilter"));
+        assert!(rendered.contains("gate_1410"));
+
+        let dsp_path = engine
+            .paths
+            .effect_chains_dir()
+            .join("wavelinux-chain-hardware_in.json");
+        let dsp_config: wavelinux_dsp::DspChannelConfig =
+            serde_json::from_str(&fs::read_to_string(&dsp_path).unwrap()).unwrap();
+        let bypassed = dsp_config
+            .effects
+            .iter()
+            .map(|effect| (effect.effect_id.as_str(), effect.bypassed))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(bypassed.get("deepfilternet"), Some(&true));
+        assert_eq!(bypassed.get("gate"), Some(&false));
     }
 
     #[test]
