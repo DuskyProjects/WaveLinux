@@ -3,6 +3,9 @@
 This page collects the operational details that do not need to live on the
 front README.
 
+For the engine, effect-routing, logging, and AppImage packaging design, see
+[Architecture notes](architecture.md).
+
 ## Install From A Release
 
 Download the latest release artifact:
@@ -23,6 +26,11 @@ helpers, libusb for optional Elgato controls, and supported LADSPA effect
 plugins present on the release builder. First launch still checks host-bound
 pieces such as PipeWire, desktop display/GL libraries, fonts, portals, and
 distro-provided effect packages.
+
+PipeWire is intentionally host-bound for AppImage builds. Release packaging
+must not bundle `libpipewire-0.3.so*`, the GStreamer PipeWire plugin, or partial
+`pipewire-0.3`/`spa-0.2` module trees because version-mismatched client
+libraries can prevent live meters from creating PipeWire streams.
 
 ## Local Install
 
@@ -46,6 +54,14 @@ seeds local hardware profiles into:
 
 ```bash
 ~/.config/wavelinux/hardware-profiles/v1/local/wavelinux-local-seed
+```
+
+The WaveLinux5 test line installs side-by-side instead:
+
+```bash
+~/.local/share/wavelinux5/WaveLinux5_5.0.0_amd64.AppImage
+~/.local/bin/wavelinux5
+~/.config/wavelinux5/hardware-profiles/v1/local/wavelinux5-local-seed
 ```
 
 ## Runtime Checks
@@ -75,6 +91,15 @@ Run AppImage preflight manually:
 ./WaveLinux_4.3.7_amd64.AppImage --check-runtime-dependencies
 ./WaveLinux_4.3.7_amd64.AppImage --install-runtime-dependencies
 ```
+
+The runtime check reports the host PipeWire client stack and fails if an
+AppImage is shadowing it with bundled PipeWire libraries or modules.
+
+AppImage startup also probes `pactl info` before the UI opens. If packages are
+installed but the user audio stack is not running, WaveLinux tries to start
+`pipewire`, `pipewire-pulse`, and `wireplumber` through `systemctl --user`; on
+non-systemd sessions it falls back to launching those daemons directly. Set
+`WAVELINUX_SKIP_AUDIO_SERVICE_START=1` to disable this startup recovery.
 
 Use `WAVELINUX_SKIP_RUNTIME_INSTALL=1` to skip the AppImage preflight, or
 `WAVELINUX_ASSUME_RUNTIME_DEPS=1` when a packager has already provided all host
@@ -200,6 +225,18 @@ Build local desktop bundles:
 yarn desktop:build
 ```
 
+The local and release build scripts sanitize the generated AppDir, rebuild the
+AppImage, and reject artifacts that contain bundled PipeWire client libraries,
+PipeWire GStreamer plugins, or partial SPA/PipeWire module trees.
+
+If Tauri's cached linuxdeploy AppImage fails while stripping newer ELF sections,
+`scripts/build-local.sh` retries with
+`scripts/rebuild-appimage-with-host-strip.sh`. That fallback extracts
+linuxdeploy, replaces the embedded `strip` with the host `strip`, and reruns the
+GTK/GStreamer plugin pass before `scripts/finalize-appimage.sh` rebuilds the
+sanitized AppImage. For the full packaging flow, see
+[Architecture notes](architecture.md#appimage-packaging).
+
 Regenerate and stage AUR files:
 
 ```bash
@@ -218,6 +255,8 @@ package files when a `v*` tag is pushed. Hardware profiles are fetched from
 `profiles/v1` in the repository instead of being uploaded as release assets.
 Stable tags publish only the matching section from `RELEASE_NOTES.md`, prune
 older GitHub release pages, and keep stable git tags for source history.
+Testing tags containing `testing`, `beta`, `pre`, or `rc` publish to the moving
+`prerelease` GitHub release instead of the stable `latest` release.
 
 Required GitHub Actions secrets:
 
@@ -232,6 +271,6 @@ Required GitHub Actions secrets:
 - `crates/pw`: PipeWire/PulseAudio command planning, parsing, and DSP rendering.
 - `profiles/v1`: hardware profile schema, examples, author docs, and device seeds.
 - `src`: React/TypeScript UI.
-- `docs`: setup, testing, and theme authoring docs.
+- `docs`: architecture, setup, testing, and theme authoring docs.
 - `scripts`: installers, release helpers, dependency checks, and validation.
 - `packaging/aur`: Arch/AUR package metadata.

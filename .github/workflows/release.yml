@@ -67,6 +67,9 @@ jobs:
           NO_STRIP: "0"
         run: yarn desktop:release
 
+      - name: Assert AppImage uses host PipeWire
+        run: bash scripts/sanitize-appimage-pipewire.sh --check target/release/bundle/appimage/*.AppImage
+
       - name: Build updater latest.json
         run: |
           TAG="${GITHUB_REF_NAME}"
@@ -75,7 +78,10 @@ jobs:
           if [[ "$TAG" == *pre* || "$TAG" == *beta* || "$TAG" == *rc* || "$TAG" == *testing* || "$TAG" == *Testing* ]]; then
             FEED_TAG="prerelease"
           fi
-          ARTIFACT="$(find target/release/bundle/appimage \( -name '*.AppImage.tar.gz' -o -name '*.AppImage' \) | sort | head -n 1)"
+          ARTIFACT="$(find target/release/bundle/appimage -name '*.AppImage.tar.gz' | sort | head -n 1)"
+          if [[ -z "$ARTIFACT" ]]; then
+            ARTIFACT="$(find target/release/bundle/appimage -name '*.AppImage' | sort | head -n 1)"
+          fi
           python3 scripts/build-updater-manifest.py \
             --artifact "$ARTIFACT" \
             --version "$VERSION" \

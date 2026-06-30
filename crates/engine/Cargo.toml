@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 directories.workspace = true
+libc = "0.2"
 pipewire = { version = "0.9", features = ["v0_3_44"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 serde.workspace = true
@@ -17,6 +18,7 @@ time.workspace = true
 uuid.workspace = true
 wavelinux-model = { path = "../model" }
 wavelinux-pw = { path = "../pw" }
+wavelinux-dsp = { path = "../dsp" }
 
 [dev-dependencies]
 include_dir.workspace = true

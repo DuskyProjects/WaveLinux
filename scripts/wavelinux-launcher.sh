@@ -1,13 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SUPPORT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wavelinux"
+PROGRAM_NAME="$(basename "$0")"
+BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
+if [[ "$PROGRAM_NAME" == "wavelinux5" ]]; then
+  SUPPORT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wavelinux5"
+  PRODUCT_NAME="WaveLinux5"
+  export WAVELINUX_XDG_APP_NAME="${WAVELINUX_XDG_APP_NAME:-WaveLinux5}"
+  export WAVELINUX_GRAPH_PREFIX="${WAVELINUX_GRAPH_PREFIX:-wavelinux5}"
+  export WAVELINUX_GRAPH_PROPERTY_PREFIX="${WAVELINUX_GRAPH_PROPERTY_PREFIX:-wavelinux5}"
+  export WAVELINUX_APP_DISPLAY_NAME="${WAVELINUX_APP_DISPLAY_NAME:-WaveLinux5}"
+  LOCAL_DSP_HELPER="$BIN_DIR/wavelinux5-dsp-helper"
+  if [[ -x "$LOCAL_DSP_HELPER" ]]; then
+    export WAVELINUX_DSP_HELPER="${WAVELINUX_DSP_HELPER:-$LOCAL_DSP_HELPER}"
+  fi
+  if [[ -z "${WAVELINUX_FILTER_CHAIN_PIPEWIRE:-}" ]]; then
+    if HOST_PIPEWIRE="$(command -v pipewire 2>/dev/null)" && [[ -x "$HOST_PIPEWIRE" ]]; then
+      export WAVELINUX_FILTER_CHAIN_PIPEWIRE="$HOST_PIPEWIRE"
+    fi
+  fi
+else
+  SUPPORT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wavelinux"
+  PRODUCT_NAME="WaveLinux"
+fi
 APPIMAGE="${WAVELINUX_APPIMAGE:-}"
 SANITIZER="$SUPPORT_DIR/sanitize-runtime-env.sh"
 
 if [[ -z "$APPIMAGE" ]]; then
-  APPIMAGE="$({ find "$SUPPORT_DIR" -maxdepth 1 -type f -name 'WaveLinux_*_amd64.AppImage' -print 2>/dev/null || true; } | sort -V | tail -n1)"
-  APPIMAGE="${APPIMAGE:-$SUPPORT_DIR/WaveLinux.AppImage}"
+  APPIMAGE="$({ find "$SUPPORT_DIR" -maxdepth 1 -type f -name "${PRODUCT_NAME}_*_amd64.AppImage" -print 2>/dev/null || true; } | sort -V | tail -n1)"
+  APPIMAGE="${APPIMAGE:-$SUPPORT_DIR/${PRODUCT_NAME}.AppImage}"
 fi
 
 if [[ -f "$SANITIZER" ]]; then
@@ -33,7 +54,7 @@ else
 fi
 
 if [[ ! -x "$APPIMAGE" ]]; then
-  echo "WaveLinux AppImage is missing or not executable: $APPIMAGE" >&2
+  echo "$PRODUCT_NAME AppImage is missing or not executable: $APPIMAGE" >&2
   echo "Run bash scripts/build-local.sh && bash scripts/install-local.sh from the WaveLinux source tree to reinstall it." >&2
   exit 1
 fi

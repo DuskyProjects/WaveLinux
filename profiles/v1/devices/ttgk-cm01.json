@@ -1,0 +1,45 @@
+{
+  "id": "ttgk.cm01",
+  "name": "TTGK CM01 USB Audio",
+  "revision": 2,
+  "matches": [
+    {
+      "bus": "usb",
+      "vendor_id": "3302",
+      "product_id": "33a0",
+      "description_contains": ["cm01"]
+    },
+    {
+      "bus": "usb",
+      "node_name_contains": ["TTGK_Technology_Co._Ltd_CM01"]
+    }
+  ],
+  "capabilities": {
+    "input": true,
+    "output": true,
+    "duplex": true,
+    "usb_audio_class": true,
+    "sample_rates_hz": [48000]
+  },
+  "latency_policy": {
+    "stable_msec": 28,
+    "low_latency_msec": 14
+  },
+  "routing_policy": {
+    "input_priority": 55,
+    "output_priority": 76,
+    "allow_auto_select_input": true,
+    "allow_auto_select_output": true
+  },
+  "bluetooth_mic_policy": "never_if_hfp",
+  "codec_policy": {},
+  "confidence": "medium",
+  "quirks": [
+    "Observed Linux endpoints expose CM01 Analog Stereo output plus a CM01 Mono capture endpoint for an attached microphone.",
+    "Local PipeWire logs showed ALSA playback resyncs when WaveLinux5 ran this adapter at 8 ms with heavy realtime FX, so the profile keeps a more conservative USB-mic latency floor."
+  ],
+  "source_notes": [
+    "Seeded from local PipeWire detection: TTGK Technology Co.,Ltd CM01 reports USB ids 3302:33a0 and ALSA card name CM01."
+  ],
+  "maintainer": "WaveLinux"
+}

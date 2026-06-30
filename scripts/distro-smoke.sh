@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="${WAVELINUX_SMOKE_REPO:-DuskyProjects/WaveLinux}"
+PRODUCT_NAME="${WAVELINUX_SMOKE_PRODUCT_NAME:-WaveLinux5}"
 DISTRO="${WAVELINUX_SMOKE_DISTRO:-all}"
 TARGET="${WAVELINUX_SMOKE_TARGET:-appimage}"
 RELEASE_TAG="${WAVELINUX_SMOKE_RELEASE_TAG:-latest}"
@@ -24,8 +25,10 @@ Targets:
   native         Install the release deb/rpm package and check runtime deps. Arch is skipped.
   source-helper  Run scripts/check-dependencies.sh --install --strict-runtime from the checkout.
 
-Environment:
+  Environment:
   WAVELINUX_CONTAINER_ENGINE=docker|podman
+  WAVELINUX_SMOKE_PRODUCT_NAME=WaveLinux5
+  WAVELINUX_SMOKE_ARTIFACT_VERSION=5.0.0
   WAVELINUX_SMOKE_PRIVILEGED=0  Disable privileged container mode.
 HELP
 }
@@ -157,7 +160,9 @@ run_runtime_check() {
 }
 
 installed_wavelinux_command() {
-  if command -v wavelinux >/dev/null 2>&1; then
+  if command -v wavelinux5 >/dev/null 2>&1; then
+    command -v wavelinux5
+  elif command -v wavelinux >/dev/null 2>&1; then
     command -v wavelinux
   elif command -v wavelinux-app >/dev/null 2>&1; then
     command -v wavelinux-app
@@ -167,14 +172,16 @@ installed_wavelinux_command() {
 }
 
 smoke_appimage() {
-  local tag version asset appimage
+  local tag version artifact_version asset appimage
   tag="$(resolve_latest_tag)"
   version="${tag#v}"
-  asset="WaveLinux_${version}_amd64.AppImage"
+  artifact_version="${WAVELINUX_SMOKE_ARTIFACT_VERSION:-${version%%-*}}"
+  asset="${PRODUCT_NAME}_${artifact_version}_amd64.AppImage"
   appimage="/tmp/$asset"
 
   download_release_asset "$tag" "$asset" "$appimage"
   chmod +x "$appimage"
+  bash "$ROOT_DIR/scripts/sanitize-appimage-pipewire.sh" --check "$appimage"
 
   echo "Initial AppImage runtime report for $tag:"
   APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --check-runtime-dependencies || true
@@ -187,13 +194,14 @@ smoke_appimage() {
 }
 
 smoke_native() {
-  local tag version manager asset package
+  local tag version artifact_version manager asset package
   tag="$(resolve_latest_tag)"
   version="${tag#v}"
+  artifact_version="${WAVELINUX_SMOKE_ARTIFACT_VERSION:-${version%%-*}}"
   manager="$(manager_id)"
   case "$manager" in
     apt)
-      asset="WaveLinux_${version}_amd64.deb"
+      asset="${PRODUCT_NAME}_${artifact_version}_amd64.deb"
       package="/tmp/$asset"
       download_release_asset "$tag" "$asset" "$package"
       export DEBIAN_FRONTEND=noninteractive
@@ -201,7 +209,7 @@ smoke_native() {
       apt-get install -y "$package"
       ;;
     dnf)
-      asset="WaveLinux-${version}-1.x86_64.rpm"
+      asset="${PRODUCT_NAME}-${artifact_version}-1.x86_64.rpm"
       package="/tmp/$asset"
       download_release_asset "$tag" "$asset" "$package"
       dnf install -y "$package"

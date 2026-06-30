@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wavelinux_model::{
-    safe_node_id, AppMatcher, AppStream, Channel, ChannelInputMode, DeviceBus, DeviceInfo,
-    Diagnostic, DiagnosticSeverity, EffectAvailability, EffectCatalog, EffectInstance, Mix,
-    MixerConfig, MixerSettings, OptimizationMode, PluginHint, RuntimeGraph, SAMPLE_RATE_HZ,
+    app_display_name, graph_prefix, graph_property_prefix, safe_node_id, AppMatcher, AppStream,
+    Channel, ChannelInputMode, DeviceBus, DeviceInfo, Diagnostic, DiagnosticSeverity,
+    EffectAvailability, EffectCatalog, EffectInstance, Mix, MixerConfig, MixerSettings,
+    OptimizationMode, PluginHint, RuntimeGraph, SAMPLE_RATE_HZ,
 };
 
 pub const INPUT_ROUTE_REVISION: &str = "4";
@@ -65,6 +66,26 @@ const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
     "WEBKIT_EXEC_PATH",
     "XDG_DATA_DIRS",
 ];
+
+fn graph_prop(name: &str) -> String {
+    format!("{}.{}", graph_property_prefix(), name)
+}
+
+fn graph_prop_assignment(name: &str, value: impl AsRef<str>) -> String {
+    format!("{}={}", graph_prop(name), property_value(value.as_ref()))
+}
+
+fn graph_property_string(
+    properties: &BTreeMap<String, serde_json::Value>,
+    name: &str,
+) -> Option<String> {
+    property_string(properties, &graph_prop(name))
+}
+
+fn graph_property_value_from_arg<'a>(argument: &'a str, name: &str) -> Option<&'a str> {
+    let key = format!("{}=", graph_prop(name));
+    property_value_from_arg(argument, &key)
+}
 
 #[derive(Debug, Error)]
 pub enum PwError {
@@ -267,6 +288,35 @@ impl PwClient {
                 },
             });
         }
+        let pactl_info =
+            command_output_with_timeout("pactl", &["info".to_string()], COMMAND_TIMEOUT);
+        diagnostics.push(match pactl_info {
+            Ok(output) if output.status.success() => Diagnostic {
+                code: "host_audio.pactl_info".into(),
+                severity: DiagnosticSeverity::Info,
+                message: "pactl can connect to the host audio server".into(),
+                action: None,
+            },
+            Ok(output) => Diagnostic {
+                code: "host_audio.pactl_info".into(),
+                severity: DiagnosticSeverity::Error,
+                message: format!(
+                    "pactl cannot connect to the host audio server: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                action: Some(
+                    "Start the user PipeWire stack: systemctl --user start pipewire pipewire-pulse wireplumber".into(),
+                ),
+            },
+            Err(err) => Diagnostic {
+                code: "host_audio.pactl_info".into(),
+                severity: DiagnosticSeverity::Error,
+                message: format!("pactl audio server probe failed: {err}"),
+                action: Some(
+                    "Install and start PipeWire, WirePlumber, and pipewire-pulse for the current user session".into(),
+                ),
+            },
+        });
         diagnostics
     }
 
@@ -667,11 +717,11 @@ fn effect_meter_sources_by_channel(available_sources: &[DeviceInfo]) -> BTreeMap
     available_sources
         .iter()
         .filter_map(|source| {
-            let role = source.pipewire_properties.get("wavelinux.role")?;
+            let role = source.pipewire_properties.get(&graph_prop("role"))?;
             if role != "effect_output" {
                 return None;
             }
-            let channel_id = source.pipewire_properties.get("wavelinux.channel_id")?;
+            let channel_id = source.pipewire_properties.get(&graph_prop("channel_id"))?;
             (!channel_id.trim().is_empty() && !source.name.trim().is_empty())
                 .then(|| (channel_id.clone(), source.name.clone()))
         })
@@ -893,6 +943,7 @@ fn route_settings_for_config(config: &MixerConfig) -> MixerSettings {
 pub fn plan_ensure_mix(mix: &Mix) -> Vec<CommandSpec> {
     let display_name = wavelinux_display_name(&mix.name);
     let display_value = property_value(&display_name);
+    let app_name = property_value(&app_display_name());
     vec![
         CommandSpec::new(
             CommandDomain::Graph,
@@ -903,11 +954,14 @@ pub fn plan_ensure_mix(mix: &Mix) -> Vec<CommandSpec> {
                 format!("sink_name={}", mix.virtual_sink_name),
                 format!("rate={SAMPLE_RATE_HZ}"),
                 "channels=2".into(),
-                "channel_map=front-left,front-right".into(),
-                format!(
-                    "sink_properties=device.description={0} node.description={0} node.nick={0} media.name={0} application.name=WaveLinux media.class=Audio/Sink wavelinux.managed=1 wavelinux.role=mix wavelinux.mix_id={1}",
+            "channel_map=front-left,front-right".into(),
+            format!(
+                    "sink_properties=device.description={0} node.description={0} node.nick={0} media.name={0} application.name={1} media.class=Audio/Sink {2} {3} {4}",
                     display_value,
-                    mix.id
+                    app_name,
+                    graph_prop_assignment("managed", "1"),
+                    graph_prop_assignment("role", "mix"),
+                    graph_prop_assignment("mix_id", &mix.id),
                 ),
             ],
             format!("create virtual mix sink '{}'", mix.name),
@@ -921,11 +975,14 @@ pub fn plan_ensure_mix(mix: &Mix) -> Vec<CommandSpec> {
                 format!("master={}.monitor", mix.virtual_sink_name),
                 format!("source_name={}", mix.virtual_source_name),
                 "channels=2".into(),
-                "channel_map=front-left,front-right".into(),
-                format!(
-                    "source_properties=device.description={0} node.description={0} node.nick={0} media.name={0} application.name=WaveLinux media.class=Audio/Source/Virtual wavelinux.managed=1 wavelinux.role=mix_source wavelinux.mix_id={1}",
+            "channel_map=front-left,front-right".into(),
+            format!(
+                    "source_properties=device.description={0} node.description={0} node.nick={0} media.name={0} application.name={1} media.class=Audio/Source/Virtual {2} {3} {4}",
                     display_value,
-                    mix.id
+                    app_name,
+                    graph_prop_assignment("managed", "1"),
+                    graph_prop_assignment("role", "mix_source"),
+                    graph_prop_assignment("mix_id", &mix.id),
                 ),
             ],
             format!("expose '{}' as virtual source", mix.name),
@@ -936,6 +993,7 @@ pub fn plan_ensure_mix(mix: &Mix) -> Vec<CommandSpec> {
 pub fn plan_ensure_channel(channel: &Channel) -> Vec<CommandSpec> {
     let display_name = wavelinux_display_name(&channel.name);
     let display_value = property_value(&display_name);
+    let app_name = property_value(&app_display_name());
     vec![CommandSpec::new(
         CommandDomain::Graph,
         "pactl",
@@ -945,11 +1003,14 @@ pub fn plan_ensure_channel(channel: &Channel) -> Vec<CommandSpec> {
             format!("sink_name={}", channel.virtual_sink_name),
             format!("rate={SAMPLE_RATE_HZ}"),
             "channels=2".into(),
-            "channel_map=front-left,front-right".into(),
-            format!(
-                "sink_properties=device.description={0} node.description={0} node.nick={0} media.name={0} application.name=WaveLinux media.class=Audio/Sink wavelinux.managed=1 wavelinux.role=channel wavelinux.channel_id={1}",
+        "channel_map=front-left,front-right".into(),
+        format!(
+                "sink_properties=device.description={0} node.description={0} node.nick={0} media.name={0} application.name={1} media.class=Audio/Sink {2} {3} {4}",
                 display_value,
-                channel.id
+                app_name,
+                graph_prop_assignment("managed", "1"),
+                graph_prop_assignment("role", "channel"),
+                graph_prop_assignment("channel_id", &channel.id),
             ),
         ],
         format!("create channel sink '{}'", channel.name),
@@ -965,10 +1026,10 @@ pub fn plan_route_channel_to_mix(
     let latency_msec = channel_mix_latency_msec(channel, mix, settings);
     let route_revision = route_revision_with_latency(CHANNEL_MIX_ROUTE_REVISION, latency_msec);
     let route_properties = [
-        ("wavelinux.role", "channel_to_mix".to_string()),
-        ("wavelinux.channel_id", channel.id.clone()),
-        ("wavelinux.mix_id", mix.id.clone()),
-        ("wavelinux.route_revision", route_revision.clone()),
+        (graph_prop("role"), "channel_to_mix".to_string()),
+        (graph_prop("channel_id"), channel.id.clone()),
+        (graph_prop("mix_id"), mix.id.clone()),
+        (graph_prop("route_revision"), route_revision.clone()),
     ];
     vec![CommandSpec::new(
         CommandDomain::Route,
@@ -1041,21 +1102,21 @@ pub fn channel_has_active_effects(channel: &Channel) -> bool {
 }
 
 pub fn effect_chain_input_name(channel: &Channel) -> String {
-    format!("wavelinux_fx_{}_input", safe_node_id(&channel.id))
+    format!("{}_fx_{}_input", graph_prefix(), safe_node_id(&channel.id))
 }
 
 pub fn effect_chain_source_name(channel: &Channel) -> String {
     if channel.id == "hardware_in" {
-        return "wavelinux-mic".into();
+        return format!("{}-mic", graph_prefix());
     }
-    format!("wavelinux_fx_{}_source", safe_node_id(&channel.id))
+    format!("{}_fx_{}_source", graph_prefix(), safe_node_id(&channel.id))
 }
 
 fn effect_chain_source_label(channel: &Channel) -> String {
     if channel.id == "hardware_in" {
-        "WaveLinux-mic".into()
+        format!("{}-mic", app_display_name())
     } else {
-        format!("WaveLinux FX {} Output", channel.name)
+        format!("{} FX {} Output", app_display_name(), channel.name)
     }
 }
 
@@ -1067,9 +1128,9 @@ pub fn plan_route_channel_to_effect(
     let latency_msec = hardware_route_latency_msec(channel, settings);
     let route_revision = route_revision_with_latency(EFFECT_ROUTE_REVISION, latency_msec);
     let route_properties = [
-        ("wavelinux.role", "channel_to_effect".to_string()),
-        ("wavelinux.channel_id", channel.id.clone()),
-        ("wavelinux.route_revision", route_revision.clone()),
+        (graph_prop("role"), "channel_to_effect".to_string()),
+        (graph_prop("channel_id"), channel.id.clone()),
+        (graph_prop("route_revision"), route_revision.clone()),
     ];
     vec![CommandSpec::new(
         CommandDomain::Route,
@@ -1116,10 +1177,10 @@ pub fn plan_route_input_to_channel(
     let latency_msec = hardware_route_latency_msec(channel, settings);
     let route_revision = route_revision_with_latency(INPUT_ROUTE_REVISION, latency_msec);
     let route_properties = [
-        ("wavelinux.role", "input_to_channel".to_string()),
-        ("wavelinux.channel_id", channel.id.clone()),
-        ("wavelinux.input_mode", mode_id.to_string()),
-        ("wavelinux.route_revision", route_revision.clone()),
+        (graph_prop("role"), "input_to_channel".to_string()),
+        (graph_prop("channel_id"), channel.id.clone()),
+        (graph_prop("input_mode"), mode_id.to_string()),
+        (graph_prop("route_revision"), route_revision.clone()),
     ];
     vec![CommandSpec::new(
         CommandDomain::Route,
@@ -1304,12 +1365,12 @@ fn managed_loopback_properties(
     side: &str,
     route_kind: &str,
     route_parts: &[&str],
-    route_properties: &[(&str, String)],
+    route_properties: &[(String, String)],
 ) -> String {
     let media_name = managed_loopback_media_name(side, route_kind, route_parts);
     let mut properties = vec![
-        "wavelinux.managed=1".to_string(),
-        "application.name=WaveLinux".to_string(),
+        graph_prop_assignment("managed", "1"),
+        format!("application.name={}", property_value(&app_display_name())),
         format!("media.name={}", property_value(&media_name)),
         "node.dont-move=true".to_string(),
         "state.restore-props=false".to_string(),
@@ -1325,7 +1386,7 @@ fn managed_loopback_properties(
 
 fn managed_loopback_media_name(side: &str, route_kind: &str, route_parts: &[&str]) -> String {
     let mut parts = vec![
-        "wavelinux-route".to_string(),
+        format!("{}-route", graph_prefix()),
         safe_node_id(side),
         safe_node_id(route_kind),
     ];
@@ -1341,9 +1402,9 @@ pub fn plan_route_mix_to_output(
     let latency_msec = mix_monitor_latency_msec_for_sink(mix, sink_name, settings);
     let route_revision = route_revision_with_latency(MIX_MONITOR_ROUTE_REVISION, latency_msec);
     let route_properties = [
-        ("wavelinux.role", "mix_monitor".to_string()),
-        ("wavelinux.mix_id", mix.id.clone()),
-        ("wavelinux.route_revision", route_revision.clone()),
+        (graph_prop("role"), "mix_monitor".to_string()),
+        (graph_prop("mix_id"), mix.id.clone()),
+        (graph_prop("route_revision"), route_revision.clone()),
     ];
     vec![CommandSpec::new(
         CommandDomain::Route,
@@ -1746,10 +1807,11 @@ pub fn plan_kill_stale_processes(processes: &[StaleProcess]) -> Vec<CommandSpec>
 }
 
 pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String {
-    let chain_name = format!("wavelinux_fx_{}_chain", safe_node_id(&channel.id));
+    let chain_name = format!("{}_fx_{}_chain", graph_prefix(), safe_node_id(&channel.id));
     let input_name = effect_chain_input_name(channel);
     let source_name = effect_chain_source_name(channel);
     let source_label = effect_chain_source_label(channel);
+    let app_name = app_display_name();
     let effect_nodes = channel
         .effects
         .iter()
@@ -1781,20 +1843,28 @@ pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String
     rendered.push_str("      node.name = \"");
     rendered.push_str(&escape_pw(&chain_name));
     rendered.push_str("\"\n");
-    rendered.push_str("      wavelinux.managed = \"1\"\n");
-    rendered.push_str("      wavelinux.role = \"effect_chain\"\n");
-    rendered.push_str("      wavelinux.effect_config_revision = \"");
+    append_filter_property(&mut rendered, 6, "managed", "1");
+    append_filter_property(&mut rendered, 6, "role", "effect_chain");
+    rendered.push_str("      ");
+    rendered.push_str(&graph_prop("effect_config_revision"));
+    rendered.push_str(" = \"");
     rendered.push_str(EFFECT_CONFIG_REVISION);
     rendered.push_str("\"\n");
-    rendered.push_str("      wavelinux.channel_id = \"");
+    rendered.push_str("      ");
+    rendered.push_str(&graph_prop("channel_id"));
+    rendered.push_str(" = \"");
     rendered.push_str(&escape_pw(&channel.id));
     rendered.push_str("\"\n");
     rendered.push_str("      audio.channels = 2\n");
     rendered.push_str("      audio.position = [ FL FR ]\n");
-    rendered.push_str("      node.description = \"WaveLinux FX ");
+    rendered.push_str("      node.description = \"");
+    rendered.push_str(&escape_pw(&app_name));
+    rendered.push_str(" FX ");
     rendered.push_str(&escape_pw(&channel.name));
     rendered.push_str("\"\n");
-    rendered.push_str("      media.name = \"WaveLinux FX ");
+    rendered.push_str("      media.name = \"");
+    rendered.push_str(&escape_pw(&app_name));
+    rendered.push_str(" FX ");
     rendered.push_str(&escape_pw(&channel.name));
     rendered.push_str("\"\n");
     rendered.push_str("      filter.graph = {\n");
@@ -1829,11 +1899,17 @@ pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String
     rendered.push_str("        node.name = \"");
     rendered.push_str(&escape_pw(&input_name));
     rendered.push_str("\"\n");
-    rendered.push_str("        node.description = \"WaveLinux FX ");
+    rendered.push_str("        node.description = \"");
+    rendered.push_str(&escape_pw(&app_name));
+    rendered.push_str(" FX ");
     rendered.push_str(&escape_pw(&channel.name));
     rendered.push_str(" Input\"\n");
-    rendered.push_str("        node.nick = \"WaveLinux FX Input\"\n");
-    rendered.push_str("        media.name = \"WaveLinux FX ");
+    rendered.push_str("        node.nick = \"");
+    rendered.push_str(&escape_pw(&app_name));
+    rendered.push_str(" FX Input\"\n");
+    rendered.push_str("        media.name = \"");
+    rendered.push_str(&escape_pw(&app_name));
+    rendered.push_str(" FX ");
     rendered.push_str(&escape_pw(&channel.name));
     rendered.push_str(" Input\"\n");
     rendered.push_str("        media.class = Audio/Sink\n");
@@ -1842,12 +1918,16 @@ pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String
     rendered.push_str("        audio.channels = 2\n");
     rendered.push_str("        audio.position = [ FL FR ]\n");
     rendered.push_str("        node.always-process = true\n");
-    rendered.push_str("        wavelinux.managed = \"1\"\n");
-    rendered.push_str("        wavelinux.role = \"effect_input\"\n");
-    rendered.push_str("        wavelinux.effect_config_revision = \"");
+    append_filter_property(&mut rendered, 8, "managed", "1");
+    append_filter_property(&mut rendered, 8, "role", "effect_input");
+    rendered.push_str("        ");
+    rendered.push_str(&graph_prop("effect_config_revision"));
+    rendered.push_str(" = \"");
     rendered.push_str(EFFECT_CONFIG_REVISION);
     rendered.push_str("\"\n");
-    rendered.push_str("        wavelinux.channel_id = \"");
+    rendered.push_str("        ");
+    rendered.push_str(&graph_prop("channel_id"));
+    rendered.push_str(" = \"");
     rendered.push_str(&escape_pw(&channel.id));
     rendered.push_str("\"\n");
     rendered.push_str("      }\n");
@@ -1873,12 +1953,16 @@ pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String
     rendered.push_str("        audio.channels = 2\n");
     rendered.push_str("        audio.position = [ FL FR ]\n");
     rendered.push_str("        node.always-process = true\n");
-    rendered.push_str("        wavelinux.managed = \"1\"\n");
-    rendered.push_str("        wavelinux.role = \"effect_output\"\n");
-    rendered.push_str("        wavelinux.effect_config_revision = \"");
+    append_filter_property(&mut rendered, 8, "managed", "1");
+    append_filter_property(&mut rendered, 8, "role", "effect_output");
+    rendered.push_str("        ");
+    rendered.push_str(&graph_prop("effect_config_revision"));
+    rendered.push_str(" = \"");
     rendered.push_str(EFFECT_CONFIG_REVISION);
     rendered.push_str("\"\n");
-    rendered.push_str("        wavelinux.channel_id = \"");
+    rendered.push_str("        ");
+    rendered.push_str(&graph_prop("channel_id"));
+    rendered.push_str(" = \"");
     rendered.push_str(&escape_pw(&channel.id));
     rendered.push_str("\"\n");
     rendered.push_str("      }\n");
@@ -1886,6 +1970,14 @@ pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String
     rendered.push_str("  }\n");
     rendered.push_str("]\n");
     rendered
+}
+
+fn append_filter_property(rendered: &mut String, indent: usize, name: &str, value: &str) {
+    rendered.push_str(&" ".repeat(indent));
+    rendered.push_str(&graph_prop(name));
+    rendered.push_str(" = \"");
+    rendered.push_str(&escape_pw(value));
+    rendered.push_str("\"\n");
 }
 
 pub fn probe_effect_availability(catalog: &EffectCatalog) -> Vec<EffectAvailability> {
@@ -2271,11 +2363,7 @@ pub fn parse_devices_json(json: &str, fallback_prefix: &str) -> Vec<DeviceInfo> 
             let is_virtual = looks_like_wavelinux_family_node(&id)
                 || looks_like_wavelinux_family_node(&device.name)
                 || looks_like_wavelinux_family_node(&description)
-                || device
-                    .properties
-                    .get("wavelinux.managed")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("1");
+                || graph_property_string(&device.properties, "managed").as_deref() == Some("1");
             let is_available = device_is_available(&device);
             let bus = detect_device_bus(&id, &device.properties, is_virtual);
             DeviceInfo {
@@ -2600,7 +2688,7 @@ fn parse_sink_inputs_json_with_client_properties(
             let media_name = property_string(&properties, "media.name");
             let sink_name = sink_names_by_index.get(&input.sink.to_string());
             let routed_channel_id =
-                property_string(&properties, "wavelinux.channel_id").or_else(|| {
+                graph_property_string(&properties, "channel_id").or_else(|| {
                     let sink_name = sink_name?;
                     config?
                         .channels
@@ -2684,9 +2772,9 @@ pub fn parse_sink_input_routes_json(json: &str) -> Vec<SinkInputRoute> {
         .map(|input| SinkInputRoute {
             id: input.index.to_string(),
             module_id: input.owner_module.module_id(),
-            role: property_string(&input.properties, "wavelinux.role"),
-            channel_id: property_string(&input.properties, "wavelinux.channel_id"),
-            mix_id: property_string(&input.properties, "wavelinux.mix_id"),
+            role: graph_property_string(&input.properties, "role"),
+            channel_id: graph_property_string(&input.properties, "channel_id"),
+            mix_id: graph_property_string(&input.properties, "mix_id"),
             muted: Some(input.mute),
             volume_percent: parse_first_volume_percent(&input.volume),
             sink: Some(input.sink.to_string()).filter(|value| !value.is_empty()),
@@ -2711,7 +2799,7 @@ fn active_playback_sink_from_sink_inputs_json(
 }
 
 fn is_managed_or_loopback_sink_input(properties: &BTreeMap<String, serde_json::Value>) -> bool {
-    if property_string(properties, "wavelinux.managed").as_deref() == Some("1") {
+    if graph_property_string(properties, "managed").as_deref() == Some("1") {
         return true;
     }
     let node_name = property_string(properties, "node.name");
@@ -2743,9 +2831,9 @@ pub fn parse_source_outputs_json(json: &str) -> Vec<SourceOutputRoute> {
         .map(|output| SourceOutputRoute {
             id: output.index.to_string(),
             module_id: output.owner_module.module_id(),
-            role: property_string(&output.properties, "wavelinux.role"),
-            channel_id: property_string(&output.properties, "wavelinux.channel_id"),
-            mix_id: property_string(&output.properties, "wavelinux.mix_id"),
+            role: graph_property_string(&output.properties, "role"),
+            channel_id: graph_property_string(&output.properties, "channel_id"),
+            mix_id: graph_property_string(&output.properties, "mix_id"),
             muted: Some(output.mute),
             volume_percent: parse_first_volume_percent(&output.volume),
             source_id: output.source.object_id(),
@@ -2754,7 +2842,7 @@ pub fn parse_source_outputs_json(json: &str) -> Vec<SourceOutputRoute> {
             application_name: property_string(&output.properties, "application.name"),
             node_name: property_string(&output.properties, "node.name"),
             media_name: property_string(&output.properties, "media.name"),
-            managed: property_string(&output.properties, "wavelinux.managed"),
+            managed: graph_property_string(&output.properties, "managed"),
         })
         .collect()
 }
@@ -2870,12 +2958,11 @@ fn managed_module_from_module_line(
     let node_name = wavelinux_node_name_from_module_argument(argument);
     let source_name = command_arg_value_from_text(argument, "source=");
     let sink_name = command_arg_value_from_text(argument, "sink=");
-    let role = property_value_from_arg(argument, "wavelinux.role=").map(ToOwned::to_owned);
-    let channel_id =
-        property_value_from_arg(argument, "wavelinux.channel_id=").map(ToOwned::to_owned);
-    let mix_id = property_value_from_arg(argument, "wavelinux.mix_id=").map(ToOwned::to_owned);
+    let role = graph_property_value_from_arg(argument, "role").map(ToOwned::to_owned);
+    let channel_id = graph_property_value_from_arg(argument, "channel_id").map(ToOwned::to_owned);
+    let mix_id = graph_property_value_from_arg(argument, "mix_id").map(ToOwned::to_owned);
     let route_revision =
-        property_value_from_arg(argument, "wavelinux.route_revision=").map(ToOwned::to_owned);
+        graph_property_value_from_arg(argument, "route_revision").map(ToOwned::to_owned);
     let managed_flag = argument_has_wavelinux_managed_flag(argument);
     let managed = node_name
         .as_deref()
@@ -2914,10 +3001,11 @@ pub fn parse_stale_processes(processes_text: &str) -> Vec<StaleProcess> {
 
 fn is_stale_wavelinux_audio_process(command: &str) -> bool {
     let command = command.to_ascii_lowercase();
+    let prefix = graph_prefix();
     command.contains("pipewire")
-        && (command.contains("wavelinux-chain")
-            || command.contains("wavelinux.fx")
-            || command.contains("/wavelinux-chain-"))
+        && (command.contains(&format!("{prefix}-chain"))
+            || command.contains(&format!("{prefix}.fx"))
+            || command.contains(&format!("/{prefix}-chain-")))
 }
 
 fn wavelinux_node_name_from_module_argument(argument: &str) -> Option<String> {
@@ -2939,16 +3027,16 @@ fn managed_module_from_parts(
     argument: Option<&str>,
     properties: &BTreeMap<String, serde_json::Value>,
 ) -> Option<ManagedModule> {
-    let role = property_string(properties, "wavelinux.role");
-    let channel_id = property_string(properties, "wavelinux.channel_id");
-    let mix_id = property_string(properties, "wavelinux.mix_id");
-    let route_revision = property_string(properties, "wavelinux.route_revision");
+    let role = graph_property_string(properties, "role");
+    let channel_id = graph_property_string(properties, "channel_id");
+    let mix_id = graph_property_string(properties, "mix_id");
+    let route_revision = graph_property_string(properties, "route_revision");
     let argument_node_name = argument.and_then(wavelinux_node_name_from_module_argument);
     let node_name = node_name
         .filter(|value| !value.is_empty())
         .or_else(|| property_string(properties, "node.name"))
         .or(argument_node_name);
-    let managed = property_string(properties, "wavelinux.managed").as_deref() == Some("1")
+    let managed = graph_property_string(properties, "managed").as_deref() == Some("1")
         || role.is_some()
         || node_name
             .as_deref()
@@ -3017,7 +3105,7 @@ fn hydrate_source_output_routes_from_sources(
         };
         if let Some(source_name) = source_names_by_id.get(source_id) {
             route.source_name = Some(source_name.clone());
-        } else if source_id.contains('.') || source_id.starts_with("wavelinux_") {
+        } else if source_id.contains('.') || starts_with_graph_prefix(source_id) {
             route.source_name = Some(source_id.to_owned());
         }
     }
@@ -3072,7 +3160,7 @@ fn hydrate_sink_input_routes_from_sinks(
         };
         if let Some(sink_name) = sink_names_by_id.get(sink_id) {
             route.sink_name = Some(sink_name.clone());
-        } else if sink_id.contains('.') || sink_id.starts_with("wavelinux_") {
+        } else if sink_id.contains('.') || starts_with_graph_prefix(sink_id) {
             route.sink_name = Some(sink_id.to_owned());
         }
     }
@@ -3083,13 +3171,19 @@ fn hydrate_sink_input_routes_from_sinks(
 fn looks_like_wavelinux_node(value: &str) -> bool {
     let value = normalized_node_leaf(value);
     let compact = compact_node_name(&value);
-    value == "wavelinux"
-        || compact == "wavelinux"
-        || value.starts_with("wavelinux_")
-        || value.starts_with("wavelinux-")
-        || value.starts_with("wavelinux.")
-        || compact.starts_with("wavelinux_")
-        || value.starts_with("output.wavelinux.fx.")
+    let prefix = graph_prefix();
+    value == prefix
+        || compact == prefix
+        || value.starts_with(&format!("{prefix}_"))
+        || value.starts_with(&format!("{prefix}-"))
+        || value.starts_with(&format!("{prefix}."))
+        || compact.starts_with(&format!("{prefix}_"))
+        || value.starts_with(&format!("output.{prefix}.fx."))
+}
+
+fn starts_with_graph_prefix(value: &str) -> bool {
+    let prefix = graph_prefix();
+    value.starts_with(&format!("{prefix}_")) || value.starts_with(&format!("{prefix}-"))
 }
 
 fn looks_like_wavelinux_family_node(value: &str) -> bool {
@@ -3743,21 +3837,22 @@ fn property_value_from_arg<'a>(properties: &'a str, key: &str) -> Option<&'a str
 
 fn argument_has_wavelinux_managed_flag(argument: &str) -> bool {
     argument.split_whitespace().any(|part| {
-        property_value_from_arg(part, "wavelinux.managed=") == Some("1")
+        graph_property_value_from_arg(part, "managed") == Some("1")
             || part
                 .strip_prefix("sink_input_properties=")
                 .is_some_and(|properties| {
-                    property_value_from_arg(properties, "wavelinux.managed=") == Some("1")
+                    graph_property_value_from_arg(properties, "managed") == Some("1")
                 })
             || part
                 .strip_prefix("source_output_properties=")
                 .is_some_and(|properties| {
-                    property_value_from_arg(properties, "wavelinux.managed=") == Some("1")
+                    graph_property_value_from_arg(properties, "managed") == Some("1")
                 })
     })
 }
 
 fn wavelinux_display_name(value: &str) -> String {
+    let prefix = graph_prefix();
     let mut slug = String::new();
     for ch in value.chars() {
         let ch = ch.to_ascii_lowercase();
@@ -3769,13 +3864,13 @@ fn wavelinux_display_name(value: &str) -> String {
     }
 
     let slug = slug.trim_matches('-');
-    if slug.is_empty() || slug == "wavelinux" {
-        return "wavelinux-source".into();
+    if slug.is_empty() || slug == prefix {
+        return format!("{prefix}-source");
     }
-    if slug.starts_with("wavelinux-") {
+    if slug.starts_with(&format!("{prefix}-")) {
         slug.into()
     } else {
-        format!("wavelinux-{slug}")
+        format!("{prefix}-{slug}")
     }
 }
 

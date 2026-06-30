@@ -1642,6 +1642,48 @@ mod tests {
     }
 
     #[test]
+    fn shipped_cm01_is_duplex_usb_audio() {
+        let root = tempdir().unwrap();
+        let paths = EnginePaths::for_tests(root.path());
+        let catalog = load_hardware_profile_catalog(&paths);
+        let mut input = device(
+            "alsa_input.usb-TTGK_Technology_Co._Ltd_CM01-00.mono-fallback",
+            "CM01 Mono",
+            DeviceBus::Usb,
+        );
+        input.vendor_id = Some("3302".into());
+        input.product_id = Some("33a0".into());
+        let mut output = device(
+            "alsa_output.usb-TTGK_Technology_Co._Ltd_CM01-00.analog-stereo",
+            "CM01 Analog Stereo",
+            DeviceBus::Usb,
+        );
+        output.vendor_id = Some("3302".into());
+        output.product_id = Some("33a0".into());
+        let mut devices = vec![input, output];
+
+        apply_profiles_to_devices(&mut devices, &catalog);
+
+        for device in &devices {
+            assert_eq!(device.matched_profile_id.as_deref(), Some("ttgk.cm01"));
+            assert_eq!(
+                device
+                    .active_routing_policy
+                    .as_ref()
+                    .map(|policy| policy.allow_auto_select_input),
+                Some(true)
+            );
+            assert_eq!(
+                device
+                    .active_routing_policy
+                    .as_ref()
+                    .map(|policy| policy.allow_auto_select_output),
+                Some(true)
+            );
+        }
+    }
+
+    #[test]
     fn shipped_th_x00_profile_only_matches_explicit_alias() {
         let root = tempdir().unwrap();
         let paths = EnginePaths::for_tests(root.path());
