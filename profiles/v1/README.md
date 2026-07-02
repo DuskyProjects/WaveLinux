@@ -27,7 +27,7 @@ matching profile from `profiles/v1/devices/` over HTTPS and caches it in
 `~/.config/wavelinux/hardware-profiles/v1/remote/`. It does not ship or load a
 full built-in profile catalog.
 
-Installers may run `wavelinux --prewarm-hardware-profiles` after install. That command performs a read-only audio hardware check, downloads any matching repo-hosted remote profiles into the same cache, and exits without opening the UI or changing PipeWire routing. If hardware, PipeWire, or GitHub is unavailable during install, WaveLinux logs the reason and retries from the normal background detector when the app starts.
+Installers may run `wavelinux --prewarm-hardware-profiles` after install. That command performs a read-only audio hardware check, downloads any matching repo-hosted remote profiles into the same cache, and exits without opening the UI or changing PipeWire routing. Its `matched` counter reports currently installed local or remote profile matches for detected endpoints, while `fetched` reports newly downloaded remote profile assets. If hardware, PipeWire, or GitHub is unavailable during install, WaveLinux logs the reason and retries from the normal background detector when the app starts.
 
 Local profiles go here:
 

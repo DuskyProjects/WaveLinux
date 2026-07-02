@@ -54,6 +54,8 @@ wavelinux
 
 ## Documentation
 
+- [Architecture notes](docs/architecture.md)
+- [WaveLinux5 hardware-acceleration test line](docs/wavelinux5-hardware-acceleration.md)
 - [Setup and development](docs/setup.md)
 - [Theme authoring](docs/themes.md)
 - [Test suites](docs/testing.md)

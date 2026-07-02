@@ -88,13 +88,50 @@ detect_manager() {
   fi
 }
 
-sudo_prefix() {
+stdin_is_terminal() {
+  [[ -t 0 ]]
+}
+
+privilege_helpers() {
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
     return 0
   fi
-  if command_exists sudo; then
-    printf '%s\n' sudo
+
+  if stdin_is_terminal; then
+    command_exists sudo && printf '%s\n' sudo
+    command_exists pkexec && printf '%s\n' pkexec
+  else
+    command_exists pkexec && printf '%s\n' pkexec
+    command_exists sudo && printf '%s\n' sudo
   fi
+}
+
+run_privileged() {
+  local program="$1"
+  shift
+
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$program" "$@"
+    return $?
+  fi
+
+  local helpers=()
+  mapfile -t helpers < <(privilege_helpers)
+  if (( ${#helpers[@]} == 0 )); then
+    echo "No sudo or pkexec command is available; install manually: $program $*" >&2
+    return 1
+  fi
+
+  local helper status
+  for helper in "${helpers[@]}"; do
+    echo "Requesting administrator permission with $helper for: $program $*" >&2
+    "$helper" "$program" "$@" && return 0
+    status=$?
+    echo "$helper failed with status $status; trying next privilege helper if available." >&2
+  done
+
+  echo "Privileged command failed: $program $*" >&2
+  return 1
 }
 
 package_available() {
@@ -138,29 +175,23 @@ install_packages() {
     return 0
   fi
 
-  local sudo_cmd
-  sudo_cmd="$(sudo_prefix || true)"
-  if [[ "${EUID:-$(id -u)}" -ne 0 && -z "$sudo_cmd" ]]; then
-    echo "sudo is unavailable; install manually: ${packages[*]}" >&2
-    return 0
-  fi
-
   case "$manager" in
     apt)
-      $sudo_cmd apt-get update
-      $sudo_cmd apt-get install -y "${packages[@]}"
+      run_privileged apt-get update
+      run_privileged apt-get install -y "${packages[@]}"
       ;;
     dnf)
-      $sudo_cmd dnf install -y "${packages[@]}"
+      run_privileged dnf install -y "${packages[@]}"
       ;;
     pacman)
-      $sudo_cmd pacman -Syu --needed --noconfirm "${packages[@]}"
+      run_privileged pacman -Syu --needed --noconfirm "${packages[@]}"
       ;;
     zypper)
-      $sudo_cmd zypper --non-interactive install --no-recommends "${packages[@]}"
+      run_privileged zypper --non-interactive install --no-recommends "${packages[@]}"
       ;;
     *)
       echo "No supported package manager detected; install manually: ${packages[*]}" >&2
+      return 1
       ;;
   esac
 }
@@ -176,6 +207,7 @@ install_aur_packages() {
     yay -S --needed --noconfirm "${packages[@]}"
   else
     echo "No AUR helper found; install manually: ${packages[*]}" >&2
+    return 1
   fi
 }
 
@@ -185,6 +217,8 @@ existing_ladspa_paths() {
     IFS=':' read -r -a paths <<< "$LADSPA_PATH"
   fi
   paths+=(
+    "${APPDIR:-}/usr/wavelinux-runtime/lib/ladspa"
+    "${APPDIR:-}/usr/lib/ladspa"
     /usr/lib/ladspa
     /usr/lib64/ladspa
     /usr/local/lib/ladspa

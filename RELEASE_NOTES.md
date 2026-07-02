@@ -1,3 +1,31 @@
+# WaveLinux 5.0.0
+
+WaveLinux 5.0.0 is the WaveLinux5 hardware-acceleration testing line. It
+installs beside stable WaveLinux and keeps its own identity, config, launcher,
+runtime data, PipeWire namespace, and update behavior.
+
+## Fixes
+
+- Fixes AppImage setup on tester machines by using `sudo` first in terminal
+  installs, `pkexec` first from GUI/no-tty launches, and falling back to the
+  other privilege helper if the first path fails.
+- Stops the shell dependency checker from silently succeeding when it cannot
+  get administrator permission.
+- Starts/probes the user PipeWire stack before the UI opens. If `pactl info`
+  cannot connect after trying `pipewire`, `pipewire-pulse`, and `wireplumber`
+  user services, WaveLinux5 now reports a setup error instead of launching with
+  missing virtual sinks.
+- Keeps bundled AppImage LADSPA plugins visible to runtime checks so
+  DeepFilterNet3, RNNoise, and SWH dynamics are not reinstalled when the bundle
+  already provides them.
+- Updates clean-distro smoke helpers for WaveLinux5 artifact names and testing
+  tags whose release tag suffix differs from the built artifact version.
+
+## Testing
+
+- Adds regression coverage for privilege-helper ordering, WaveLinux5 process
+  matching, effect-chain helper launch modes, and realtime FX fallback.
+
 # WaveLinux 4.3.7
 
 WaveLinux 4.3.7 finishes the current Debian AppImage smoke path.

@@ -12,12 +12,91 @@ pub const MAX_CHANNELS: usize = MAX_SOFTWARE_CHANNELS + MAX_HARDWARE_INPUTS;
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const BIT_DEPTH: u16 = 24;
 pub const CHANNEL_LAYOUT: &str = "stereo";
+pub const GRAPH_PREFIX_ENV: &str = "WAVELINUX_GRAPH_PREFIX";
+pub const GRAPH_PROPERTY_PREFIX_ENV: &str = "WAVELINUX_GRAPH_PROPERTY_PREFIX";
+pub const APP_DISPLAY_NAME_ENV: &str = "WAVELINUX_APP_DISPLAY_NAME";
 
 pub type MixId = String;
 pub type ChannelId = String;
 pub type DeviceId = String;
 pub type AppStreamId = String;
 pub type EffectInstanceId = String;
+
+pub fn graph_prefix() -> String {
+    clean_graph_prefix(
+        std::env::var(GRAPH_PREFIX_ENV)
+            .ok()
+            .as_deref()
+            .unwrap_or("wavelinux"),
+    )
+}
+
+pub fn graph_property_prefix() -> String {
+    let value = std::env::var(GRAPH_PROPERTY_PREFIX_ENV)
+        .ok()
+        .unwrap_or_else(graph_prefix);
+    clean_graph_property_prefix(&value)
+}
+
+pub fn app_display_name() -> String {
+    std::env::var(APP_DISPLAY_NAME_ENV)
+        .ok()
+        .map(|value| value.trim().chars().take(64).collect::<String>())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "WaveLinux".into())
+}
+
+pub fn graph_mix_sink_name(mix_id: &str) -> String {
+    graph_mix_sink_name_for_prefix(&graph_prefix(), mix_id)
+}
+
+pub fn graph_mix_source_name(mix_id: &str) -> String {
+    graph_mix_source_name_for_prefix(&graph_prefix(), mix_id)
+}
+
+pub fn graph_channel_sink_name(channel_id: &str) -> String {
+    graph_channel_sink_name_for_prefix(&graph_prefix(), channel_id)
+}
+
+pub fn apply_graph_namespace(config: &mut MixerConfig) {
+    apply_graph_namespace_with_prefix(config, &graph_prefix());
+}
+
+pub fn apply_graph_namespace_with_prefix(config: &mut MixerConfig, prefix: &str) {
+    let prefix = clean_graph_prefix(prefix);
+    for mix in &mut config.mixes {
+        mix.virtual_sink_name = graph_mix_sink_name_for_prefix(&prefix, &mix.id);
+        mix.virtual_source_name = graph_mix_source_name_for_prefix(&prefix, &mix.id);
+        mix.normalize_outputs();
+    }
+    for channel in &mut config.channels {
+        channel.virtual_sink_name = graph_channel_sink_name_for_prefix(&prefix, &channel.id);
+    }
+}
+
+fn graph_mix_sink_name_for_prefix(prefix: &str, mix_id: &str) -> String {
+    format!(
+        "{}_mix_{}",
+        clean_graph_prefix(prefix),
+        safe_node_id(mix_id)
+    )
+}
+
+fn graph_mix_source_name_for_prefix(prefix: &str, mix_id: &str) -> String {
+    format!(
+        "{}_mix_{}_source",
+        clean_graph_prefix(prefix),
+        safe_node_id(mix_id)
+    )
+}
+
+fn graph_channel_sink_name_for_prefix(prefix: &str, channel_id: &str) -> String {
+    format!(
+        "{}_channel_{}",
+        clean_graph_prefix(prefix),
+        safe_node_id(channel_id)
+    )
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ModelError {
@@ -458,7 +537,7 @@ impl MixerConfig {
         channel.id = "hardware_in".into();
         channel.name = "Input".into();
         channel.kind = ChannelKind::Generic;
-        channel.virtual_sink_name = "wavelinux_channel_hardware_in".into();
+        channel.virtual_sink_name = graph_channel_sink_name("hardware_in");
 
         for route in &mut self.app_routes {
             if route.channel_id == old_id {
@@ -1364,12 +1443,11 @@ pub struct Mix {
 
 impl Mix {
     pub fn new_fixed(id: &str, name: &str) -> Self {
-        let safe = safe_node_id(id);
         Self {
             id: id.into(),
             name: name.into(),
-            virtual_sink_name: format!("wavelinux_mix_{safe}"),
-            virtual_source_name: format!("wavelinux_mix_{safe}_source"),
+            virtual_sink_name: graph_mix_sink_name(id),
+            virtual_source_name: graph_mix_source_name(id),
             monitor_output: None,
             output_devices: Vec::new(),
             icon: None,
@@ -1379,12 +1457,11 @@ impl Mix {
     }
 
     fn ensure_virtual_node_names(&mut self) {
-        let safe = safe_node_id(&self.id);
         if self.virtual_sink_name.trim().is_empty() {
-            self.virtual_sink_name = format!("wavelinux_mix_{safe}");
+            self.virtual_sink_name = graph_mix_sink_name(&self.id);
         }
         if self.virtual_source_name.trim().is_empty() {
-            self.virtual_source_name = format!("wavelinux_mix_{safe}_source");
+            self.virtual_source_name = graph_mix_source_name(&self.id);
         }
     }
 
@@ -1504,7 +1581,6 @@ pub struct Channel {
 
 impl Channel {
     pub fn new_fixed(id: &str, name: &str, kind: ChannelKind) -> Self {
-        let safe = safe_node_id(id);
         let input_mode = if kind.uses_hardware_slot() {
             ChannelInputMode::SumMono
         } else {
@@ -1514,7 +1590,7 @@ impl Channel {
             id: id.into(),
             name: name.into(),
             kind,
-            virtual_sink_name: format!("wavelinux_channel_{safe}"),
+            virtual_sink_name: graph_channel_sink_name(id),
             source_device: None,
             icon: None,
             input_mode,
@@ -1535,7 +1611,7 @@ impl Channel {
 
     fn ensure_virtual_node_name(&mut self) {
         if self.virtual_sink_name.trim().is_empty() {
-            self.virtual_sink_name = format!("wavelinux_channel_{}", safe_node_id(&self.id));
+            self.virtual_sink_name = graph_channel_sink_name(&self.id);
         }
     }
 }
@@ -2901,6 +2977,28 @@ pub fn safe_node_id(value: &str) -> String {
     }
 }
 
+fn clean_graph_prefix(value: &str) -> String {
+    let prefix = safe_node_id(value);
+    if prefix.is_empty() {
+        "wavelinux".into()
+    } else {
+        prefix
+    }
+}
+
+fn clean_graph_property_prefix(value: &str) -> String {
+    let mut clean = value
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if clean.is_empty() {
+        clean = "wavelinux".into();
+    }
+    clean
+}
+
 fn valid_unit(value: f32) -> Result<f32, ModelError> {
     if value.is_finite() && (0.0..=1.0).contains(&value) {
         Ok(value)
@@ -2969,9 +3067,19 @@ fn clean_output_devices(values: Vec<String>) -> Vec<String> {
     values
         .into_iter()
         .filter_map(|value| clean_optional_matcher(Some(value)))
-        .filter(|value| !value.starts_with("wavelinux_"))
+        .filter(|value| !looks_like_wave_owned_node_name(value))
         .filter(|value| seen.insert(value.clone()))
         .collect()
+}
+
+fn looks_like_wave_owned_node_name(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.starts_with("wavelinux_")
+        || value.starts_with("wavelinux5_")
+        || value.starts_with("wavelinux-")
+        || value.starts_with("wavelinux5-")
+        || value == "wavelinux"
+        || value == "wavelinux5"
 }
 
 fn clean_optional_icon(value: Option<String>) -> Option<String> {
@@ -3670,6 +3778,37 @@ mod tests {
         assert_eq!(config.channels[0].name, "Input");
         assert_eq!(config.channels[0].mix_buses["monitor"].volume, 1.0);
         assert!(!config.channels[0].mix_buses["monitor"].muted);
+    }
+
+    #[test]
+    fn graph_namespace_rewrites_virtual_nodes_for_wavelinux5_import() {
+        let mut config = MixerConfig::default();
+        config.mixes[0].virtual_sink_name = "wavelinux_mix_monitor".into();
+        config.mixes[0].virtual_source_name = "wavelinux_mix_monitor_source".into();
+        config.channels[0].virtual_sink_name = "wavelinux_channel_hardware_in".into();
+        config.mixes[0].output_devices = vec![
+            "wavelinux_mix_monitor".into(),
+            "wavelinux5_mix_old".into(),
+            "alsa_output.speakers".into(),
+        ];
+        config.mixes[0].monitor_output = Some("wavelinux_mix_monitor".into());
+
+        apply_graph_namespace_with_prefix(&mut config, "wavelinux5");
+
+        assert_eq!(config.mixes[0].virtual_sink_name, "wavelinux5_mix_monitor");
+        assert_eq!(
+            config.mixes[0].virtual_source_name,
+            "wavelinux5_mix_monitor_source"
+        );
+        assert_eq!(
+            config.channels[0].virtual_sink_name,
+            "wavelinux5_channel_hardware_in"
+        );
+        assert_eq!(config.mixes[0].output_devices, vec!["alsa_output.speakers"]);
+        assert_eq!(
+            config.mixes[0].monitor_output.as_deref(),
+            Some("alsa_output.speakers")
+        );
     }
 
     #[test]

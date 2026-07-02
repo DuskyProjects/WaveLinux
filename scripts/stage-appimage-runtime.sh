@@ -24,6 +24,17 @@ stage_binary() {
   fi
 }
 
+stage_repo_binary() {
+  local name="$1"
+  local path="$ROOT_DIR/target/release/$name"
+  if [[ -x "$path" ]]; then
+    install -m 0755 "$path" "$BIN_DIR/$name"
+    echo "Staged AppImage runtime helper: $name"
+  else
+    stage_binary "$name"
+  fi
+}
+
 stage_library() {
   local output_name="$1"
   shift
@@ -94,6 +105,7 @@ stage_ladspa_plugins() {
   fi
 }
 
+stage_repo_binary wavelinux5-dsp-helper
 stage_binary bwrap
 stage_binary xdg-dbus-proxy
 

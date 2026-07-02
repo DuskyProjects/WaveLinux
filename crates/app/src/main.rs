@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::image::Image;
@@ -22,12 +24,12 @@ use wavelinux_engine::{
     HardwareProfilePrewarmReport, SoundCheckReport, WaveLinuxEngine,
 };
 use wavelinux_model::{
-    AppMatcher, AppRoute, AppStateSnapshot, AppVolumePreset, Channel, ChannelInputMode,
-    ChannelKind, EffectAvailability, EffectCatalog, EffectInstance, FallbackHardwareProfile,
-    HardwareProfileUiState, KnownApp, LatencyPolicy, LevelMeter, Mix, MixBus, MixerConfig,
-    MixerSettings, ReleaseChannel, RoutingPolicy, StreamerAction, StreamerActionResult,
-    StreamerBindingProfile, StreamerDeviceSummary, StreamerDevicesConfig, StreamerLearnResult,
-    StreamerPermissionStatus,
+    app_display_name, graph_prefix, AppMatcher, AppRoute, AppStateSnapshot, AppVolumePreset,
+    Channel, ChannelInputMode, ChannelKind, EffectAvailability, EffectCatalog, EffectInstance,
+    FallbackHardwareProfile, HardwareProfileUiState, KnownApp, LatencyPolicy, LevelMeter, Mix,
+    MixBus, MixerConfig, MixerSettings, ReleaseChannel, RoutingPolicy, StreamerAction,
+    StreamerActionResult, StreamerBindingProfile, StreamerDeviceSummary, StreamerDevicesConfig,
+    StreamerLearnResult, StreamerPermissionStatus,
 };
 
 mod elgato;
@@ -64,6 +66,8 @@ const STABLE_UPDATE_ENDPOINT: &str =
     "https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json";
 const BETA_UPDATE_ENDPOINT: &str =
     "https://github.com/DuskyProjects/WaveLinux/releases/download/prerelease/latest.json";
+const WAVELINUX5_UPDATES_DISABLED_MESSAGE: &str =
+    "WaveLinux5 is a local test build; stable self-updates are disabled.";
 const UI_THEME_PREFERENCE_FILE: &str = "ui-theme.json";
 const UI_THEMES_DIR: &str = "themes";
 const WEBKIT_DMABUF_DISABLE_ENV: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
@@ -74,6 +78,8 @@ const WEBKIT_SANDBOX_KEEP_ENV: &str = "WAVELINUX_KEEP_WEBKIT_SANDBOX";
 const RUNTIME_INSTALL_SKIP_ENV: &str = "WAVELINUX_SKIP_RUNTIME_INSTALL";
 const RUNTIME_INSTALL_FORCE_ENV: &str = "WAVELINUX_INSTALL_RUNTIME_ON_START";
 const RUNTIME_DEPS_ASSUME_ENV: &str = "WAVELINUX_ASSUME_RUNTIME_DEPS";
+const AUDIO_SERVICE_START_SKIP_ENV: &str = "WAVELINUX_SKIP_AUDIO_SERVICE_START";
+const AUDIO_DAEMON_FALLBACK_DISABLE_ENV: &str = "WAVELINUX_DISABLE_AUDIO_DAEMON_FALLBACK";
 const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
     "APPDIR",
     "APPIMAGE",
@@ -109,6 +115,58 @@ const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
     "QT_PLUGIN_PATH",
     "WEBKIT_EXEC_PATH",
     "XDG_DATA_DIRS",
+];
+const PIPEWIRE_CLIENT_STACK_PROBES: &[(&str, &[&str])] = &[
+    (
+        "libpipewire-0.3.so.0",
+        &[
+            "/usr/lib/libpipewire-0.3.so.0",
+            "/usr/lib64/libpipewire-0.3.so.0",
+            "/usr/lib/x86_64-linux-gnu/libpipewire-0.3.so.0",
+            "/usr/lib/aarch64-linux-gnu/libpipewire-0.3.so.0",
+            "/usr/lib/arm-linux-gnueabihf/libpipewire-0.3.so.0",
+        ],
+    ),
+    (
+        "libpipewire-module-client-node.so",
+        &[
+            "/usr/lib/pipewire-0.3/libpipewire-module-client-node.so",
+            "/usr/lib64/pipewire-0.3/libpipewire-module-client-node.so",
+            "/usr/lib/x86_64-linux-gnu/pipewire-0.3/libpipewire-module-client-node.so",
+            "/usr/lib/aarch64-linux-gnu/pipewire-0.3/libpipewire-module-client-node.so",
+            "/usr/lib/arm-linux-gnueabihf/pipewire-0.3/libpipewire-module-client-node.so",
+        ],
+    ),
+    (
+        "libpipewire-module-protocol-native.so",
+        &[
+            "/usr/lib/pipewire-0.3/libpipewire-module-protocol-native.so",
+            "/usr/lib64/pipewire-0.3/libpipewire-module-protocol-native.so",
+            "/usr/lib/x86_64-linux-gnu/pipewire-0.3/libpipewire-module-protocol-native.so",
+            "/usr/lib/aarch64-linux-gnu/pipewire-0.3/libpipewire-module-protocol-native.so",
+            "/usr/lib/arm-linux-gnueabihf/pipewire-0.3/libpipewire-module-protocol-native.so",
+        ],
+    ),
+    (
+        "libspa-support.so",
+        &[
+            "/usr/lib/spa-0.2/support/libspa-support.so",
+            "/usr/lib64/spa-0.2/support/libspa-support.so",
+            "/usr/lib/x86_64-linux-gnu/spa-0.2/support/libspa-support.so",
+            "/usr/lib/aarch64-linux-gnu/spa-0.2/support/libspa-support.so",
+            "/usr/lib/arm-linux-gnueabihf/spa-0.2/support/libspa-support.so",
+        ],
+    ),
+    (
+        "libspa-audioconvert.so",
+        &[
+            "/usr/lib/spa-0.2/audioconvert/libspa-audioconvert.so",
+            "/usr/lib64/spa-0.2/audioconvert/libspa-audioconvert.so",
+            "/usr/lib/x86_64-linux-gnu/spa-0.2/audioconvert/libspa-audioconvert.so",
+            "/usr/lib/aarch64-linux-gnu/spa-0.2/audioconvert/libspa-audioconvert.so",
+            "/usr/lib/arm-linux-gnueabihf/spa-0.2/audioconvert/libspa-audioconvert.so",
+        ],
+    ),
 ];
 const APT_RUNTIME_PACKAGES: &[&str] = &[
     "pipewire",
@@ -328,7 +386,9 @@ fn prepend_env_path(key: &str, path: PathBuf) {
     let current = std::env::var_os(key).unwrap_or_default();
     let mut paths = Vec::new();
     paths.push(path);
-    paths.extend(std::env::split_paths(&current));
+    if !current.is_empty() {
+        paths.extend(std::env::split_paths(&current));
+    }
     if let Ok(joined) = std::env::join_paths(paths) {
         std::env::set_var(key, joined);
     }
@@ -461,6 +521,100 @@ fn command_exists(program: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn path_exists_or_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn missing_pipewire_client_stack() -> Vec<&'static str> {
+    PIPEWIRE_CLIENT_STACK_PROBES
+        .iter()
+        .filter_map(|(name, candidates)| {
+            candidates
+                .iter()
+                .all(|path| !path_exists_or_symlink(Path::new(path)))
+                .then_some(*name)
+        })
+        .collect()
+}
+
+fn appimage_library_roots(appdir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for path in [
+        appdir.join("usr/lib"),
+        appdir.join("usr/lib64"),
+        appdir.join("usr/lib32"),
+        appdir.join("lib"),
+        appdir.join("lib64"),
+        appdir.join("lib32"),
+        appdir.join("usr/lib/x86_64-linux-gnu"),
+        appdir.join("usr/lib/aarch64-linux-gnu"),
+        appdir.join("usr/lib/arm-linux-gnueabihf"),
+    ] {
+        if path.is_dir() {
+            roots.push(path);
+        }
+    }
+
+    let usr_lib = appdir.join("usr/lib");
+    if let Ok(entries) = fs::read_dir(usr_lib) {
+        for path in entries.flatten().map(|entry| entry.path()) {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if path.is_dir() && name.contains("linux-gnu") && roots.iter().all(|root| root != &path)
+            {
+                roots.push(path);
+            }
+        }
+    }
+
+    roots
+}
+
+fn collect_entries_with_prefix(root: &Path, prefix: &str, output: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(prefix) && path_exists_or_symlink(&path) {
+            output.push(path.display().to_string());
+        }
+    }
+}
+
+fn push_existing_path(path: PathBuf, output: &mut Vec<String>) {
+    if path_exists_or_symlink(&path) {
+        output.push(path.display().to_string());
+    }
+}
+
+fn appimage_bundled_pipewire_conflicts() -> Vec<String> {
+    let Some(appdir) = std::env::var_os("APPDIR")
+        .map(PathBuf::from)
+        .or_else(appdir_from_current_exe)
+    else {
+        return Vec::new();
+    };
+
+    let mut conflicts = Vec::new();
+    for root in appimage_library_roots(&appdir) {
+        collect_entries_with_prefix(&root, "libpipewire-0.3.so", &mut conflicts);
+
+        let gstreamer = root.join("gstreamer-1.0");
+        collect_entries_with_prefix(&gstreamer, "libgstpipewire.so", &mut conflicts);
+
+        push_existing_path(root.join("pipewire-0.3"), &mut conflicts);
+        push_existing_path(root.join("spa-0.2"), &mut conflicts);
+    }
+
+    conflicts.sort();
+    conflicts.dedup();
+    conflicts
+}
+
 fn missing_webkit_sandbox_helpers() -> Vec<&'static str> {
     let mut missing = Vec::new();
     if !command_exists("bwrap") {
@@ -546,6 +700,8 @@ fn print_runtime_dependency_report() -> i32 {
     let missing_arch = missing_arch_runtime_packages();
     let missing_helpers = missing_webkit_sandbox_helpers();
     let session_bus = session_bus_path_status();
+    let missing_pipewire_stack = missing_pipewire_client_stack();
+    let appimage_pipewire_conflicts = appimage_bundled_pipewire_conflicts();
     let missing_effect_ids = missing_ladspa_effect_ids();
     let missing_effect_names = effect_names_from_ids(&missing_effect_ids);
     let (effect_packages, aur_effect_packages) =
@@ -613,6 +769,24 @@ fn print_runtime_dependency_report() -> i32 {
         );
     }
 
+    if missing_pipewire_stack.is_empty() {
+        println!("PipeWire client stack: ok");
+    } else {
+        println!(
+            "PipeWire client stack missing: {}",
+            missing_pipewire_stack.join(" ")
+        );
+    }
+
+    if appimage_pipewire_conflicts.is_empty() {
+        println!("AppImage PipeWire bundle: ok");
+    } else {
+        println!(
+            "AppImage PipeWire bundle conflicts: {}",
+            appimage_pipewire_conflicts.join(" ")
+        );
+    }
+
     if missing_effect_names.is_empty() {
         println!("Effect plugins: ok");
     } else {
@@ -647,6 +821,8 @@ fn print_runtime_dependency_report() -> i32 {
     if missing_runtime.is_empty()
         && missing_arch.is_empty()
         && missing_helpers.is_empty()
+        && missing_pipewire_stack.is_empty()
+        && appimage_pipewire_conflicts.is_empty()
         && !matches!(session_bus, Some((_, false)))
     {
         0
@@ -882,6 +1058,158 @@ fn ensure_runtime_dependencies_before_ui() {
             );
             std::process::exit(1);
         }
+    }
+}
+
+fn ensure_audio_services_before_ui() {
+    if std::env::var_os(AUDIO_SERVICE_START_SKIP_ENV).is_some() || !command_exists("pactl") {
+        return;
+    }
+
+    let initial_error = match pactl_info_status() {
+        Ok(()) => return,
+        Err(err) => err,
+    };
+
+    eprintln!(
+        "WaveLinux audio setup: pactl cannot connect; attempting to start user PipeWire services."
+    );
+    let attempts = start_user_audio_services();
+    for _ in 0..12 {
+        if pactl_info_status().is_ok() {
+            eprintln!("WaveLinux audio setup: pactl connection is ready after service start.");
+            return;
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+
+    let final_error = pactl_info_status().err().unwrap_or(initial_error.clone());
+    let attempted = if attempts.is_empty() {
+        "No service start method was available.".into()
+    } else {
+        attempts.join("\n")
+    };
+    let message = format!(
+        "WaveLinux cannot connect to PipeWire/PulseAudio through pactl, so virtual sinks cannot be created.\n\nInitial error:\n{initial_error}\n\nAfter service start attempts:\n{final_error}\n\nTried:\n{attempted}"
+    );
+    show_runtime_setup_message(
+        "WaveLinux audio service unavailable",
+        &message,
+        RuntimeSetupMessageKind::Error,
+    );
+    std::process::exit(1);
+}
+
+fn pactl_info_status() -> Result<(), String> {
+    let output = host_command("pactl")
+        .arg("info")
+        .output()
+        .map_err(|err| format!("pactl info failed to start: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "pactl info exited with status {}: {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+            if output.stdout.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", String::from_utf8_lossy(&output.stdout).trim())
+            }
+        ))
+    }
+}
+
+fn start_user_audio_services() -> Vec<String> {
+    let mut attempts = Vec::new();
+    if command_exists("systemctl") {
+        for unit in user_audio_service_units() {
+            let output = host_command("systemctl")
+                .args(["--user", "start", unit])
+                .output()
+                .map_err(|err| format!("systemctl failed to start: {err}"));
+            attempts.push(command_attempt_summary(
+                "systemctl",
+                &["--user", "start", unit],
+                output,
+            ));
+            if pactl_info_status().is_ok() {
+                return attempts;
+            }
+        }
+    }
+
+    if std::env::var_os(AUDIO_DAEMON_FALLBACK_DISABLE_ENV).is_some() {
+        return attempts;
+    }
+
+    for program in ["pipewire", "pipewire-pulse", "wireplumber"] {
+        if !command_exists(program) {
+            continue;
+        }
+        let output = spawn_detached_audio_daemon(program);
+        attempts.push(command_attempt_summary(program, &[], output));
+        thread::sleep(Duration::from_millis(150));
+        if pactl_info_status().is_ok() {
+            break;
+        }
+    }
+
+    attempts
+}
+
+fn user_audio_service_units() -> &'static [&'static str] {
+    &[
+        "pipewire.socket",
+        "pipewire-pulse.socket",
+        "pipewire.service",
+        "pipewire-pulse.service",
+        "wireplumber.service",
+    ]
+}
+
+fn spawn_detached_audio_daemon(program: &str) -> Result<Output, String> {
+    host_command(program)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| Output {
+            status: successful_exit_status(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+        .map_err(|err| format!("{program} failed to start: {err}"))
+}
+
+#[cfg(unix)]
+fn successful_exit_status() -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(0)
+}
+
+#[cfg(not(unix))]
+fn successful_exit_status() -> std::process::ExitStatus {
+    Command::new("cmd")
+        .args(["/C", "exit", "0"])
+        .status()
+        .expect("failed to synthesize successful exit status")
+}
+
+fn command_attempt_summary(program: &str, args: &[&str], output: Result<Output, String>) -> String {
+    let command = std::iter::once(program)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    match output {
+        Ok(output) if output.status.success() => format!("{command}: ok"),
+        Ok(output) => format!(
+            "{command}: status {} {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(err) => format!("{command}: {err}"),
     }
 }
 
@@ -1705,6 +2033,22 @@ async fn check_for_updates(
     }
     let endpoint = update_endpoint(&settings);
     let release_url = release_url_for_settings(&settings).to_string();
+    if wavelinux5_test_line() {
+        let current_version = current_update_version().to_string();
+        return Ok(UpdateInfo {
+            available: false,
+            install_supported: false,
+            current_version,
+            version: None,
+            date: None,
+            body: None,
+            url: None,
+            release_url,
+            channel: release_channel_name(&settings).to_string(),
+            endpoint,
+            message: WAVELINUX5_UPDATES_DISABLED_MESSAGE.into(),
+        });
+    }
     let endpoint_url = endpoint
         .parse::<url::Url>()
         .map_err(|err| err.to_string())?;
@@ -1789,6 +2133,9 @@ async fn install_update(
     engine: State<'_, EngineState>,
     release_channel: Option<ReleaseChannel>,
 ) -> Result<UpdateInstallResult, String> {
+    if wavelinux5_test_line() {
+        return Err(WAVELINUX5_UPDATES_DISABLED_MESSAGE.into());
+    }
     if !is_appimage_install() {
         return Err(
             "Self-update is available for AppImage installs. Use deb, rpm, or AUR updates through your package manager."
@@ -2346,17 +2693,58 @@ fn run_privileged_command(program: &str, args: &[String]) -> Result<Output, Stri
     if running_as_root() {
         return run_command_capture(program, args);
     }
-    if command_exists("pkexec") {
-        let mut pkexec_args = vec![program.to_string()];
-        pkexec_args.extend(args.iter().cloned());
-        return run_command_capture("pkexec", &pkexec_args);
+
+    let helpers = privilege_helper_order(
+        command_exists("sudo"),
+        command_exists("pkexec"),
+        stdin_is_terminal(),
+    );
+    let mut failures = Vec::new();
+    for helper in helpers {
+        let mut helper_args = vec![program.to_string()];
+        helper_args.extend(args.iter().cloned());
+        match run_command_capture(helper, &helper_args) {
+            Ok(output) => return Ok(output),
+            Err(err) => failures.push(err),
+        }
     }
-    if command_exists("sudo") {
-        let mut sudo_args = vec![program.to_string()];
-        sudo_args.extend(args.iter().cloned());
-        return run_command_capture("sudo", &sudo_args);
+
+    if failures.is_empty() {
+        Err("No sudo or pkexec command is available for privileged package installation".into())
+    } else {
+        Err(format!(
+            "privileged package installation failed after trying {}: {}",
+            privilege_failure_subject(&failures),
+            failures.join("; ")
+        ))
     }
-    Err("No pkexec or sudo command is available for privileged package installation".into())
+}
+
+fn privilege_helper_order(
+    sudo_available: bool,
+    pkexec_available: bool,
+    stdin_is_terminal: bool,
+) -> Vec<&'static str> {
+    let preferred = if stdin_is_terminal {
+        ["sudo", "pkexec"]
+    } else {
+        ["pkexec", "sudo"]
+    };
+    preferred
+        .into_iter()
+        .filter(|helper| match *helper {
+            "sudo" => sudo_available,
+            "pkexec" => pkexec_available,
+            _ => false,
+        })
+        .collect()
+}
+
+fn privilege_failure_subject(failures: &[String]) -> &'static str {
+    match failures.len() {
+        1 => "one helper",
+        _ => "multiple helpers",
+    }
 }
 
 fn run_command_capture(program: &str, args: &[String]) -> Result<Output, String> {
@@ -2400,6 +2788,10 @@ fn sanitize_host_command_env(command: &mut Command) {
 
 fn running_as_root() -> bool {
     unsafe { libc::geteuid() == 0 }
+}
+
+fn stdin_is_terminal() -> bool {
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
 fn append_output(stdout: &mut String, stderr: &mut String, outputs: Vec<Output>) {
@@ -2551,6 +2943,20 @@ fn current_update_version() -> semver::Version {
         .expect("package version is valid semver")
 }
 
+fn wavelinux5_test_line() -> bool {
+    env!("CARGO_PKG_VERSION").starts_with("5.")
+}
+
+fn apply_wavelinux5_test_line_env() {
+    if !wavelinux5_test_line() {
+        return;
+    }
+    set_env_default("WAVELINUX_XDG_APP_NAME", "WaveLinux5");
+    set_env_default("WAVELINUX_GRAPH_PREFIX", "wavelinux5");
+    set_env_default("WAVELINUX_GRAPH_PROPERTY_PREFIX", "wavelinux5");
+    set_env_default("WAVELINUX_APP_DISPLAY_NAME", "WaveLinux5");
+}
+
 fn release_tag_update_version(tag: &str) -> Option<semver::Version> {
     let version = tag.trim().trim_start_matches('v');
     if version.is_empty() || version.eq_ignore_ascii_case("prerelease") {
@@ -2615,7 +3021,7 @@ fn shutdown_audio_graph(engine: &WaveLinuxEngine, shutdown_started: &AtomicBool)
 fn show_main_window(app: &AppHandle) {
     let window = app.get_webview_window("main").or_else(|| {
         WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-            .title(format!("WaveLinux {}", env!("CARGO_PKG_VERSION")))
+            .title(app_display_name())
             .inner_size(1280.0, 820.0)
             .min_inner_size(960.0, 640.0)
             .resizable(true)
@@ -2633,7 +3039,7 @@ fn acquire_process_lock() -> std::io::Result<Option<ProcessLock>> {
     let lock_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let lock_path = lock_dir.join("wavelinux-4.lock");
+    let lock_path = lock_dir.join(format!("{}-5.lock", graph_prefix()));
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -2660,11 +3066,17 @@ fn build_tray(
     shutdown_started: Arc<AtomicBool>,
     allow_exit: Arc<AtomicBool>,
 ) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "Show WaveLinux", true, None::<&str>)?;
+    let show = MenuItem::with_id(
+        app,
+        "show",
+        format!("Show {}", app_display_name()),
+        true,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
     let icon = Image::from_bytes(include_bytes!("../icons/tray-icon.png"))?;
-    let tooltip = format!("WaveLinux {}", env!("CARGO_PKG_VERSION"));
+    let tooltip = app_display_name().to_string();
 
     TrayIconBuilder::with_id("main")
         .icon(icon)
@@ -2725,6 +3137,7 @@ fn print_hardware_profile_prewarm_report(report: &HardwareProfilePrewarmReport) 
 }
 
 fn main() {
+    apply_wavelinux5_test_line_env();
     prepare_appimage_bundled_runtime();
 
     let args: Vec<String> = std::env::args().collect();
@@ -2758,6 +3171,7 @@ fn main() {
     }
 
     ensure_runtime_dependencies_before_ui();
+    ensure_audio_services_before_ui();
     apply_webkit_runtime_defaults();
 
     let shutdown_started = Arc::new(AtomicBool::new(false));
@@ -2855,7 +3269,10 @@ fn main() {
     let Some(_process_lock) =
         acquire_process_lock().expect("failed to acquire WaveLinux process lock")
     else {
-        eprintln!("WaveLinux is already running; refusing to start a duplicate audio engine");
+        eprintln!(
+            "{} is already running; refusing to start a duplicate audio engine",
+            app_display_name()
+        );
         return;
     };
 
@@ -2930,5 +3347,29 @@ mod updater_tests {
                 .to_string(),
             "4.3.0-testing.7"
         );
+    }
+
+    #[test]
+    fn privileged_install_prefers_sudo_in_terminal() {
+        assert_eq!(
+            privilege_helper_order(true, true, true),
+            vec!["sudo", "pkexec"]
+        );
+    }
+
+    #[test]
+    fn privileged_install_prefers_pkexec_without_terminal() {
+        assert_eq!(
+            privilege_helper_order(true, true, false),
+            vec!["pkexec", "sudo"]
+        );
+    }
+
+    #[test]
+    fn audio_service_start_covers_pipewire_pulse_and_session_manager() {
+        let units = user_audio_service_units();
+        assert!(units.contains(&"pipewire.service"));
+        assert!(units.contains(&"pipewire-pulse.service"));
+        assert!(units.contains(&"wireplumber.service"));
     }
 }

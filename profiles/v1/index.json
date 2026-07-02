@@ -1031,6 +1031,28 @@
       ]
     },
     {
+      "id": "ttgk.cm01",
+      "name": "TTGK CM01 USB Audio",
+      "revision": 2,
+      "asset": "ttgk-cm01.json",
+      "matches": [
+        {
+          "bus": "usb",
+          "vendor_id": "3302",
+          "product_id": "33a0",
+          "description_contains": [
+            "cm01"
+          ]
+        },
+        {
+          "bus": "usb",
+          "node_name_contains": [
+            "TTGK_Technology_Co._Ltd_CM01"
+          ]
+        }
+      ]
+    },
+    {
       "id": "universal-audio.volt-2",
       "name": "Universal Audio Volt 2",
       "revision": 1,
