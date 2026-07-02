@@ -81,6 +81,8 @@ const METER_DISPLAY_EXPONENT: f32 = 1.15;
 const EFFECT_GRAPH_SYNC_DEBOUNCE: Duration = Duration::from_millis(500);
 const EFFECT_NODE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const EFFECT_NODE_CLEAR_TIMEOUT: Duration = Duration::from_secs(2);
+const EFFECT_NODE_READY_STABLE_SAMPLES: usize = 2;
+const EFFECT_NODE_READY_SETTLE: Duration = Duration::from_millis(100);
 const GRAPH_REPAIR_DEBOUNCE: Duration = Duration::from_millis(650);
 const ROUTE_HEALTH_REPAIR_BACKOFF: Duration = Duration::from_secs(10);
 const UI_STATE_REFRESH_MAX_AGE: Duration = Duration::from_millis(4_000);
@@ -271,6 +273,18 @@ pub struct CommandExecution {
     pub stderr: String,
     pub skipped: bool,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EffectEndpointReadiness {
+    source_ready: bool,
+    input_ready: bool,
+}
+
+impl EffectEndpointReadiness {
+    fn ready(self) -> bool {
+        self.source_ready && self.input_ready
+    }
 }
 
 impl From<Result<CommandOutput, PwError>> for CommandExecution {
@@ -1929,26 +1943,12 @@ impl WaveLinuxEngine {
             let post_effect_graph = self
                 .pw
                 .snapshot_for_config_with_effect_availability(None, Vec::new());
-            let available_inputs = post_effect_graph
-                .inputs
-                .iter()
-                .map(|input| input.name.as_str())
-                .collect::<BTreeSet<_>>();
-            let available_outputs = post_effect_graph
-                .outputs
-                .iter()
-                .map(|output| output.name.as_str())
-                .collect::<BTreeSet<_>>();
             let mut missing_effect_channels = Vec::new();
             for channel in &mut route_config.channels {
                 if !channel_has_active_effects(channel) {
                     continue;
                 }
-                let effect_source = effect_chain_source_name(channel);
-                let effect_input = effect_chain_input_name(channel);
-                if available_inputs.contains(effect_source.as_str())
-                    && available_outputs.contains(effect_input.as_str())
-                {
+                if effect_chain_endpoint_readiness_for_graph(&post_effect_graph, channel).ready() {
                     continue;
                 }
                 missing_effect_channels.push(channel.name.clone());
@@ -4360,13 +4360,10 @@ impl WaveLinuxEngine {
     }
 
     fn effect_chain_nodes_visible(&self, channel: &Channel) -> bool {
-        let source_name = effect_chain_source_name(channel);
-        let input_name = effect_chain_input_name(channel);
         let graph = self
             .pw
             .snapshot_for_config_with_effect_availability(None, Vec::new());
-        graph.inputs.iter().any(|source| source.name == source_name)
-            && graph.outputs.iter().any(|sink| sink.name == input_name)
+        effect_chain_endpoint_readiness_for_graph(&graph, channel).ready()
     }
 
     fn stop_tracked_effect_chain_process(&self, channel_id: &str) {
@@ -5177,7 +5174,19 @@ impl WaveLinuxEngine {
             return Ok(Vec::new());
         }
 
-        let mut outputs = Vec::new();
+        let mut outputs = self.cleanup_modules(|module| {
+            matches!(
+                module.role.as_deref(),
+                Some("channel_to_mix") | Some("channel_to_effect")
+            ) && module
+                .channel_id
+                .as_deref()
+                .is_some_and(|channel_id| channel_ids.contains(channel_id))
+        })?;
+        if !outputs.is_empty() {
+            thread::sleep(CLEANUP_MODULE_SETTLE);
+        }
+
         let stale_processes = self.pw.stale_processes()?;
         let effect_processes = stale_processes
             .into_iter()
@@ -5200,19 +5209,23 @@ impl WaveLinuxEngine {
         if !effect_processes.is_empty() {
             thread::sleep(Duration::from_millis(50));
             self.reap_effect_chain_processes();
+        }
+        let mut uncleared_effect_channels = BTreeSet::new();
+        if !effect_processes.is_empty() {
             for channel in channels
                 .iter()
                 .copied()
                 .filter(|channel| channel_has_active_effects(channel))
             {
                 if !self.wait_for_effect_nodes_to_clear(channel) {
+                    uncleared_effect_channels.insert(channel.id.clone());
                     self.log_engine_event(
-                            "effects.sync",
-                            format!(
-                                "{} old FX nodes were still visible before restart; continuing with fresh route guards",
-                                channel.name
-                            ),
-                        );
+                        "effects.sync",
+                        format!(
+                            "{} old FX nodes were still visible before restart; routing this pass from the raw channel monitor",
+                            channel.name
+                        ),
+                    );
                 }
             }
         }
@@ -5223,7 +5236,10 @@ impl WaveLinuxEngine {
                 let start_output = self.start_effect_chain_process(channel);
                 let start_failed = start_output.error.is_some();
                 outputs.push(start_output);
-                if start_failed || !self.wait_for_effect_nodes(channel) {
+                if uncleared_effect_channels.contains(&channel.id)
+                    || start_failed
+                    || !self.wait_for_effect_nodes(channel)
+                {
                     self.log_engine_event(
                         "effects.sync",
                         format!(
@@ -5236,13 +5252,6 @@ impl WaveLinuxEngine {
                     }
                 }
             }
-
-            outputs.extend(self.cleanup_modules(|module| {
-                matches!(
-                    module.role.as_deref(),
-                    Some("channel_to_mix") | Some("channel_to_effect")
-                ) && module.channel_id.as_deref() == Some(channel.id.as_str())
-            })?);
 
             if channel_has_active_effects(&route_channel) {
                 outputs.extend(
@@ -5294,15 +5303,18 @@ impl WaveLinuxEngine {
         if self.options.dry_run {
             return true;
         }
-        let source_name = effect_chain_source_name(channel);
-        let input_name = effect_chain_input_name(channel);
         let started = Instant::now();
+        let mut ready_samples = 0;
         while started.elapsed() < EFFECT_NODE_WAIT_TIMEOUT {
-            let (source_visible, input_visible) =
-                self.effect_chain_endpoint_visibility(&source_name, &input_name);
-            if source_visible && input_visible {
-                return true;
+            if self.effect_chain_endpoint_readiness(channel).ready() {
+                ready_samples += 1;
+                if ready_samples >= EFFECT_NODE_READY_STABLE_SAMPLES {
+                    return true;
+                }
+                thread::sleep(EFFECT_NODE_READY_SETTLE);
+                continue;
             }
+            ready_samples = 0;
             thread::sleep(Duration::from_millis(50));
         }
         false
@@ -5324,6 +5336,12 @@ impl WaveLinuxEngine {
             thread::sleep(Duration::from_millis(50));
         }
         false
+    }
+
+    fn effect_chain_endpoint_readiness(&self, channel: &Channel) -> EffectEndpointReadiness {
+        let inputs = self.pw.list_inputs().unwrap_or_default();
+        let outputs = self.pw.list_outputs().unwrap_or_default();
+        effect_chain_endpoint_readiness_for_devices(&inputs, &outputs, channel)
     }
 
     fn effect_chain_endpoint_visibility(
@@ -6391,16 +6409,6 @@ fn config_with_unavailable_effects_bypassed(
     config: &MixerConfig,
     graph: &RuntimeGraph,
 ) -> MixerConfig {
-    let input_names = graph
-        .inputs
-        .iter()
-        .map(|input| input.name.as_str())
-        .collect::<BTreeSet<_>>();
-    let output_names = graph
-        .outputs
-        .iter()
-        .map(|output| output.name.as_str())
-        .collect::<BTreeSet<_>>();
     let mut effective = config.clone();
 
     for channel in effective
@@ -6408,11 +6416,7 @@ fn config_with_unavailable_effects_bypassed(
         .iter_mut()
         .filter(|channel| channel_has_active_effects(channel))
     {
-        let effect_source = effect_chain_source_name(channel);
-        let effect_input = effect_chain_input_name(channel);
-        if input_names.contains(effect_source.as_str())
-            && output_names.contains(effect_input.as_str())
-        {
+        if effect_chain_endpoint_readiness_for_graph(graph, channel).ready() {
             continue;
         }
         for effect in &mut channel.effects {
@@ -7229,6 +7233,52 @@ fn effect_node_has_current_config_revision(device: &DeviceInfo) -> bool {
         .is_some_and(|revision| revision == EFFECT_CONFIG_REVISION)
 }
 
+fn effect_node_matches_current_channel(
+    device: &DeviceInfo,
+    channel: &Channel,
+    expected_name: &str,
+    expected_role: &str,
+) -> bool {
+    device.name == expected_name
+        && device
+            .pipewire_properties
+            .get(&graph_prop("managed"))
+            .is_some_and(|managed| managed == "1")
+        && device
+            .pipewire_properties
+            .get(&graph_prop("role"))
+            .is_some_and(|role| role == expected_role)
+        && device
+            .pipewire_properties
+            .get(&graph_prop("channel_id"))
+            .is_some_and(|channel_id| channel_id == &channel.id)
+        && effect_node_has_current_config_revision(device)
+}
+
+fn effect_chain_endpoint_readiness_for_graph(
+    graph: &RuntimeGraph,
+    channel: &Channel,
+) -> EffectEndpointReadiness {
+    effect_chain_endpoint_readiness_for_devices(&graph.inputs, &graph.outputs, channel)
+}
+
+fn effect_chain_endpoint_readiness_for_devices(
+    inputs: &[DeviceInfo],
+    outputs: &[DeviceInfo],
+    channel: &Channel,
+) -> EffectEndpointReadiness {
+    let source_name = effect_chain_source_name(channel);
+    let input_name = effect_chain_input_name(channel);
+    EffectEndpointReadiness {
+        source_ready: inputs.iter().any(|source| {
+            effect_node_matches_current_channel(source, channel, &source_name, "effect_output")
+        }),
+        input_ready: outputs.iter().any(|sink| {
+            effect_node_matches_current_channel(sink, channel, &input_name, "effect_input")
+        }),
+    }
+}
+
 fn app_routing_graph_ready(
     config: &MixerConfig,
     graph: &RuntimeGraph,
@@ -7281,8 +7331,8 @@ fn app_routing_graph_ready(
             &config.mixes,
             &config.settings,
             &output_names,
-            &input_names,
             managed_modules,
+            effect_chain_endpoint_readiness_for_graph(graph, channel),
         )
     })
 }
@@ -7297,11 +7347,6 @@ fn active_effect_routes_need_repair(
         .iter()
         .map(|output| output.name.as_str())
         .collect::<BTreeSet<_>>();
-    let input_names = graph
-        .inputs
-        .iter()
-        .map(|input| input.name.as_str())
-        .collect::<BTreeSet<_>>();
 
     config
         .channels
@@ -7313,8 +7358,8 @@ fn active_effect_routes_need_repair(
                 &config.mixes,
                 &config.settings,
                 &output_names,
-                &input_names,
                 managed_modules,
+                effect_chain_endpoint_readiness_for_graph(graph, channel),
             )
         })
 }
@@ -7340,18 +7385,13 @@ fn stream_route_ready(
         .iter()
         .map(|output| output.name.as_str())
         .collect::<BTreeSet<_>>();
-    let input_names = graph
-        .inputs
-        .iter()
-        .map(|input| input.name.as_str())
-        .collect::<BTreeSet<_>>();
     channel_route_ready(
         channel,
         &config.mixes,
         &config.settings,
         &output_names,
-        &input_names,
         managed_modules,
+        effect_chain_endpoint_readiness_for_graph(graph, channel),
     )
 }
 
@@ -7360,8 +7400,8 @@ fn channel_route_ready(
     mixes: &[Mix],
     settings: &MixerSettings,
     output_names: &BTreeSet<&str>,
-    input_names: &BTreeSet<&str>,
     managed_modules: &[ManagedModule],
+    effect_readiness: EffectEndpointReadiness,
 ) -> bool {
     if !output_names.contains(channel.virtual_sink_name.as_str()) {
         return false;
@@ -7371,9 +7411,7 @@ fn channel_route_ready(
     if channel_has_active_effects(channel) {
         let effect_source_name = effect_chain_source_name(channel);
         let effect_input_name = effect_chain_input_name(channel);
-        let effect_nodes_ready = input_names.contains(effect_source_name.as_str())
-            && output_names.contains(effect_input_name.as_str());
-        if effect_nodes_ready {
+        if effect_readiness.ready() {
             let effect_route_ready = managed_modules.iter().any(|module| {
                 module.role.as_deref() == Some("channel_to_effect")
                     && module.channel_id.as_deref() == Some(channel.id.as_str())
@@ -8618,11 +8656,6 @@ fn route_diagnostics(
         return diagnostics;
     }
 
-    let input_names = graph
-        .inputs
-        .iter()
-        .map(|input| input.name.as_str())
-        .collect::<BTreeSet<_>>();
     let output_names = graph
         .outputs
         .iter()
@@ -8640,10 +8673,8 @@ fn route_diagnostics(
         if channel_has_active_effects(channel) {
             let effect_source_name = effect_chain_source_name(channel);
             let effect_input_name = effect_chain_input_name(channel);
-            let effect_nodes_ready = input_names.contains(effect_source_name.as_str())
-                && output_names.contains(effect_input_name.as_str());
 
-            if effect_nodes_ready {
+            if effect_chain_endpoint_readiness_for_graph(graph, channel).ready() {
                 if !managed_modules.iter().any(|module| {
                     managed_module_matches_route(
                         module,
@@ -9494,6 +9525,30 @@ mod tests {
         }
     }
 
+    fn effect_endpoint_device(
+        id: &str,
+        description: &str,
+        channel: &Channel,
+        role: &str,
+    ) -> DeviceInfo {
+        let mut device = device(id, description, false);
+        device.is_virtual = true;
+        device
+            .pipewire_properties
+            .insert(graph_prop("managed"), "1".into());
+        device
+            .pipewire_properties
+            .insert(graph_prop("role"), role.into());
+        device.pipewire_properties.insert(
+            graph_prop("effect_config_revision"),
+            EFFECT_CONFIG_REVISION.into(),
+        );
+        device
+            .pipewire_properties
+            .insert(graph_prop("channel_id"), channel.id.clone());
+        device
+    }
+
     fn plan_has_channel_to_mix_route(plan: &PlannedGraph, channel_id: &str, mix_id: &str) -> bool {
         plan.commands.iter().any(|command| {
             command.args.iter().any(|arg| {
@@ -9529,7 +9584,12 @@ mod tests {
                     .iter()
                     .filter(|channel| channel_has_active_effects(channel))
                     .map(|channel| {
-                        device(&effect_chain_source_name(channel), &channel.name, false)
+                        effect_endpoint_device(
+                            &effect_chain_source_name(channel),
+                            &channel.name,
+                            channel,
+                            "effect_output",
+                        )
                     }),
             )
             .collect();
@@ -9548,7 +9608,14 @@ mod tests {
                     .channels
                     .iter()
                     .filter(|channel| channel_has_active_effects(channel))
-                    .map(|channel| device(&effect_chain_input_name(channel), &channel.name, false)),
+                    .map(|channel| {
+                        effect_endpoint_device(
+                            &effect_chain_input_name(channel),
+                            &channel.name,
+                            channel,
+                            "effect_input",
+                        )
+                    }),
             )
             .collect();
         RuntimeGraph {
@@ -9929,6 +9996,40 @@ mod tests {
         assert!(active_effect_routes_need_repair(
             &config,
             &missing_fx_graph,
+            &modules
+        ));
+
+        let mut stale_fx_graph = graph.clone();
+        stale_fx_graph
+            .inputs
+            .iter_mut()
+            .find(|input| input.name == "wavelinux_fx_music_source")
+            .unwrap()
+            .pipewire_properties
+            .insert(graph_prop("effect_config_revision"), "stale".into());
+        assert!(!app_routing_graph_ready(&config, &stale_fx_graph, &modules));
+        assert!(active_effect_routes_need_repair(
+            &config,
+            &stale_fx_graph,
+            &modules
+        ));
+
+        let mut wrong_channel_graph = graph.clone();
+        wrong_channel_graph
+            .outputs
+            .iter_mut()
+            .find(|output| output.name == "wavelinux_fx_music_input")
+            .unwrap()
+            .pipewire_properties
+            .insert(graph_prop("channel_id"), "chat".into());
+        assert!(!app_routing_graph_ready(
+            &config,
+            &wrong_channel_graph,
+            &modules
+        ));
+        assert!(active_effect_routes_need_repair(
+            &config,
+            &wrong_channel_graph,
             &modules
         ));
 
