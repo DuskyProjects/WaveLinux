@@ -1486,6 +1486,9 @@ impl WaveLinuxEngine {
         let route_health_repair_needed = audio_graph_running
             && !route_health.is_empty()
             && self.route_health_repair_allowed(&route_health);
+        let realtime_fallback_channel_ids =
+            self.realtime_fallback_sync_channel_ids_for_runtime_prefix(&config, &graph_prefix());
+        let realtime_fallback_repair_needed = !realtime_fallback_channel_ids.is_empty();
         let default_device_lock_repair_needed = default_device_lock_repair_needed(
             &audio_config,
             default_source.as_deref(),
@@ -1512,6 +1515,7 @@ impl WaveLinuxEngine {
             && (auto_device_repair_needed
                 || active_effect_route_repair_needed
                 || route_health_repair_needed
+                || realtime_fallback_repair_needed
                 || bluetooth_monitor_route_refresh_needed)
         {
             route_mutation_requested = true;
@@ -1519,6 +1523,7 @@ impl WaveLinuxEngine {
                 && !auto_device_route_repair_needed
                 && !active_effect_route_repair_needed
                 && !route_health_repair_needed
+                && !realtime_fallback_repair_needed
                 && !bluetooth_monitor_route_refresh_needed;
             let reason = if default_lock_only_repair {
                 "default audio device selection changed; restoring app-facing default only"
@@ -1526,8 +1531,15 @@ impl WaveLinuxEngine {
                 && !auto_device_repair_needed
                 && !active_effect_route_repair_needed
                 && !route_health_repair_needed
+                && !realtime_fallback_repair_needed
             {
                 "Bluetooth monitor route changed or duplicated; rebuilding final output route"
+            } else if realtime_fallback_repair_needed
+                && !auto_device_repair_needed
+                && !active_effect_route_repair_needed
+                && !route_health_repair_needed
+            {
+                "realtime FX fallback triggered; rebuilding affected effect chains"
             } else if route_health_repair_needed {
                 "managed audio route is stale or detached; repairing audio routes"
             } else if active_effect_route_repair_needed && !auto_device_repair_needed {
@@ -1545,6 +1557,23 @@ impl WaveLinuxEngine {
                     } else if bluetooth_monitor_route_refresh_needed {
                         outputs
                             .extend(self.repair_bluetooth_monitor_routes_unlocked(&audio_config)?);
+                    }
+                    if realtime_fallback_repair_needed {
+                        self.log_engine_event(
+                            "effects.fallback",
+                            format!(
+                                "recent realtime underrun; syncing channels: {}",
+                                realtime_fallback_channel_ids
+                                    .iter()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        );
+                        self.rebuild_effect_chain_configs()?;
+                        outputs.extend(
+                            self.sync_effect_channels_unlocked(&realtime_fallback_channel_ids)?,
+                        );
                     }
                     if active_effect_route_repair_needed || route_health_repair_needed {
                         outputs.extend(self.repair_audio_graph_unlocked()?.outputs);
@@ -4122,6 +4151,29 @@ impl WaveLinuxEngine {
             bypass_realtime_fallback_effects(channel);
         }
         effective
+    }
+
+    fn realtime_fallback_sync_channel_ids_for_runtime_prefix(
+        &self,
+        config: &MixerConfig,
+        runtime_prefix: &str,
+    ) -> BTreeSet<String> {
+        if runtime_prefix != "wavelinux5" {
+            return BTreeSet::new();
+        }
+
+        config
+            .channels
+            .iter()
+            .filter(|channel| {
+                channel
+                    .effects
+                    .iter()
+                    .any(|effect| !effect.bypassed && realtime_fallback_effect(&effect.effect_id))
+            })
+            .filter(|channel| self.effect_chain_log_mentions_realtime_underrun(channel))
+            .map(|channel| channel.id.clone())
+            .collect()
     }
 
     fn cleanup_modules(
@@ -7365,7 +7417,29 @@ fn is_restorable_device(device: &str) -> bool {
 }
 
 fn effect_chain_log_mentions_recent(path: &Path, markers: &[&str]) -> bool {
-    if !effect_chain_log_mentions(path, markers) {
+    let Ok(log) = fs::read_to_string(path) else {
+        return false;
+    };
+    let now_nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let window_nanos = FX_LOG_WARNING_WINDOW.as_nanos() as i128;
+    let mut found_untimestamped_marker = false;
+
+    for line in log.lines().rev() {
+        let lower = line.to_ascii_lowercase();
+        if !markers.iter().any(|marker| lower.contains(marker)) {
+            continue;
+        }
+        let Some(timestamp) = effect_chain_log_line_timestamp(line) else {
+            found_untimestamped_marker = true;
+            continue;
+        };
+        let age_nanos = now_nanos - timestamp.unix_timestamp_nanos();
+        if age_nanos <= 0 || age_nanos <= window_nanos {
+            return true;
+        }
+    }
+
+    if !found_untimestamped_marker {
         return false;
     }
 
@@ -7378,12 +7452,9 @@ fn effect_chain_log_mentions_recent(path: &Path, markers: &[&str]) -> bool {
     }
 }
 
-fn effect_chain_log_mentions(path: &Path, markers: &[&str]) -> bool {
-    let Ok(log) = fs::read_to_string(path) else {
-        return false;
-    };
-    let log = log.to_ascii_lowercase();
-    markers.iter().any(|marker| log.contains(marker))
+fn effect_chain_log_line_timestamp(line: &str) -> Option<OffsetDateTime> {
+    let timestamp = line.split_whitespace().next()?;
+    OffsetDateTime::parse(timestamp, &Rfc3339).ok()
 }
 
 fn realtime_fallback_effect(effect_id: &str) -> bool {
@@ -12674,6 +12745,36 @@ mod tests {
     }
 
     #[test]
+    fn old_timestamped_fx_chain_log_warnings_are_ignored() {
+        let engine = test_engine();
+        let mut config = MixerConfig::default();
+        config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("deepfilternet")])
+            .unwrap();
+        let channel = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        let old_timestamp = (OffsetDateTime::now_utc() - time::Duration::minutes(30))
+            .format(&Rfc3339)
+            .unwrap();
+        fs::write(
+            engine.effect_chain_log_path(channel),
+            format!(
+                "{old_timestamp} | WARN | deep_filter_ladspa | Underrun detected (RTF: 2.00). Processing too slow!\n"
+            ),
+        )
+        .unwrap();
+
+        let diagnostics = engine.effect_chain_diagnostics(&config, &RuntimeGraph::default());
+
+        assert!(!diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "effects.underrun.hardware_in"));
+    }
+
+    #[test]
     fn unhealthy_fx_chain_runtime_keeps_processed_input() {
         let engine = test_engine();
         let mut config = MixerConfig::default();
@@ -12711,6 +12812,57 @@ mod tests {
         assert!(diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "effects.underrun.hardware_in"));
+    }
+
+    #[test]
+    fn wavelinux5_realtime_underrun_schedules_effect_chain_sync() {
+        let engine = test_engine();
+        let mut config = MixerConfig::default();
+        config
+            .set_effect_chain(
+                "hardware_in",
+                vec![
+                    EffectInstance::new("highpass"),
+                    EffectInstance::new("deepfilternet"),
+                    EffectInstance::new("gate"),
+                ],
+            )
+            .unwrap();
+        let channel = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        let timestamp = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        fs::write(
+            engine.effect_chain_log_path(channel),
+            format!(
+                "{timestamp} | WARN | deep_filter_ladspa | Underrun detected (RTF: 1.57). Processing too slow!\n"
+            ),
+        )
+        .unwrap();
+
+        let stable_ids =
+            engine.realtime_fallback_sync_channel_ids_for_runtime_prefix(&config, "wavelinux");
+        let wavelinux5_ids =
+            engine.realtime_fallback_sync_channel_ids_for_runtime_prefix(&config, "wavelinux5");
+        let effective =
+            engine.config_with_unhealthy_effects_bypassed_for_runtime_prefix(&config, "wavelinux5");
+        let bypassed = effective
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap()
+            .effects
+            .iter()
+            .map(|effect| (effect.effect_id.as_str(), effect.bypassed))
+            .collect::<BTreeMap<_, _>>();
+
+        assert!(stable_ids.is_empty());
+        assert_eq!(wavelinux5_ids, BTreeSet::from(["hardware_in".to_string()]));
+        assert_eq!(bypassed.get("deepfilternet"), Some(&true));
+        assert_eq!(bypassed.get("highpass"), Some(&false));
+        assert_eq!(bypassed.get("gate"), Some(&false));
     }
 
     #[test]
