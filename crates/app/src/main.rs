@@ -3021,11 +3021,7 @@ fn shutdown_audio_graph(engine: &WaveLinuxEngine, shutdown_started: &AtomicBool)
 fn show_main_window(app: &AppHandle) {
     let window = app.get_webview_window("main").or_else(|| {
         WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-            .title(format!(
-                "{} {}",
-                app_display_name(),
-                env!("CARGO_PKG_VERSION")
-            ))
+            .title(app_display_name())
             .inner_size(1280.0, 820.0)
             .min_inner_size(960.0, 640.0)
             .resizable(true)
@@ -3080,7 +3076,7 @@ fn build_tray(
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
     let icon = Image::from_bytes(include_bytes!("../icons/tray-icon.png"))?;
-    let tooltip = format!("{} {}", app_display_name(), env!("CARGO_PKG_VERSION"));
+    let tooltip = app_display_name().to_string();
 
     TrayIconBuilder::with_id("main")
         .icon(icon)

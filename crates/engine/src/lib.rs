@@ -84,6 +84,9 @@ const EFFECT_NODE_CLEAR_TIMEOUT: Duration = Duration::from_secs(2);
 const GRAPH_REPAIR_DEBOUNCE: Duration = Duration::from_millis(650);
 const ROUTE_HEALTH_REPAIR_BACKOFF: Duration = Duration::from_secs(10);
 const UI_STATE_REFRESH_MAX_AGE: Duration = Duration::from_millis(4_000);
+const SLOW_REFRESH_LOG_THRESHOLD: Duration = Duration::from_millis(300);
+const SEVERE_REFRESH_LOG_THRESHOLD: Duration = Duration::from_millis(1_500);
+const ROUTINE_SLOW_REFRESH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
     "APPDIR",
     "APPIMAGE",
@@ -397,6 +400,17 @@ struct RouteHealthRepairState {
 }
 
 #[derive(Debug, Default)]
+struct SlowRefreshLogState {
+    last_logged_at: Option<Instant>,
+    suppressed_refreshes: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SlowRefreshLogDecision {
+    suppressed_refreshes: u32,
+}
+
+#[derive(Debug, Default)]
 struct TimedCache<T> {
     checked_at: Option<Instant>,
     value: T,
@@ -432,6 +446,36 @@ fn format_snapshot_command_timings(timings: &[SnapshotCommandTiming]) -> String 
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn slow_refresh_log_decision(
+    state: &mut SlowRefreshLogState,
+    now: Instant,
+    elapsed: Duration,
+    snapshot_failed: bool,
+    route_mutation_requested: bool,
+) -> Option<SlowRefreshLogDecision> {
+    if elapsed < SLOW_REFRESH_LOG_THRESHOLD {
+        return None;
+    }
+
+    let urgent =
+        elapsed >= SEVERE_REFRESH_LOG_THRESHOLD || snapshot_failed || route_mutation_requested;
+    if !urgent
+        && state.last_logged_at.is_some_and(|last_logged_at| {
+            now.saturating_duration_since(last_logged_at) < ROUTINE_SLOW_REFRESH_LOG_INTERVAL
+        })
+    {
+        state.suppressed_refreshes = state.suppressed_refreshes.saturating_add(1);
+        return None;
+    }
+
+    let decision = SlowRefreshLogDecision {
+        suppressed_refreshes: state.suppressed_refreshes,
+    };
+    state.suppressed_refreshes = 0;
+    state.last_logged_at = Some(now);
+    Some(decision)
 }
 
 #[derive(Debug)]
@@ -1094,6 +1138,7 @@ pub struct WaveLinuxEngine {
     effect_availability: Mutex<TimedCache<Vec<EffectAvailability>>>,
     hardware_profiles: Arc<Mutex<TimedCache<HardwareProfileCatalog>>>,
     remote_profile_sync: Arc<Mutex<RemoteProfileSyncState>>,
+    slow_refresh_log: Mutex<SlowRefreshLogState>,
     audio_commands: Mutex<()>,
     capture_move_failures: Mutex<BTreeMap<String, CaptureMoveFailure>>,
     app_stream_move_failures: Mutex<BTreeMap<String, Instant>>,
@@ -1156,6 +1201,7 @@ impl WaveLinuxEngine {
             effect_availability: Mutex::new(TimedCache::default()),
             hardware_profiles: Arc::new(Mutex::new(TimedCache::default())),
             remote_profile_sync: Arc::new(Mutex::new(RemoteProfileSyncState::default())),
+            slow_refresh_log: Mutex::new(SlowRefreshLogState::default()),
             audio_commands: Mutex::new(()),
             capture_move_failures: Mutex::new(BTreeMap::new()),
             app_stream_move_failures: Mutex::new(BTreeMap::new()),
@@ -1460,6 +1506,7 @@ impl WaveLinuxEngine {
                 })
                 .unwrap_or(false);
         let mut route_mutations_deferred = false;
+        let mut route_mutation_requested = false;
         if audio_graph_running
             && !self.stop.load(Ordering::SeqCst)
             && (auto_device_repair_needed
@@ -1467,6 +1514,7 @@ impl WaveLinuxEngine {
                 || route_health_repair_needed
                 || bluetooth_monitor_route_refresh_needed)
         {
+            route_mutation_requested = true;
             let default_lock_only_repair = default_device_lock_repair_needed
                 && !auto_device_route_repair_needed
                 && !active_effect_route_repair_needed
@@ -1626,7 +1674,23 @@ impl WaveLinuxEngine {
         };
         record_refresh_phase(&mut refresh_phases, &mut phase_started, "state");
         let elapsed = started.elapsed();
-        if elapsed > Duration::from_millis(300) {
+        let snapshot_failed = snapshot_command_timings
+            .iter()
+            .any(|timing| !timing.succeeded);
+        let slow_refresh_decision = {
+            let mut state = self
+                .slow_refresh_log
+                .lock()
+                .map_err(|_| EngineError::LockPoisoned)?;
+            slow_refresh_log_decision(
+                &mut state,
+                Instant::now(),
+                elapsed,
+                snapshot_failed,
+                route_mutation_requested || route_mutations_deferred,
+            )
+        };
+        if let Some(decision) = slow_refresh_decision {
             let phases = refresh_phases
                 .iter()
                 .map(|(phase, elapsed_ms)| format!("{phase}={elapsed_ms}ms"))
@@ -1636,8 +1700,9 @@ impl WaveLinuxEngine {
             self.log_engine_event(
                 "runtime.refresh",
                 format!(
-                    "slow_refresh_ms={} inputs={} outputs={} streams={} meters={} graph_running={} phases={} snapshot_commands={}",
+                    "slow_refresh_ms={} suppressed_refreshes={} inputs={} outputs={} streams={} meters={} graph_running={} phases={} snapshot_commands={}",
                     elapsed.as_millis(),
+                    decision.suppressed_refreshes,
                     runtime.graph.inputs.len(),
                     runtime.graph.outputs.len(),
                     runtime.graph.app_streams.len(),
@@ -9155,6 +9220,82 @@ mod tests {
             .unwrap();
 
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn slow_refresh_log_decision_throttles_routine_refreshes() {
+        let mut state = SlowRefreshLogState::default();
+        let now = Instant::now();
+
+        assert_eq!(
+            slow_refresh_log_decision(&mut state, now, Duration::from_millis(450), false, false),
+            Some(SlowRefreshLogDecision {
+                suppressed_refreshes: 0
+            })
+        );
+        assert_eq!(
+            slow_refresh_log_decision(
+                &mut state,
+                now + Duration::from_secs(10),
+                Duration::from_millis(500),
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(state.suppressed_refreshes, 1);
+        assert_eq!(
+            slow_refresh_log_decision(
+                &mut state,
+                now + ROUTINE_SLOW_REFRESH_LOG_INTERVAL + Duration::from_secs(1),
+                Duration::from_millis(475),
+                false,
+                false
+            ),
+            Some(SlowRefreshLogDecision {
+                suppressed_refreshes: 1
+            })
+        );
+        assert_eq!(state.suppressed_refreshes, 0);
+    }
+
+    #[test]
+    fn slow_refresh_log_decision_logs_urgent_refreshes_without_throttle() {
+        let mut state = SlowRefreshLogState::default();
+        let now = Instant::now();
+
+        assert!(slow_refresh_log_decision(
+            &mut state,
+            now,
+            Duration::from_millis(450),
+            false,
+            false
+        )
+        .is_some());
+        assert_eq!(
+            slow_refresh_log_decision(
+                &mut state,
+                now + Duration::from_secs(5),
+                Duration::from_millis(450),
+                true,
+                false
+            ),
+            Some(SlowRefreshLogDecision {
+                suppressed_refreshes: 0
+            })
+        );
+        assert_eq!(
+            slow_refresh_log_decision(
+                &mut state,
+                now + Duration::from_secs(6),
+                Duration::from_millis(450),
+                false,
+                true
+            ),
+            Some(SlowRefreshLogDecision {
+                suppressed_refreshes: 0
+            })
+        );
     }
 
     #[test]

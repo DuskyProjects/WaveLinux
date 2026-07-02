@@ -123,6 +123,7 @@ function initialView(): View {
 
 const MAX_SOFTWARE_CHANNELS = 8;
 const MAX_MIXES = 5;
+const APP_DISPLAY_NAME = "WaveLinux5";
 const AUTO_MONITOR_OUTPUT_VALUE = "__auto_monitor_output__";
 const CLEAR_MIX_OUTPUTS_VALUE = "__clear_mix_outputs__";
 const MIX_TEMPLATE_NAMES = ["Personal", "Chat", "Stream"];
@@ -990,11 +991,11 @@ export default function App() {
         style={themeToStyle(activeTheme)}
       >
         <aside className="wl-rail">
-          <div className="wl-brand" title="WaveLinux">
+          <div className="wl-brand" title={APP_DISPLAY_NAME}>
             <AudioLines size={22} />
             <span>WL</span>
           </div>
-          <nav className="wl-nav" aria-label="WaveLinux sections">
+          <nav className="wl-nav" aria-label={`${APP_DISPLAY_NAME} sections`}>
             {views.map((view) => {
               const Icon = view.icon;
               return (
@@ -1021,7 +1022,7 @@ export default function App() {
         <main className="wl-main">
           <header className="wl-topbar">
             <div>
-              <p>WaveLinux</p>
+              <p>{APP_DISPLAY_NAME}</p>
               <h1>{viewTitle(activeView)}</h1>
             </div>
             {topActions}
@@ -1043,8 +1044,7 @@ export default function App() {
             <AudioLines size={22} />
           </div>
           <div>
-            <strong>WaveLinux</strong>
-            <span>4.2</span>
+            <strong>{APP_DISPLAY_NAME}</strong>
           </div>
         </div>
 

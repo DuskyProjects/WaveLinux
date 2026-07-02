@@ -14,7 +14,7 @@
     "enableGTKAppId": true,
     "windows": [
       {
-        "title": "WaveLinux5 5.0.0",
+        "title": "WaveLinux5",
         "width": 1280,
         "height": 820,
         "minWidth": 960,
