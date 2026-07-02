@@ -91,9 +91,17 @@ cleanup_wavelinux5_audio_modules() {
   mapfile -t modules < <(
     pactl list short modules 2>/dev/null | awk '
       /wavelinux5|WaveLinux5/ {
-        print $1
+        priority = 50
+        if ($2 == "module-loopback") {
+          priority = 10
+        } else if ($2 == "module-remap-source") {
+          priority = 20
+        } else if ($2 == "module-null-sink") {
+          priority = 30
+        }
+        printf "%03d %s\n", priority, $1
       }
-    ' | sort -nu
+    ' | sort -k1,1n -k2,2n | awk '{ print $2 }'
   )
   if ((${#modules[@]} == 0)); then
     return 0
@@ -105,6 +113,7 @@ cleanup_wavelinux5_audio_modules() {
   done
 }
 
+cleanup_wavelinux5_audio_modules
 stop_wavelinux5_processes
 cleanup_wavelinux5_audio_modules
 

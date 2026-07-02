@@ -9024,6 +9024,10 @@ mod tests {
         assert!(script.contains("WaveLinux5_[^ ]*_amd64"));
         assert!(script.contains(r"\/wavelinux5\/effects\/wavelinux5-chain-"));
         assert!(script.contains("/wavelinux5|WaveLinux5/"));
+        assert!(script.contains("$2 == \"module-loopback\""));
+        assert!(script.contains(
+            "cleanup_wavelinux5_audio_modules\nstop_wavelinux5_processes\ncleanup_wavelinux5_audio_modules"
+        ));
         assert!(!script.contains("(^|[/ ])wavelinux([ ]|$)"));
         assert!(!script.contains("WaveLinux_[^ ]*_amd64"));
         assert!(!script.contains(r"\/wavelinux\/effects\/wavelinux-chain-"));
