@@ -18,6 +18,11 @@ runtime data, PipeWire namespace, and update behavior.
 - Keeps bundled AppImage LADSPA plugins visible to runtime checks so
   DeepFilterNet3, RNNoise, and SWH dynamics are not reinstalled when the bundle
   already provides them.
+- Retunes DeepFilterNet3 for WaveLinux5 by replacing the weak 18 dB balanced
+  profile with a stronger 70 dB profile, making `Noisy Room` use the plugin's
+  full 100 dB reduction range, and migrating old weak balanced configs forward.
+- Keeps RNNoise as the low-latency `Noise Suppression` path instead of treating
+  it as a heavy realtime-fallback effect when DeepFilterNet3 underruns.
 - Updates clean-distro smoke helpers for WaveLinux5 artifact names and testing
   tags whose release tag suffix differs from the built artifact version.
 

@@ -4071,7 +4071,7 @@ impl WaveLinuxEngine {
                     severity: DiagnosticSeverity::Warning,
                     message: format!("{} FX chain is missing realtime deadlines", channel.name),
                     action: Some(
-                        "Bypass duplicate/heavy noise suppression or switch to the light voice preset"
+                        "WaveLinux5 temporarily bypasses heavy FX such as DeepFilterNet after underruns; use RNNoise for the low-latency noise suppression path or retry DeepFilterNet with a lighter preset"
                             .into(),
                     ),
                 });
@@ -7496,7 +7496,7 @@ fn effect_chain_log_line_timestamp(line: &str) -> Option<OffsetDateTime> {
 }
 
 fn realtime_fallback_effect(effect_id: &str) -> bool {
-    matches!(effect_id, "deepfilternet" | "rnnoise" | "convolver")
+    matches!(effect_id, "deepfilternet" | "convolver")
 }
 
 fn bypass_realtime_fallback_effects(channel: &mut Channel) -> bool {
@@ -12995,7 +12995,7 @@ mod tests {
             .map(|effect| (effect.effect_id.as_str(), effect.bypassed))
             .collect::<BTreeMap<_, _>>();
         assert_eq!(bypassed.get("deepfilternet"), Some(&true));
-        assert_eq!(bypassed.get("rnnoise"), Some(&true));
+        assert_eq!(bypassed.get("rnnoise"), Some(&false));
         assert_eq!(bypassed.get("highpass"), Some(&false));
         assert_eq!(bypassed.get("eq"), Some(&false));
         assert_eq!(bypassed.get("compressor"), Some(&false));

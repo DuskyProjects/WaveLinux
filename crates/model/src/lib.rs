@@ -2258,7 +2258,7 @@ impl Default for EffectCatalog {
                         "Reduction Limit",
                         0.0,
                         100.0,
-                        18.0,
+                        70.0,
                         " dB",
                     ),
                     param(
@@ -2274,7 +2274,7 @@ impl Default for EffectCatalog {
                         "Max ERB Threshold",
                         -15.0,
                         35.0,
-                        30.0,
+                        35.0,
                         " dB",
                     ),
                     param(
@@ -2282,7 +2282,7 @@ impl Default for EffectCatalog {
                         "Max DF Threshold",
                         -15.0,
                         35.0,
-                        20.0,
+                        35.0,
                         " dB",
                     ),
                     param(
@@ -2290,7 +2290,7 @@ impl Default for EffectCatalog {
                         "Min Buffer",
                         0.0,
                         10.0,
-                        8.0,
+                        0.0,
                         " frames",
                     ),
                     param("post_filter_beta", "Post Filter Beta", 0.0, 0.05, 0.0, ""),
@@ -2386,11 +2386,11 @@ impl Default for EffectCatalog {
                     &[
                         ("input_trim_db", -6.0),
                         ("output_makeup_db", 6.0),
-                        ("attenuation_limit_db", 18.0),
+                        ("attenuation_limit_db", 70.0),
                         ("min_processing_threshold_db", -15.0),
-                        ("max_erb_processing_threshold_db", 30.0),
-                        ("max_df_processing_threshold_db", 20.0),
-                        ("min_processing_buffer_frames", 8.0),
+                        ("max_erb_processing_threshold_db", 35.0),
+                        ("max_df_processing_threshold_db", 35.0),
+                        ("min_processing_buffer_frames", 0.0),
                         ("post_filter_beta", 0.0),
                     ],
                 ),
@@ -2399,11 +2399,11 @@ impl Default for EffectCatalog {
                     &[
                         ("input_trim_db", -3.0),
                         ("output_makeup_db", 3.0),
-                        ("attenuation_limit_db", 12.0),
+                        ("attenuation_limit_db", 24.0),
                         ("min_processing_threshold_db", -15.0),
                         ("max_erb_processing_threshold_db", 30.0),
-                        ("max_df_processing_threshold_db", 10.0),
-                        ("min_processing_buffer_frames", 6.0),
+                        ("max_df_processing_threshold_db", 20.0),
+                        ("min_processing_buffer_frames", 0.0),
                         ("post_filter_beta", 0.0),
                     ],
                 ),
@@ -2412,11 +2412,11 @@ impl Default for EffectCatalog {
                     &[
                         ("input_trim_db", -6.0),
                         ("output_makeup_db", 6.0),
-                        ("attenuation_limit_db", 70.0),
+                        ("attenuation_limit_db", 100.0),
                         ("min_processing_threshold_db", -15.0),
-                        ("max_erb_processing_threshold_db", 30.0),
-                        ("max_df_processing_threshold_db", 20.0),
-                        ("min_processing_buffer_frames", 8.0),
+                        ("max_erb_processing_threshold_db", 35.0),
+                        ("max_df_processing_threshold_db", 35.0),
+                        ("min_processing_buffer_frames", 0.0),
                         ("post_filter_beta", 0.0),
                     ],
                 ),
@@ -3446,36 +3446,55 @@ fn migrate_deepfilternet_capture_profile(
         return;
     }
 
-    let old_conservative_profile = [
-        ("input_trim_db", -12.0),
-        ("output_makeup_db", 6.0),
-        ("attenuation_limit_db", 24.0),
-        ("min_processing_threshold_db", -10.0),
-        ("max_erb_processing_threshold_db", 30.0),
-        ("max_df_processing_threshold_db", 0.0),
-        ("min_processing_buffer_frames", 8.0),
-        ("post_filter_beta", 0.0),
-    ];
+    let old_conservative_profile = profile_matches(
+        params,
+        &[
+            ("input_trim_db", -12.0),
+            ("output_makeup_db", 6.0),
+            ("attenuation_limit_db", 24.0),
+            ("min_processing_threshold_db", -10.0),
+            ("max_erb_processing_threshold_db", 30.0),
+            ("max_df_processing_threshold_db", 0.0),
+            ("min_processing_buffer_frames", 8.0),
+            ("post_filter_beta", 0.0),
+        ],
+    );
+    let weak_balanced_profile = profile_matches(
+        params,
+        &[
+            ("input_trim_db", -6.0),
+            ("output_makeup_db", 6.0),
+            ("attenuation_limit_db", 18.0),
+            ("min_processing_threshold_db", -15.0),
+            ("max_erb_processing_threshold_db", 30.0),
+            ("max_df_processing_threshold_db", 20.0),
+            ("min_processing_buffer_frames", 8.0),
+            ("post_filter_beta", 0.0),
+        ],
+    );
 
-    if !old_conservative_profile
-        .iter()
-        .all(|(id, expected)| param_matches(params, id, *expected))
-    {
+    if !old_conservative_profile && !weak_balanced_profile {
         return;
     }
 
     for (id, value) in [
         ("input_trim_db", -6.0),
         ("output_makeup_db", 6.0),
-        ("attenuation_limit_db", 18.0),
+        ("attenuation_limit_db", 70.0),
         ("min_processing_threshold_db", -15.0),
-        ("max_erb_processing_threshold_db", 30.0),
-        ("max_df_processing_threshold_db", 20.0),
-        ("min_processing_buffer_frames", 8.0),
+        ("max_erb_processing_threshold_db", 35.0),
+        ("max_df_processing_threshold_db", 35.0),
+        ("min_processing_buffer_frames", 0.0),
         ("post_filter_beta", 0.0),
     ] {
         params.insert(id.into(), value);
     }
+}
+
+fn profile_matches(params: &BTreeMap<String, f32>, profile: &[(&str, f32)]) -> bool {
+    profile
+        .iter()
+        .all(|(id, expected)| param_matches(params, id, *expected))
 }
 
 fn migrate_gate_room_mic_profile(
@@ -4584,7 +4603,7 @@ mod tests {
             .iter()
             .any(|param| param.id == "attenuation_limit_db"
                 && (param.max - 100.0).abs() < f32::EPSILON
-                && (param.default - 18.0).abs() < f32::EPSILON));
+                && (param.default - 70.0).abs() < f32::EPSILON));
         assert!(deepfilter
             .params
             .iter()
@@ -4596,13 +4615,13 @@ mod tests {
             .iter()
             .any(|param| param.id == "max_df_processing_threshold_db"
                 && (param.max - 35.0).abs() < f32::EPSILON
-                && (param.default - 20.0).abs() < f32::EPSILON));
+                && (param.default - 35.0).abs() < f32::EPSILON));
         assert!(deepfilter
             .params
             .iter()
             .any(|param| param.id == "min_processing_buffer_frames"
                 && (param.min - 0.0).abs() < f32::EPSILON
-                && (param.default - 8.0).abs() < f32::EPSILON));
+                && (param.default - 0.0).abs() < f32::EPSILON));
 
         let compressor = catalog
             .effects
@@ -4641,6 +4660,19 @@ mod tests {
             .presets
             .iter()
             .any(|preset| preset.name == "Broadcast"));
+        let deepfilter = catalog
+            .effects
+            .iter()
+            .find(|effect| effect.id == "deepfilternet")
+            .unwrap();
+        assert!(deepfilter.params.iter().any(|param| {
+            param.id == "attenuation_limit_db" && (param.default - 70.0).abs() < f32::EPSILON
+        }));
+        assert!(deepfilter.presets.iter().any(|preset| {
+            preset.name == "Noisy Room"
+                && preset.values.get("attenuation_limit_db") == Some(&100.0)
+                && preset.values.get("max_df_processing_threshold_db") == Some(&35.0)
+        }));
         let eq = catalog
             .effects
             .iter()
@@ -4697,11 +4729,39 @@ mod tests {
 
         assert_eq!(params.get("input_trim_db"), Some(&-6.0));
         assert_eq!(params.get("output_makeup_db"), Some(&6.0));
-        assert_eq!(params.get("attenuation_limit_db"), Some(&18.0));
+        assert_eq!(params.get("attenuation_limit_db"), Some(&70.0));
         assert_eq!(params.get("min_processing_threshold_db"), Some(&-15.0));
-        assert_eq!(params.get("max_erb_processing_threshold_db"), Some(&30.0));
-        assert_eq!(params.get("max_df_processing_threshold_db"), Some(&20.0));
-        assert_eq!(params.get("min_processing_buffer_frames"), Some(&8.0));
+        assert_eq!(params.get("max_erb_processing_threshold_db"), Some(&35.0));
+        assert_eq!(params.get("max_df_processing_threshold_db"), Some(&35.0));
+        assert_eq!(params.get("min_processing_buffer_frames"), Some(&0.0));
+    }
+
+    #[test]
+    fn deepfilternet_weak_balanced_defaults_migrate_to_stronger_voice() {
+        let mut config = MixerConfig::default();
+        let mut deepfilter = EffectInstance::new("deepfilternet");
+        for (id, value) in [
+            ("input_trim_db", -6.0),
+            ("output_makeup_db", 6.0),
+            ("attenuation_limit_db", 18.0),
+            ("min_processing_threshold_db", -15.0),
+            ("max_erb_processing_threshold_db", 30.0),
+            ("max_df_processing_threshold_db", 20.0),
+            ("min_processing_buffer_frames", 8.0),
+            ("post_filter_beta", 0.0),
+        ] {
+            deepfilter.params.insert(id.into(), value);
+        }
+
+        let channel = config
+            .set_effect_chain("hardware_in", vec![deepfilter])
+            .unwrap();
+        let params = &channel.effects[0].params;
+
+        assert_eq!(params.get("attenuation_limit_db"), Some(&70.0));
+        assert_eq!(params.get("max_erb_processing_threshold_db"), Some(&35.0));
+        assert_eq!(params.get("max_df_processing_threshold_db"), Some(&35.0));
+        assert_eq!(params.get("min_processing_buffer_frames"), Some(&0.0));
     }
 
     #[test]

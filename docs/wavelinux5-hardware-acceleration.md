@@ -117,6 +117,29 @@ Provider order is CUDA/NVIDIA, OpenVINO/Intel, portable CPU acceleration, pure
 CPU fallback. Host GPU and ML runtimes are optional and are not bundled in the
 AppImage.
 
+## Noise Suppression FX
+
+WaveLinux exposes two separate realtime microphone cleanup effects:
+
+- `rnnoise`: the UI's `Noise Suppression` effect. It is the low-latency
+  RNNoise LADSPA plugin and is suitable as the default realtime voice cleanup
+  path.
+- `deepfilternet`: the `DeepFilterNet3` effect. It is a continuous neural
+  denoiser through the DeepFilterNet3 LADSPA plugin.
+
+DeepFilterNet3 defaults intentionally track the plugin's stronger denoising
+range for WaveLinux5: `Balanced Voice` allows 70 dB reduction with full ERB/DF
+thresholds, and `Noisy Room` allows 100 dB reduction for steady room noise such
+as fans or AC. Older WaveLinux5 configs that still contain the weak 18 dB
+balanced profile are migrated to the stronger balanced profile when the config
+is normalized.
+
+WaveLinux5 treats DeepFilterNet3 as a heavy realtime effect because the LADSPA
+plugin does not advertise a realtime guarantee. If the effect-chain log reports
+recent realtime underruns, WaveLinux5 temporarily bypasses heavy effects such as
+DeepFilterNet3 while keeping lighter effects and RNNoise eligible so capture
+audio stays alive.
+
 ## DSP Helper
 
 `crates/dsp` builds `wavelinux5-dsp-helper`. The helper exposes:
