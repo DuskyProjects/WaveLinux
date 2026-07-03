@@ -16,6 +16,7 @@ WaveLinux5 uses its own application identity:
 - AppImage: `~/.local/share/wavelinux5/WaveLinux5_5.0.0_amd64.AppImage`
 - Config: `~/.config/wavelinux5/config.json`
 - Runtime data: `~/.local/share/wavelinux5`
+- Optional ALSA aliases: marked `WaveLinux5 ALSA aliases` block in `~/.asoundrc`
 
 The stable `wavelinux` launcher, stable AppImage, stable desktop entry, and
 stable config remain separate.
@@ -39,6 +40,13 @@ The model and PipeWire planner derive virtual nodes from that namespace:
 - Effect-chain nodes: `wavelinux5_fx_<channel-id>_*`
 - PipeWire ownership properties: `wavelinux5.managed`,
   `wavelinux5.role`, `wavelinux5.channel_id`, and related route metadata.
+
+The local installer refreshes ALSA aliases for legacy applications that do not
+enumerate PipeWire/PulseAudio sources directly. Those aliases use the same
+namespace, for example `wavelinux5_mic`, `wavelinux5_mix_stream`,
+`wavelinux5_mix_monitor`, and `wavelinux5_channel_hardware_in`. The
+`wavelinux5_mic` alias targets the processed effect output named
+`wavelinux5-mic`.
 
 Stable WaveLinux still uses `wavelinux_*` node names and `wavelinux.*`
 properties. Cleanup, stale-helper matching, graph parsing, and route planning

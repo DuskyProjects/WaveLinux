@@ -107,16 +107,20 @@ runtime dependencies.
 
 ## ALSA-Only Apps
 
-Most apps should see WaveLinux devices through PipeWire/PulseAudio. For legacy
-ALSA-only applications that cannot see those devices, install optional ALSA
-aliases:
+Most apps should see WaveLinux devices through PipeWire/PulseAudio. WaveLinux5
+also installs user-scoped ALSA aliases during local install so legacy capture
+tools can discover the test-line virtual sources through ALSA.
+
+To refresh the aliases manually:
 
 ```bash
 yarn install:alsa-aliases
 ```
 
 This uses a marked block in `~/.asoundrc` so uninstall can remove only
-WaveLinux-owned aliases.
+WaveLinux-owned aliases. For WaveLinux5, Audacity's ALSA host should then show
+entries such as `wavelinux5_mic`, `wavelinux5_mix_stream`,
+`wavelinux5_mix_monitor`, and `wavelinux5_channel_hardware_in`.
 
 ## Hardware Profiles
 

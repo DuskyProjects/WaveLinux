@@ -193,12 +193,15 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
   gtk-update-icon-cache -q "$ICON_BASE" >/dev/null 2>&1 || true
 fi
 
-if [[ "${WAVELINUX_INSTALL_ALSA_ALIASES:-0}" == "1" ]]; then
-  "$ROOT_DIR/scripts/install-alsa-aliases.sh" || {
-    echo "Warning: failed to install WaveLinux ALSA aliases" >&2
-  }
+if [[ "${WAVELINUX_INSTALL_ALSA_ALIASES:-1}" != "0" ]]; then
+  WAVELINUX_APP_DISPLAY_NAME=WaveLinux5 \
+    WAVELINUX_GRAPH_PREFIX=wavelinux5 \
+    WAVELINUX_CONFIG_DIR="$CONFIG_DIR" \
+    "$ROOT_DIR/scripts/install-alsa-aliases.sh" || {
+      echo "Warning: failed to install WaveLinux5 ALSA aliases" >&2
+    }
 else
-  echo "Skipped ALSA aliases. Run yarn install:alsa-aliases if an ALSA-only app needs WaveLinux devices."
+  echo "Skipped ALSA aliases. Run yarn install:alsa-aliases if an ALSA-only app needs WaveLinux5 devices."
 fi
 
 if [[ "${WAVELINUX_PREWARM_HARDWARE_PROFILES:-1}" != "0" ]]; then

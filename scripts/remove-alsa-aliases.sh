@@ -2,8 +2,9 @@
 set -euo pipefail
 
 ASOUNDRC="${WAVELINUX_ASOUNDRC:-$HOME/.asoundrc}"
-START_MARKER="# >>> WaveLinux ALSA aliases >>>"
-END_MARKER="# <<< WaveLinux ALSA aliases <<<"
+APP_DISPLAY_NAME="${WAVELINUX_APP_DISPLAY_NAME:-WaveLinux5}"
+START_MARKER="# >>> $APP_DISPLAY_NAME ALSA aliases >>>"
+END_MARKER="# <<< $APP_DISPLAY_NAME ALSA aliases <<<"
 
 if [[ ! -f "$ASOUNDRC" ]]; then
   exit 0
@@ -22,14 +23,14 @@ awk -v start="$START_MARKER" -v end="$END_MARKER" '
 case "${status:-0}" in
   0)
     install -m 0644 "$tmp_output" "$ASOUNDRC"
-    echo "Removed WaveLinux ALSA aliases from $ASOUNDRC"
+    echo "Removed $APP_DISPLAY_NAME ALSA aliases from $ASOUNDRC"
     ;;
   2)
-    echo "WaveLinux ALSA alias block in $ASOUNDRC is missing its end marker" >&2
+    echo "$APP_DISPLAY_NAME ALSA alias block in $ASOUNDRC is missing its end marker" >&2
     exit 1
     ;;
   3)
-    echo "No WaveLinux ALSA aliases found in $ASOUNDRC"
+    echo "No $APP_DISPLAY_NAME ALSA aliases found in $ASOUNDRC"
     ;;
   *)
     exit "$status"
