@@ -1,7 +1,8 @@
-# WaveLinux5 Hardware Acceleration Test Line
+# WaveLinux5 Hardware Acceleration
 
-WaveLinux5 is the local 5.0.0 hardware-acceleration test line. It is designed
-to install beside stable WaveLinux instead of replacing it.
+WaveLinux5 is the 5.0.0 release line. It keeps a separate application identity
+from pre-5 WaveLinux installs while the hardware-acceleration work continues to
+be hardened behind runtime switches.
 
 ## Identity And Paths
 
@@ -57,8 +58,8 @@ must use the active namespace only.
 WaveLinux5 AppImages bundle supported LADSPA plugins under
 `usr/wavelinux-runtime/lib/ladspa` and prepend that directory to `LADSPA_PATH`
 before dependency checks, effect availability probes, or helper launches run.
-If bundled DeepFilterNet3, RNNoise, or SWH dynamics are present, the installer
-does not ask the host package manager to reinstall them.
+If bundled RNNoise or SWH dynamics are present, the installer does not ask the
+host package manager to reinstall them.
 
 When runtime packages are missing, WaveLinux5 chooses the privilege helper based
 on launch context:
@@ -106,12 +107,12 @@ Modes:
 - `dsp_accelerated`: prefer CUDA/OpenVINO and report a fallback if neither
   provider is available.
 
-Current test status: `dsp_cpu` is the native-helper test path for high-pass,
-EQ, compressor, gate, limiter, and DeepFilterNet-style CPU fallback. It creates
-the same logical FX input/output nodes as the filter-chain path, but audio is
-processed inside `wavelinux5-dsp-helper`. `dsp_auto` and `dsp_accelerated` still
-launch the helper-supervised filter-chain rollback while accelerated providers
-are benchmarked and hardened.
+Current release status: `dsp_cpu` is the native-helper path for high-pass, EQ,
+compressor, gate, and limiter. It creates the same logical FX input/output
+nodes as the filter-chain path, but audio is processed inside
+`wavelinux5-dsp-helper`. RNNoise remains on the PipeWire LADSPA filter-chain
+path. `dsp_auto` and `dsp_accelerated` still launch the helper-supervised
+filter-chain rollback while accelerated providers are benchmarked and hardened.
 
 Provider order is CUDA/NVIDIA, OpenVINO/Intel, portable CPU acceleration, pure
 CPU fallback. Host GPU and ML runtimes are optional and are not bundled in the
@@ -119,26 +120,28 @@ AppImage.
 
 ## Noise Suppression FX
 
-WaveLinux exposes two separate realtime microphone cleanup effects:
+WaveLinux5 exposes one realtime microphone cleanup effect:
 
-- `rnnoise`: the UI's `Noise Suppression` effect. It is the low-latency
-  RNNoise LADSPA plugin and is suitable as the default realtime voice cleanup
-  path.
-- `deepfilternet`: the `DeepFilterNet3` effect. It is a continuous neural
-  denoiser through the DeepFilterNet3 LADSPA plugin.
+- `rnnoise`: the low-latency RNNoise LADSPA plugin. It is the primary
+  user-selectable noise suppression effect in WaveLinux5.
 
-DeepFilterNet3 defaults intentionally track the plugin's stronger denoising
-range for WaveLinux5: `Balanced Voice` allows 70 dB reduction with full ERB/DF
-thresholds, and `Noisy Room` allows 100 dB reduction for steady room noise such
-as fans or AC. Older WaveLinux5 configs that still contain the weak 18 dB
-balanced profile are migrated to the stronger balanced profile when the config
-is normalized.
+The tested RNNoise Broadcast profile is the default and first preset:
 
-WaveLinux5 treats DeepFilterNet3 as a heavy realtime effect because the LADSPA
-plugin does not advertise a realtime guarantee. If the effect-chain log reports
-recent realtime underruns, WaveLinux5 temporarily bypasses heavy effects such as
-DeepFilterNet3 while keeping lighter effects and RNNoise eligible so capture
-audio stays alive.
+- `vad_threshold`: `50`
+- `hold_ms`: `200`
+- `lead_in_ms`: `0`
+
+DeepFilterNet3 was removed from the WaveLinux5 release line after live testing
+showed it was not reliable enough across hardware and room-noise conditions.
+The app no longer advertises, installs, stages, probes, or renders the
+DeepFilterNet LADSPA plugin. Existing configs that still contain a
+`deepfilternet` effect id are migrated to RNNoise Broadcast during model
+normalization so the config remains loadable.
+
+If the effect-chain log reports realtime underruns, WaveLinux5 keeps reporting
+the underrun in Health diagnostics. Heavy-effect quarantine remains generic for
+future effects that explicitly opt into it, but RNNoise is not treated as a
+heavy fallback effect.
 
 ## DSP Helper
 
@@ -159,10 +162,9 @@ The engine writes two files per active FX channel:
   chain parameters.
 
 The helper includes provider probing, the filter-chain bridge, native PipeWire
-stream endpoints, CPU DSP nodes for high-pass filtering, 3-band EQ, compressor,
-gate, limiter, and a DeepFilterNet-style CPU fallback path using the
-`deep_filter` crate's frame primitives. CUDA and OpenVINO are provider probes in
-this test implementation; they are selected only when the host runtime is
+stream endpoints, and CPU DSP nodes for high-pass filtering, 3-band EQ,
+compressor, gate, and limiter. CUDA and OpenVINO are provider probes in this
+experimental implementation; they are selected only when the host runtime is
 discoverable, otherwise the helper reports CPU fallback.
 
 Native helper logs include `native_start`, capture/playback stream state,
@@ -176,7 +178,7 @@ fallback reason, and fallback count when WaveLinux5 or a DSP override is active.
 
 ## Build And Install
 
-Build and install the side-by-side test line from the checkout:
+Build and install the side-by-side release line from the checkout:
 
 ```sh
 bash scripts/build-local.sh
@@ -194,7 +196,7 @@ The installer stops only WaveLinux5-owned processes:
 After those processes are stopped, install and uninstall also unload only
 Pulse/PipeWire modules whose module metadata contains the WaveLinux5 namespace
 (`wavelinux5` or `WaveLinux5`). This clears modules left behind by a forced
-kill or crashed test build without touching stable WaveLinux modules.
+kill or crashed build without touching pre-5 WaveLinux modules.
 
 It must not kill stable `wavelinux`, stable `WaveLinux_*` AppImages, or stable
 effect helpers.

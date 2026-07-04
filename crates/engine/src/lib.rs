@@ -83,6 +83,10 @@ const EFFECT_NODE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const EFFECT_NODE_CLEAR_TIMEOUT: Duration = Duration::from_secs(2);
 const EFFECT_NODE_READY_STABLE_SAMPLES: usize = 2;
 const EFFECT_NODE_READY_SETTLE: Duration = Duration::from_millis(100);
+const EFFECT_ROUTE_READY_SETTLE: Duration = Duration::from_millis(300);
+const EFFECT_ROUTE_LINK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const EFFECT_ROUTE_LINK_SETTLE: Duration = Duration::from_millis(100);
+const EFFECT_CHAIN_FAILURE_LOGS: usize = 8;
 const GRAPH_REPAIR_DEBOUNCE: Duration = Duration::from_millis(650);
 const ROUTE_HEALTH_REPAIR_BACKOFF: Duration = Duration::from_secs(10);
 const UI_STATE_REFRESH_MAX_AGE: Duration = Duration::from_millis(4_000);
@@ -1584,9 +1588,29 @@ impl WaveLinuxEngine {
                                     .join(", ")
                             ),
                         );
+                        for (channel_id, path) in self
+                            .preserve_realtime_fallback_logs_for_runtime_prefix(
+                                &config,
+                                &realtime_fallback_channel_ids,
+                                &graph_prefix(),
+                            )
+                        {
+                            self.log_engine_event(
+                                "effects.fallback",
+                                format!(
+                                    "preserved failed FX log channel={channel_id} path={}",
+                                    path.display()
+                                ),
+                            );
+                        }
                         self.rebuild_effect_chain_configs()?;
                         outputs.extend(
                             self.sync_effect_channels_unlocked(&realtime_fallback_channel_ids)?,
+                        );
+                        self.clear_realtime_fallback_trigger_logs_for_runtime_prefix(
+                            &config,
+                            &realtime_fallback_channel_ids,
+                            &graph_prefix(),
                         );
                     }
                     if active_effect_route_repair_needed || route_health_repair_needed {
@@ -1938,7 +1962,7 @@ impl WaveLinuxEngine {
             .collect::<Vec<_>>();
         if !active_effect_channels.is_empty() {
             for channel in &active_effect_channels {
-                let _ = self.wait_for_effect_nodes(channel);
+                let _ = self.wait_for_effect_nodes_ready_for_routing(channel);
             }
             let post_effect_graph = self
                 .pw
@@ -2000,6 +2024,23 @@ impl WaveLinuxEngine {
                 .map(command_execution),
         );
         outputs.extend(self.apply_graph_levels(&route_config)?);
+        let linked_effect_channel_ids = route_config
+            .channels
+            .iter()
+            .filter(|channel| channel_has_active_effects(channel))
+            .map(|channel| channel.id.clone())
+            .collect::<BTreeSet<_>>();
+        let route_issues =
+            self.wait_for_effect_routes_linked(&route_config, &linked_effect_channel_ids);
+        if !route_issues.is_empty() {
+            self.log_engine_event(
+                "repair.effects",
+                format!(
+                    "FX loopbacks still unhealthy after repair: {}",
+                    route_health_summary(&route_issues)
+                ),
+            );
+        }
         outputs.extend(self.apply_default_device_locks(&route_config)?);
         let source_outputs = self.pw.source_output_routes().unwrap_or_default();
         outputs.extend(self.execute_capture_stream_moves_unlocked(&route_config, &source_outputs)?);
@@ -3999,6 +4040,201 @@ impl WaveLinuxEngine {
             .join(effect_chain_file_name(&channel.id, "log"))
     }
 
+    fn effect_chain_failure_log_prefix(&self, channel: &Channel) -> String {
+        format!("{}.failure.", effect_chain_file_name(&channel.id, "log"))
+    }
+
+    fn effect_chain_failure_log_path(&self, channel: &Channel) -> PathBuf {
+        let timestamp = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        self.paths.config_dir.join(format!(
+            "{}{timestamp}.log",
+            self.effect_chain_failure_log_prefix(channel)
+        ))
+    }
+
+    fn preserve_realtime_fallback_logs_for_runtime_prefix(
+        &self,
+        config: &MixerConfig,
+        channel_ids: &BTreeSet<String>,
+        runtime_prefix: &str,
+    ) -> Vec<(String, PathBuf)> {
+        if runtime_prefix != "wavelinux5" {
+            return Vec::new();
+        }
+
+        config
+            .channels
+            .iter()
+            .filter(|channel| channel_ids.contains(&channel.id))
+            .filter(|channel| {
+                channel
+                    .effects
+                    .iter()
+                    .any(|effect| !effect.bypassed && realtime_fallback_effect(&effect.effect_id))
+            })
+            .filter(|channel| self.effect_chain_log_mentions_realtime_underrun(channel))
+            .filter_map(|channel| {
+                self.preserve_effect_chain_failure_log(channel)
+                    .map(|path| (channel.id.clone(), path))
+            })
+            .collect()
+    }
+
+    fn clear_realtime_fallback_trigger_logs_for_runtime_prefix(
+        &self,
+        config: &MixerConfig,
+        channel_ids: &BTreeSet<String>,
+        runtime_prefix: &str,
+    ) {
+        if runtime_prefix != "wavelinux5" {
+            return;
+        }
+
+        for channel in config
+            .channels
+            .iter()
+            .filter(|channel| channel_ids.contains(&channel.id))
+            .filter(|channel| self.effect_chain_log_mentions_realtime_underrun(channel))
+        {
+            let _ = fs::write(self.effect_chain_log_path(channel), "");
+        }
+    }
+
+    fn preserve_effect_chain_failure_log(&self, channel: &Channel) -> Option<PathBuf> {
+        let source = self.effect_chain_log_path(channel);
+        let metadata = fs::metadata(&source).ok()?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return None;
+        }
+
+        let target = self.effect_chain_failure_log_path(channel);
+        fs::create_dir_all(&self.paths.config_dir).ok()?;
+        fs::copy(&source, &target).ok()?;
+        self.preserve_effect_chain_failure_artifact(channel, &target, "conf");
+        self.preserve_effect_chain_failure_artifact(channel, &target, "json");
+        self.trim_effect_chain_failure_logs(channel);
+        Some(target)
+    }
+
+    fn preserve_effect_chain_failure_artifact(
+        &self,
+        channel: &Channel,
+        failure_log_path: &Path,
+        suffix: &str,
+    ) {
+        let source = self
+            .paths
+            .effect_chains_dir()
+            .join(effect_chain_file_name(&channel.id, suffix));
+        let Ok(metadata) = fs::metadata(&source) else {
+            return;
+        };
+        if !metadata.is_file() || metadata.len() == 0 {
+            return;
+        }
+        let _ = fs::copy(source, failure_log_path.with_extension(suffix));
+    }
+
+    fn effect_chain_failure_log_entries(&self, channel: &Channel) -> Vec<(SystemTime, PathBuf)> {
+        let prefix = self.effect_chain_failure_log_prefix(channel);
+        let Ok(entries) = fs::read_dir(&self.paths.config_dir) else {
+            return Vec::new();
+        };
+
+        let mut logs = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_name()?.to_str()?;
+                if !name.starts_with(&prefix) || !name.ends_with(".log") {
+                    return None;
+                }
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                Some((modified, path))
+            })
+            .collect::<Vec<_>>();
+
+        logs.sort_by(|left, right| right.0.cmp(&left.0));
+        logs
+    }
+
+    fn matching_effect_chain_failure_log_path(&self, channel: &Channel) -> Option<PathBuf> {
+        let current = dsp_channel_config(channel);
+        self.effect_chain_failure_log_entries(channel)
+            .into_iter()
+            .find(|(_, path)| self.effect_chain_failure_artifact_matches_channel(path, &current))
+            .map(|(_, path)| path)
+    }
+
+    fn effect_chain_failure_artifact_matches_channel(
+        &self,
+        failure_log_path: &Path,
+        current: &wavelinux_dsp::DspChannelConfig,
+    ) -> bool {
+        let artifact_path = failure_log_path.with_extension("json");
+        let Ok(failed) = read_json::<wavelinux_dsp::DspChannelConfig>(&artifact_path) else {
+            return false;
+        };
+        failed.sample_rate_hz == current.sample_rate_hz
+            && failed.latency_frames == current.latency_frames
+            && failed.effects == current.effects
+    }
+
+    fn active_effect_chain_failure_log_path(&self, channel: &Channel) -> Option<PathBuf> {
+        self.matching_effect_chain_failure_log_path(channel)
+    }
+
+    fn active_effect_chain_failure_artifact_path(
+        &self,
+        channel: &Channel,
+        suffix: &str,
+    ) -> Option<PathBuf> {
+        self.active_effect_chain_failure_log_path(channel)
+            .map(|path| path.with_extension(suffix))
+            .filter(|path| path.exists())
+    }
+
+    fn trim_effect_chain_failure_logs(&self, channel: &Channel) {
+        let prefix = self.effect_chain_failure_log_prefix(channel);
+        let Ok(entries) = fs::read_dir(&self.paths.config_dir) else {
+            return;
+        };
+        let mut logs = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_name()?.to_str()?;
+                if !name.starts_with(&prefix) || !name.ends_with(".log") {
+                    return None;
+                }
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                Some((modified, path))
+            })
+            .collect::<Vec<_>>();
+
+        logs.sort_by(|left, right| right.0.cmp(&left.0));
+        for (_, path) in logs.into_iter().skip(EFFECT_CHAIN_FAILURE_LOGS) {
+            remove_effect_chain_failure_artifacts(&path);
+        }
+    }
+
+    fn recent_effect_chain_failure_summary(&self, channel: &Channel) -> Option<String> {
+        let current_log_path = self.effect_chain_log_path(channel);
+        [
+            Some(current_log_path),
+            self.active_effect_chain_failure_log_path(channel),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|path| effect_chain_log_failure_summary(&path))
+    }
+
     fn effect_chain_diagnostics(
         &self,
         config: &MixerConfig,
@@ -4065,18 +4301,41 @@ impl WaveLinuxEngine {
                 },
             });
 
-            if self.effect_chain_log_mentions_realtime_underrun(channel) {
+            let realtime_underrun_log = self.effect_chain_log_mentions_realtime_underrun(channel);
+            let preserved_failure_log = self.active_effect_chain_failure_log_path(channel);
+            if realtime_underrun_log || preserved_failure_log.is_some() {
+                let current_log_path = self.effect_chain_log_path(channel);
+                let log_path = preserved_failure_log.as_ref().unwrap_or(&current_log_path);
+                let failure_summary = self
+                    .recent_effect_chain_failure_summary(channel)
+                    .map(|summary| format!(": {summary}"))
+                    .unwrap_or_default();
+                let conf_path = self.active_effect_chain_failure_artifact_path(channel, "conf");
+                let json_path = self.active_effect_chain_failure_artifact_path(channel, "json");
+                let mut action = format!(
+                    "WaveLinux5 bypassed heavy FX to keep audio alive; inspect {} before reenabling the affected effect",
+                    log_path.display()
+                );
+                if let Some(conf_path) = conf_path {
+                    action.push_str(&format!(
+                        "; generated PipeWire config: {}",
+                        conf_path.display()
+                    ));
+                }
+                if let Some(json_path) = json_path {
+                    action.push_str(&format!("; generated DSP config: {}", json_path.display()));
+                }
                 diagnostics.push(Diagnostic {
                     code: format!("effects.underrun.{}", channel.id),
                     severity: DiagnosticSeverity::Warning,
-                    message: format!("{} FX chain is missing realtime deadlines", channel.name),
-                    action: Some(
-                        "WaveLinux5 temporarily bypasses heavy FX such as DeepFilterNet after underruns; use RNNoise for the low-latency noise suppression path or retry DeepFilterNet with a lighter preset"
-                            .into(),
+                    message: format!(
+                        "{} FX chain is missing realtime deadlines{}",
+                        channel.name, failure_summary
                     ),
+                    action: Some(action),
                 });
             }
-            if self.effect_chain_log_mentions_clipping(channel) {
+            if self.effect_chain_recent_log_mentions_clipping(channel) {
                 diagnostics.push(Diagnostic {
                     code: format!("effects.clipping.{}", channel.id),
                     severity: DiagnosticSeverity::Warning,
@@ -4121,11 +4380,22 @@ impl WaveLinuxEngine {
         )
     }
 
-    fn effect_chain_log_mentions_clipping(&self, channel: &Channel) -> bool {
-        effect_chain_log_mentions_recent(
-            &self.effect_chain_log_path(channel),
-            &["clipping detected"],
-        )
+    fn effect_chain_has_active_realtime_failure(&self, channel: &Channel) -> bool {
+        self.effect_chain_log_mentions_realtime_underrun(channel)
+            || self.active_effect_chain_failure_log_path(channel).is_some()
+    }
+
+    fn effect_chain_recent_log_mentions_clipping(&self, channel: &Channel) -> bool {
+        self.effect_chain_recent_log_mentions(channel, &["clipping detected"])
+    }
+
+    fn effect_chain_recent_log_mentions(&self, channel: &Channel, markers: &[&str]) -> bool {
+        if effect_chain_log_mentions_recent(&self.effect_chain_log_path(channel), markers) {
+            return true;
+        }
+        self.active_effect_chain_failure_log_path(channel)
+            .as_deref()
+            .is_some_and(|path| effect_chain_log_mentions(path, markers))
     }
 
     fn config_with_unhealthy_effects_bypassed(&self, config: &MixerConfig) -> MixerConfig {
@@ -4145,7 +4415,7 @@ impl WaveLinuxEngine {
 
         let mut effective = config.clone();
         for channel in &mut effective.channels {
-            if !self.effect_chain_log_mentions_realtime_underrun(channel) {
+            if !self.effect_chain_has_active_realtime_failure(channel) {
                 continue;
             }
             bypass_realtime_fallback_effects(channel);
@@ -5230,6 +5500,7 @@ impl WaveLinuxEngine {
             }
         }
 
+        let mut linked_effect_channel_ids = BTreeSet::new();
         for channel in channels {
             let mut route_channel = (*channel).clone();
             if channel_has_active_effects(channel) {
@@ -5238,7 +5509,7 @@ impl WaveLinuxEngine {
                 outputs.push(start_output);
                 if uncleared_effect_channels.contains(&channel.id)
                     || start_failed
-                    || !self.wait_for_effect_nodes(channel)
+                    || !self.wait_for_effect_nodes_ready_for_routing(channel)
                 {
                     self.log_engine_event(
                         "effects.sync",
@@ -5254,6 +5525,7 @@ impl WaveLinuxEngine {
             }
 
             if channel_has_active_effects(&route_channel) {
+                linked_effect_channel_ids.insert(route_channel.id.clone());
                 outputs.extend(
                     self.pw
                         .execute_all(plan_route_channel_to_effect(
@@ -5296,6 +5568,18 @@ impl WaveLinuxEngine {
             }
         }
 
+        let route_issues = self.wait_for_effect_routes_linked(&config, &linked_effect_channel_ids);
+        if !route_issues.is_empty() {
+            self.log_engine_event(
+                "effects.sync",
+                format!(
+                    "FX loopbacks did not link cleanly after targeted sync: {}; running full repair",
+                    route_health_summary(&route_issues)
+                ),
+            );
+            outputs.extend(self.repair_audio_graph_unlocked()?.outputs);
+        }
+
         Ok(outputs)
     }
 
@@ -5318,6 +5602,51 @@ impl WaveLinuxEngine {
             thread::sleep(Duration::from_millis(50));
         }
         false
+    }
+
+    fn wait_for_effect_nodes_ready_for_routing(&self, channel: &Channel) -> bool {
+        if !self.wait_for_effect_nodes(channel) {
+            return false;
+        }
+        if self.options.dry_run {
+            return true;
+        }
+        thread::sleep(EFFECT_ROUTE_READY_SETTLE);
+        self.effect_chain_endpoint_readiness(channel).ready()
+    }
+
+    fn wait_for_effect_routes_linked(
+        &self,
+        config: &MixerConfig,
+        channel_ids: &BTreeSet<String>,
+    ) -> Vec<RouteHealthIssue> {
+        if self.options.dry_run || channel_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let started = Instant::now();
+        let mut issues = Vec::new();
+        while started.elapsed() < EFFECT_ROUTE_LINK_WAIT_TIMEOUT {
+            let graph = self
+                .pw
+                .snapshot_for_config_with_effect_availability(None, Vec::new());
+            let managed_modules = self.pw.managed_modules().unwrap_or_default();
+            let source_outputs = self.pw.source_output_routes().unwrap_or_default();
+            let sink_inputs = self.pw.sink_input_routes().unwrap_or_default();
+            issues = effect_route_health_issues_for_channels(
+                config,
+                &graph,
+                &managed_modules,
+                &source_outputs,
+                &sink_inputs,
+                channel_ids,
+            );
+            if issues.is_empty() {
+                return issues;
+            }
+            thread::sleep(EFFECT_ROUTE_LINK_SETTLE);
+        }
+        issues
     }
 
     fn wait_for_effect_nodes_to_clear(&self, channel: &Channel) -> bool {
@@ -7490,13 +7819,46 @@ fn effect_chain_log_mentions_recent(path: &Path, markers: &[&str]) -> bool {
     }
 }
 
+fn effect_chain_log_mentions(path: &Path, markers: &[&str]) -> bool {
+    let Ok(log) = fs::read_to_string(path) else {
+        return false;
+    };
+    log.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        markers.iter().any(|marker| lower.contains(marker))
+    })
+}
+
+fn effect_chain_log_failure_summary(path: &Path) -> Option<String> {
+    let log = fs::read_to_string(path).ok()?;
+    log.lines().rev().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("underrun detected") && !lower.contains("processing too slow") {
+            return None;
+        }
+        let summary = line
+            .rsplit('|')
+            .next()
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+            .unwrap_or(line.trim());
+        Some(summary.chars().take(180).collect())
+    })
+}
+
+fn remove_effect_chain_failure_artifacts(log_path: &Path) {
+    for suffix in ["log", "conf", "json"] {
+        let _ = fs::remove_file(log_path.with_extension(suffix));
+    }
+}
+
 fn effect_chain_log_line_timestamp(line: &str) -> Option<OffsetDateTime> {
     let timestamp = line.split_whitespace().next()?;
     OffsetDateTime::parse(timestamp, &Rfc3339).ok()
 }
 
 fn realtime_fallback_effect(effect_id: &str) -> bool {
-    matches!(effect_id, "deepfilternet" | "convolver")
+    matches!(effect_id, "convolver")
 }
 
 fn bypass_realtime_fallback_effects(channel: &mut Channel) -> bool {
@@ -7941,6 +8303,26 @@ fn route_health_issues(
     }
 
     issues
+}
+
+fn effect_route_health_issues_for_channels(
+    config: &MixerConfig,
+    graph: &RuntimeGraph,
+    managed_modules: &[ManagedModule],
+    source_outputs: &[SourceOutputRoute],
+    sink_inputs: &[SinkInputRoute],
+    channel_ids: &BTreeSet<String>,
+) -> Vec<RouteHealthIssue> {
+    route_health_issues(config, graph, managed_modules, source_outputs, sink_inputs)
+        .into_iter()
+        .filter(|issue| {
+            matches!(issue.role.as_str(), "channel_to_effect" | "channel_to_mix")
+                && issue
+                    .channel_id
+                    .as_deref()
+                    .is_some_and(|channel_id| channel_ids.contains(channel_id))
+        })
+        .collect()
 }
 
 fn route_endpoint_source_available(source_name: &str, graph: &RuntimeGraph) -> bool {
@@ -8776,7 +9158,7 @@ fn latency_diagnostics(config: &MixerConfig) -> Vec<Diagnostic> {
                 .filter(|effect| !effect.bypassed)
                 .map(move |effect| (channel, effect.effect_id.as_str()))
         })
-        .filter(|(_, effect_id)| matches!(*effect_id, "deepfilternet" | "rnnoise" | "convolver"))
+        .filter(|(_, effect_id)| matches!(*effect_id, "rnnoise" | "convolver"))
         .collect::<Vec<_>>();
 
     if let Ok(latency) = std::env::var("PIPEWIRE_LATENCY") {
@@ -10786,6 +11168,47 @@ mod tests {
     }
 
     #[test]
+    fn effect_route_health_filter_targets_only_synced_effect_channels() {
+        let mut config = MixerConfig::default();
+        config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("limiter")])
+            .unwrap();
+        let graph = running_graph_for_config(&config);
+        let modules = routing_modules_for_config(&config);
+        let mut source_outputs = modules
+            .iter()
+            .map(source_output_for_module)
+            .collect::<Vec<_>>();
+        let sink_inputs = modules
+            .iter()
+            .map(sink_input_for_module)
+            .collect::<Vec<_>>();
+        source_outputs.retain(|route| {
+            !(route.role.as_deref() == Some("channel_to_mix")
+                && route.channel_id.as_deref() == Some("hardware_in")
+                && route.mix_id.as_deref() == Some("stream"))
+                && !(route.role.as_deref() == Some("channel_to_mix")
+                    && route.channel_id.as_deref() == Some("music")
+                    && route.mix_id.as_deref() == Some("monitor"))
+        });
+
+        let issues = effect_route_health_issues_for_channels(
+            &config,
+            &graph,
+            &modules,
+            &source_outputs,
+            &sink_inputs,
+            &BTreeSet::from(["hardware_in".to_string()]),
+        );
+
+        assert_eq!(issues.len(), 1, "issues={issues:?}");
+        assert_eq!(issues[0].role, "channel_to_mix");
+        assert_eq!(issues[0].channel_id.as_deref(), Some("hardware_in"));
+        assert_eq!(issues[0].mix_id.as_deref(), Some("stream"));
+        assert_eq!(issues[0].reason, RouteHealthReason::MissingSourceOutput);
+    }
+
+    #[test]
     fn route_health_reports_stale_non_auto_channel_mix_route() {
         let config = MixerConfig::default();
         let graph = running_graph_for_config(&config);
@@ -12702,7 +13125,7 @@ mod tests {
     }
 
     #[test]
-    fn wavelinux5_effect_chain_configs_bypass_recent_underrun_heavy_effects() {
+    fn wavelinux5_effect_chain_configs_migrate_deepfilternet_to_rnnoise() {
         let engine = test_engine();
         let mut deepfilter = EffectInstance::new("deepfilternet");
         deepfilter.instance_id = "deepfilter".into();
@@ -12733,6 +13156,8 @@ mod tests {
             .effect_chains_dir()
             .join("wavelinux-chain-hardware_in.conf");
         let rendered = fs::read_to_string(&path).unwrap();
+        assert!(rendered.contains("librnnoise_ladspa"));
+        assert!(rendered.contains("noise_suppressor_stereo"));
         assert!(!rendered.contains("libdeep_filter_ladspa"));
         assert!(!rendered.contains("deepfilter"));
         assert!(rendered.contains("gate_1410"));
@@ -12748,7 +13173,7 @@ mod tests {
             .iter()
             .map(|effect| (effect.effect_id.as_str(), effect.bypassed))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(bypassed.get("deepfilternet"), Some(&true));
+        assert_eq!(bypassed.get("rnnoise"), Some(&false));
         assert_eq!(bypassed.get("gate"), Some(&false));
     }
 
@@ -12826,7 +13251,7 @@ mod tests {
         let engine = test_engine();
         let mut config = MixerConfig::default();
         config
-            .set_effect_chain("hardware_in", vec![EffectInstance::new("deepfilternet")])
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("rnnoise")])
             .unwrap();
         let channel = config
             .channels
@@ -12844,6 +13269,12 @@ mod tests {
         assert!(diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "effects.underrun.hardware_in"));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "effects.underrun.hardware_in"
+                && diagnostic
+                    .message
+                    .contains("FX chain is missing realtime deadlines")
+        }));
         assert!(diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "effects.clipping.hardware_in"));
@@ -12854,7 +13285,7 @@ mod tests {
         let engine = test_engine();
         let mut config = MixerConfig::default();
         config
-            .set_effect_chain("hardware_in", vec![EffectInstance::new("deepfilternet")])
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("rnnoise")])
             .unwrap();
         let channel = config
             .channels
@@ -12867,7 +13298,7 @@ mod tests {
         fs::write(
             engine.effect_chain_log_path(channel),
             format!(
-                "{old_timestamp} | WARN | deep_filter_ladspa | Underrun detected (RTF: 2.00). Processing too slow!\n"
+                "{old_timestamp} | WARN | rnnoise_ladspa | Underrun detected (RTF: 2.00). Processing too slow!\n"
             ),
         )
         .unwrap();
@@ -12884,7 +13315,7 @@ mod tests {
         let engine = test_engine();
         let mut config = MixerConfig::default();
         config
-            .set_effect_chain("hardware_in", vec![EffectInstance::new("deepfilternet")])
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("rnnoise")])
             .unwrap();
         let channel = config
             .channels
@@ -12920,58 +13351,7 @@ mod tests {
     }
 
     #[test]
-    fn wavelinux5_realtime_underrun_schedules_effect_chain_sync() {
-        let engine = test_engine();
-        let mut config = MixerConfig::default();
-        config
-            .set_effect_chain(
-                "hardware_in",
-                vec![
-                    EffectInstance::new("highpass"),
-                    EffectInstance::new("deepfilternet"),
-                    EffectInstance::new("gate"),
-                ],
-            )
-            .unwrap();
-        let channel = config
-            .channels
-            .iter()
-            .find(|channel| channel.id == "hardware_in")
-            .unwrap();
-        let timestamp = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-        fs::write(
-            engine.effect_chain_log_path(channel),
-            format!(
-                "{timestamp} | WARN | deep_filter_ladspa | Underrun detected (RTF: 1.57). Processing too slow!\n"
-            ),
-        )
-        .unwrap();
-
-        let stable_ids =
-            engine.realtime_fallback_sync_channel_ids_for_runtime_prefix(&config, "wavelinux");
-        let wavelinux5_ids =
-            engine.realtime_fallback_sync_channel_ids_for_runtime_prefix(&config, "wavelinux5");
-        let effective =
-            engine.config_with_unhealthy_effects_bypassed_for_runtime_prefix(&config, "wavelinux5");
-        let bypassed = effective
-            .channels
-            .iter()
-            .find(|channel| channel.id == "hardware_in")
-            .unwrap()
-            .effects
-            .iter()
-            .map(|effect| (effect.effect_id.as_str(), effect.bypassed))
-            .collect::<BTreeMap<_, _>>();
-
-        assert!(stable_ids.is_empty());
-        assert_eq!(wavelinux5_ids, BTreeSet::from(["hardware_in".to_string()]));
-        assert_eq!(bypassed.get("deepfilternet"), Some(&true));
-        assert_eq!(bypassed.get("highpass"), Some(&false));
-        assert_eq!(bypassed.get("gate"), Some(&false));
-    }
-
-    #[test]
-    fn realtime_fallback_bypasses_only_heavy_effects() {
+    fn realtime_fallback_does_not_bypass_rnnoise_or_standard_effects() {
         let mut channel = MixerConfig::default()
             .channels
             .into_iter()
@@ -12980,21 +13360,19 @@ mod tests {
         channel.effects = vec![
             EffectInstance::new("highpass"),
             EffectInstance::new("eq"),
-            EffectInstance::new("deepfilternet"),
             EffectInstance::new("compressor"),
             EffectInstance::new("rnnoise"),
             EffectInstance::new("gate"),
             EffectInstance::new("limiter"),
         ];
 
-        assert!(bypass_realtime_fallback_effects(&mut channel));
+        assert!(!bypass_realtime_fallback_effects(&mut channel));
 
         let bypassed = channel
             .effects
             .iter()
             .map(|effect| (effect.effect_id.as_str(), effect.bypassed))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(bypassed.get("deepfilternet"), Some(&true));
         assert_eq!(bypassed.get("rnnoise"), Some(&false));
         assert_eq!(bypassed.get("highpass"), Some(&false));
         assert_eq!(bypassed.get("eq"), Some(&false));
@@ -13004,11 +13382,41 @@ mod tests {
     }
 
     #[test]
+    fn realtime_fallback_bypasses_future_heavy_effect_without_inserting_rnnoise() {
+        let mut channel = MixerConfig::default()
+            .channels
+            .into_iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        channel.effects = vec![
+            EffectInstance::new("highpass"),
+            EffectInstance::new("convolver"),
+            EffectInstance::new("limiter"),
+        ];
+
+        assert!(bypass_realtime_fallback_effects(&mut channel));
+
+        let effects = channel
+            .effects
+            .iter()
+            .map(|effect| (effect.effect_id.as_str(), effect.bypassed))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            effects,
+            vec![("highpass", false), ("convolver", true), ("limiter", false),]
+        );
+        assert!(!channel
+            .effects
+            .iter()
+            .any(|effect| effect.effect_id == "rnnoise"));
+    }
+
+    #[test]
     fn quiet_fx_chain_runtime_keeps_processed_input() {
         let engine = test_engine();
         let mut config = MixerConfig::default();
         config
-            .set_effect_chain("hardware_in", vec![EffectInstance::new("deepfilternet")])
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("rnnoise")])
             .unwrap();
         let channel = config
             .channels
@@ -13034,7 +13442,7 @@ mod tests {
         let engine = test_engine();
         let mut config = MixerConfig::default();
         config
-            .set_effect_chain("hardware_in", vec![EffectInstance::new("deepfilternet")])
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("rnnoise")])
             .unwrap();
         let channel = config
             .channels
@@ -13835,7 +14243,7 @@ mod tests {
     #[test]
     #[ignore = "mutates the live user PipeWire graph"]
     fn live_audio_graph_complex_voice_chain_uses_fx_source() {
-        let required = ["deepfilternet", "compressor", "limiter"];
+        let required = ["rnnoise", "compressor", "limiter"];
         let availability = probe_effect_availability(&EffectCatalog::default());
         if required.iter().any(|effect_id| {
             !availability
@@ -13887,8 +14295,14 @@ mod tests {
                         ],
                     ),
                     test_effect("limiter", &[("ceiling_db", -1.0), ("input_gain_db", 0.0)]),
-                    test_effect("deepfilternet", &[("attenuation_limit_db", 100.0)]),
-                    test_effect("deepfilternet", &[("attenuation_limit_db", 12.0)]),
+                    test_effect(
+                        "rnnoise",
+                        &[
+                            ("vad_threshold", 50.0),
+                            ("hold_ms", 200.0),
+                            ("lead_in_ms", 0.0),
+                        ],
+                    ),
                 ],
             )
             .unwrap();

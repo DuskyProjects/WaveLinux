@@ -3101,6 +3101,25 @@ button:disabled {
   scrollbar-color: var(--wl-muted, #b7c2cc) var(--wl-panel-alt, #eef2f5);
 }
 
+.wl-effects-drawer .wl-drawer-body {
+  align-content: start;
+}
+
+.wl-effects-drawer .wl-effects-editor-stack {
+  grid-template-rows: none;
+  grid-auto-rows: max-content;
+  align-content: start;
+  overflow: auto;
+}
+
+.wl-effects-drawer .wl-effects-editor-stack > .panel {
+  overflow: visible;
+}
+
+.wl-effects-drawer .fader-row.compact {
+  grid-template-columns: minmax(92px, 0.4fr) minmax(140px, 1fr) minmax(64px, auto);
+}
+
 .wl-effects-drawer .effect-chain,
 .wl-effects-drawer .catalog-grid {
   align-content: start;

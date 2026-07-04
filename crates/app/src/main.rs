@@ -66,8 +66,6 @@ const STABLE_UPDATE_ENDPOINT: &str =
     "https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json";
 const BETA_UPDATE_ENDPOINT: &str =
     "https://github.com/DuskyProjects/WaveLinux/releases/download/prerelease/latest.json";
-const WAVELINUX5_UPDATES_DISABLED_MESSAGE: &str =
-    "WaveLinux5 is a local test build; stable self-updates are disabled.";
 const UI_THEME_PREFERENCE_FILE: &str = "ui-theme.json";
 const UI_THEMES_DIR: &str = "themes";
 const WEBKIT_DMABUF_DISABLE_ENV: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
@@ -334,14 +332,6 @@ const ZYPPER_PORTAL_BACKENDS: &[&str] = &[
     "xdg-desktop-portal-gnome",
     "xdg-desktop-portal-wlr",
 ];
-const DEEPFILTERNET_LADSPA_NAMES: &[&str] = &[
-    "libdeep_filter_ladspa.so",
-    "deep_filter_ladspa.so",
-    "libdeepfilternet_ladspa.so",
-    "deepfilternet_ladspa.so",
-    "libdeep_filter_net_ladspa.so",
-    "deep_filter_net_ladspa.so",
-];
 const RNNOISE_LADSPA_NAMES: &[&str] = &["librnnoise_ladspa.so", "rnnoise_ladspa.so"];
 const COMPRESSOR_LADSPA_NAMES: &[&str] = &["sc4_1882.so", "compressor.so"];
 const GATE_LADSPA_NAMES: &[&str] = &["gate_1410.so"];
@@ -422,24 +412,8 @@ fn ladspa_has_any(names: &[&str]) -> bool {
         .any(|root| root.is_dir() && names.iter().any(|name| root.join(name).is_file()))
 }
 
-fn ladspa_file_has_marker(marker: &[u8], names: &[&str]) -> bool {
-    existing_ladspa_paths().into_iter().any(|root| {
-        if !root.is_dir() {
-            return false;
-        }
-        names.iter().any(|name| {
-            fs::read(root.join(name))
-                .ok()
-                .is_some_and(|bytes| bytes.windows(marker.len()).any(|window| window == marker))
-        })
-    })
-}
-
 fn missing_ladspa_effect_ids() -> Vec<String> {
     let mut missing = Vec::new();
-    if !ladspa_file_has_marker(b"DeepFilterNet3", DEEPFILTERNET_LADSPA_NAMES) {
-        push_unique(&mut missing, "deepfilternet");
-    }
     if !ladspa_has_any(RNNOISE_LADSPA_NAMES) {
         push_unique(&mut missing, "rnnoise");
     }
@@ -2033,22 +2007,6 @@ async fn check_for_updates(
     }
     let endpoint = update_endpoint(&settings);
     let release_url = release_url_for_settings(&settings).to_string();
-    if wavelinux5_test_line() {
-        let current_version = current_update_version().to_string();
-        return Ok(UpdateInfo {
-            available: false,
-            install_supported: false,
-            current_version,
-            version: None,
-            date: None,
-            body: None,
-            url: None,
-            release_url,
-            channel: release_channel_name(&settings).to_string(),
-            endpoint,
-            message: WAVELINUX5_UPDATES_DISABLED_MESSAGE.into(),
-        });
-    }
     let endpoint_url = endpoint
         .parse::<url::Url>()
         .map_err(|err| err.to_string())?;
@@ -2133,9 +2091,6 @@ async fn install_update(
     engine: State<'_, EngineState>,
     release_channel: Option<ReleaseChannel>,
 ) -> Result<UpdateInstallResult, String> {
-    if wavelinux5_test_line() {
-        return Err(WAVELINUX5_UPDATES_DISABLED_MESSAGE.into());
-    }
     if !is_appimage_install() {
         return Err(
             "Self-update is available for AppImage installs. Use deb, rpm, or AUR updates through your package manager."
@@ -2239,7 +2194,7 @@ fn install_effect_plugins(
             missing_after: missing_effect_names(&before),
             stdout: String::new(),
             stderr: String::new(),
-            message: "No supported package manager was found. Install DeepFilterNet3, RNNoise, and SWH LADSPA packages manually.".into(),
+            message: "No supported package manager was found. Install RNNoise and SWH LADSPA packages manually.".into(),
         });
     }
 
@@ -2365,42 +2320,6 @@ fn resolve_effect_plugin_packages(
 ) -> (Vec<String>, Vec<String>) {
     let mut packages = Vec::new();
     let mut aur_packages = Vec::new();
-
-    if missing_ids.iter().any(|id| id == "deepfilternet") {
-        match manager {
-            PackageManager::Apt => {
-                push_first_available_package(
-                    manager,
-                    &mut packages,
-                    &["deepfilternet-ladspa", "deepfilternet"],
-                );
-            }
-            PackageManager::Dnf | PackageManager::Zypper => {
-                push_first_available_package(manager, &mut packages, &["deepfilternet"]);
-            }
-            PackageManager::Pacman => {
-                push_first_available_package(
-                    manager,
-                    &mut packages,
-                    &["deepfilternet-plugin-pipewire-bin"],
-                );
-                if packages
-                    .iter()
-                    .all(|package| package != "deepfilternet-plugin-pipewire-bin")
-                {
-                    push_first_available_aur_package(
-                        &mut aur_packages,
-                        &[
-                            "deepfilternet-plugin-pipewire-bin",
-                            "deepfilternet-ladspa",
-                            "deepfilternet",
-                        ],
-                    );
-                }
-            }
-            PackageManager::Unknown => {}
-        }
-    }
 
     if missing_ids.iter().any(|id| id == "rnnoise") {
         match manager {
@@ -2681,7 +2600,7 @@ fn install_aur_packages(packages: &[String]) -> Result<Vec<Output>, String> {
     } else if command_exists("yay") {
         "yay"
     } else {
-        return Err("No AUR helper found for DeepFilterNet3. Install paru or yay, or install deepfilternet-plugin-pipewire-bin manually.".into());
+        return Err("No AUR helper found. Install paru or yay, or install the listed effect plugin packages manually.".into());
     };
 
     let mut args = vec!["-S".into(), "--needed".into(), "--noconfirm".into()];
@@ -2943,12 +2862,12 @@ fn current_update_version() -> semver::Version {
         .expect("package version is valid semver")
 }
 
-fn wavelinux5_test_line() -> bool {
+fn is_wavelinux5_build() -> bool {
     env!("CARGO_PKG_VERSION").starts_with("5.")
 }
 
-fn apply_wavelinux5_test_line_env() {
-    if !wavelinux5_test_line() {
+fn apply_wavelinux5_env() {
+    if !is_wavelinux5_build() {
         return;
     }
     set_env_default("WAVELINUX_XDG_APP_NAME", "WaveLinux5");
@@ -3137,7 +3056,7 @@ fn print_hardware_profile_prewarm_report(report: &HardwareProfilePrewarmReport) 
 }
 
 fn main() {
-    apply_wavelinux5_test_line_env();
+    apply_wavelinux5_env();
     prepare_appimage_bundled_runtime();
 
     let args: Vec<String> = std::env::args().collect();

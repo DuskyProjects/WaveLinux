@@ -168,7 +168,7 @@ cat > "$DESKTOP_FILE" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=WaveLinux5
-Comment=Linux creator audio mixer test line
+Comment=Linux creator audio mixer
 Exec=$LAUNCHER
 Icon=wavelinux5
 Terminal=false

@@ -2014,72 +2014,13 @@ pub fn probe_effect_availability(catalog: &EffectCatalog) -> Vec<EffectAvailabil
 }
 
 fn ladspa_plugin_available(effect_id: &str, path: &Path) -> bool {
-    if effect_id == "deepfilternet" {
-        return deepfilternet_model_generation(path) == Some("DeepFilterNet3");
-    }
-
+    let _ = (effect_id, path);
     true
 }
 
 fn ladspa_plugin_detail(effect_id: &str, path: &Path) -> String {
-    let display_path = path.display().to_string();
-    if effect_id != "deepfilternet" {
-        return display_path;
-    }
-
-    match deepfilternet_model_generation(path) {
-        Some("DeepFilterNet3") => format!("{display_path} (DeepFilterNet3 model)"),
-        Some("DeepFilterNet2") => format!(
-            "{display_path} is a legacy DeepFilterNet2 plugin; install a DeepFilterNet3 LADSPA/PipeWire plugin"
-        ),
-        _ => format!(
-            "{display_path} does not identify a DeepFilterNet3 model; install a DeepFilterNet3 LADSPA/PipeWire plugin"
-        ),
-    }
-}
-
-fn deepfilternet_model_generation(path: &Path) -> Option<&'static str> {
-    if file_contains_ascii_marker(path, b"DeepFilterNet3") {
-        Some("DeepFilterNet3")
-    } else if file_contains_ascii_marker(path, b"DeepFilterNet2") {
-        Some("DeepFilterNet2")
-    } else {
-        None
-    }
-}
-
-fn file_contains_ascii_marker(path: &Path, marker: &[u8]) -> bool {
-    if marker.is_empty() {
-        return true;
-    }
-
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut buffer = [0_u8; 8192];
-    let mut tail = Vec::new();
-
-    loop {
-        let read = match file.read(&mut buffer) {
-            Ok(0) => return false,
-            Ok(read) => read,
-            Err(_) => return false,
-        };
-
-        let mut haystack = Vec::with_capacity(tail.len() + read);
-        haystack.extend_from_slice(&tail);
-        haystack.extend_from_slice(&buffer[..read]);
-        if haystack
-            .windows(marker.len())
-            .any(|window| window == marker)
-        {
-            return true;
-        }
-
-        let keep = marker.len().saturating_sub(1).min(haystack.len());
-        tail.clear();
-        tail.extend_from_slice(&haystack[haystack.len() - keep..]);
-    }
+    let _ = effect_id;
+    path.display().to_string()
 }
 
 #[cfg(feature = "pipewire-rs")]
@@ -3262,13 +3203,6 @@ const BUILTIN_STEREO_PORTS: EffectAudioPorts = EffectAudioPorts {
     right_output: "Out",
 };
 
-const DEEPFILTER_STEREO_PORTS: EffectAudioPorts = EffectAudioPorts {
-    left_input: "Audio In L",
-    right_input: "Audio In R",
-    left_output: "Audio Out L",
-    right_output: "Audio Out R",
-};
-
 const RNNOISE_STEREO_PORTS: EffectAudioPorts = EffectAudioPorts {
     left_input: "Input (L)",
     right_input: "Input (R)",
@@ -3306,7 +3240,6 @@ fn render_effect_node(
     };
 
     match effect.effect_id.as_str() {
-        "deepfilternet" => render_deepfilternet_node(effect, definition),
         "rnnoise" => render_ladspa_node(
             effect,
             "librnnoise_ladspa",
@@ -3397,95 +3330,6 @@ fn render_effect_node(
             FAST_LIMITER_STEREO_PORTS,
         ),
         _ => render_builtin_node(effect, "copy", &[]),
-    }
-}
-
-fn render_deepfilternet_node(
-    effect: &EffectInstance,
-    definition: &wavelinux_model::EffectDefinition,
-) -> RenderedEffectNode {
-    let deepfilter = render_ladspa_node(
-        effect,
-        "libdeep_filter_ladspa",
-        "deep_filter_stereo",
-        &[
-            (
-                "Attenuation Limit (dB)",
-                effect_param(effect, definition, "attenuation_limit_db"),
-            ),
-            (
-                "Min processing threshold (dB)",
-                effect_param(effect, definition, "min_processing_threshold_db"),
-            ),
-            (
-                "Max ERB processing threshold (dB)",
-                effect_param(effect, definition, "max_erb_processing_threshold_db"),
-            ),
-            (
-                "Max DF processing threshold (dB)",
-                effect_param(effect, definition, "max_df_processing_threshold_db"),
-            ),
-            (
-                "Min Processing Buffer (frames)",
-                effect_param(effect, definition, "min_processing_buffer_frames"),
-            ),
-            (
-                "Post Filter Beta",
-                effect_param(effect, definition, "post_filter_beta"),
-            ),
-        ],
-        DEEPFILTER_STEREO_PORTS,
-    );
-    let input_trim_db = effect_param(effect, definition, "input_trim_db");
-    let output_makeup_db = effect_param(effect, definition, "output_makeup_db");
-    if input_trim_db >= -0.01 && output_makeup_db <= 0.01 {
-        return deepfilter;
-    }
-
-    let mut config = String::new();
-    let mut internal_links = Vec::new();
-    let mut left_input = deepfilter.left_input.clone();
-    let mut right_input = deepfilter.right_input.clone();
-    let mut left_output = deepfilter.left_output.clone();
-    let mut right_output = deepfilter.right_output.clone();
-
-    if input_trim_db < -0.01 {
-        let trim_name = format!("{}_input_trim", effect_node_name(effect));
-        let trim = render_builtin_stereo_pair_node(
-            &trim_name,
-            "linear",
-            &[("Mult", db_to_gain(input_trim_db)), ("Add", 0.0)],
-        );
-        left_input = trim.left_input.clone();
-        right_input = trim.right_input.clone();
-        internal_links.push((trim.left_output, deepfilter.left_input.clone()));
-        internal_links.push((trim.right_output, deepfilter.right_input.clone()));
-        config.push_str(&trim.config);
-    }
-
-    config.push_str(&deepfilter.config);
-
-    if output_makeup_db > 0.01 {
-        let makeup_name = format!("{}_output_makeup", effect_node_name(effect));
-        let makeup = render_builtin_stereo_pair_node(
-            &makeup_name,
-            "linear",
-            &[("Mult", db_to_gain(output_makeup_db)), ("Add", 0.0)],
-        );
-        internal_links.push((deepfilter.left_output, makeup.left_input.clone()));
-        internal_links.push((deepfilter.right_output, makeup.right_input.clone()));
-        left_output = makeup.left_output;
-        right_output = makeup.right_output;
-        config.push_str(&makeup.config);
-    }
-
-    RenderedEffectNode {
-        left_input,
-        right_input,
-        left_output,
-        right_output,
-        config,
-        internal_links,
     }
 }
 
@@ -3607,10 +3451,6 @@ fn render_builtin_stereo_pair_node(
         config: rendered,
         internal_links: Vec::new(),
     }
-}
-
-fn db_to_gain(db: f32) -> f32 {
-    10.0_f32.powf(db / 20.0)
 }
 
 fn append_builtin_node(rendered: &mut String, label: &str, name: &str, controls: &[(&str, f32)]) {
@@ -4036,13 +3876,7 @@ fn plugin_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
     use wavelinux_model::{ChannelInputMode, ChannelKind, MixerConfig, MixerSettings};
-
-    fn ladspa_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
 
     fn assert_managed_loopback_disables_stream_restore(spec: &CommandSpec) {
         for prefix in ["source_output_properties=", "sink_input_properties="] {
@@ -5488,6 +5322,7 @@ mod tests {
             .unwrap();
         let rendered = render_filter_chain(&config.channels[0], &EffectCatalog::default());
         assert!(rendered.contains("context.spa-libs = {"));
+        assert!(rendered.contains("log.level = 0"));
         assert!(rendered.contains("libpipewire-module-protocol-native"));
         assert!(rendered.contains("active"));
         assert!(!rendered.contains("bypassed"));
@@ -5504,40 +5339,29 @@ mod tests {
     #[test]
     fn filter_chain_wires_stereo_effects_in_order() {
         let mut config = MixerConfig::default();
-        let mut deepfilter = EffectInstance::new("deepfilternet");
-        deepfilter.instance_id = "deepfilter".into();
         let mut rnnoise = EffectInstance::new("rnnoise");
         rnnoise.instance_id = "rnnoise".into();
         let mut eq = EffectInstance::new("eq");
         eq.instance_id = "voice_eq".into();
         let mut limiter = EffectInstance::new("limiter");
         limiter.instance_id = "limiter".into();
-        config.channels[0].effects = vec![deepfilter, rnnoise, eq, limiter];
+        config.channels[0].effects = vec![rnnoise, eq, limiter];
 
         let rendered = render_filter_chain(&config.channels[0], &EffectCatalog::default());
+        assert!(rendered.contains("log.level = 0"));
         assert!(rendered.contains("links = ["));
-        assert!(rendered.contains("label = \"linear\" name = \"deepfilter_input_trim_left\""));
-        assert!(rendered.contains("\"Mult\" = 0.501"));
-        assert!(rendered.contains("label = \"linear\" name = \"deepfilter_output_makeup_left\""));
-        assert!(rendered.contains("\"Mult\" = 1.995"));
         assert!(rendered.contains(
-            "output = \"deepfilter_input_trim_left:Out\" input = \"deepfilter:Audio In L\""
+            "plugin = \"librnnoise_ladspa\" label = \"noise_suppressor_stereo\" name = \"rnnoise\""
         ));
-        assert!(rendered.contains(
-            "output = \"deepfilter:Audio Out L\" input = \"deepfilter_output_makeup_left:In\""
-        ));
-        assert!(rendered.contains(
-            "output = \"deepfilter_output_makeup_left:Out\" input = \"rnnoise:Input (L)\""
-        ));
+        assert!(rendered.contains("\"VAD Threshold (%)\" = 50.000"));
+        assert!(rendered.contains("\"VAD Grace Period (ms)\" = 200.000"));
         assert!(rendered.contains("filters1 = ["));
         assert!(rendered.contains("filters2 = ["));
         assert!(rendered.contains("output = \"rnnoise:Output (L)\" input = \"voice_eq:In 1\""));
         assert!(rendered.contains("output = \"rnnoise:Output (R)\" input = \"voice_eq:In 2\""));
         assert!(rendered.contains("output = \"voice_eq:Out 1\" input = \"limiter:Input 1\""));
         assert!(rendered.contains("output = \"voice_eq:Out 2\" input = \"limiter:Input 2\""));
-        assert!(rendered.contains(
-            "inputs = [ \"deepfilter_input_trim_left:In\" \"deepfilter_input_trim_right:In\" ]"
-        ));
+        assert!(rendered.contains("inputs = [ \"rnnoise:Input (L)\" \"rnnoise:Input (R)\" ]"));
         assert!(rendered.contains("outputs = [ \"limiter:Output 1\" \"limiter:Output 2\" ]"));
     }
 
@@ -5563,63 +5387,6 @@ mod tests {
         );
         assert!(rendered
             .contains("outputs = [ \"voice_gate_left:Output\" \"voice_gate_right:Output\" ]"));
-    }
-
-    #[test]
-    fn detects_deepfilternet3_from_ladspa_path() {
-        let _env_lock = ladspa_env_lock();
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("libdeep_filter_ladspa.so"),
-            b"Loading model DeepFilterNet3_ll_onnx.tar.gz",
-        )
-        .unwrap();
-        let old_ladspa_path = std::env::var_os("LADSPA_PATH");
-        std::env::set_var("LADSPA_PATH", root.path());
-
-        let availability = probe_effect_availability(&EffectCatalog::default());
-        let deepfilternet = availability
-            .iter()
-            .find(|effect| effect.effect_id == "deepfilternet")
-            .unwrap();
-
-        if let Some(old_ladspa_path) = old_ladspa_path {
-            std::env::set_var("LADSPA_PATH", old_ladspa_path);
-        } else {
-            std::env::remove_var("LADSPA_PATH");
-        }
-
-        assert!(deepfilternet.available);
-        assert!(deepfilternet.detail.contains("libdeep_filter_ladspa.so"));
-        assert!(deepfilternet.detail.contains("DeepFilterNet3"));
-    }
-
-    #[test]
-    fn rejects_legacy_deepfilternet_without_v3_marker() {
-        let _env_lock = ladspa_env_lock();
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("libdeep_filter_ladspa.so"),
-            b"DeepFilterNet2 models are deprecated",
-        )
-        .unwrap();
-        let old_ladspa_path = std::env::var_os("LADSPA_PATH");
-        std::env::set_var("LADSPA_PATH", root.path());
-
-        let availability = probe_effect_availability(&EffectCatalog::default());
-        let deepfilternet = availability
-            .iter()
-            .find(|effect| effect.effect_id == "deepfilternet")
-            .unwrap();
-
-        if let Some(old_ladspa_path) = old_ladspa_path {
-            std::env::set_var("LADSPA_PATH", old_ladspa_path);
-        } else {
-            std::env::remove_var("LADSPA_PATH");
-        }
-
-        assert!(!deepfilternet.available);
-        assert!(deepfilternet.detail.contains("legacy DeepFilterNet2"));
     }
 
     #[test]

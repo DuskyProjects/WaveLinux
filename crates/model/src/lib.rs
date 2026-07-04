@@ -2237,66 +2237,6 @@ impl Default for EffectCatalog {
     fn default() -> Self {
         let mut effects = vec![
             effect(
-                "deepfilternet",
-                "DeepFilterNet3",
-                "DeepFilterNet3 neural noise suppression",
-                PluginHint::Ladspa {
-                    library_names: vec![
-                        "libdeep_filter_ladspa.so".into(),
-                        "deep_filter_ladspa.so".into(),
-                        "libdeepfilternet_ladspa.so".into(),
-                        "deepfilternet_ladspa.so".into(),
-                        "libdeep_filter_net_ladspa.so".into(),
-                        "deep_filter_net_ladspa.so".into(),
-                    ],
-                },
-                vec![
-                    param("input_trim_db", "Input Trim", -24.0, 0.0, -6.0, " dB"),
-                    param("output_makeup_db", "Output Makeup", 0.0, 18.0, 6.0, " dB"),
-                    param(
-                        "attenuation_limit_db",
-                        "Reduction Limit",
-                        0.0,
-                        100.0,
-                        70.0,
-                        " dB",
-                    ),
-                    param(
-                        "min_processing_threshold_db",
-                        "Min Threshold",
-                        -15.0,
-                        35.0,
-                        -15.0,
-                        " dB",
-                    ),
-                    param(
-                        "max_erb_processing_threshold_db",
-                        "Max ERB Threshold",
-                        -15.0,
-                        35.0,
-                        35.0,
-                        " dB",
-                    ),
-                    param(
-                        "max_df_processing_threshold_db",
-                        "Max DF Threshold",
-                        -15.0,
-                        35.0,
-                        35.0,
-                        " dB",
-                    ),
-                    param(
-                        "min_processing_buffer_frames",
-                        "Min Buffer",
-                        0.0,
-                        10.0,
-                        0.0,
-                        " frames",
-                    ),
-                    param("post_filter_beta", "Post Filter Beta", 0.0, 0.05, 0.0, ""),
-                ],
-            ),
-            effect(
                 "rnnoise",
                 "Noise Suppression",
                 "RNNoise speech noise suppression",
@@ -2379,66 +2319,21 @@ impl Default for EffectCatalog {
 
         set_presets(
             &mut effects,
-            "deepfilternet",
-            vec![
-                preset(
-                    "Balanced Voice",
-                    &[
-                        ("input_trim_db", -6.0),
-                        ("output_makeup_db", 6.0),
-                        ("attenuation_limit_db", 70.0),
-                        ("min_processing_threshold_db", -15.0),
-                        ("max_erb_processing_threshold_db", 35.0),
-                        ("max_df_processing_threshold_db", 35.0),
-                        ("min_processing_buffer_frames", 0.0),
-                        ("post_filter_beta", 0.0),
-                    ],
-                ),
-                preset(
-                    "Natural Voice",
-                    &[
-                        ("input_trim_db", -3.0),
-                        ("output_makeup_db", 3.0),
-                        ("attenuation_limit_db", 24.0),
-                        ("min_processing_threshold_db", -15.0),
-                        ("max_erb_processing_threshold_db", 30.0),
-                        ("max_df_processing_threshold_db", 20.0),
-                        ("min_processing_buffer_frames", 0.0),
-                        ("post_filter_beta", 0.0),
-                    ],
-                ),
-                preset(
-                    "Noisy Room",
-                    &[
-                        ("input_trim_db", -6.0),
-                        ("output_makeup_db", 6.0),
-                        ("attenuation_limit_db", 100.0),
-                        ("min_processing_threshold_db", -15.0),
-                        ("max_erb_processing_threshold_db", 35.0),
-                        ("max_df_processing_threshold_db", 35.0),
-                        ("min_processing_buffer_frames", 0.0),
-                        ("post_filter_beta", 0.0),
-                    ],
-                ),
-            ],
-        );
-        set_presets(
-            &mut effects,
             "rnnoise",
             vec![
-                preset(
-                    "Gentle",
-                    &[
-                        ("vad_threshold", 25.0),
-                        ("hold_ms", 250.0),
-                        ("lead_in_ms", 0.0),
-                    ],
-                ),
                 preset(
                     "Broadcast",
                     &[
                         ("vad_threshold", 50.0),
                         ("hold_ms", 200.0),
+                        ("lead_in_ms", 0.0),
+                    ],
+                ),
+                preset(
+                    "Gentle",
+                    &[
+                        ("vad_threshold", 25.0),
+                        ("hold_ms", 250.0),
                         ("lead_in_ms", 0.0),
                     ],
                 ),
@@ -2594,7 +2489,6 @@ impl Default for EffectCatalog {
         Self {
             effects,
             preferred_order: vec![
-                "deepfilternet".into(),
                 "rnnoise".into(),
                 "highpass".into(),
                 "eq".into(),
@@ -3308,6 +3202,7 @@ fn normalize_effect_chain(
     let mut normalized = Vec::new();
     for mut effect in effects {
         effect.effect_id = effect.effect_id.trim().to_string();
+        migrate_removed_effect(&mut effect);
         let definition = match catalog
             .effects
             .iter()
@@ -3329,6 +3224,34 @@ fn normalize_effect_chain(
     Ok(keep_one_single_instance_effect_per_channel(
         normalized, None,
     ))
+}
+
+fn migrate_removed_effect(effect: &mut EffectInstance) {
+    if effect.effect_id != "deepfilternet" {
+        return;
+    }
+
+    effect.effect_id = "rnnoise".into();
+    let legacy_instance_id = effect.instance_id.to_ascii_lowercase();
+    if legacy_instance_id.contains("deepfilter") || legacy_instance_id.contains("deep-filter") {
+        effect.instance_id = Uuid::new_v4().to_string();
+    }
+    let old_name = effect.name.take();
+    effect.name = old_name
+        .filter(|name| {
+            let name = name.to_ascii_lowercase();
+            !name.contains("deepfilter") && !name.contains("deep filter")
+        })
+        .or_else(|| Some("Noise Suppression".into()));
+    effect.params = rnnoise_broadcast_params();
+}
+
+fn rnnoise_broadcast_params() -> BTreeMap<String, f32> {
+    BTreeMap::from([
+        ("vad_threshold".into(), 50.0),
+        ("hold_ms".into(), 200.0),
+        ("lead_in_ms".into(), 0.0),
+    ])
 }
 
 fn keep_one_single_instance_effect_per_channel(
@@ -3380,7 +3303,7 @@ fn keep_one_single_instance_effect_per_channel(
 
 fn single_instance_effect_group(effect_id: &str) -> Option<&'static str> {
     match effect_id {
-        "deepfilternet" | "rnnoise" => Some("noise_suppression"),
+        "rnnoise" => Some("noise_suppression"),
         "highpass" => Some("highpass"),
         "eq" => Some("eq"),
         "compressor" => Some("compressor"),
@@ -3426,7 +3349,6 @@ fn normalize_effect_params(
     mut params: BTreeMap<String, f32>,
     definition: &EffectDefinition,
 ) -> BTreeMap<String, f32> {
-    migrate_deepfilternet_capture_profile(&mut params, definition);
     migrate_gate_room_mic_profile(&mut params, definition);
     definition
         .params
@@ -3436,65 +3358,6 @@ fn normalize_effect_params(
             (param.id.clone(), clamp_param_value(value, param))
         })
         .collect()
-}
-
-fn migrate_deepfilternet_capture_profile(
-    params: &mut BTreeMap<String, f32>,
-    definition: &EffectDefinition,
-) {
-    if definition.id != "deepfilternet" {
-        return;
-    }
-
-    let old_conservative_profile = profile_matches(
-        params,
-        &[
-            ("input_trim_db", -12.0),
-            ("output_makeup_db", 6.0),
-            ("attenuation_limit_db", 24.0),
-            ("min_processing_threshold_db", -10.0),
-            ("max_erb_processing_threshold_db", 30.0),
-            ("max_df_processing_threshold_db", 0.0),
-            ("min_processing_buffer_frames", 8.0),
-            ("post_filter_beta", 0.0),
-        ],
-    );
-    let weak_balanced_profile = profile_matches(
-        params,
-        &[
-            ("input_trim_db", -6.0),
-            ("output_makeup_db", 6.0),
-            ("attenuation_limit_db", 18.0),
-            ("min_processing_threshold_db", -15.0),
-            ("max_erb_processing_threshold_db", 30.0),
-            ("max_df_processing_threshold_db", 20.0),
-            ("min_processing_buffer_frames", 8.0),
-            ("post_filter_beta", 0.0),
-        ],
-    );
-
-    if !old_conservative_profile && !weak_balanced_profile {
-        return;
-    }
-
-    for (id, value) in [
-        ("input_trim_db", -6.0),
-        ("output_makeup_db", 6.0),
-        ("attenuation_limit_db", 70.0),
-        ("min_processing_threshold_db", -15.0),
-        ("max_erb_processing_threshold_db", 35.0),
-        ("max_df_processing_threshold_db", 35.0),
-        ("min_processing_buffer_frames", 0.0),
-        ("post_filter_beta", 0.0),
-    ] {
-        params.insert(id.into(), value);
-    }
-}
-
-fn profile_matches(params: &BTreeMap<String, f32>, profile: &[(&str, f32)]) -> bool {
-    profile
-        .iter()
-        .all(|(id, expected)| param_matches(params, id, *expected))
 }
 
 fn migrate_gate_room_mic_profile(
@@ -4573,55 +4436,31 @@ mod tests {
             .map(|effect| effect.id.as_str())
             .collect();
         assert!(ids.contains("rnnoise"));
-        assert!(ids.contains("deepfilternet"));
+        assert!(!ids.contains("deepfilternet"));
         assert!(ids.contains("limiter"));
     }
 
     #[test]
     fn effect_catalog_matches_known_plugin_control_ranges() {
         let catalog = EffectCatalog::default();
-        let deepfilter = catalog
+        let rnnoise = catalog
             .effects
             .iter()
-            .find(|effect| effect.id == "deepfilternet")
+            .find(|effect| effect.id == "rnnoise")
             .unwrap();
-        assert!(
-            deepfilter
-                .params
-                .iter()
-                .any(|param| param.id == "post_filter_beta"
-                    && (param.max - 0.05).abs() < f32::EPSILON)
-        );
-        assert!(deepfilter
+        assert!(rnnoise
             .params
             .iter()
-            .any(|param| param.id == "input_trim_db"
-                && (param.max - 0.0).abs() < f32::EPSILON
-                && (param.default + 6.0).abs() < f32::EPSILON));
-        assert!(deepfilter
-            .params
-            .iter()
-            .any(|param| param.id == "attenuation_limit_db"
-                && (param.max - 100.0).abs() < f32::EPSILON
-                && (param.default - 70.0).abs() < f32::EPSILON));
-        assert!(deepfilter
-            .params
-            .iter()
-            .any(|param| param.id == "min_processing_threshold_db"
-                && (param.min + 15.0).abs() < f32::EPSILON
-                && (param.default + 15.0).abs() < f32::EPSILON));
-        assert!(deepfilter
-            .params
-            .iter()
-            .any(|param| param.id == "max_df_processing_threshold_db"
-                && (param.max - 35.0).abs() < f32::EPSILON
-                && (param.default - 35.0).abs() < f32::EPSILON));
-        assert!(deepfilter
-            .params
-            .iter()
-            .any(|param| param.id == "min_processing_buffer_frames"
+            .any(|param| param.id == "vad_threshold"
                 && (param.min - 0.0).abs() < f32::EPSILON
-                && (param.default - 0.0).abs() < f32::EPSILON));
+                && (param.max - 99.0).abs() < f32::EPSILON
+                && (param.default - 50.0).abs() < f32::EPSILON));
+        assert!(rnnoise.params.iter().any(|param| param.id == "hold_ms"
+            && (param.max - 1000.0).abs() < f32::EPSILON
+            && (param.default - 200.0).abs() < f32::EPSILON));
+        assert!(rnnoise.params.iter().any(|param| param.id == "lead_in_ms"
+            && (param.max - 200.0).abs() < f32::EPSILON
+            && (param.default - 0.0).abs() < f32::EPSILON));
 
         let compressor = catalog
             .effects
@@ -4656,23 +4495,11 @@ mod tests {
             .iter()
             .find(|effect| effect.id == "rnnoise")
             .unwrap();
-        assert!(rnnoise
-            .presets
-            .iter()
-            .any(|preset| preset.name == "Broadcast"));
-        let deepfilter = catalog
-            .effects
-            .iter()
-            .find(|effect| effect.id == "deepfilternet")
-            .unwrap();
-        assert!(deepfilter.params.iter().any(|param| {
-            param.id == "attenuation_limit_db" && (param.default - 70.0).abs() < f32::EPSILON
-        }));
-        assert!(deepfilter.presets.iter().any(|preset| {
-            preset.name == "Noisy Room"
-                && preset.values.get("attenuation_limit_db") == Some(&100.0)
-                && preset.values.get("max_df_processing_threshold_db") == Some(&35.0)
-        }));
+        let broadcast = rnnoise.presets.first().unwrap();
+        assert_eq!(broadcast.name, "Broadcast");
+        assert_eq!(broadcast.values.get("vad_threshold"), Some(&50.0));
+        assert_eq!(broadcast.values.get("hold_ms"), Some(&200.0));
+        assert_eq!(broadcast.values.get("lead_in_ms"), Some(&0.0));
         let eq = catalog
             .effects
             .iter()
@@ -4706,89 +4533,28 @@ mod tests {
     }
 
     #[test]
-    fn deepfilternet_conservative_defaults_migrate_to_balanced_voice() {
+    fn deepfilternet_configs_migrate_to_rnnoise_broadcast() {
         let mut config = MixerConfig::default();
         let mut deepfilter = EffectInstance::new("deepfilternet");
-        for (id, value) in [
-            ("input_trim_db", -12.0),
-            ("output_makeup_db", 6.0),
-            ("attenuation_limit_db", 24.0),
-            ("min_processing_threshold_db", -10.0),
-            ("max_erb_processing_threshold_db", 30.0),
-            ("max_df_processing_threshold_db", 0.0),
-            ("min_processing_buffer_frames", 8.0),
-            ("post_filter_beta", 0.0),
-        ] {
-            deepfilter.params.insert(id.into(), value);
-        }
+        deepfilter.instance_id = "old-deepfilter".into();
+        deepfilter.name = Some("DeepFilterNet3".into());
+        deepfilter
+            .params
+            .insert("attenuation_limit_db".into(), 100.0);
 
         let channel = config
             .set_effect_chain("hardware_in", vec![deepfilter])
             .unwrap();
-        let params = &channel.effects[0].params;
+        let effect = &channel.effects[0];
 
-        assert_eq!(params.get("input_trim_db"), Some(&-6.0));
-        assert_eq!(params.get("output_makeup_db"), Some(&6.0));
-        assert_eq!(params.get("attenuation_limit_db"), Some(&70.0));
-        assert_eq!(params.get("min_processing_threshold_db"), Some(&-15.0));
-        assert_eq!(params.get("max_erb_processing_threshold_db"), Some(&35.0));
-        assert_eq!(params.get("max_df_processing_threshold_db"), Some(&35.0));
-        assert_eq!(params.get("min_processing_buffer_frames"), Some(&0.0));
-    }
-
-    #[test]
-    fn deepfilternet_weak_balanced_defaults_migrate_to_stronger_voice() {
-        let mut config = MixerConfig::default();
-        let mut deepfilter = EffectInstance::new("deepfilternet");
-        for (id, value) in [
-            ("input_trim_db", -6.0),
-            ("output_makeup_db", 6.0),
-            ("attenuation_limit_db", 18.0),
-            ("min_processing_threshold_db", -15.0),
-            ("max_erb_processing_threshold_db", 30.0),
-            ("max_df_processing_threshold_db", 20.0),
-            ("min_processing_buffer_frames", 8.0),
-            ("post_filter_beta", 0.0),
-        ] {
-            deepfilter.params.insert(id.into(), value);
-        }
-
-        let channel = config
-            .set_effect_chain("hardware_in", vec![deepfilter])
-            .unwrap();
-        let params = &channel.effects[0].params;
-
-        assert_eq!(params.get("attenuation_limit_db"), Some(&70.0));
-        assert_eq!(params.get("max_erb_processing_threshold_db"), Some(&35.0));
-        assert_eq!(params.get("max_df_processing_threshold_db"), Some(&35.0));
-        assert_eq!(params.get("min_processing_buffer_frames"), Some(&0.0));
-    }
-
-    #[test]
-    fn deepfilternet_custom_settings_are_not_migrated() {
-        let mut config = MixerConfig::default();
-        let mut deepfilter = EffectInstance::new("deepfilternet");
-        for (id, value) in [
-            ("input_trim_db", -9.0),
-            ("output_makeup_db", 6.0),
-            ("attenuation_limit_db", 24.0),
-            ("min_processing_threshold_db", -10.0),
-            ("max_erb_processing_threshold_db", 30.0),
-            ("max_df_processing_threshold_db", 0.0),
-            ("min_processing_buffer_frames", 8.0),
-            ("post_filter_beta", 0.0),
-        ] {
-            deepfilter.params.insert(id.into(), value);
-        }
-
-        let channel = config
-            .set_effect_chain("hardware_in", vec![deepfilter])
-            .unwrap();
-        let params = &channel.effects[0].params;
-
-        assert_eq!(params.get("input_trim_db"), Some(&-9.0));
-        assert_eq!(params.get("attenuation_limit_db"), Some(&24.0));
-        assert_eq!(params.get("max_df_processing_threshold_db"), Some(&0.0));
+        assert_ne!(effect.instance_id, "old-deepfilter");
+        assert!(!effect.instance_id.contains("deepfilter"));
+        assert_eq!(effect.effect_id, "rnnoise");
+        assert_eq!(effect.name.as_deref(), Some("Noise Suppression"));
+        assert_eq!(effect.params.get("vad_threshold"), Some(&50.0));
+        assert_eq!(effect.params.get("hold_ms"), Some(&200.0));
+        assert_eq!(effect.params.get("lead_in_ms"), Some(&0.0));
+        assert!(!effect.params.contains_key("attenuation_limit_db"));
     }
 
     #[test]
@@ -4865,12 +4631,12 @@ mod tests {
     #[test]
     fn duplicate_realtime_noise_suppressors_keep_last_active_instance() {
         let mut config = MixerConfig::default();
-        let mut first = EffectInstance::new("deepfilternet");
-        first.instance_id = "deepfilter-default".into();
-        first.params.insert("attenuation_limit_db".into(), 100.0);
-        let mut second = EffectInstance::new("deepfilternet");
-        second.instance_id = "deepfilter-natural".into();
-        second.params.insert("attenuation_limit_db".into(), 12.0);
+        let mut first = EffectInstance::new("rnnoise");
+        first.instance_id = "rnnoise-gentle".into();
+        first.params.insert("vad_threshold".into(), 25.0);
+        let mut second = EffectInstance::new("rnnoise");
+        second.instance_id = "rnnoise-broadcast".into();
+        second.params.insert("vad_threshold".into(), 50.0);
 
         let channel = config
             .set_effect_chain("hardware_in", vec![first, second])
@@ -4879,8 +4645,8 @@ mod tests {
 
         assert_eq!(effects.len(), 1);
         assert!(!effects[0].bypassed);
-        assert_eq!(effects[0].instance_id, "deepfilter-natural");
-        assert_eq!(effects[0].params.get("attenuation_limit_db"), Some(&12.0));
+        assert_eq!(effects[0].instance_id, "rnnoise-broadcast");
+        assert_eq!(effects[0].params.get("vad_threshold"), Some(&50.0));
     }
 
     #[test]
@@ -4905,22 +4671,22 @@ mod tests {
     #[test]
     fn mixed_realtime_noise_suppressor_enable_removes_other_suppressors() {
         let mut config = MixerConfig::default();
-        let mut deepfilter = EffectInstance::new("deepfilternet");
-        deepfilter.instance_id = "deepfilter".into();
-        deepfilter.bypassed = true;
+        let mut first = EffectInstance::new("rnnoise");
+        first.instance_id = "rnnoise-gentle".into();
+        first.bypassed = true;
         let mut rnnoise = EffectInstance::new("rnnoise");
-        rnnoise.instance_id = "rnnoise".into();
-        config.channels[0].effects = vec![deepfilter, rnnoise];
+        rnnoise.instance_id = "rnnoise-broadcast".into();
+        config.channels[0].effects = vec![first, rnnoise];
 
         let channel = config
-            .bypass_effect("hardware_in", "deepfilter", false)
+            .bypass_effect("hardware_in", "rnnoise-gentle", false)
             .unwrap();
         let effects = &channel.effects;
 
         assert_eq!(effects.len(), 1);
         assert!(!effects[0].bypassed);
-        assert_eq!(effects[0].effect_id, "deepfilternet");
-        assert_eq!(effects[0].instance_id, "deepfilter");
+        assert_eq!(effects[0].effect_id, "rnnoise");
+        assert_eq!(effects[0].instance_id, "rnnoise-gentle");
     }
 
     #[test]
@@ -4946,21 +4712,21 @@ mod tests {
     #[test]
     fn enabling_duplicate_realtime_noise_suppressor_removes_other_instances() {
         let mut config = MixerConfig::default();
-        let mut first = EffectInstance::new("deepfilternet");
-        first.instance_id = "deepfilter-default".into();
+        let mut first = EffectInstance::new("rnnoise");
+        first.instance_id = "rnnoise-gentle".into();
         first.bypassed = true;
-        let mut second = EffectInstance::new("deepfilternet");
-        second.instance_id = "deepfilter-natural".into();
+        let mut second = EffectInstance::new("rnnoise");
+        second.instance_id = "rnnoise-broadcast".into();
         config.channels[0].effects = vec![first, second];
 
         let channel = config
-            .bypass_effect("hardware_in", "deepfilter-default", false)
+            .bypass_effect("hardware_in", "rnnoise-gentle", false)
             .unwrap();
         let effects = &channel.effects;
 
         assert_eq!(effects.len(), 1);
         assert!(!effects[0].bypassed);
-        assert_eq!(effects[0].instance_id, "deepfilter-default");
+        assert_eq!(effects[0].instance_id, "rnnoise-gentle");
     }
 
     #[test]

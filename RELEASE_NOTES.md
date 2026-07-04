@@ -1,8 +1,9 @@
 # WaveLinux 5.0.0
 
-WaveLinux 5.0.0 is the WaveLinux5 hardware-acceleration testing line. It
-installs beside stable WaveLinux and keeps its own identity, config, launcher,
-runtime data, PipeWire namespace, and update behavior.
+WaveLinux 5.0.0 promotes WaveLinux5 to the main release line. It keeps its own
+identity, config, launcher, runtime data, PipeWire namespace, and updater feed
+so it can coexist with pre-5 WaveLinux installs while moving users onto the new
+5.x line.
 
 ## Fixes
 
@@ -15,16 +16,25 @@ runtime data, PipeWire namespace, and update behavior.
   cannot connect after trying `pipewire`, `pipewire-pulse`, and `wireplumber`
   user services, WaveLinux5 now reports a setup error instead of launching with
   missing virtual sinks.
-- Keeps bundled AppImage LADSPA plugins visible to runtime checks so
-  DeepFilterNet3, RNNoise, and SWH dynamics are not reinstalled when the bundle
-  already provides them.
-- Retunes DeepFilterNet3 for WaveLinux5 by replacing the weak 18 dB balanced
-  profile with a stronger 70 dB profile, making `Noisy Room` use the plugin's
-  full 100 dB reduction range, and migrating old weak balanced configs forward.
-- Keeps RNNoise as the low-latency `Noise Suppression` path instead of treating
-  it as a heavy realtime-fallback effect when DeepFilterNet3 underruns.
-- Updates clean-distro smoke helpers for WaveLinux5 artifact names and testing
-  tags whose release tag suffix differs from the built artifact version.
+- Keeps bundled AppImage LADSPA plugins visible to runtime checks so RNNoise
+  and SWH dynamics are not reinstalled when the bundle already provides them.
+- Removes DeepFilterNet3 from the WaveLinux5 user-facing catalog, dependency
+  installer, AppImage staging, PipeWire renderer, DSP helper, and Health
+  diagnostics after live testing showed it was not reliable enough for the
+  release line.
+- Migrates existing `deepfilternet` config entries to RNNoise `Noise
+  Suppression` using the tested Broadcast settings: 50% VAD threshold, 200 ms
+  hold-open, and 0 ms lead-in.
+- Restores RNNoise `Noise Suppression` as the primary microphone denoiser in
+  the FX catalog.
+- Repairs realtime FX routing after enabling the full hardware input chain by
+  waiting for effect endpoints to settle, verifying the post-route graph, and
+  triggering a full graph repair when a targeted sync leaves dangling
+  loopbacks.
+- Fixes the FX drawer layout so effect cards and the catalog share one stable
+  drawer scroll area instead of clipping through nested scrollbars.
+- Updates clean-distro smoke helpers for WaveLinux5 artifact names and release
+  tags whose suffix can differ from the built artifact version.
 
 ## Testing
 

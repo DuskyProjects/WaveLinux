@@ -212,14 +212,6 @@ stage_startup_library libX11-xcb.so.1 \
   /usr/lib64/libX11-xcb.so.1 \
   /usr/lib/libX11-xcb.so.1
 
-stage_ladspa_plugins "DeepFilterNet3" \
-  libdeep_filter_ladspa.so \
-  deep_filter_ladspa.so \
-  libdeepfilternet_ladspa.so \
-  deepfilternet_ladspa.so \
-  libdeep_filter_net_ladspa.so \
-  deep_filter_net_ladspa.so
-
 stage_ladspa_plugins "RNNoise" \
   librnnoise_ladspa.so \
   rnnoise_ladspa.so

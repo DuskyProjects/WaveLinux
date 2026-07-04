@@ -19,7 +19,6 @@ const isTauri =
   ("__TAURI_INTERNALS__" in window || "__TAURI__" in window);
 
 const singleInstanceEffectIds = new Set([
-  "deepfilternet",
   "rnnoise",
   "highpass",
   "eq",
@@ -395,7 +394,7 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return {
       available: false,
       install_supported: false,
-      current_version: "4.3.7",
+      current_version: "5.0.0",
       version: null,
       date: null,
       body: null,
@@ -424,9 +423,6 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
   if (command === "install_effect_plugins") {
     for (const effect of demoState.graph.effect_availability) {
       effect.available = true;
-      if (effect.effect_id === "deepfilternet") {
-        effect.detail = "/usr/lib/ladspa/libdeep_filter_ladspa.so (DeepFilterNet3 model)";
-      }
     }
     return {
       attempted: true,
@@ -987,7 +983,6 @@ function applyDemoHardwareProfiles() {
 
 const catalog: EffectCatalog = {
   preferred_order: [
-    "deepfilternet",
     "rnnoise",
     "highpass",
     "eq",
@@ -996,119 +991,6 @@ const catalog: EffectCatalog = {
     "limiter",
   ],
   effects: [
-    {
-      id: "deepfilternet",
-      name: "DeepFilterNet3",
-      description: "DeepFilterNet3 neural noise suppression",
-      plugin_hint: {},
-      params: [
-        {
-          id: "input_trim_db",
-          label: "Input Trim",
-          min: -24,
-          max: 0,
-          default: -6,
-          unit: " dB",
-        },
-        {
-          id: "output_makeup_db",
-          label: "Output Makeup",
-          min: 0,
-          max: 18,
-          default: 6,
-          unit: " dB",
-        },
-        {
-          id: "attenuation_limit_db",
-          label: "Reduction Limit",
-          min: 0,
-          max: 100,
-          default: 70,
-          unit: " dB",
-        },
-        {
-          id: "min_processing_threshold_db",
-          label: "Min Threshold",
-          min: -15,
-          max: 35,
-          default: -15,
-          unit: " dB",
-        },
-        {
-          id: "max_erb_processing_threshold_db",
-          label: "Max ERB Threshold",
-          min: -15,
-          max: 35,
-          default: 35,
-          unit: " dB",
-        },
-        {
-          id: "max_df_processing_threshold_db",
-          label: "Max DF Threshold",
-          min: -15,
-          max: 35,
-          default: 35,
-          unit: " dB",
-        },
-        {
-          id: "min_processing_buffer_frames",
-          label: "Min Buffer",
-          min: 0,
-          max: 10,
-          default: 0,
-          unit: " frames",
-        },
-        {
-          id: "post_filter_beta",
-          label: "Post Filter Beta",
-          min: 0,
-          max: 0.05,
-          default: 0,
-          unit: "",
-        },
-      ],
-      presets: [
-        {
-          name: "Balanced Voice",
-          values: {
-            input_trim_db: -6,
-            output_makeup_db: 6,
-            attenuation_limit_db: 70,
-            min_processing_threshold_db: -15,
-            max_erb_processing_threshold_db: 35,
-            max_df_processing_threshold_db: 35,
-            min_processing_buffer_frames: 0,
-            post_filter_beta: 0,
-          },
-        },
-        {
-          name: "Natural Voice",
-          values: {
-            input_trim_db: -3,
-            output_makeup_db: 3,
-            attenuation_limit_db: 24,
-            min_processing_threshold_db: -15,
-            max_erb_processing_threshold_db: 30,
-            max_df_processing_threshold_db: 20,
-            min_processing_buffer_frames: 0,
-            post_filter_beta: 0,
-          },
-        },
-        {
-          name: "Noisy Room",
-          values: {
-            input_trim_db: -6,
-            output_makeup_db: 6,
-            attenuation_limit_db: 100,
-            min_processing_threshold_db: -15,
-            max_erb_processing_threshold_db: 35,
-            max_df_processing_threshold_db: 35,
-            min_processing_buffer_frames: 0,
-            post_filter_beta: 0,
-          },
-        },
-      ],
-    },
     {
       id: "rnnoise",
       name: "Noise Suppression",
@@ -1120,8 +1002,8 @@ const catalog: EffectCatalog = {
         { id: "lead_in_ms", label: "Lead-In", min: 0, max: 200, default: 0, unit: " ms" },
       ],
       presets: [
-        { name: "Gentle", values: { vad_threshold: 25, hold_ms: 250, lead_in_ms: 0 } },
         { name: "Broadcast", values: { vad_threshold: 50, hold_ms: 200, lead_in_ms: 0 } },
+        { name: "Gentle", values: { vad_threshold: 25, hold_ms: 250, lead_in_ms: 0 } },
         { name: "Aggressive", values: { vad_threshold: 75, hold_ms: 150, lead_in_ms: 0 } },
       ],
     },
@@ -1469,15 +1351,11 @@ export const demoState: AppStateSnapshot = {
     effect_availability: catalog.effects.map((effect) => ({
       effect_id: effect.id,
       available: effect.id !== "gate",
-      detail:
-        effect.id === "deepfilternet"
-          ? "/usr/lib/ladspa/libdeep_filter_ladspa.so"
-          : "demo availability",
+      detail: "demo availability",
     })),
   },
   diagnostics: [
     { code: "host_command.pipewire", severity: "info", message: "pipewire is available", action: null },
-    { code: "plugin.deepfilternet", severity: "info", message: "DeepFilterNet3 LADSPA detected", action: null },
   ],
   engine: {
     dry_run: true,

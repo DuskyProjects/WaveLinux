@@ -81,7 +81,16 @@ remove_generated_gtk_module_links() {
   done
 }
 
+remove_obsolete_runtime_artifacts() {
+  find "$APPDIR/usr/wavelinux-runtime/lib/ladspa" \
+    -maxdepth 1 \
+    -type f \
+    \( -iname '*deep_filter*' -o -iname '*deepfilter*' \) \
+    -delete 2>/dev/null || true
+}
+
 remove_generated_gtk_module_links
+remove_obsolete_runtime_artifacts
 
 ensure_appdir_identity() {
   rm -f \

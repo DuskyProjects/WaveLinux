@@ -49,13 +49,13 @@ yarn install:local
 Launch from the app menu or run:
 
 ```bash
-wavelinux
+wavelinux5
 ```
 
 ## Documentation
 
 - [Architecture notes](docs/architecture.md)
-- [WaveLinux5 hardware-acceleration test line](docs/wavelinux5-hardware-acceleration.md)
+- [WaveLinux5 hardware acceleration](docs/wavelinux5-hardware-acceleration.md)
 - [Setup and development](docs/setup.md)
 - [Theme authoring](docs/themes.md)
 - [Test suites](docs/testing.md)

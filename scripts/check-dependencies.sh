@@ -306,43 +306,24 @@ aur_effect_candidates=()
 case "$manager" in
   apt)
     runtime_candidates=(pipewire wireplumber pipewire-pulse pipewire-bin pulseaudio-utils alsa-utils libwebkit2gtk-4.1-0 libayatana-appindicator3-1 libusb-1.0-0 bubblewrap xdg-dbus-proxy xwayland libegl1 libgl1 libgbm1 libdrm2 gstreamer1.0-plugins-base gstreamer1.0-plugins-good fonts-dejavu-core xdg-desktop-portal xdg-desktop-portal-gtk)
-    effect_candidates=(swh-plugins lsp-plugins-ladspa librnnoise-ladspa deepfilternet-ladspa deepfilternet)
+    effect_candidates=(swh-plugins lsp-plugins-ladspa librnnoise-ladspa noise-suppression-for-voice)
     ;;
   dnf)
     runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils alsa-utils webkit2gtk4.1 libappindicator-gtk3 libusb1 bubblewrap xdg-dbus-proxy xorg-x11-server-Xwayland mesa-libEGL mesa-libGL mesa-libgbm libdrm gstreamer1-plugins-base gstreamer1-plugins-good google-noto-sans-fonts xdg-desktop-portal xdg-desktop-portal-gtk)
-    effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise noise-suppression-for-voice deepfilternet)
+    effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise noise-suppression-for-voice)
     ;;
   pacman)
     runtime_candidates=(pipewire wireplumber pipewire-pulse libpulse alsa-utils webkit2gtk-4.1 gtk3 libayatana-appindicator libusb bubblewrap xdg-dbus-proxy xorg-xwayland mesa libglvnd gstreamer gst-plugins-base-libs gst-plugins-good noto-fonts xdg-desktop-portal xdg-desktop-portal-gtk)
     effect_candidates=(swh-plugins noise-suppression-for-voice)
-    aur_effect_candidates=(deepfilternet-plugin-pipewire-bin noise-suppression-for-voice deepfilternet deepfilternet-ladspa)
+    aur_effect_candidates=(noise-suppression-for-voice)
     ;;
   zypper)
     runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils alsa libwebkit2gtk-4_1-0 typelib-1_0-AyatanaAppIndicator3-0_1 libusb-1_0-0 bubblewrap xdg-dbus-proxy xwayland libwebkit2gtk-4_1-0 Mesa-libEGL1 Mesa-libGL1 libgbm1 libdrm2 gstreamer-plugins-base gstreamer-plugins-good google-noto-sans-fonts xdg-desktop-portal xdg-desktop-portal-gtk)
-    effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise deepfilternet)
+    effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise)
     ;;
 esac
 
-ladspa_file_has_marker() {
-  local marker="$1"
-  shift
-  local pattern path
-  while IFS= read -r root; do
-    [[ -d "$root" ]] || continue
-    for pattern in "$@"; do
-      for path in "$root"/$pattern; do
-        [[ -f "$path" ]] || continue
-        grep -a -q "$marker" "$path" && return 0
-      done
-    done
-  done < <(existing_ladspa_paths)
-  return 1
-}
-
 missing_effects=()
-if ! ladspa_file_has_marker 'DeepFilterNet3' 'libdeep_filter_ladspa.so' 'deep_filter_ladspa.so' 'libdeepfilternet_ladspa.so' 'deepfilternet_ladspa.so' 'libdeep_filter_net_ladspa.so' 'deep_filter_net_ladspa.so'; then
-  missing_effects+=("DeepFilterNet3")
-fi
 if ! ladspa_has_any 'librnnoise_ladspa.so' 'rnnoise_ladspa.so'; then
   missing_effects+=("RNNoise")
 fi

@@ -400,7 +400,7 @@ impl DspChannelConfig {
 pub fn native_dsp_effect_supported(effect_id: &str) -> bool {
     matches!(
         effect_id,
-        "deepfilternet" | "highpass" | "eq" | "compressor" | "gate" | "limiter"
+        "highpass" | "eq" | "compressor" | "gate" | "limiter"
     )
 }
 
@@ -487,7 +487,6 @@ enum DspNode {
     Compressor(CompressorNode),
     Gate(GateNode),
     Limiter(LimiterNode),
-    DeepFilterNet(DeepFilterNetNode),
 }
 
 impl DspNode {
@@ -501,19 +500,17 @@ impl DspNode {
             ))),
             "gate" => Some(Self::Gate(GateNode::new(effect, sample_rate_hz))),
             "limiter" => Some(Self::Limiter(LimiterNode::new(effect))),
-            "deepfilternet" => Some(Self::DeepFilterNet(DeepFilterNetNode::new(effect))),
             _ => None,
         }
     }
 
-    fn process(&mut self, sample_rate_hz: u32, data: &mut [f32]) {
+    fn process(&mut self, _sample_rate_hz: u32, data: &mut [f32]) {
         match self {
             Self::Highpass(node) => node.process(data),
             Self::Eq(node) => node.process(data),
             Self::Compressor(node) => node.process(data),
             Self::Gate(node) => node.process(data),
             Self::Limiter(node) => node.process(data),
-            Self::DeepFilterNet(node) => node.process(sample_rate_hz, data),
         }
     }
 }
@@ -702,44 +699,6 @@ impl LimiterNode {
     }
 }
 
-#[derive(Debug, Clone)]
-struct DeepFilterNetNode {
-    input_trim: f32,
-    output_makeup: f32,
-    threshold: f32,
-    attenuation: f32,
-}
-
-impl DeepFilterNetNode {
-    fn new(effect: &EffectInstance) -> Self {
-        Self {
-            input_trim: db_to_amp(param(effect, "input_trim_db", -6.0).clamp(-24.0, 0.0)),
-            output_makeup: db_to_amp(param(effect, "output_makeup_db", 6.0).clamp(0.0, 18.0)),
-            threshold: db_to_amp(param(effect, "min_processing_threshold_db", -15.0)),
-            attenuation: db_to_amp(-param(effect, "attenuation_limit_db", 18.0).clamp(0.0, 100.0)),
-        }
-    }
-
-    fn process(&self, sample_rate_hz: u32, data: &mut [f32]) {
-        for sample in data.iter_mut() {
-            *sample *= self.input_trim;
-        }
-
-        #[cfg(feature = "deep-filter")]
-        deep_filter_identity_pass(sample_rate_hz, data);
-
-        for frame in data.chunks_exact_mut(2) {
-            let level = frame[0].abs().max(frame[1].abs());
-            if level < self.threshold {
-                frame[0] *= self.attenuation;
-                frame[1] *= self.attenuation;
-            }
-            frame[0] *= self.output_makeup;
-            frame[1] *= self.output_makeup;
-        }
-    }
-}
-
 #[cfg(test)]
 fn process_effect_chain_interleaved_stereo_once(
     effects: &[EffectInstance],
@@ -756,7 +715,6 @@ fn process_effect_chain_interleaved_stereo_once(
             "compressor" => apply_compressor(effect, sample_rate_hz, interleaved),
             "gate" => apply_gate(effect, sample_rate_hz, interleaved),
             "limiter" => apply_limiter(effect, interleaved),
-            "deepfilternet" => apply_deepfilternet_cpu(effect, sample_rate_hz, interleaved),
             _ => {}
         }
         let per_frame = effect_started.elapsed().as_secs_f64() * 1_000_000.0
@@ -930,60 +888,6 @@ fn apply_limiter(effect: &EffectInstance, data: &mut [f32]) {
     let ceiling = db_to_amp(param(effect, "ceiling_db", -1.0).clamp(-20.0, 0.0));
     for sample in data {
         *sample = (*sample * input_gain).clamp(-ceiling, ceiling);
-    }
-}
-
-#[cfg(test)]
-fn apply_deepfilternet_cpu(effect: &EffectInstance, sample_rate_hz: u32, data: &mut [f32]) {
-    let input_trim = db_to_amp(param(effect, "input_trim_db", -6.0).clamp(-24.0, 0.0));
-    let output_makeup = db_to_amp(param(effect, "output_makeup_db", 6.0).clamp(0.0, 18.0));
-    for sample in data.iter_mut() {
-        *sample *= input_trim;
-    }
-
-    #[cfg(feature = "deep-filter")]
-    deep_filter_identity_pass(sample_rate_hz, data);
-
-    let threshold = db_to_amp(param(effect, "min_processing_threshold_db", -15.0));
-    let attenuation = db_to_amp(-param(effect, "attenuation_limit_db", 18.0).clamp(0.0, 100.0));
-    for frame in data.chunks_exact_mut(2) {
-        let level = frame[0].abs().max(frame[1].abs());
-        if level < threshold {
-            frame[0] *= attenuation;
-            frame[1] *= attenuation;
-        }
-        frame[0] *= output_makeup;
-        frame[1] *= output_makeup;
-    }
-}
-
-#[cfg(feature = "deep-filter")]
-fn deep_filter_identity_pass(sample_rate_hz: u32, data: &mut [f32]) {
-    let frame_size = (sample_rate_hz / 100).max(160) as usize;
-    let fft_size = frame_size * 2;
-    let mut left_state = df::DFState::new(sample_rate_hz as usize, fft_size, frame_size, 32, 1);
-    let mut right_state = df::DFState::new(sample_rate_hz as usize, fft_size, frame_size, 32, 1);
-    let mut left_in = vec![0.0_f32; frame_size];
-    let mut right_in = vec![0.0_f32; frame_size];
-    let mut left_out = vec![0.0_f32; frame_size];
-    let mut right_out = vec![0.0_f32; frame_size];
-    let frames = frame_count(data);
-    let mut offset = 0;
-    while offset < frames {
-        left_in.fill(0.0);
-        right_in.fill(0.0);
-        let count = frame_size.min(frames - offset);
-        for idx in 0..count {
-            left_in[idx] = data[(offset + idx) * 2];
-            right_in[idx] = data[(offset + idx) * 2 + 1];
-        }
-        left_state.process_frame(&left_in, &mut left_out);
-        right_state.process_frame(&right_in, &mut right_out);
-        for idx in 0..count {
-            data[(offset + idx) * 2] = left_out[idx];
-            data[(offset + idx) * 2 + 1] = right_out[idx];
-        }
-        offset += count;
     }
 }
 

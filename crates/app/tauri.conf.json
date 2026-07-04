@@ -39,7 +39,7 @@
     ],
     "category": "Music",
     "shortDescription": "Linux creator audio mixer",
-    "longDescription": "WaveLinux5 is a Rust and PipeWire creator audio mixer test line for Linux.",
+    "longDescription": "WaveLinux5 is a Rust and PipeWire creator audio mixer for Linux.",
     "linux": {
       "appimage": {
         "bundleMediaFramework": true,
@@ -105,7 +105,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc2QjhFQjM3NzFDRkY2MwpSV1JqL3h4M3M0NXJCMXJDbm5GQ3F2ajdPdVRzanBIREJQYzdHL2FTVG44cFFTVm5XWlZQeVBqawo=",
       "endpoints": [
-        "https://127.0.0.1/wavelinux5-test-build-no-updates.json"
+        "https://github.com/DuskyProjects/WaveLinux/releases/latest/download/latest.json"
       ]
     }
   }

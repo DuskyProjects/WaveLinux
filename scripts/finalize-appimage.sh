@@ -104,7 +104,16 @@ DESKTOP
   install -m 0644 "$ROOT_DIR/crates/app/icons/128x128@2x.png" "$APPDIR/$MAIN_BINARY_NAME.png"
 }
 
+remove_obsolete_runtime_artifacts() {
+  find "$APPDIR/usr/wavelinux-runtime/lib/ladspa" \
+    -maxdepth 1 \
+    -type f \
+    \( -iname '*deep_filter*' -o -iname '*deepfilter*' \) \
+    -delete 2>/dev/null || true
+}
+
 ensure_appdir_identity
+remove_obsolete_runtime_artifacts
 "$ROOT_DIR/scripts/sanitize-appimage-pipewire.sh" --sanitize "$APPDIR"
 
 echo "Rebuilding sanitized AppImage: $appimage"

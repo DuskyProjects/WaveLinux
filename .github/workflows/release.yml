@@ -52,7 +52,6 @@ jobs:
         run: |
           sudo apt-get install -y swh-plugins || true
           sudo apt-get install -y librnnoise-ladspa || true
-          sudo apt-get install -y deepfilternet-ladspa || true
 
       - run: corepack enable
       - run: corepack prepare yarn@1.22.22 --activate

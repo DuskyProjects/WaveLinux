@@ -105,7 +105,6 @@ const views: Array<{ id: View; label: string; icon: typeof SlidersHorizontal }> 
 ];
 
 const singleInstanceEffectIds = new Set([
-  "deepfilternet",
   "rnnoise",
   "highpass",
   "eq",
@@ -113,6 +112,8 @@ const singleInstanceEffectIds = new Set([
   "gate",
   "limiter",
 ]);
+
+const hiddenUserCatalogEffectIds = new Set<string>();
 
 function initialView(): View {
   if (typeof window === "undefined") return "mixer";
@@ -4226,6 +4227,10 @@ function WaveLinkEffectsEditor({
   const [pendingEffectWrites, setPendingEffectWrites] = useState<Record<string, number>>({});
   const [effectError, setEffectError] = useState<string | null>(null);
   const effectWriteGeneration = useRef<Record<string, number>>({});
+  const catalogEffects = useMemo(
+    () => visibleUserCatalogEffects(state.catalog.effects),
+    [state.catalog.effects],
+  );
   const selectedEffects = channel
     ? draftEffectsByChannel[channel.id] ?? channel.effects
     : [];
@@ -4417,10 +4422,10 @@ function WaveLinkEffectsEditor({
           <div className="panel-actions">
             <button
               className="secondary-button"
-              disabled={!channel || state.catalog.effects.length === 0}
+              disabled={!channel || catalogEffects.length === 0}
               onClick={() => {
-                if (!state.catalog.effects[0]) return;
-                addEffect(state.catalog.effects[0]);
+                if (!catalogEffects[0]) return;
+                addEffect(catalogEffects[0]);
               }}
               type="button"
             >
@@ -4502,7 +4507,7 @@ function WaveLinkEffectsEditor({
           <Sparkles size={18} />
         </div>
         <div className="catalog-grid">
-          {state.catalog.effects.map((effect) => {
+          {catalogEffects.map((effect) => {
             const availability = state.graph.effect_availability.find((item) => item.effect_id === effect.id);
             const isEnabled = selectedEffects.some((item) => item.effect_id === effect.id && !item.bypassed);
             const isPresent = selectedEffects.some((item) => item.effect_id === effect.id);
@@ -4572,6 +4577,10 @@ function EffectsView({
   const [pendingEffectWrites, setPendingEffectWrites] = useState<Record<string, number>>({});
   const [effectError, setEffectError] = useState<string | null>(null);
   const effectWriteGeneration = useRef<Record<string, number>>({});
+  const catalogEffects = useMemo(
+    () => visibleUserCatalogEffects(state.catalog.effects),
+    [state.catalog.effects],
+  );
   const selectedEffects = selectedChannel
     ? draftEffectsByChannel[selectedChannel.id] ?? selectedChannel.effects
     : [];
@@ -4789,10 +4798,10 @@ function EffectsView({
           <div className="panel-actions">
             <button
               className="secondary-button"
-              disabled={!selectedChannel}
+              disabled={!selectedChannel || catalogEffects.length === 0}
               onClick={() => {
-                if (!selectedChannel) return;
-                addEffect(state.catalog.effects[0]);
+                if (!selectedChannel || !catalogEffects[0]) return;
+                addEffect(catalogEffects[0]);
               }}
               type="button"
             >
@@ -4874,7 +4883,7 @@ function EffectsView({
           <Sparkles size={18} />
         </div>
         <div className="catalog-grid">
-          {state.catalog.effects.map((effect) => {
+          {catalogEffects.map((effect) => {
             const availability = state.graph.effect_availability.find((item) => item.effect_id === effect.id);
             const isEnabled = selectedEffects.some((item) => item.effect_id === effect.id && !item.bypassed);
             const isPresent = selectedEffects.some((item) => item.effect_id === effect.id);
@@ -5440,7 +5449,7 @@ function valueOrNone(value: string | null | undefined): string {
 function LatencySummary({ state }: { state: AppStateSnapshot }) {
   const latencySensitiveFx = state.config.channels.flatMap((channel) =>
     channel.effects
-      .filter((effect) => !effect.bypassed && ["deepfilternet", "rnnoise", "convolver"].includes(effect.effect_id))
+      .filter((effect) => !effect.bypassed && ["rnnoise", "convolver"].includes(effect.effect_id))
       .map((effect) => `${channelDisplayName(channel)}: ${effect.effect_id}`),
   );
   const activeMixRoutes = state.config.channels.length * state.config.mixes.length;
@@ -5630,8 +5639,12 @@ function EffectAvailabilitySummary({
   state: AppStateSnapshot;
 }) {
   const availabilityById = new Map(state.graph.effect_availability.map((item) => [item.effect_id, item]));
-  const available = state.graph.effect_availability.filter((item) => item.available).length;
-  const total = state.catalog.effects.length;
+  const visibleEffectIds = state.catalog.preferred_order.filter(isVisibleUserCatalogEffect);
+  const visibleEffectIdSet = new Set(visibleEffectIds);
+  const available = state.graph.effect_availability.filter(
+    (item) => item.available && visibleEffectIdSet.has(item.effect_id),
+  ).length;
+  const total = visibleEffectIds.length;
   const missing = total - available;
 
   return (
@@ -5660,7 +5673,7 @@ function EffectAvailabilitySummary({
         </div>
       </div>
       <div className="fx-availability-list">
-        {state.catalog.preferred_order.map((effectId) => {
+        {visibleEffectIds.map((effectId) => {
           const definition = state.catalog.effects.find((effect) => effect.id === effectId);
           if (!definition) return null;
           const availability = availabilityById.get(effectId);
@@ -7752,6 +7765,14 @@ function normalizeSourceEffects(effects: EffectInstance[], preferredInstanceId?:
 
 function isSingleInstanceEffect(effectId: string): boolean {
   return singleInstanceEffectIds.has(effectId);
+}
+
+function visibleUserCatalogEffects(effects: EffectDefinition[]): EffectDefinition[] {
+  return effects.filter((effect) => !hiddenUserCatalogEffectIds.has(effect.id));
+}
+
+function isVisibleUserCatalogEffect(effectId: string): boolean {
+  return !hiddenUserCatalogEffectIds.has(effectId);
 }
 
 function effectChainsEqual(left: EffectInstance[], right: EffectInstance[]): boolean {

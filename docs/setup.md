@@ -56,7 +56,7 @@ seeds local hardware profiles into:
 ~/.config/wavelinux/hardware-profiles/v1/local/wavelinux-local-seed
 ```
 
-The WaveLinux5 test line installs side-by-side instead:
+WaveLinux5 installs side-by-side instead:
 
 ```bash
 ~/.local/share/wavelinux5/WaveLinux5_5.0.0_amd64.AppImage
