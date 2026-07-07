@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CONFIG_VERSION: u32 = 9;
+pub const CONFIG_VERSION: u32 = 10;
 pub const MAX_MIXES: usize = 5;
 pub const MAX_SOFTWARE_CHANNELS: usize = 8;
 pub const MAX_HARDWARE_INPUTS: usize = 4;
@@ -373,6 +373,9 @@ impl MixerConfig {
         for channel in &mut self.channels {
             channel.effects =
                 normalize_effect_chain(std::mem::take(&mut channel.effects), &catalog, true)?;
+            if previous_version < 10 && channel.kind.uses_hardware_slot() {
+                migrate_wavelinux5_voice_effect_defaults(&mut channel.effects, &catalog);
+            }
         }
         self.normalize_app_identity();
         self.normalize_device_policy();
@@ -2244,7 +2247,7 @@ impl Default for EffectCatalog {
                     library_names: vec!["librnnoise_ladspa.so".into(), "rnnoise_ladspa.so".into()],
                 },
                 vec![
-                    param("vad_threshold", "VAD Threshold", 0.0, 99.0, 50.0, "%"),
+                    param("vad_threshold", "VAD Threshold", 0.0, 99.0, 25.0, "%"),
                     param("hold_ms", "Hold Open", 0.0, 1000.0, 200.0, " ms"),
                     param("lead_in_ms", "Lead-In", 0.0, 200.0, 0.0, " ms"),
                 ],
@@ -2293,11 +2296,11 @@ impl Default for EffectCatalog {
                     library_names: vec!["gate_1410.so".into()],
                 },
                 vec![
-                    param("threshold_db", "Threshold", -70.0, 0.0, -35.0, " dB"),
-                    param("attack_ms", "Attack", 0.1, 100.0, 2.5, " ms"),
-                    param("hold_ms", "Hold", 2.0, 500.0, 80.0, " ms"),
-                    param("release_ms", "Release", 2.0, 2000.0, 160.0, " ms"),
-                    param("range_db", "Range", -90.0, 0.0, -60.0, " dB"),
+                    param("threshold_db", "Threshold", -70.0, 0.0, -60.0, " dB"),
+                    param("attack_ms", "Attack", 0.1, 100.0, 5.0, " ms"),
+                    param("hold_ms", "Hold", 2.0, 500.0, 120.0, " ms"),
+                    param("release_ms", "Release", 2.0, 2000.0, 220.0, " ms"),
+                    param("range_db", "Range", -90.0, 0.0, -30.0, " dB"),
                 ],
             ),
             effect(
@@ -2324,7 +2327,7 @@ impl Default for EffectCatalog {
                 preset(
                     "Broadcast",
                     &[
-                        ("vad_threshold", 50.0),
+                        ("vad_threshold", 25.0),
                         ("hold_ms", 200.0),
                         ("lead_in_ms", 0.0),
                     ],
@@ -2489,11 +2492,11 @@ impl Default for EffectCatalog {
         Self {
             effects,
             preferred_order: vec![
-                "rnnoise".into(),
                 "highpass".into(),
+                "rnnoise".into(),
                 "eq".into(),
-                "compressor".into(),
                 "gate".into(),
+                "compressor".into(),
                 "limiter".into(),
             ],
         }
@@ -3248,7 +3251,7 @@ fn migrate_removed_effect(effect: &mut EffectInstance) {
 
 fn rnnoise_broadcast_params() -> BTreeMap<String, f32> {
     BTreeMap::from([
-        ("vad_threshold".into(), 50.0),
+        ("vad_threshold".into(), 25.0),
         ("hold_ms".into(), 200.0),
         ("lead_in_ms".into(), 0.0),
     ])
@@ -3383,15 +3386,88 @@ fn migrate_gate_room_mic_profile(
         return;
     }
 
-    for (id, value) in [
-        ("threshold_db", -35.0),
-        ("range_db", -60.0),
-        ("attack_ms", 2.5),
-        ("hold_ms", 80.0),
-        ("release_ms", 160.0),
-    ] {
+    for (id, value) in soft_gate_profile() {
         params.insert(id.into(), value);
     }
+}
+
+fn migrate_wavelinux5_voice_effect_defaults(
+    effects: &mut Vec<EffectInstance>,
+    catalog: &EffectCatalog,
+) {
+    migrate_hard_gate_profile_to_soft_default(effects);
+    reorder_standard_voice_effect_chain(effects, catalog);
+}
+
+fn migrate_hard_gate_profile_to_soft_default(effects: &mut [EffectInstance]) {
+    for effect in effects
+        .iter_mut()
+        .filter(|effect| effect.effect_id == "gate")
+    {
+        let hard_gate_profile = [
+            ("threshold_db", -35.0),
+            ("range_db", -60.0),
+            ("attack_ms", 2.5),
+            ("hold_ms", 80.0),
+            ("release_ms", 160.0),
+        ];
+        if hard_gate_profile
+            .iter()
+            .all(|(id, expected)| param_matches(&effect.params, id, *expected))
+        {
+            for (id, value) in soft_gate_profile() {
+                effect.params.insert(id.into(), value);
+            }
+        }
+    }
+}
+
+fn reorder_standard_voice_effect_chain(effects: &mut Vec<EffectInstance>, catalog: &EffectCatalog) {
+    if effects.len() < 2
+        || effects
+            .iter()
+            .any(|effect| !is_standard_voice_effect(&effect.effect_id))
+    {
+        return;
+    }
+
+    let order = catalog
+        .preferred_order
+        .iter()
+        .enumerate()
+        .map(|(index, effect_id)| (effect_id.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut indexed = std::mem::take(effects)
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<_>>();
+    indexed.sort_by_key(|(index, effect)| {
+        (
+            order
+                .get(effect.effect_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX),
+            *index,
+        )
+    });
+    *effects = indexed.into_iter().map(|(_, effect)| effect).collect();
+}
+
+fn is_standard_voice_effect(effect_id: &str) -> bool {
+    matches!(
+        effect_id,
+        "highpass" | "rnnoise" | "eq" | "gate" | "compressor" | "limiter"
+    )
+}
+
+fn soft_gate_profile() -> [(&'static str, f32); 5] {
+    [
+        ("threshold_db", -60.0),
+        ("range_db", -30.0),
+        ("attack_ms", 5.0),
+        ("hold_ms", 120.0),
+        ("release_ms", 220.0),
+    ]
 }
 
 fn param_matches(params: &BTreeMap<String, f32>, id: &str, expected: f32) -> bool {
@@ -4454,7 +4530,7 @@ mod tests {
             .any(|param| param.id == "vad_threshold"
                 && (param.min - 0.0).abs() < f32::EPSILON
                 && (param.max - 99.0).abs() < f32::EPSILON
-                && (param.default - 50.0).abs() < f32::EPSILON));
+                && (param.default - 25.0).abs() < f32::EPSILON));
         assert!(rnnoise.params.iter().any(|param| param.id == "hold_ms"
             && (param.max - 1000.0).abs() < f32::EPSILON
             && (param.default - 200.0).abs() < f32::EPSILON));
@@ -4481,10 +4557,10 @@ mod tests {
             .unwrap();
         assert!(gate.params.iter().any(|param| param.id == "threshold_db"
             && (param.min + 70.0).abs() < f32::EPSILON
-            && (param.default + 35.0).abs() < f32::EPSILON));
+            && (param.default + 60.0).abs() < f32::EPSILON));
         assert!(gate.params.iter().any(|param| param.id == "range_db"
             && (param.min + 90.0).abs() < f32::EPSILON
-            && (param.default + 60.0).abs() < f32::EPSILON));
+            && (param.default + 30.0).abs() < f32::EPSILON));
     }
 
     #[test]
@@ -4497,7 +4573,7 @@ mod tests {
             .unwrap();
         let broadcast = rnnoise.presets.first().unwrap();
         assert_eq!(broadcast.name, "Broadcast");
-        assert_eq!(broadcast.values.get("vad_threshold"), Some(&50.0));
+        assert_eq!(broadcast.values.get("vad_threshold"), Some(&25.0));
         assert_eq!(broadcast.values.get("hold_ms"), Some(&200.0));
         assert_eq!(broadcast.values.get("lead_in_ms"), Some(&0.0));
         let eq = catalog
@@ -4551,14 +4627,14 @@ mod tests {
         assert!(!effect.instance_id.contains("deepfilter"));
         assert_eq!(effect.effect_id, "rnnoise");
         assert_eq!(effect.name.as_deref(), Some("Noise Suppression"));
-        assert_eq!(effect.params.get("vad_threshold"), Some(&50.0));
+        assert_eq!(effect.params.get("vad_threshold"), Some(&25.0));
         assert_eq!(effect.params.get("hold_ms"), Some(&200.0));
         assert_eq!(effect.params.get("lead_in_ms"), Some(&0.0));
         assert!(!effect.params.contains_key("attenuation_limit_db"));
     }
 
     #[test]
-    fn gate_room_mic_defaults_migrate_to_stronger_default() {
+    fn gate_room_mic_defaults_migrate_to_soft_default() {
         let mut config = MixerConfig::default();
         let mut gate = EffectInstance::new("gate");
         for (id, value) in [
@@ -4574,11 +4650,11 @@ mod tests {
         let channel = config.set_effect_chain("hardware_in", vec![gate]).unwrap();
         let params = &channel.effects[0].params;
 
-        assert_eq!(params.get("threshold_db"), Some(&-35.0));
-        assert_eq!(params.get("range_db"), Some(&-60.0));
-        assert_eq!(params.get("attack_ms"), Some(&2.5));
-        assert_eq!(params.get("hold_ms"), Some(&80.0));
-        assert_eq!(params.get("release_ms"), Some(&160.0));
+        assert_eq!(params.get("threshold_db"), Some(&-60.0));
+        assert_eq!(params.get("range_db"), Some(&-30.0));
+        assert_eq!(params.get("attack_ms"), Some(&5.0));
+        assert_eq!(params.get("hold_ms"), Some(&120.0));
+        assert_eq!(params.get("release_ms"), Some(&220.0));
     }
 
     #[test]
@@ -4605,6 +4681,58 @@ mod tests {
     }
 
     #[test]
+    fn legacy_wavelinux5_voice_chain_migrates_to_safe_order_and_gate() {
+        let mut config = MixerConfig::default();
+        config.version = 9;
+        let channel = config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        let mut gate = EffectInstance::new("gate");
+        for (id, value) in [
+            ("threshold_db", -35.0),
+            ("range_db", -60.0),
+            ("attack_ms", 2.5),
+            ("hold_ms", 80.0),
+            ("release_ms", 160.0),
+        ] {
+            gate.params.insert(id.into(), value);
+        }
+        channel.effects = vec![
+            EffectInstance::new("rnnoise"),
+            EffectInstance::new("eq"),
+            EffectInstance::new("limiter"),
+            gate,
+            EffectInstance::new("compressor"),
+            EffectInstance::new("highpass"),
+        ];
+
+        let normalized = config.normalized().unwrap();
+        let effects = &normalized
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap()
+            .effects;
+        let ids = effects
+            .iter()
+            .map(|effect| effect.effect_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            vec!["highpass", "rnnoise", "eq", "gate", "compressor", "limiter"]
+        );
+        let gate = effects
+            .iter()
+            .find(|effect| effect.effect_id == "gate")
+            .unwrap();
+        assert_eq!(gate.params.get("threshold_db"), Some(&-60.0));
+        assert_eq!(gate.params.get("range_db"), Some(&-30.0));
+    }
+
+    #[test]
     fn unknown_effects_are_rejected_or_dropped_during_repair() {
         let mut config = MixerConfig::default();
         let err = config
@@ -4625,7 +4753,7 @@ mod tests {
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].effect_id, "gate");
         assert_eq!(effects[0].params.get("threshold_db"), Some(&-70.0));
-        assert_eq!(effects[0].params.get("release_ms"), Some(&160.0));
+        assert_eq!(effects[0].params.get("release_ms"), Some(&220.0));
     }
 
     #[test]

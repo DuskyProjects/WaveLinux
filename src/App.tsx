@@ -4228,8 +4228,8 @@ function WaveLinkEffectsEditor({
   const [effectError, setEffectError] = useState<string | null>(null);
   const effectWriteGeneration = useRef<Record<string, number>>({});
   const catalogEffects = useMemo(
-    () => visibleUserCatalogEffects(state.catalog.effects),
-    [state.catalog.effects],
+    () => visibleUserCatalogEffects(state.catalog.effects, state.catalog.preferred_order),
+    [state.catalog.effects, state.catalog.preferred_order],
   );
   const selectedEffects = channel
     ? draftEffectsByChannel[channel.id] ?? channel.effects
@@ -4318,7 +4318,11 @@ function WaveLinkEffectsEditor({
       bypassed: false,
       params: Object.fromEntries(effect.params.map((param) => [param.id, param.default])),
     };
-    updateEffects([...selectedEffects, instance], "Effect added", instance.instance_id);
+    updateEffects(
+      insertEffectByPreferredOrder(selectedEffects, instance, state.catalog.preferred_order),
+      "Effect added",
+      instance.instance_id,
+    );
   };
 
   const applyPreset = (instanceId: string, values: Record<string, number>) => {
@@ -4403,7 +4407,11 @@ function WaveLinkEffectsEditor({
       );
       return;
     }
-    updateEffects([...selectedEffects, pastedEffect], "Effect pasted", pastedEffect.instance_id);
+    updateEffects(
+      insertEffectByPreferredOrder(selectedEffects, pastedEffect, state.catalog.preferred_order),
+      "Effect pasted",
+      pastedEffect.instance_id,
+    );
   };
 
   const deleteEffect = (instanceId: string) => {
@@ -4578,8 +4586,8 @@ function EffectsView({
   const [effectError, setEffectError] = useState<string | null>(null);
   const effectWriteGeneration = useRef<Record<string, number>>({});
   const catalogEffects = useMemo(
-    () => visibleUserCatalogEffects(state.catalog.effects),
-    [state.catalog.effects],
+    () => visibleUserCatalogEffects(state.catalog.effects, state.catalog.preferred_order),
+    [state.catalog.effects, state.catalog.preferred_order],
   );
   const selectedEffects = selectedChannel
     ? draftEffectsByChannel[selectedChannel.id] ?? selectedChannel.effects
@@ -4670,7 +4678,11 @@ function EffectsView({
       bypassed: false,
       params: Object.fromEntries(effect.params.map((param) => [param.id, param.default])),
     };
-    updateEffects([...selectedEffects, instance], "Effect added", instance.instance_id);
+    updateEffects(
+      insertEffectByPreferredOrder(selectedEffects, instance, state.catalog.preferred_order),
+      "Effect added",
+      instance.instance_id,
+    );
   };
   const applyPreset = (instanceId: string, values: Record<string, number>) => {
     if (!selectedChannel) return;
@@ -4747,7 +4759,7 @@ function EffectsView({
       return;
     }
     updateEffects(
-      [...selectedEffects, pastedEffect],
+      insertEffectByPreferredOrder(selectedEffects, pastedEffect, state.catalog.preferred_order),
       "Effect pasted",
       pastedEffect.instance_id,
     );
@@ -7763,12 +7775,45 @@ function normalizeSourceEffects(effects: EffectInstance[], preferredInstanceId?:
     .map((effect) => structuredClone(effect));
 }
 
+function insertEffectByPreferredOrder(
+  effects: EffectInstance[],
+  nextEffect: EffectInstance,
+  preferredOrder: string[],
+): EffectInstance[] {
+  const preferredIndex = effectPreferredOrderIndex(nextEffect.effect_id, preferredOrder);
+  const next = structuredClone(effects);
+  let insertAt = next.length;
+  for (let index = 0; index < next.length; index += 1) {
+    if (effectPreferredOrderIndex(next[index].effect_id, preferredOrder) > preferredIndex) {
+      insertAt = index;
+      break;
+    }
+  }
+  next.splice(insertAt, 0, structuredClone(nextEffect));
+  return next;
+}
+
+function effectPreferredOrderIndex(effectId: string, preferredOrder: string[]): number {
+  const index = preferredOrder.indexOf(effectId);
+  return index >= 0 ? index : Number.MAX_SAFE_INTEGER;
+}
+
 function isSingleInstanceEffect(effectId: string): boolean {
   return singleInstanceEffectIds.has(effectId);
 }
 
-function visibleUserCatalogEffects(effects: EffectDefinition[]): EffectDefinition[] {
-  return effects.filter((effect) => !hiddenUserCatalogEffectIds.has(effect.id));
+function visibleUserCatalogEffects(
+  effects: EffectDefinition[],
+  preferredOrder: string[] = [],
+): EffectDefinition[] {
+  return [...effects]
+    .filter((effect) => !hiddenUserCatalogEffectIds.has(effect.id))
+    .sort((left, right) => {
+      const leftOrder = effectPreferredOrderIndex(left.id, preferredOrder);
+      const rightOrder = effectPreferredOrderIndex(right.id, preferredOrder);
+      if (leftOrder !== rightOrder) return leftOrder - rightOrder;
+      return left.name.localeCompare(right.name);
+    });
 }
 
 function isVisibleUserCatalogEffect(effectId: string): boolean {
