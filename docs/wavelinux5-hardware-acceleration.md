@@ -127,7 +127,7 @@ WaveLinux5 exposes one realtime microphone cleanup effect:
 
 The tested RNNoise Broadcast profile is the default and first preset:
 
-- `vad_threshold`: `50`
+- `vad_threshold`: `25`
 - `hold_ms`: `200`
 - `lead_in_ms`: `0`
 

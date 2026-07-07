@@ -26,7 +26,7 @@
     "low_latency_msec": 14
   },
   "routing_policy": {
-    "input_priority": 55,
+    "input_priority": 80,
     "output_priority": 76,
     "allow_auto_select_input": true,
     "allow_auto_select_output": true

@@ -6159,7 +6159,7 @@ fn input_device_can_route_source(
     bluetooth_cards: &[BluetoothAudioCard],
 ) -> bool {
     audio_endpoint_names_match(&input.id, source)
-        && input.is_available
+        && input_device_can_be_opened(input)
         && !input.is_virtual
         && is_restorable_device(&input.id)
         && !looks_like_monitor_source(input)
@@ -6214,19 +6214,26 @@ fn preferred_hardware_input_choice(
     default_source: Option<&str>,
     bluetooth_cards: &[BluetoothAudioCard],
 ) -> Option<AutoDeviceChoice> {
-    if let Some(default_input) = default_source.and_then(|source| {
-        inputs.iter().find(|input| {
-            audio_endpoint_names_match(&input.id, source)
-                && input_device_can_auto_select(input, bluetooth_cards)
+    let best_choice = best_hardware_input_choice(inputs, bluetooth_cards);
+    let default_choice = default_source
+        .and_then(|source| {
+            inputs.iter().find(|input| {
+                audio_endpoint_names_match(&input.id, source)
+                    && input_device_can_auto_select(input, bluetooth_cards)
+            })
         })
-    }) {
-        return Some(AutoDeviceChoice {
+        .map(|default_input| AutoDeviceChoice {
             device_id: default_input.id.clone(),
             priority: hardware_input_priority(default_input),
             reason: AutoDeviceReason::SystemDefault,
         });
+
+    match (best_choice, default_choice) {
+        (Some(best), Some(default)) if default.priority >= best.priority => Some(default),
+        (Some(best), _) => Some(best),
+        (None, Some(default)) => Some(default),
+        (None, None) => None,
     }
-    best_hardware_input_choice(inputs, bluetooth_cards)
 }
 
 fn preferred_hardware_input(
@@ -6243,7 +6250,7 @@ fn input_device_can_auto_select(
     bluetooth_cards: &[BluetoothAudioCard],
 ) -> bool {
     !input.is_virtual
-        && input.is_available
+        && input_device_can_be_opened(input)
         && is_restorable_device(&input.id)
         && !looks_like_monitor_source(input)
         && !bluetooth_input_would_force_hfp(&input.id, bluetooth_cards)
@@ -6253,6 +6260,10 @@ fn input_device_can_auto_select(
             .is_none_or(|policy| policy.allow_auto_select_input)
 }
 
+fn input_device_can_be_opened(input: &DeviceInfo) -> bool {
+    input.is_available || input_looks_like_alsa_headset_mono_with_bad_jack_state(input)
+}
+
 fn startup_microphone_level_reset_commands(
     inputs: &[DeviceInfo],
     bluetooth_cards: &[BluetoothAudioCard],
@@ -6260,7 +6271,7 @@ fn startup_microphone_level_reset_commands(
     inputs
         .iter()
         .filter(|input| {
-            input.is_available
+            input_device_can_be_opened(input)
                 && !input.is_virtual
                 && is_restorable_device(&input.id)
                 && !looks_like_monitor_source(input)
@@ -6438,19 +6449,35 @@ fn bluetooth_device_matches_card_key(device: &DeviceInfo, card_key: &str) -> boo
 }
 
 fn hardware_input_priority(input: &DeviceInfo) -> u8 {
+    let class_priority = hardware_input_class_priority(input);
+    if input_looks_like_alsa_headset_mono_with_bad_jack_state(input) {
+        let profile_priority = input
+            .active_routing_policy
+            .as_ref()
+            .and_then(|policy| policy.input_priority)
+            .unwrap_or(50);
+        return profile_priority.max(class_priority).max(65);
+    }
     if let Some(priority) = input
         .active_routing_policy
         .as_ref()
         .and_then(|policy| policy.input_priority)
     {
-        return priority;
+        return priority.max(class_priority);
     }
-    let text = device_search_text(input);
+    class_priority
+}
 
-    if text.contains("usb") {
-        return 60;
+fn hardware_input_class_priority(input: &DeviceInfo) -> u8 {
+    let text = device_search_text_with_properties(input);
+
+    if input.bus == Some(wavelinux_model::DeviceBus::Usb) || text.contains("usb") {
+        return 80;
     }
-    if text.contains("bluez") || text.contains("bluetooth") {
+    if input.bus == Some(wavelinux_model::DeviceBus::Bluetooth)
+        || text.contains("bluez")
+        || text.contains("bluetooth")
+    {
         return 30;
     }
     if text.contains("jack")
@@ -6461,7 +6488,7 @@ fn hardware_input_priority(input: &DeviceInfo) -> u8 {
         || text.contains("front mic")
         || text.contains("rear mic")
     {
-        return 50;
+        return 65;
     }
     if text.contains("built-in")
         || text.contains("built in")
@@ -6480,33 +6507,43 @@ fn hardware_input_priority(input: &DeviceInfo) -> u8 {
 }
 
 fn monitor_output_priority(output: &DeviceInfo) -> u8 {
+    let class_priority = monitor_output_class_priority(output);
     if let Some(priority) = output
         .active_routing_policy
         .as_ref()
         .and_then(|policy| policy.output_priority)
     {
-        return priority;
+        return priority.max(class_priority);
     }
-    let text = device_search_text(output);
+    class_priority
+}
 
-    if text.contains("bluez") || text.contains("bluetooth") {
-        return 50;
+fn monitor_output_class_priority(output: &DeviceInfo) -> u8 {
+    let text = device_search_text_with_properties(output);
+
+    if output.bus == Some(wavelinux_model::DeviceBus::Usb) || text.contains("usb") {
+        return 80;
     }
-    if text.contains("usb") {
-        return 40;
+    if output.bus == Some(wavelinux_model::DeviceBus::Bluetooth)
+        || text.contains("bluez")
+        || text.contains("bluetooth")
+    {
+        return 70;
     }
     if text.contains("headphone")
         || text.contains("headset")
         || text.contains("lineout")
         || text.contains("line-out")
-        || text.contains("analog")
         || text.contains("aux")
         || text.contains("jack")
     {
-        return 30;
+        return 60;
     }
     if text.contains("speaker") {
-        return 20;
+        return 35;
+    }
+    if text.contains("analog") {
+        return 45;
     }
     if text.contains("hdmi") || text.contains("displayport") {
         return 10;
@@ -6516,6 +6553,51 @@ fn monitor_output_priority(output: &DeviceInfo) -> u8 {
 
 fn device_search_text(device: &DeviceInfo) -> String {
     format!("{} {} {}", device.id, device.name, device.description).to_ascii_lowercase()
+}
+
+fn device_search_text_with_properties(device: &DeviceInfo) -> String {
+    let properties = [
+        "device.api",
+        "device.icon_name",
+        "device.profile.description",
+        "device.profile.name",
+        "media.class",
+        "node.nick",
+    ]
+    .iter()
+    .filter_map(|key| device.pipewire_properties.get(*key))
+    .cloned()
+    .collect::<Vec<_>>()
+    .join(" ");
+    format!("{} {}", device_search_text(device), properties).to_ascii_lowercase()
+}
+
+fn input_looks_like_alsa_headset_mono_with_bad_jack_state(input: &DeviceInfo) -> bool {
+    if input.is_available {
+        return false;
+    }
+
+    let text = device_search_text_with_properties(input);
+    let is_alsa_input = input
+        .pipewire_properties
+        .get("device.api")
+        .is_some_and(|api| api.eq_ignore_ascii_case("alsa"))
+        || input.alsa_card.is_some();
+    let structured_headset_metadata = [
+        "device.icon_name",
+        "device.profile.description",
+        "device.profile.name",
+        "node.nick",
+    ]
+    .iter()
+    .filter_map(|key| input.pipewire_properties.get(*key))
+    .any(|value| value.to_ascii_lowercase().contains("headset"));
+
+    is_alsa_input
+        && structured_headset_metadata
+        && text.contains("headset")
+        && text.contains("mono")
+        && (text.contains("mic") || text.contains("microphone"))
 }
 
 fn looks_like_monitor_source(input: &DeviceInfo) -> bool {
@@ -9907,6 +9989,37 @@ mod tests {
         }
     }
 
+    fn unavailable_alsa_headset_mono(id: &str) -> DeviceInfo {
+        let mut input = device(id, "Headset Mono Microphone", false);
+        input.is_available = false;
+        input.bus = Some(wavelinux_model::DeviceBus::Pci);
+        input.alsa_card = Some("2".into());
+        input
+            .pipewire_properties
+            .insert("device.api".into(), "alsa".into());
+        input
+            .pipewire_properties
+            .insert("device.icon_name".into(), "audio-headset".into());
+        input.pipewire_properties.insert(
+            "device.profile.description".into(),
+            "Headset Mono Microphone".into(),
+        );
+        input
+            .pipewire_properties
+            .insert("node.nick".into(), "Headset Mono Microphone".into());
+        input
+    }
+
+    fn routing_policy_with_input_priority(priority: u8) -> RoutingPolicy {
+        RoutingPolicy {
+            input_priority: Some(priority),
+            output_priority: None,
+            allow_auto_select_input: true,
+            allow_auto_select_output: true,
+            prefer_non_bluetooth_input: true,
+        }
+    }
+
     fn effect_endpoint_device(
         id: &str,
         description: &str,
@@ -12260,7 +12373,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_output_prefers_bluetooth_then_usb_then_jack_then_speaker() {
+    fn auto_output_prefers_usb_then_bluetooth_then_jack_then_speaker() {
         let outputs = vec![
             device("alsa_output.speaker", "Built-in Speakers", false),
             device("alsa_output.pci_headphones", "Headphones", false),
@@ -12270,7 +12383,7 @@ mod tests {
 
         assert_eq!(
             best_monitor_output(&outputs).as_deref(),
-            Some("bluez_output.sony")
+            Some("alsa_output.usb_dac")
         );
         assert_eq!(
             best_monitor_output(&outputs[..3]).as_deref(),
@@ -12286,11 +12399,11 @@ mod tests {
         );
         assert_eq!(
             preferred_monitor_output(&outputs, Some("alsa_output.pci_headphones"), None).as_deref(),
-            Some("bluez_output.sony")
+            Some("alsa_output.usb_dac")
         );
         assert_eq!(
             preferred_monitor_output(&outputs, Some("wavelinux_channel_system"), None).as_deref(),
-            Some("bluez_output.sony")
+            Some("alsa_output.usb_dac")
         );
         assert_eq!(
             preferred_monitor_output(
@@ -12299,7 +12412,7 @@ mod tests {
                 Some("bluez_output.sony")
             )
             .as_deref(),
-            Some("bluez_output.sony")
+            Some("alsa_output.usb_dac")
         );
         let rotated_bluetooth = [device(
             "bluez_output.AC_80_0A_72_BD_10.a2dp-sink",
@@ -12389,6 +12502,35 @@ mod tests {
         assert_eq!(
             hardware.source_device.as_deref(),
             Some("alsa_input.pci_mic")
+        );
+        assert!(!effective.device_policy.active_input_fallback);
+    }
+
+    #[test]
+    fn unavailable_alsa_headset_mono_manual_input_is_preserved() {
+        let mut config = MixerConfig::default();
+        let hardware = config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        hardware.source_device = Some("alsa_input.pci_headset".into());
+        let inputs = vec![
+            unavailable_alsa_headset_mono("alsa_input.pci_headset"),
+            device("alsa_input.pci_mic", "Digital Microphone", true),
+        ];
+
+        let effective =
+            effective_config_with_profiled_devices(&config, &inputs, &[], &[], None, None, None);
+        let hardware = effective
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+
+        assert_eq!(
+            hardware.source_device.as_deref(),
+            Some("alsa_input.pci_headset")
         );
         assert!(!effective.device_policy.active_input_fallback);
     }
@@ -12591,6 +12733,30 @@ mod tests {
             Some("alsa_input.pci_mic")
         );
 
+        assert_eq!(
+            best_hardware_input(
+                &[
+                    unavailable_alsa_headset_mono("alsa_input.pci_headset"),
+                    device("alsa_input.pci_mic", "Digital Microphone", false),
+                ],
+                &[],
+            )
+            .as_deref(),
+            Some("alsa_input.pci_headset")
+        );
+
+        let mut profiled_headset = unavailable_alsa_headset_mono("alsa_input.pci_headset");
+        profiled_headset.active_routing_policy = Some(routing_policy_with_input_priority(58));
+        let mut profiled_digital_mic = device("alsa_input.pci_mic", "Digital Microphone", false);
+        profiled_digital_mic.active_routing_policy = Some(routing_policy_with_input_priority(58));
+        let mut cm01 = device("alsa_input.usb_cm01", "CM01 Mono", true);
+        cm01.bus = Some(wavelinux_model::DeviceBus::Usb);
+        cm01.active_routing_policy = Some(routing_policy_with_input_priority(80));
+        assert_eq!(
+            best_hardware_input(&[profiled_headset, profiled_digital_mic, cm01], &[]).as_deref(),
+            Some("alsa_input.usb_cm01")
+        );
+
         let old_route = ManagedModule {
             module_id: "1".into(),
             role: Some("input_to_channel".into()),
@@ -12630,7 +12796,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_input_prefers_system_default_microphone_when_safe() {
+    fn auto_input_uses_priority_before_system_default_microphone() {
         let config = MixerConfig::default();
         let inputs = vec![
             device("alsa_input.pci_mic", "Built-in Microphone", true),
@@ -12654,7 +12820,7 @@ mod tests {
 
         assert_eq!(
             hardware.source_device.as_deref(),
-            Some("alsa_input.pci_mic")
+            Some("alsa_input.usb_interface")
         );
     }
 
@@ -12715,7 +12881,7 @@ mod tests {
             input.device_description.as_deref(),
             Some("USB Audio Interface")
         );
-        assert_eq!(input.priority, Some(60));
+        assert_eq!(input.priority, Some(80));
         assert_eq!(input.reason, AutoDeviceReason::Priority);
     }
 
@@ -13057,6 +13223,23 @@ mod tests {
                 "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source",
                 "0"
             ]
+        );
+    }
+
+    #[test]
+    fn startup_microphone_level_reset_allows_routeable_unavailable_headset_mono() {
+        let headset = unavailable_alsa_headset_mono("alsa_input.pci_headset");
+
+        let commands = startup_microphone_level_reset_commands(&[headset], &[]);
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            commands[0].args,
+            ["set-source-volume", "alsa_input.pci_headset", "46%"]
+        );
+        assert_eq!(
+            commands[1].args,
+            ["set-source-mute", "alsa_input.pci_headset", "0"]
         );
     }
 
@@ -14298,7 +14481,7 @@ mod tests {
                     test_effect(
                         "rnnoise",
                         &[
-                            ("vad_threshold", 50.0),
+                            ("vad_threshold", 25.0),
                             ("hold_ms", 200.0),
                             ("lead_in_ms", 0.0),
                         ],

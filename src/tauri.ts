@@ -983,11 +983,11 @@ function applyDemoHardwareProfiles() {
 
 const catalog: EffectCatalog = {
   preferred_order: [
-    "rnnoise",
     "highpass",
+    "rnnoise",
     "eq",
-    "compressor",
     "gate",
+    "compressor",
     "limiter",
   ],
   effects: [
@@ -997,12 +997,12 @@ const catalog: EffectCatalog = {
       description: "RNNoise speech cleanup",
       plugin_hint: {},
       params: [
-        { id: "vad_threshold", label: "VAD Threshold", min: 0, max: 99, default: 50, unit: "%" },
+        { id: "vad_threshold", label: "VAD Threshold", min: 0, max: 99, default: 25, unit: "%" },
         { id: "hold_ms", label: "Hold Open", min: 0, max: 1000, default: 200, unit: " ms" },
         { id: "lead_in_ms", label: "Lead-In", min: 0, max: 200, default: 0, unit: " ms" },
       ],
       presets: [
-        { name: "Broadcast", values: { vad_threshold: 50, hold_ms: 200, lead_in_ms: 0 } },
+        { name: "Broadcast", values: { vad_threshold: 25, hold_ms: 200, lead_in_ms: 0 } },
         { name: "Gentle", values: { vad_threshold: 25, hold_ms: 250, lead_in_ms: 0 } },
         { name: "Aggressive", values: { vad_threshold: 75, hold_ms: 150, lead_in_ms: 0 } },
       ],
@@ -1101,11 +1101,11 @@ const catalog: EffectCatalog = {
       description: "Quiet-signal attenuation",
       plugin_hint: {},
       params: [
-        { id: "threshold_db", label: "Threshold", min: -70, max: 0, default: -35, unit: " dB" },
-        { id: "attack_ms", label: "Attack", min: 0.1, max: 100, default: 2.5, unit: " ms" },
-        { id: "hold_ms", label: "Hold", min: 2, max: 500, default: 80, unit: " ms" },
-        { id: "release_ms", label: "Release", min: 2, max: 2000, default: 160, unit: " ms" },
-        { id: "range_db", label: "Range", min: -90, max: 0, default: -60, unit: " dB" },
+        { id: "threshold_db", label: "Threshold", min: -70, max: 0, default: -60, unit: " dB" },
+        { id: "attack_ms", label: "Attack", min: 0.1, max: 100, default: 5, unit: " ms" },
+        { id: "hold_ms", label: "Hold", min: 2, max: 500, default: 120, unit: " ms" },
+        { id: "release_ms", label: "Release", min: 2, max: 2000, default: 220, unit: " ms" },
+        { id: "range_db", label: "Range", min: -90, max: 0, default: -30, unit: " dB" },
       ],
       presets: [
         {

@@ -1670,6 +1670,13 @@ mod tests {
                 device
                     .active_routing_policy
                     .as_ref()
+                    .and_then(|policy| policy.input_priority),
+                Some(80)
+            );
+            assert_eq!(
+                device
+                    .active_routing_policy
+                    .as_ref()
                     .map(|policy| policy.allow_auto_select_input),
                 Some(true)
             );
