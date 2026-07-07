@@ -5353,7 +5353,7 @@ mod tests {
         assert!(rendered.contains(
             "plugin = \"librnnoise_ladspa\" label = \"noise_suppressor_stereo\" name = \"rnnoise\""
         ));
-        assert!(rendered.contains("\"VAD Threshold (%)\" = 50.000"));
+        assert!(rendered.contains("\"VAD Threshold (%)\" = 25.000"));
         assert!(rendered.contains("\"VAD Grace Period (ms)\" = 200.000"));
         assert!(rendered.contains("filters1 = ["));
         assert!(rendered.contains("filters2 = ["));
@@ -5378,10 +5378,10 @@ mod tests {
         );
         assert!(rendered
             .contains("plugin = \"gate_1410\" label = \"gate\" name = \"voice_gate_right\""));
-        assert!(rendered.contains("\"Threshold (dB)\" = -35.000"));
-        assert!(rendered.contains("\"Hold (ms)\" = 80.000"));
-        assert!(rendered.contains("\"Decay (ms)\" = 160.000"));
-        assert!(rendered.contains("\"Range (dB)\" = -60.000"));
+        assert!(rendered.contains("\"Threshold (dB)\" = -60.000"));
+        assert!(rendered.contains("\"Hold (ms)\" = 120.000"));
+        assert!(rendered.contains("\"Decay (ms)\" = 220.000"));
+        assert!(rendered.contains("\"Range (dB)\" = -30.000"));
         assert!(
             rendered.contains("inputs = [ \"voice_gate_left:Input\" \"voice_gate_right:Input\" ]")
         );
