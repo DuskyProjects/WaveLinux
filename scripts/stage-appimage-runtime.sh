@@ -106,6 +106,8 @@ stage_ladspa_plugins() {
 }
 
 stage_repo_binary wavelinux5-dsp-helper
+install -m 0755 "$ROOT_DIR/scripts/check-dependencies.sh" "$BIN_DIR/check-dependencies.sh"
+echo "Staged AppImage runtime helper: check-dependencies.sh"
 stage_binary bwrap
 stage_binary xdg-dbus-proxy
 
