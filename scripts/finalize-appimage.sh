@@ -9,6 +9,7 @@ APPIMAGE_DIR="$ROOT_DIR/target/release/bundle/appimage"
 PRODUCT_NAME="$(node -e 'console.log(require(process.argv[1]).productName || "WaveLinux5")' "$ROOT_DIR/crates/app/tauri.conf.json")"
 MAIN_BINARY_NAME="$(node -e 'console.log(require(process.argv[1]).mainBinaryName || "wavelinux5")' "$ROOT_DIR/crates/app/tauri.conf.json")"
 APP_IDENTIFIER="$(node -e 'console.log(require(process.argv[1]).identifier || "io.github.duskyprojects.WaveLinux5")' "$ROOT_DIR/crates/app/tauri.conf.json")"
+PACKAGE_VERSION="$(node -e 'console.log(require(process.argv[1]).version)' "$ROOT_DIR/package.json")"
 APPDIR="$APPIMAGE_DIR/${PRODUCT_NAME}.AppDir"
 PLUGIN="${LINUXDEPLOY_PLUGIN_APPIMAGE:-$HOME/.cache/tauri/linuxdeploy-plugin-appimage.AppImage}"
 CREATE_UPDATER=0
@@ -54,11 +55,7 @@ if [[ ! -x "$PLUGIN" ]]; then
   exit 1
 fi
 
-appimage="$({ find "$APPIMAGE_DIR" -maxdepth 1 -type f -name "${PRODUCT_NAME}_*_amd64.AppImage" -print 2>/dev/null || true; } | sort -V | tail -n1)"
-if [[ -z "$appimage" ]]; then
-  version="$(node -e 'console.log(require(process.argv[1]).version)' "$ROOT_DIR/package.json")"
-  appimage="$APPIMAGE_DIR/${PRODUCT_NAME}_${version}_amd64.AppImage"
-fi
+appimage="$APPIMAGE_DIR/${PRODUCT_NAME}_${PACKAGE_VERSION}_amd64.AppImage"
 
 ensure_appdir_identity() {
   rm -f \
@@ -112,8 +109,20 @@ remove_obsolete_runtime_artifacts() {
     -delete 2>/dev/null || true
 }
 
+install_appimage_apprun() {
+  install -d "$APPDIR/usr/wavelinux-runtime/bin"
+  install -m 0755 "$ROOT_DIR/scripts/check-dependencies.sh" "$APPDIR/usr/wavelinux-runtime/bin/check-dependencies.sh"
+  if [[ ! -x "$APPDIR/AppRun.wrapped" ]]; then
+    echo "Missing linuxdeploy AppRun payload: $APPDIR/AppRun.wrapped" >&2
+    echo "Run the Tauri AppImage build step before finalizing the AppImage." >&2
+    exit 1
+  fi
+  install -m 0755 "$ROOT_DIR/scripts/appimage-apprun.sh" "$APPDIR/AppRun"
+}
+
 ensure_appdir_identity
 remove_obsolete_runtime_artifacts
+install_appimage_apprun
 "$ROOT_DIR/scripts/sanitize-appimage-pipewire.sh" --sanitize "$APPDIR"
 
 echo "Rebuilding sanitized AppImage: $appimage"

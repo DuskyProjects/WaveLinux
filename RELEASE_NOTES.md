@@ -1,3 +1,19 @@
+# WaveLinux 5.0.1
+
+WaveLinux 5.0.1 fixes the first stable WaveLinux5 release packaging pass.
+
+## Fixes
+
+- Fixes clean AppImage installs where `--install-runtime-dependencies` could
+  not start on machines missing host PipeWire client libraries.
+- Adds an AppImage shell preflight that can run dependency checks and the
+  sudo/pkexec installer before launching the Rust application binary.
+- Packages the dependency checker inside the AppImage runtime helper directory
+  so clean Debian, Ubuntu, Fedora, and Arch testers can install runtime and
+  RNNoise/SWH effect dependencies from the AppImage itself.
+- Updates frontend build dependencies to resolve the open Babel and esbuild
+  Dependabot alerts.
+
 # WaveLinux 5.0.0
 
 WaveLinux 5.0.0 promotes WaveLinux5 to the main release line. It keeps its own
