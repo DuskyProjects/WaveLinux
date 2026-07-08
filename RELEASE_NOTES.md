@@ -1,3 +1,17 @@
+# WaveLinux 5.0.2
+
+WaveLinux 5.0.2 finishes clean-distro AppImage coverage for the WaveLinux5
+release line.
+
+## Fixes
+
+- Bundles a pinned RNNoise LADSPA plugin build into AppImages when the release
+  runner cannot install a distro-provided `librnnoise_ladspa.so`.
+- Adds Fedora `pipewire-utils` to runtime dependency installation so `pw-cli`
+  and `pw-dump` are installed with the AppImage and rpm package paths.
+- Makes release builds fail if the RNNoise LADSPA plugin cannot be staged,
+  preventing another published AppImage without the required denoiser.
+
 # WaveLinux 5.0.1
 
 WaveLinux 5.0.1 fixes the first stable WaveLinux5 release packaging pass.

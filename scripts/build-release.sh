@@ -20,7 +20,7 @@ fi
 cd "$ROOT_DIR/crates/app"
 export NO_STRIP="${NO_STRIP:-0}"
 (cd "$ROOT_DIR" && cargo build --release -p wavelinux-dsp --bin wavelinux5-dsp-helper)
-"$ROOT_DIR/scripts/stage-appimage-runtime.sh"
+WAVELINUX_REQUIRE_RNNOISE_LADSPA=1 "$ROOT_DIR/scripts/stage-appimage-runtime.sh"
 rm -rf "$ROOT_DIR/target/release/bundle/appimage/${PRODUCT_NAME}.AppDir"
 rm -f "$ROOT_DIR/target/release/bundle/appimage/${PRODUCT_NAME}"*.AppImage
 rm -f "$ROOT_DIR/target/release/$MAIN_BINARY_NAME"

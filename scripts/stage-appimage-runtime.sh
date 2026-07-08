@@ -101,7 +101,29 @@ stage_ladspa_plugins() {
   done < <(existing_ladspa_paths)
 
   if (( staged == 0 )); then
-    echo "Warning: AppImage LADSPA plugin not found: $label" >&2
+    if [[ "${WAVELINUX_STAGE_LADSPA_WARN_MISSING:-1}" == "1" ]]; then
+      echo "Warning: AppImage LADSPA plugin not found: $label" >&2
+    fi
+    return 1
+  fi
+  return 0
+}
+
+stage_rnnoise_ladspa_plugin() {
+  if [[ "${WAVELINUX_FORCE_BUILD_RNNOISE_LADSPA:-0}" != "1" ]] \
+    && WAVELINUX_STAGE_LADSPA_WARN_MISSING=0 stage_ladspa_plugins "RNNoise" \
+      librnnoise_ladspa.so \
+      rnnoise_ladspa.so; then
+    return 0
+  fi
+
+  if "$ROOT_DIR/scripts/build-rnnoise-ladspa.sh" "$LADSPA_DIR/librnnoise_ladspa.so"; then
+    return 0
+  fi
+
+  echo "Warning: AppImage LADSPA plugin not found or built: RNNoise" >&2
+  if [[ "${WAVELINUX_REQUIRE_RNNOISE_LADSPA:-0}" == "1" ]]; then
+    exit 1
   fi
 }
 
@@ -214,9 +236,7 @@ stage_startup_library libX11-xcb.so.1 \
   /usr/lib64/libX11-xcb.so.1 \
   /usr/lib/libX11-xcb.so.1
 
-stage_ladspa_plugins "RNNoise" \
-  librnnoise_ladspa.so \
-  rnnoise_ladspa.so
+stage_rnnoise_ladspa_plugin
 
 stage_ladspa_plugins "SWH compressor/gate/limiter" \
   sc4_1882.so \

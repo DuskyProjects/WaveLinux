@@ -211,6 +211,7 @@ const APT_PORTAL_BACKENDS: &[&str] = &[
 ];
 const DNF_RUNTIME_PACKAGES: &[&str] = &[
     "pipewire",
+    "pipewire-utils",
     "wireplumber",
     "pipewire-pulseaudio",
     "pulseaudio-utils",
@@ -232,6 +233,7 @@ const DNF_RUNTIME_PACKAGES: &[&str] = &[
 ];
 const DNF_APPIMAGE_HOST_PACKAGES: &[&str] = &[
     "pipewire",
+    "pipewire-utils",
     "wireplumber",
     "pipewire-pulseaudio",
     "pulseaudio-utils",

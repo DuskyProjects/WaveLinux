@@ -1,6 +1,6 @@
 [package]
 name = "wavelinux-app"
-version = "5.0.1"
+version = "5.0.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
