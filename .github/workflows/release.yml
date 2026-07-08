@@ -28,6 +28,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            cmake \
             curl \
             desktop-file-utils \
             file \
@@ -51,7 +52,6 @@ jobs:
       - name: Install LADSPA effect plugins for AppImage staging
         run: |
           sudo apt-get install -y swh-plugins || true
-          sudo apt-get install -y librnnoise-ladspa || true
 
       - run: corepack enable
       - run: corepack prepare yarn@1.22.22 --activate

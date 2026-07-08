@@ -309,7 +309,7 @@ case "$manager" in
     effect_candidates=(swh-plugins lsp-plugins-ladspa librnnoise-ladspa noise-suppression-for-voice)
     ;;
   dnf)
-    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils alsa-utils webkit2gtk4.1 libappindicator-gtk3 libusb1 bubblewrap xdg-dbus-proxy xorg-x11-server-Xwayland mesa-libEGL mesa-libGL mesa-libgbm libdrm gstreamer1-plugins-base gstreamer1-plugins-good google-noto-sans-fonts xdg-desktop-portal xdg-desktop-portal-gtk)
+    runtime_candidates=(pipewire pipewire-utils wireplumber pipewire-pulseaudio pulseaudio-utils alsa-utils webkit2gtk4.1 libappindicator-gtk3 libusb1 bubblewrap xdg-dbus-proxy xorg-x11-server-Xwayland mesa-libEGL mesa-libGL mesa-libgbm libdrm gstreamer1-plugins-base gstreamer1-plugins-good google-noto-sans-fonts xdg-desktop-portal xdg-desktop-portal-gtk)
     effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise noise-suppression-for-voice)
     ;;
   pacman)
