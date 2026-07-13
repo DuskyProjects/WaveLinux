@@ -1709,6 +1709,77 @@ input[type="range"] {
   border-color: #48bfd0;
 }
 
+.effect-style-select {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 12px;
+}
+
+.effect-style-select .app-select {
+  width: min(100%, 360px);
+}
+
+.graphic-eq {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 10px;
+  align-items: end;
+  min-width: 0;
+  margin-top: 10px;
+}
+
+.graphic-eq-scale {
+  display: grid;
+  grid-template-rows: 1fr auto 1fr;
+  align-items: center;
+  height: 164px;
+  color: #8da0ad;
+  font-size: 11px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.graphic-eq-bands {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(38px, 1fr));
+  gap: 8px;
+  min-width: 0;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  scrollbar-width: thin;
+}
+
+.graphic-eq-band {
+  display: grid;
+  grid-template-rows: 24px 164px 18px;
+  justify-items: center;
+  align-items: center;
+  gap: 6px;
+  min-width: 38px;
+  color: #dce8ee;
+}
+
+.graphic-eq-band strong,
+.graphic-eq-band span {
+  font-size: 11px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.graphic-eq-band span {
+  color: #9ba9b4;
+}
+
+.graphic-eq-band input[type="range"] {
+  width: 28px;
+  height: 164px;
+  margin: 0;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  cursor: ns-resize;
+}
+
 .catalog-panel {
   align-self: start;
 }
@@ -3457,12 +3528,15 @@ button:disabled {
 
 .wl-shell.dark .wl-effects-drawer .panel-header h2,
 .wl-shell.dark .wl-effects-drawer .effect-name strong,
+.wl-shell.dark .wl-effects-drawer .graphic-eq-band strong,
 .wl-shell.dark .wl-effects-drawer .fader-row strong {
   color: var(--wl-text, #eef4f7);
 }
 
 .wl-shell.dark .wl-effects-drawer .field-label,
 .wl-shell.dark .wl-effects-drawer .effect-name span,
+.wl-shell.dark .wl-effects-drawer .graphic-eq-band span,
+.wl-shell.dark .wl-effects-drawer .graphic-eq-scale,
 .wl-shell.dark .wl-effects-drawer .fader-row span,
 .wl-shell.dark .wl-effects-drawer .catalog-item.bypassed {
   color: var(--wl-muted, #9aa8b3);

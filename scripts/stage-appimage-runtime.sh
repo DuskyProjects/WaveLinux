@@ -238,9 +238,11 @@ stage_startup_library libX11-xcb.so.1 \
 
 stage_rnnoise_ladspa_plugin
 
-stage_ladspa_plugins "SWH compressor/gate/limiter" \
+stage_ladspa_plugins "SWH voice effects" \
   sc4_1882.so \
   compressor.so \
   gate_1410.so \
   fast_lookahead_limiter_1913.so \
-  hard_limiter_1413.so
+  hard_limiter_1413.so \
+  pitch_scale_1193.so \
+  gverb_1216.so

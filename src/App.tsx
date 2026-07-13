@@ -71,6 +71,7 @@ import type {
   ElgatoWaveXlrState,
   EffectPluginInstallResult,
   EffectDefinition,
+  EffectParamDefinition,
   EffectAvailability,
   EffectInstance,
   FallbackHardwareProfile,
@@ -110,6 +111,7 @@ const singleInstanceEffectIds = new Set([
   "eq",
   "compressor",
   "gate",
+  "karaoke_stage",
   "limiter",
 ]);
 
@@ -4970,6 +4972,9 @@ function EffectBlock({
   onToggleBypass: (instanceId: string, bypassed: boolean) => void;
   onUpdateParam: (instanceId: string, paramId: string, value: number) => void;
 }) {
+  const isVoiceStyle = definition?.id === "karaoke_stage";
+  const isGraphicEq = definition?.id === "eq";
+
   return (
     <article className={effect.bypassed ? "effect-block bypassed" : "effect-block"}>
       <div className="effect-title">
@@ -5040,32 +5045,174 @@ function EffectBlock({
         </div>
       )}
       {definition && definition.presets.length > 0 && (
-        <div className="preset-row">
-          {definition.presets.map((preset) => (
-            <button
-              key={preset.name}
-              onClick={() => onApplyPreset(effect.instance_id, preset.values)}
-              type="button"
-            >
-              {preset.name}
-            </button>
-          ))}
-        </div>
+        isVoiceStyle ? (
+          <EffectStyleSelect
+            definition={definition}
+            effect={effect}
+            onApplyPreset={onApplyPreset}
+          />
+        ) : (
+          <div className="preset-row">
+            {definition.presets.map((preset) => (
+              <button
+                key={preset.name}
+                onClick={() => onApplyPreset(effect.instance_id, preset.values)}
+                type="button"
+              >
+                {preset.name}
+              </button>
+            ))}
+          </div>
+        )
       )}
-      {definition?.params.map((param) => (
-        <VolumeFader
-          compact
-          key={param.id}
-          label={param.label}
-          max={param.max}
-          min={param.min}
-          unit={param.unit}
-          value={effect.params[param.id] ?? param.default}
-          onChange={(value) => onUpdateParam(effect.instance_id, param.id, value)}
+      {definition && isGraphicEq ? (
+        <GraphicEqualizer
+          definition={definition}
+          effect={effect}
+          onUpdateParam={onUpdateParam}
         />
-      ))}
+      ) : (
+        definition?.params.map((param) => (
+          <VolumeFader
+            compact
+            key={param.id}
+            label={param.label}
+            max={param.max}
+            min={param.min}
+            unit={param.unit}
+            value={effect.params[param.id] ?? param.default}
+            onChange={(value) => onUpdateParam(effect.instance_id, param.id, value)}
+          />
+        ))
+      )}
     </article>
   );
+}
+
+function EffectStyleSelect({
+  definition,
+  effect,
+  onApplyPreset,
+}: {
+  definition: EffectDefinition;
+  effect: EffectInstance;
+  onApplyPreset: (instanceId: string, values: Record<string, number>) => void;
+}) {
+  const selectedPreset = matchingPresetName(definition, effect);
+  return (
+    <div className="effect-style-select">
+      <label className="field-label" htmlFor={`voice-style-${effect.instance_id}`}>
+        Style
+      </label>
+      <AppSelect
+        ariaLabel="Voice style"
+        id={`voice-style-${effect.instance_id}`}
+        onChange={(value) => {
+          const preset = definition.presets.find((item) => item.name === value);
+          if (preset) onApplyPreset(effect.instance_id, preset.values);
+        }}
+        options={[
+          { value: "", label: "Custom" },
+          ...definition.presets.map((preset) => ({ value: preset.name, label: preset.name })),
+        ]}
+        value={selectedPreset ?? ""}
+      />
+    </div>
+  );
+}
+
+function GraphicEqualizer({
+  definition,
+  effect,
+  onUpdateParam,
+}: {
+  definition: EffectDefinition;
+  effect: EffectInstance;
+  onUpdateParam: (instanceId: string, paramId: string, value: number) => void;
+}) {
+  const bands = definition.params.filter((param) => param.id.startsWith("band_"));
+  return (
+    <div className="graphic-eq" role="group" aria-label="8-band equalizer">
+      <div className="graphic-eq-scale" aria-hidden="true">
+        <span>+12</span>
+        <span>0</span>
+        <span>-12</span>
+      </div>
+      <div className="graphic-eq-bands">
+        {bands.map((param) => (
+          <EqualizerBandFader
+            effect={effect}
+            key={param.id}
+            onUpdateParam={onUpdateParam}
+            param={param}
+            value={effect.params[param.id] ?? param.default}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function EqualizerBandFader({
+  effect,
+  onUpdateParam,
+  param,
+  value,
+}: {
+  effect: EffectInstance;
+  onUpdateParam: (instanceId: string, paramId: string, value: number) => void;
+  param: EffectParamDefinition;
+  value: number;
+}) {
+  const [draft, setDraft] = useState(value);
+  const lastCommitted = useRef(value);
+  const display = Math.round(draft * 10) / 10;
+
+  useEffect(() => {
+    setDraft(value);
+    lastCommitted.current = value;
+  }, [value]);
+
+  const commit = useCallback((raw: number) => {
+    const next = Number.isFinite(raw) ? Math.max(param.min, Math.min(param.max, raw)) : value;
+    setDraft(next);
+    if (lastCommitted.current === next) return;
+    lastCommitted.current = next;
+    onUpdateParam(effect.instance_id, param.id, next);
+  }, [effect.instance_id, onUpdateParam, param.id, param.max, param.min, value]);
+
+  return (
+    <label className="graphic-eq-band">
+      <strong>{display > 0 ? `+${display}` : display}</strong>
+      <input
+        aria-label={`${param.label} Hz gain`}
+        max={param.max}
+        min={param.min}
+        onBlur={(event) => commit(Number(event.currentTarget.value))}
+        onChange={(event) => setDraft(Number(event.currentTarget.value))}
+        onKeyUp={(event) => {
+          if (shouldCommitSliderKey(event)) commit(Number(event.currentTarget.value));
+        }}
+        onPointerUp={(event) => commit(Number(event.currentTarget.value))}
+        step={0.5}
+        type="range"
+        value={draft}
+      />
+      <span>{param.label}</span>
+    </label>
+  );
+}
+
+function matchingPresetName(definition: EffectDefinition, effect: EffectInstance): string | null {
+  for (const preset of definition.presets) {
+    const matches = Object.entries(preset.values).every(([paramId, expected]) => {
+      const param = definition.params.find((item) => item.id === paramId);
+      const actual = effect.params[paramId] ?? param?.default;
+      return typeof actual === "number" && Math.abs(actual - expected) <= 0.001;
+    });
+    if (matches) return preset.name;
+  }
+  return null;
 }
 
 function DiagnosticsView({
@@ -5353,6 +5500,7 @@ function buildTestingHealthReport({
     `Channel layout: ${state.config.audio.channel_layout}`,
     `Mono inputs to stereo: ${yesNo(state.config.audio.mono_inputs_to_stereo)}`,
     `Low-latency monitoring: ${yesNo(settings.low_latency_mic_monitoring)}`,
+    `Adaptive latency: ${yesNo(settings.adaptive_latency.enabled)} target=${state.engine.adaptive_latency.target_msec}ms range=${state.engine.adaptive_latency.min_msec}-${state.engine.adaptive_latency.max_msec}ms reason=${state.engine.adaptive_latency.last_reason}`,
     `Hardware direct mic monitoring: ${yesNo(settings.hardware_direct_mic_monitoring)}`,
     `Stream sync delay: ${settings.stream_sync_delay_msec} ms`,
     `Monitor sync delay: ${settings.monitor_sync_delay_msec} ms`,
@@ -5410,7 +5558,10 @@ function reportDeviceList(devices: DeviceInfo[]): string[] {
     const profile = device.matched_profile_id || device.active_profile || "none";
     const defaultState = device.is_default ? " default" : "";
     const virtualState = device.is_virtual ? " virtual" : "";
-    return `- ${device.description || device.name} | id=${device.id} | available=${yesNo(device.is_available)}${defaultState}${virtualState} | bus=${valueOrNone(device.bus)}${usb} | profile=${profile}`;
+    const activePort = device.active_port
+      ? ` | active_port=${device.active_port}:${device.ports?.find((port) => port.name === device.active_port)?.availability ?? "unknown"}`
+      : "";
+    return `- ${device.description || device.name} | id=${device.id} | available=${yesNo(device.is_available)}${defaultState}${virtualState} | bus=${valueOrNone(device.bus)}${usb}${activePort} | profile=${profile}`;
   });
 }
 

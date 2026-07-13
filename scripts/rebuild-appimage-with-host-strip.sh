@@ -14,6 +14,7 @@ APPDIR="$APPIMAGE_DIR/${PRODUCT_NAME}.AppDir"
 LINUXDEPLOY="${LINUXDEPLOY:-$HOME/.cache/tauri/linuxdeploy-x86_64.AppImage}"
 GTK_PLUGIN="${LINUXDEPLOY_PLUGIN_GTK:-$HOME/.cache/tauri/linuxdeploy-plugin-gtk.sh}"
 GSTREAMER_PLUGIN="${LINUXDEPLOY_PLUGIN_GSTREAMER:-$HOME/.cache/tauri/linuxdeploy-plugin-gstreamer.sh}"
+BUNDLE_GSTREAMER="${WAVELINUX_BUNDLE_GSTREAMER_PLUGIN:-0}"
 HOST_STRIP="${STRIP:-$(command -v strip || true)}"
 
 if [[ ! -d "$APPDIR" ]]; then
@@ -31,7 +32,7 @@ if [[ ! -x "$GTK_PLUGIN" ]]; then
   exit 1
 fi
 
-if [[ ! -x "$GSTREAMER_PLUGIN" ]]; then
+if [[ "$BUNDLE_GSTREAMER" == "1" && ! -x "$GSTREAMER_PLUGIN" ]]; then
   echo "Missing linuxdeploy GStreamer plugin: $GSTREAMER_PLUGIN" >&2
   exit 1
 fi
@@ -63,7 +64,9 @@ cp "$HOST_STRIP" "$extracted/usr/bin/strip"
 plugin_dir="$tmp/plugins"
 mkdir -p "$plugin_dir"
 ln -s "$GTK_PLUGIN" "$plugin_dir/linuxdeploy-plugin-gtk"
-ln -s "$GSTREAMER_PLUGIN" "$plugin_dir/linuxdeploy-plugin-gstreamer"
+if [[ "$BUNDLE_GSTREAMER" == "1" ]]; then
+  ln -s "$GSTREAMER_PLUGIN" "$plugin_dir/linuxdeploy-plugin-gstreamer"
+fi
 
 remove_generated_gtk_module_links() {
   local root basename target
@@ -89,8 +92,18 @@ remove_obsolete_runtime_artifacts() {
     -delete 2>/dev/null || true
 }
 
+remove_partial_gstreamer_plugin_tree() {
+  if [[ "$BUNDLE_GSTREAMER" == "1" ]]; then
+    return 0
+  fi
+  rm -rf \
+    "$APPDIR/usr/lib/gstreamer-1.0" \
+    "$APPDIR/usr/lib/gstreamer1.0"
+}
+
 remove_generated_gtk_module_links
 remove_obsolete_runtime_artifacts
+remove_partial_gstreamer_plugin_tree
 
 ensure_appdir_identity() {
   rm -f \
@@ -139,12 +152,15 @@ DESKTOP
 ensure_appdir_identity
 
 echo "Rebuilding AppImage with host strip: $HOST_STRIP"
+plugin_args=(--plugin gtk)
+if [[ "$BUNDLE_GSTREAMER" == "1" ]]; then
+  plugin_args+=(--plugin gstreamer)
+fi
 (
   cd "$APPIMAGE_DIR"
   PATH="$plugin_dir:$PATH" "$extracted/AppRun" \
     --verbosity 1 \
     --appdir "$APPDIR" \
-    --plugin gtk \
-    --plugin gstreamer \
+    "${plugin_args[@]}" \
     --output appimage
 )

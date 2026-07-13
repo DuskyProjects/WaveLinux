@@ -1155,6 +1155,8 @@ mod tests {
             name: id.into(),
             description: description.into(),
             is_available: true,
+            active_port: None,
+            ports: Vec::new(),
             is_default: false,
             is_virtual: false,
             bus: Some(bus),

@@ -1,6 +1,6 @@
 # WaveLinux5 Hardware Acceleration
 
-WaveLinux5 is the 5.0.0 release line. It keeps a separate application identity
+WaveLinux5 is the 5.0.x release line. It keeps a separate application identity
 from pre-5 WaveLinux installs while the hardware-acceleration work continues to
 be hardened behind runtime switches.
 
@@ -14,7 +14,7 @@ WaveLinux5 uses its own application identity:
 - Desktop file: `~/.local/share/applications/wavelinux5.desktop`
 - Launcher: `~/.local/bin/wavelinux5`
 - DSP helper: `~/.local/bin/wavelinux5-dsp-helper`
-- AppImage: `~/.local/share/wavelinux5/WaveLinux5_5.0.0_amd64.AppImage`
+- AppImage: `~/.local/share/wavelinux5/WaveLinux5_<version>_amd64.AppImage`
 - Config: `~/.config/wavelinux5/config.json`
 - Runtime data: `~/.local/share/wavelinux5`
 - Optional ALSA aliases: marked `WaveLinux5 ALSA aliases` block in `~/.asoundrc`

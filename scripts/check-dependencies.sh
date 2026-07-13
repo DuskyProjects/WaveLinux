@@ -330,6 +330,9 @@ fi
 if ! ladspa_has_any 'sc4_1882.so' 'gate_1410.so' 'fast_lookahead_limiter_1913.so' 'hard_limiter_1413.so'; then
   missing_effects+=("SWH LADSPA dynamics")
 fi
+if ! ladspa_has_any 'pitch_scale_1193.so' || ! ladspa_has_any 'gverb_1216.so'; then
+  missing_effects+=("SWH LADSPA karaoke stage")
+fi
 
 echo "WaveLinux dependency check"
 echo "Package manager: $manager"

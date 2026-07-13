@@ -28,6 +28,17 @@ export interface MixerSettings {
   auto_check_updates: boolean;
   auto_install_updates: boolean;
   release_channel: "stable" | "beta";
+  adaptive_latency: AdaptiveLatencySettings;
+}
+
+export type AdaptiveLatencyTriggerMode = "off" | "audio_only" | "cpu_only" | "hybrid";
+
+export interface AdaptiveLatencySettings {
+  enabled: boolean;
+  min_msec: number;
+  max_msec: number;
+  levels_msec: number[];
+  trigger_mode: AdaptiveLatencyTriggerMode;
 }
 
 export interface AudioSpec {
@@ -324,6 +335,8 @@ export interface DeviceInfo {
   name: string;
   description: string;
   is_available: boolean;
+  active_port?: string | null;
+  ports?: DevicePortInfo[];
   is_default: boolean;
   is_virtual: boolean;
   bus?: DeviceBus | null;
@@ -342,6 +355,14 @@ export interface DeviceInfo {
   active_latency_policy?: LatencyPolicy | null;
   active_routing_policy?: RoutingPolicy | null;
   active_bluetooth_mic_policy?: BluetoothMicPolicy | null;
+}
+
+export interface DevicePortInfo {
+  name: string;
+  description: string;
+  availability: string;
+  direction?: string | null;
+  port_type?: string | null;
 }
 
 export interface AppStream {
@@ -393,6 +414,19 @@ export interface RuntimeGraph {
   effect_availability: EffectAvailability[];
 }
 
+export interface AdaptiveLatencyStatus {
+  enabled: boolean;
+  target_msec: number;
+  active_level: number;
+  min_msec: number;
+  max_msec: number;
+  buffer_fill_msec?: number | null;
+  last_reason: string;
+  underrun_delta: number;
+  pipewire_warning_delta: number;
+  cpu_pressure: number;
+}
+
 export interface EffectParamDefinition {
   id: string;
   label: string;
@@ -436,6 +470,7 @@ export interface EngineStatus {
   audio_graph_running: boolean;
   message: string;
   last_refresh_unix: number;
+  adaptive_latency: AdaptiveLatencyStatus;
 }
 
 export interface AppStateSnapshot {

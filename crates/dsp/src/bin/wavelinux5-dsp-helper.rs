@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
 use std::env;
+use std::io::{Read, Write};
 use std::mem;
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -12,6 +14,7 @@ use std::time::Instant;
 
 use pipewire as pw;
 use pw::{properties::properties, spa};
+use serde::Deserialize;
 use serde::Serialize;
 use spa::pod::Pod;
 use wavelinux_dsp::{
@@ -23,6 +26,7 @@ use wavelinux_dsp::{
 const DEFAULT_SAMPLE_RATE_HZ: u32 = 48_000;
 const DEFAULT_FRAMES: usize = DEFAULT_SAMPLE_RATE_HZ as usize * 5;
 const FILTER_CHAIN_PIPEWIRE_ENV: &str = "WAVELINUX_FILTER_CHAIN_PIPEWIRE";
+const BUFFER_TARGET_HYSTERESIS_FRAMES: usize = 256;
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Serialize)]
@@ -127,15 +131,43 @@ struct NativeShared {
     ring: Mutex<VecDeque<f32>>,
     stats: Mutex<NativeStats>,
     capacity_samples: usize,
+    sample_rate_hz: u32,
+    render_quantum_frames: usize,
+    target_latency_msec: AtomicUsize,
+    target_samples: AtomicUsize,
+    last_latency_reason: Mutex<String>,
 }
 
 impl NativeShared {
-    fn new(latency_frames: u32) -> Self {
-        let capacity_frames = latency_frames.max(256).saturating_mul(8) as usize;
+    fn new(config: &DspChannelConfig) -> Self {
+        let adaptive = &config.adaptive_latency;
+        let max_msec = adaptive.max_msec.max(adaptive.min_msec).max(28);
+        let min_msec = adaptive.min_msec.min(max_msec).max(5);
+        let target_frames = msec_to_frames(min_msec, config.sample_rate_hz);
+        let capacity_frames = msec_to_frames(max_msec.saturating_mul(2), config.sample_rate_hz)
+            .max(config.latency_frames.max(256) as usize * 8);
         Self {
             ring: Mutex::new(VecDeque::with_capacity(capacity_frames * 2)),
             stats: Mutex::new(NativeStats::default()),
             capacity_samples: capacity_frames * 2,
+            sample_rate_hz: config.sample_rate_hz,
+            render_quantum_frames: config.latency_frames.max(1) as usize,
+            target_latency_msec: AtomicUsize::new(min_msec as usize),
+            target_samples: AtomicUsize::new(target_frames * 2),
+            last_latency_reason: Mutex::new("initial".into()),
+        }
+    }
+
+    fn set_target_latency(&self, target_msec: u16, reason: &str) {
+        let target_msec = target_msec.clamp(5, 500);
+        self.target_latency_msec
+            .store(target_msec as usize, Ordering::Relaxed);
+        self.target_samples.store(
+            msec_to_frames(target_msec, self.sample_rate_hz) * 2,
+            Ordering::Relaxed,
+        );
+        if let Ok(mut last_reason) = self.last_latency_reason.lock() {
+            *last_reason = reason.to_string();
         }
     }
 }
@@ -148,6 +180,7 @@ struct NativeCaptureData {
 
 struct NativePlaybackData {
     shared: Arc<NativeShared>,
+    last_frame: [f32; 2],
 }
 
 fn run_pipewire_native_graph(
@@ -162,7 +195,8 @@ fn run_pipewire_native_graph(
     let core = context
         .connect_rc(None)
         .map_err(|err| format!("PipeWire native DSP core connection failed: {err}"))?;
-    let shared = Arc::new(NativeShared::new(config.latency_frames));
+    let shared = Arc::new(NativeShared::new(&config));
+    start_latency_control_socket(&config, Arc::clone(&shared));
 
     let mut capture_props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
@@ -176,7 +210,8 @@ fn run_pipewire_native_graph(
         *pw::keys::NODE_VIRTUAL => "true",
         *pw::keys::NODE_ALWAYS_PROCESS => "true",
     };
-    insert_common_native_props(&mut capture_props, &config, "effect_input");
+    let input_role = config.input_role.as_deref().unwrap_or("effect_input");
+    insert_common_native_props(&mut capture_props, &config, input_role);
 
     let mut playback_props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
@@ -190,7 +225,8 @@ fn run_pipewire_native_graph(
         *pw::keys::NODE_VIRTUAL => "true",
         *pw::keys::NODE_ALWAYS_PROCESS => "true",
     };
-    insert_common_native_props(&mut playback_props, &config, "effect_output");
+    let output_role = config.output_role.as_deref().unwrap_or("effect_output");
+    insert_common_native_props(&mut playback_props, &config, output_role);
 
     let capture_stream = pw::stream::StreamBox::new(
         &core,
@@ -212,6 +248,7 @@ fn run_pipewire_native_graph(
     };
     let playback_data = NativePlaybackData {
         shared: Arc::clone(&shared),
+        last_frame: [0.0, 0.0],
     };
 
     let _capture_listener = capture_stream
@@ -392,6 +429,7 @@ fn process_playback_buffer(stream: &pw::stream::Stream, user_data: &mut NativePl
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
     };
+    let requested_frames = buffer.requested() as usize;
     let datas = buffer.datas_mut();
     if datas.is_empty() {
         return;
@@ -401,18 +439,43 @@ fn process_playback_buffer(stream: &pw::stream::Stream, user_data: &mut NativePl
         return;
     };
     let stride = mem::size_of::<f32>() * 2;
-    let frames = bytes.len() / stride;
+    let frames = playback_render_frames(
+        requested_frames,
+        bytes.len(),
+        stride,
+        user_data.shared.render_quantum_frames,
+    );
     let mut rendered = 0_u64;
     let mut underrun = 0_u64;
     if let Ok(mut ring) = user_data.shared.ring.lock() {
+        let target_samples = user_data.shared.target_samples.load(Ordering::Relaxed);
+        let hysteresis_samples = BUFFER_TARGET_HYSTERESIS_FRAMES * 2;
         for frame in 0..frames {
-            for channel in 0..2 {
-                let sample = ring.pop_front().unwrap_or_else(|| {
-                    underrun = underrun.saturating_add(1);
-                    0.0
-                });
+            let duplicate_frame =
+                under_target_duplicate_interval(ring.len(), target_samples, hysteresis_samples)
+                    .is_some_and(|interval| frame % interval == interval - 1)
+                    && !ring.is_empty();
+            let mut output_frame = user_data.last_frame;
+            for (channel, output_sample) in output_frame.iter_mut().enumerate() {
+                let sample = if duplicate_frame {
+                    user_data.last_frame[channel]
+                } else {
+                    ring.pop_front().unwrap_or_else(|| {
+                        underrun = underrun.saturating_add(1);
+                        user_data.last_frame[channel]
+                    })
+                };
+                *output_sample = sample;
                 let start = frame * stride + channel * mem::size_of::<f32>();
                 bytes[start..start + mem::size_of::<f32>()].copy_from_slice(&sample.to_le_bytes());
+            }
+            user_data.last_frame = output_frame;
+            let drop_frame =
+                over_target_drop_interval(ring.len(), target_samples, hysteresis_samples)
+                    .is_some_and(|interval| frame % interval == interval - 1);
+            if drop_frame && ring.len() >= 2 {
+                ring.pop_front();
+                ring.pop_front();
             }
             rendered = rendered.saturating_add(1);
         }
@@ -425,6 +488,143 @@ fn process_playback_buffer(stream: &pw::stream::Stream, user_data: &mut NativePl
         stats.rendered_frames = stats.rendered_frames.saturating_add(rendered);
         stats.underrun_frames = stats.underrun_frames.saturating_add(underrun / 2);
     }
+}
+
+fn playback_render_frames(
+    requested_frames: usize,
+    buffer_bytes: usize,
+    stride: usize,
+    fallback_frames: usize,
+) -> usize {
+    if stride == 0 {
+        return 0;
+    }
+    let capacity_frames = buffer_bytes / stride;
+    let target_frames = if requested_frames > 0 {
+        requested_frames
+    } else {
+        fallback_frames.max(1)
+    };
+    target_frames.min(capacity_frames)
+}
+
+fn under_target_duplicate_interval(
+    current_samples: usize,
+    target_samples: usize,
+    hysteresis_samples: usize,
+) -> Option<usize> {
+    if target_samples == 0 || current_samples.saturating_add(hysteresis_samples) >= target_samples {
+        return None;
+    }
+    Some(drift_correction_interval(
+        target_samples.saturating_sub(current_samples),
+        target_samples,
+    ))
+}
+
+fn over_target_drop_interval(
+    current_samples: usize,
+    target_samples: usize,
+    hysteresis_samples: usize,
+) -> Option<usize> {
+    if target_samples == 0 || current_samples <= target_samples.saturating_add(hysteresis_samples) {
+        return None;
+    }
+    Some(drift_correction_interval(
+        current_samples.saturating_sub(target_samples),
+        target_samples,
+    ))
+}
+
+fn drift_correction_interval(delta_samples: usize, target_samples: usize) -> usize {
+    let quarter = (target_samples / 4).max(1);
+    if delta_samples >= quarter.saturating_mul(3) {
+        2
+    } else if delta_samples >= quarter.saturating_mul(2) {
+        4
+    } else if delta_samples >= quarter {
+        8
+    } else {
+        12
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LatencyControlCommand {
+    command: String,
+    #[serde(default)]
+    route_id: Option<String>,
+    target_msec: u16,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn start_latency_control_socket(config: &DspChannelConfig, shared: Arc<NativeShared>) {
+    let Some(socket_path) = config.control_socket_path.clone() else {
+        return;
+    };
+    let channel_id = config.channel_id.clone();
+    thread::spawn(move || {
+        let path = PathBuf::from(&socket_path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&path);
+        let Ok(listener) = UnixListener::bind(&path) else {
+            eprintln!(
+                "wavelinux5-dsp-helper adaptive_latency_socket_failed path={}",
+                path.display()
+            );
+            return;
+        };
+        let _ = listener.set_nonblocking(true);
+        eprintln!(
+            "wavelinux5-dsp-helper adaptive_latency_socket path={} channel_id={}",
+            path.display(),
+            channel_id
+        );
+        while !TERMINATE.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let mut payload = String::new();
+                    let _ = stream.read_to_string(&mut payload);
+                    let response = match serde_json::from_str::<LatencyControlCommand>(&payload) {
+                        Ok(command)
+                            if command.command == "set_target_latency"
+                                && command
+                                    .route_id
+                                    .as_deref()
+                                    .is_none_or(|route| route == channel_id) =>
+                        {
+                            let reason = command
+                                .reason
+                                .as_deref()
+                                .unwrap_or("adaptive_latency_control");
+                            shared.set_target_latency(command.target_msec, reason);
+                            format!("{{\"ok\":true,\"target_msec\":{}}}\n", command.target_msec)
+                        }
+                        Ok(_) => "{\"ok\":false,\"error\":\"unsupported_command\"}\n".into(),
+                        Err(err) => format!("{{\"ok\":false,\"error\":\"{err}\"}}\n"),
+                    };
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => {
+                    eprintln!("wavelinux5-dsp-helper adaptive_latency_accept_error {err}");
+                    thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    });
+}
+
+fn msec_to_frames(msec: u16, sample_rate_hz: u32) -> usize {
+    ((u64::from(msec) * u64::from(sample_rate_hz)) / 1000)
+        .max(1)
+        .min(usize::MAX as u64) as usize
 }
 
 fn decode_interleaved_stereo(bytes: &[u8], channels: usize) -> Vec<f32> {
@@ -484,8 +684,14 @@ fn log_native_stats(shared: &NativeShared) {
         .map(|ring| ring.len())
         .unwrap_or_default();
     if let Ok(stats) = shared.stats.lock() {
+        let target_msec = shared.target_latency_msec.load(Ordering::Relaxed);
+        let reason = shared
+            .last_latency_reason
+            .lock()
+            .map(|reason| reason.clone())
+            .unwrap_or_else(|_| "unknown".into());
         eprintln!(
-            "wavelinux5-dsp-helper native_stats captured_frames={} rendered_frames={} dropped_frames={} underrun_frames={} process_calls={} last_process_us={} max_process_us={} buffered_frames={}",
+            "wavelinux5-dsp-helper native_stats captured_frames={} rendered_frames={} dropped_frames={} underrun_frames={} process_calls={} last_process_us={} max_process_us={} buffered_frames={} target_latency_msec={} reason={}",
             stats.captured_frames,
             stats.rendered_frames,
             stats.dropped_frames / 2,
@@ -493,7 +699,9 @@ fn log_native_stats(shared: &NativeShared) {
             stats.process_calls,
             stats.last_process_micros,
             stats.max_process_micros,
-            ring_samples / 2
+            ring_samples / 2,
+            target_msec,
+            reason
         );
     }
 }
@@ -505,11 +713,20 @@ fn run_filter_chain_bridge(args: &[String]) -> Result<(), String> {
     let config = value_after(args, "--config")
         .map(PathBuf::from)
         .ok_or_else(|| "--run-filter-chain requires --config".to_string())?;
+    let adaptive_bridge_config = value_after(args, "--adaptive-bridge-config").map(PathBuf::from);
     if !config.is_file() {
         return Err(format!(
             "PipeWire filter-chain config is missing: {}",
             config.display()
         ));
+    }
+    if let Some(path) = &adaptive_bridge_config {
+        if !path.is_file() {
+            return Err(format!(
+                "adaptive bridge config is missing: {}",
+                path.display()
+            ));
+        }
     }
 
     let status = probe_backend_from_env();
@@ -546,6 +763,45 @@ fn run_filter_chain_bridge(args: &[String]) -> Result<(), String> {
         })?;
     let child_pid = child.id();
     eprintln!("wavelinux5-dsp-helper bridge_child pid={child_pid}");
+
+    if let Some(bridge_config_path) = adaptive_bridge_config {
+        let bridge_config: DspChannelConfig = serde_json::from_str(
+            &std::fs::read_to_string(&bridge_config_path)
+                .map_err(|err| format!("failed to read adaptive bridge config: {err}"))?,
+        )
+        .map_err(|err| format!("failed to parse adaptive bridge config: {err}"))?;
+        eprintln!(
+            "wavelinux5-dsp-helper adaptive_bridge_start channel_id={} input={} output={} config={}",
+            bridge_config.channel_id,
+            bridge_config.input_node_name,
+            bridge_config.output_node_name,
+            bridge_config_path.display()
+        );
+        thread::spawn(move || loop {
+            if TERMINATE.load(Ordering::SeqCst) {
+                eprintln!("wavelinux5-dsp-helper bridge_stop child_pid={child_pid}");
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    eprintln!("wavelinux5-dsp-helper bridge_child_exit status={status}");
+                    TERMINATE.store(true, Ordering::SeqCst);
+                    break;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(100)),
+                Err(err) => {
+                    eprintln!("wavelinux5-dsp-helper bridge_child_wait_error {err}");
+                    TERMINATE.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+        });
+        let result = run_pipewire_native_graph(bridge_config, status);
+        TERMINATE.store(true, Ordering::SeqCst);
+        return result;
+    }
 
     loop {
         if TERMINATE.load(Ordering::SeqCst) {
@@ -644,3 +900,67 @@ fn install_signal_handlers() {
 
 #[cfg(not(unix))]
 fn install_signal_handlers() {}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        drift_correction_interval, over_target_drop_interval, playback_render_frames,
+        under_target_duplicate_interval,
+    };
+
+    #[test]
+    fn playback_render_frames_honors_requested_count() {
+        assert_eq!(playback_render_frames(128, 4096, 8, 256), 128);
+    }
+
+    #[test]
+    fn playback_render_frames_falls_back_to_configured_quantum() {
+        assert_eq!(playback_render_frames(0, 4096, 8, 256), 256);
+    }
+
+    #[test]
+    fn playback_render_frames_caps_at_buffer_capacity() {
+        assert_eq!(playback_render_frames(1024, 512, 8, 256), 64);
+        assert_eq!(playback_render_frames(0, 512, 8, 256), 64);
+    }
+
+    #[test]
+    fn drift_correction_gets_more_aggressive_when_far_from_target() {
+        let target = 4800 * 2;
+
+        assert_eq!(drift_correction_interval(target, target), 2);
+        assert_eq!(drift_correction_interval(target / 2, target), 4);
+        assert_eq!(drift_correction_interval(target / 4, target), 8);
+        assert_eq!(drift_correction_interval(target / 8, target), 12);
+    }
+
+    #[test]
+    fn under_target_duplicate_interval_respects_hysteresis() {
+        let target = 4800 * 2;
+        let hysteresis = 256 * 2;
+
+        assert_eq!(
+            under_target_duplicate_interval(0, target, hysteresis),
+            Some(2)
+        );
+        assert_eq!(
+            under_target_duplicate_interval(target - hysteresis, target, hysteresis),
+            None
+        );
+    }
+
+    #[test]
+    fn over_target_drop_interval_respects_hysteresis() {
+        let target = 4800 * 2;
+        let hysteresis = 256 * 2;
+
+        assert_eq!(
+            over_target_drop_interval(target + hysteresis + target, target, hysteresis),
+            Some(2)
+        );
+        assert_eq!(
+            over_target_drop_interval(target + hysteresis, target, hysteresis),
+            None
+        );
+    }
+}

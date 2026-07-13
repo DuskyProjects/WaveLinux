@@ -338,6 +338,7 @@ const RNNOISE_LADSPA_NAMES: &[&str] = &["librnnoise_ladspa.so", "rnnoise_ladspa.
 const COMPRESSOR_LADSPA_NAMES: &[&str] = &["sc4_1882.so", "compressor.so"];
 const GATE_LADSPA_NAMES: &[&str] = &["gate_1410.so"];
 const LIMITER_LADSPA_NAMES: &[&str] = &["fast_lookahead_limiter_1913.so", "hard_limiter_1413.so"];
+const KARAOKE_STAGE_LADSPA_NAMES: &[&str] = &["pitch_scale_1193.so", "gverb_1216.so"];
 
 fn prepare_appimage_bundled_runtime() {
     let Some(runtime_dir) = appimage_bundled_runtime_dir() else {
@@ -427,6 +428,12 @@ fn missing_ladspa_effect_ids() -> Vec<String> {
     }
     if !ladspa_has_any(LIMITER_LADSPA_NAMES) {
         push_unique(&mut missing, "limiter");
+    }
+    if !KARAOKE_STAGE_LADSPA_NAMES
+        .iter()
+        .all(|name| ladspa_has_any(&[*name]))
+    {
+        push_unique(&mut missing, "karaoke_stage");
     }
     missing
 }
@@ -2362,10 +2369,12 @@ fn resolve_effect_plugin_packages(
         }
     }
 
-    if missing_ids
-        .iter()
-        .any(|id| matches!(id.as_str(), "compressor" | "gate" | "limiter"))
-    {
+    if missing_ids.iter().any(|id| {
+        matches!(
+            id.as_str(),
+            "compressor" | "gate" | "limiter" | "karaoke_stage"
+        )
+    }) {
         match manager {
             PackageManager::Apt => push_first_available_package(
                 manager,

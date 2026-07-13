@@ -348,12 +348,41 @@ pub struct DspChannelConfig {
     pub app_name: String,
     pub input_node_name: String,
     pub output_node_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_role: Option<String>,
     pub sample_rate_hz: u32,
     pub latency_frames: u32,
+    #[serde(default)]
+    pub adaptive_latency: DspAdaptiveLatencyConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_socket_path: Option<String>,
     pub effects: Vec<EffectInstance>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DspAdaptiveLatencyConfig {
+    pub enabled: bool,
+    pub min_msec: u16,
+    pub max_msec: u16,
+    pub levels_msec: Vec<u16>,
+}
+
+impl Default for DspAdaptiveLatencyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_msec: 28,
+            max_msec: 120,
+            levels_msec: vec![28, 40, 60, 80, 100, 120],
+        }
+    }
+}
+
 impl DspChannelConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         channel_id: impl Into<String>,
         channel_name: impl Into<String>,
@@ -373,8 +402,12 @@ impl DspChannelConfig {
             app_name: app_name.into(),
             input_node_name: input_node_name.into(),
             output_node_name: output_node_name.into(),
+            input_role: None,
+            output_role: None,
             sample_rate_hz: 48_000,
             latency_frames: 256,
+            adaptive_latency: DspAdaptiveLatencyConfig::default(),
+            control_socket_path: None,
             effects,
         }
     }
@@ -555,16 +588,12 @@ struct EqNode {
 impl EqNode {
     fn new(effect: &EffectInstance, sample_rate_hz: u32) -> Self {
         let mut bands = Vec::new();
-        for (freq_key, gain_key, q) in [
-            ("low_freq_hz", "low_gain_db", 0.8),
-            ("mid_freq_hz", "mid_gain_db", 1.0),
-            ("high_freq_hz", "high_gain_db", 0.7),
-        ] {
+        for (freq, gain_key, q) in graphic_eq_bands() {
             let gain = param(effect, gain_key, 0.0).clamp(-12.0, 12.0);
             if gain.abs() < 0.01 {
                 continue;
             }
-            let freq = param(effect, freq_key, 1000.0).clamp(20.0, sample_rate_hz as f32 * 0.45);
+            let freq = freq.clamp(20.0, sample_rate_hz as f32 * 0.45);
             bands.push([
                 Biquad::peaking(sample_rate_hz as f32, freq, q, gain),
                 Biquad::peaking(sample_rate_hz as f32, freq, q, gain),
@@ -581,6 +610,19 @@ impl EqNode {
             }
         }
     }
+}
+
+fn graphic_eq_bands() -> [(f32, &'static str, f32); 8] {
+    [
+        (63.0, "band_63_gain_db", 0.9),
+        (125.0, "band_125_gain_db", 1.0),
+        (250.0, "band_250_gain_db", 1.0),
+        (500.0, "band_500_gain_db", 1.0),
+        (1000.0, "band_1k_gain_db", 1.0),
+        (2000.0, "band_2k_gain_db", 1.0),
+        (4000.0, "band_4k_gain_db", 1.0),
+        (8000.0, "band_8k_gain_db", 0.9),
+    ]
 }
 
 #[derive(Debug, Clone)]
@@ -740,12 +782,14 @@ pub fn fixture_effect_chain() -> Vec<EffectInstance> {
         effect(
             "eq",
             &[
-                ("low_freq_hz", 120.0),
-                ("low_gain_db", -2.0),
-                ("mid_freq_hz", 1200.0),
-                ("mid_gain_db", 2.5),
-                ("high_freq_hz", 6500.0),
-                ("high_gain_db", 1.5),
+                ("band_63_gain_db", -4.0),
+                ("band_125_gain_db", -2.0),
+                ("band_250_gain_db", -1.0),
+                ("band_500_gain_db", 0.0),
+                ("band_1k_gain_db", 1.0),
+                ("band_2k_gain_db", 2.5),
+                ("band_4k_gain_db", 2.0),
+                ("band_8k_gain_db", 1.0),
             ],
         ),
         effect(
@@ -811,16 +855,12 @@ fn apply_highpass(effect: &EffectInstance, sample_rate_hz: u32, data: &mut [f32]
 
 #[cfg(test)]
 fn apply_eq(effect: &EffectInstance, sample_rate_hz: u32, data: &mut [f32]) {
-    for (freq_key, gain_key, q) in [
-        ("low_freq_hz", "low_gain_db", 0.8),
-        ("mid_freq_hz", "mid_gain_db", 1.0),
-        ("high_freq_hz", "high_gain_db", 0.7),
-    ] {
+    for (freq, gain_key, q) in graphic_eq_bands() {
         let gain = param(effect, gain_key, 0.0).clamp(-12.0, 12.0);
         if gain.abs() < 0.01 {
             continue;
         }
-        let freq = param(effect, freq_key, 1000.0).clamp(20.0, sample_rate_hz as f32 * 0.45);
+        let freq = freq.clamp(20.0, sample_rate_hz as f32 * 0.45);
         let mut left = Biquad::peaking(sample_rate_hz as f32, freq, q, gain);
         let mut right = Biquad::peaking(sample_rate_hz as f32, freq, q, gain);
         for frame in data.chunks_exact_mut(2) {
@@ -1115,6 +1155,27 @@ mod tests {
     }
 
     #[test]
+    fn dsp_channel_config_defaults_adaptive_latency_for_legacy_json() {
+        let raw = r#"{
+            "revision": "1",
+            "channel_id": "hardware_in",
+            "channel_name": "Input",
+            "graph_prefix": "wavelinux5",
+            "property_prefix": "wavelinux5",
+            "app_name": "WaveLinux5",
+            "input_node_name": "wavelinux5_fx_hardware_in_input",
+            "output_node_name": "wavelinux5-mic",
+            "sample_rate_hz": 48000,
+            "latency_frames": 256,
+            "effects": []
+        }"#;
+        let config: DspChannelConfig = serde_json::from_str(raw).unwrap();
+        assert!(config.adaptive_latency.enabled);
+        assert_eq!(config.adaptive_latency.max_msec, 120);
+        assert_eq!(config.control_socket_path, None);
+    }
+
+    #[test]
     fn stateful_dsp_chain_keeps_filter_state_between_buffers() {
         let effects = vec![effect("highpass", &[("frequency_hz", 120.0)])];
         let mut stateful = DspChain::new(&effects, 48_000);
@@ -1149,12 +1210,14 @@ mod tests {
             &effect(
                 "eq",
                 &[
-                    ("low_freq_hz", 120.0),
-                    ("low_gain_db", 0.0),
-                    ("mid_freq_hz", 1000.0),
-                    ("mid_gain_db", 6.0),
-                    ("high_freq_hz", 6000.0),
-                    ("high_gain_db", 0.0),
+                    ("band_63_gain_db", 0.0),
+                    ("band_125_gain_db", 0.0),
+                    ("band_250_gain_db", 0.0),
+                    ("band_500_gain_db", 0.0),
+                    ("band_1k_gain_db", 6.0),
+                    ("band_2k_gain_db", 0.0),
+                    ("band_4k_gain_db", 0.0),
+                    ("band_8k_gain_db", 0.0),
                 ],
             ),
             48_000,

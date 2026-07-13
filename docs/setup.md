@@ -59,7 +59,7 @@ seeds local hardware profiles into:
 WaveLinux5 installs side-by-side instead:
 
 ```bash
-~/.local/share/wavelinux5/WaveLinux5_5.0.0_amd64.AppImage
+~/.local/share/wavelinux5/WaveLinux5_<version>_amd64.AppImage
 ~/.local/bin/wavelinux5
 ~/.config/wavelinux5/hardware-profiles/v1/local/wavelinux5-local-seed
 ```
