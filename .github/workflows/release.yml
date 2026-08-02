@@ -2,6 +2,12 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and publish
+        required: true
+        default: v6.0.0-alpha.1
+        type: string
   push:
     tags:
       - "v*"
@@ -10,7 +16,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name }}-${{ github.ref }}-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -18,11 +24,15 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
       release_name: ${{ steps.version.outputs.release_name }}
       prerelease: ${{ steps.version.outputs.prerelease }}
       make_latest: ${{ steps.version.outputs.make_latest }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -71,10 +81,19 @@ jobs:
       - name: Verify release version and identity
         id: version
         shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           version="$(node -e 'console.log(require("./package.json").version)')"
-          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match package version $version" >&2
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            release_tag="$REQUESTED_TAG"
+          else
+            release_tag="$GITHUB_REF_NAME"
+          fi
+
+          if [[ "$release_tag" != "v$version" ]]; then
+            echo "Tag $release_tag does not match package version $version" >&2
             exit 1
           fi
 
@@ -93,6 +112,7 @@ jobs:
           fi
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "release_name=$release_name" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           echo "make_latest=$make_latest" >> "$GITHUB_OUTPUT"
@@ -112,6 +132,8 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          WAVELINUX_RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          WAVELINUX_UPDATE_VERSION: ${{ steps.version.outputs.version }}
           NO_STRIP: "0"
         run: yarn desktop:release
 
@@ -156,26 +178,25 @@ jobs:
       - name: Build updater manifest
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
           RELEASE_NAME: ${{ steps.version.outputs.release_name }}
         run: |
           artifact="$(find target/release/bundle/appimage -name '*.AppImage.tar.gz' | sort | head -n 1)"
-          if [[ -z "$artifact" ]]; then
-            artifact="$(find target/release/bundle/appimage -name '*.AppImage' | sort | head -n 1)"
-          fi
           python3 scripts/build-updater-manifest.py \
             --artifact "$artifact" \
             --version "$VERSION" \
             --repo "$GITHUB_REPOSITORY" \
-            --tag "v$VERSION" \
+            --tag "$RELEASE_TAG" \
             --output target/release/bundle/latest.json \
             --notes "$RELEASE_NAME"
 
       - name: Stage AUR package metadata
         run: bash scripts/build-aur.sh
 
-      - name: Prepare release gate files
+      - name: Prepare release files
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
           RELEASE_NAME: ${{ steps.version.outputs.release_name }}
         run: |
           mkdir -p target/release/gate/assets
@@ -185,8 +206,8 @@ jobs:
           cp target/release/bundle/latest.json target/release/gate/assets/
           cp target/aur/wavelinux/PKGBUILD target/release/gate/assets/
           cp target/aur/wavelinux/.SRCINFO target/release/gate/assets/wavelinux.SRCINFO
-          printf 'Release: %s\nVersion: %s\nTag: v%s\nCommit: %s\n' \
-            "$RELEASE_NAME" "$VERSION" "$VERSION" "$GITHUB_SHA" \
+          printf 'Release: %s\nVersion: %s\nTag: %s\nCommit: %s\n' \
+            "$RELEASE_NAME" "$VERSION" "$RELEASE_TAG" "$(git rev-parse HEAD)" \
             > target/release/gate/assets/BUILD-INFO.txt
           (
             cd target/release/gate/assets
@@ -201,11 +222,12 @@ jobs:
             in_section { print }
             END { if (!found) exit 1 }
           ' RELEASE_NOTES.md > target/release/gate/release-notes.md
+          find target/release/gate -maxdepth 2 -type f -printf '%p\n' | sort
 
       - name: Upload gated release artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: wavelinux-linux-bundles
+          name: wavelinux-linux-bundles-${{ steps.version.outputs.version }}
           path: target/release/gate
           if-no-files-found: error
 
@@ -233,9 +255,11 @@ jobs:
             target: native
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.linux-bundles.outputs.release_tag }}
       - uses: actions/download-artifact@v8
         with:
-          name: wavelinux-linux-bundles
+          name: wavelinux-linux-bundles-${{ needs.linux-bundles.outputs.version }}
           path: target/release/gate
       - name: Test ${{ matrix.target }} on fresh ${{ matrix.distro }}
         env:
@@ -245,22 +269,43 @@ jobs:
           bash scripts/distro-smoke.sh \
             --distro "${{ matrix.distro }}" \
             --target "${{ matrix.target }}" \
-            --release-tag "v${{ needs.linux-bundles.outputs.version }}"
+            --release-tag "${{ needs.linux-bundles.outputs.release_tag }}"
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
     needs: [linux-bundles, portability]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: wavelinux-linux-bundles
+          name: wavelinux-linux-bundles-${{ needs.linux-bundles.outputs.version }}
           path: target/release/gate
-      - name: Publish GitHub release
+
+      - name: Verify publish payload
+        shell: bash
+        run: |
+          test -n "$(find target/release/gate/assets -maxdepth 1 -name '*.AppImage' -print -quit)"
+          test -n "$(find target/release/gate/assets -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$(find target/release/gate/assets -maxdepth 1 -name '*.rpm' -print -quit)"
+          find target/release/gate/assets -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Publish packages into GitHub release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ needs.linux-bundles.outputs.release_tag }}
           name: ${{ needs.linux-bundles.outputs.release_name }}
           body_path: target/release/gate/release-notes.md
           prerelease: ${{ needs.linux-bundles.outputs.prerelease }}
           make_latest: ${{ needs.linux-bundles.outputs.make_latest }}
-          files: target/release/gate/assets/*
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            target/release/gate/assets/*.AppImage
+            target/release/gate/assets/*.AppImage.tar.gz
+            target/release/gate/assets/*.AppImage.tar.gz.sig
+            target/release/gate/assets/*.deb
+            target/release/gate/assets/*.rpm
+            target/release/gate/assets/latest.json
+            target/release/gate/assets/SHA256SUMS
+            target/release/gate/assets/BUILD-INFO.txt
+            target/release/gate/assets/PKGBUILD
+            target/release/gate/assets/wavelinux.SRCINFO
