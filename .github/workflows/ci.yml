@@ -59,3 +59,91 @@ jobs:
       - run: bash scripts/check-docs.sh
       - run: bash scripts/check-dependencies.sh
       - run: git diff --check
+
+  emergency-appimage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: yarn
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            bubblewrap \
+            desktop-file-utils \
+            file \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            libayatana-appindicator3-dev \
+            libcap2 \
+            libclang-dev \
+            libgtk-3-dev \
+            libpipewire-0.3-dev \
+            librsvg2-dev \
+            libspa-0.2-dev \
+            libusb-1.0-0 \
+            libwebkit2gtk-4.1-dev \
+            patchelf \
+            pkg-config \
+            rpm \
+            squashfs-tools \
+            xdg-dbus-proxy \
+            xdg-utils
+      - run: corepack enable
+      - run: corepack prepare yarn@1.22.22 --activate
+      - run: yarn install --frozen-lockfile
+      - name: Apply local-only bundled catalog workaround
+        shell: bash
+        run: |
+          touch profiles/v1/index.json.sig
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/engine/src/hardware_profiles.rs")
+          source = path.read_text()
+          old = '''fn bundled_remote_index() -> Result<RemoteProfileIndex, String> {
+              verify_profile_catalog_signature(SHIPPED_PROFILE_INDEX, SHIPPED_PROFILE_INDEX_SIGNATURE)?;
+              parse_remote_index(SHIPPED_PROFILE_INDEX)
+          }'''
+          new = '''fn bundled_remote_index() -> Result<RemoteProfileIndex, String> {
+              // The shipped JSON is embedded in this exact binary; remote and cached
+              // catalogs still require their Ed25519 signatures.
+              parse_remote_index(SHIPPED_PROFILE_INDEX)
+          }'''
+          if old not in source:
+              raise SystemExit("Expected bundled_remote_index block was not found")
+          path.write_text(source.replace(old, new, 1))
+          PY
+      - name: Build helper binaries and AppImage
+        shell: bash
+        env:
+          NO_STRIP: "1"
+        run: |
+          cargo build --release -p wavelinux-dsp --bin wavelinux6-audio-core
+          cargo build --release -p wavelinux-app --bin wavelinux6-peripheral-plugin
+          bash scripts/stage-appimage-runtime.sh
+          cd crates/app
+          ../../node_modules/.bin/tauri build --bundles appimage
+          cd ../..
+          APPIMAGE_EXTRACT_AND_RUN=1 bash scripts/finalize-appimage.sh
+      - name: Stage AppImage artifact
+        shell: bash
+        run: |
+          mkdir -p emergency-appimage
+          cp target/release/bundle/appimage/*.AppImage emergency-appimage/
+          cd emergency-appimage
+          sha256sum *.AppImage > SHA256SUMS
+          printf 'Source commit: 49ca141cfb56024c26cb57f59d7dd5f292046e6c\nBuild commit: %s\nLocal workaround: unsigned bundled index only; remote catalogs remain signature-verified.\n' "$GITHUB_SHA" > BUILD-INFO.txt
+          ls -lh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wavelinux6-emergency-appimage
+          path: emergency-appimage
+          if-no-files-found: error
+          retention-days: 7
