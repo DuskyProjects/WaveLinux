@@ -24,7 +24,7 @@ silent interval, or missed performance threshold blocks release.
 
 ## Version Promotion
 
-Update the same stable version in:
+Update the same version in:
 
 - `package.json` and `yarn.lock` metadata;
 - `crates/app/Cargo.toml` and `Cargo.lock`;
@@ -49,11 +49,17 @@ the generated signatures before upload.
 After explicit authorization:
 
 1. create one intentional release commit;
-2. push the validated branch to `main` without discarding remote history;
-3. create and push the exact stable version tag;
-4. publish a normal GitHub release, not a prerelease;
-5. verify CI, distro smoke, release upload, checksums/signatures, and downloadable
+2. push the validated branch to `master` without discarding remote history;
+3. create and push the exact version tag;
+4. allow the release workflow to build, validate, and upload the AppImage,
+   Debian package, RPM package, updater artifacts, and AUR metadata;
+5. publish versions containing a prerelease suffix as GitHub prereleases and
+   stable versions as normal releases;
+6. verify CI, distro smoke, release upload, checksums/signatures, and downloadable
    package contents from GitHub.
+
+For WaveLinux 6 Alpha 1, the exact version is `6.0.0-alpha.1`, the exact tag is
+`v6.0.0-alpha.1`, and the GitHub release title is `WaveLinux 6 Alpha 1`.
 
 Do not mark the release complete while a required GitHub check is queued,
 cancelled, or failing.
