@@ -29,6 +29,82 @@ configuration, and PipeWire namespace.
 DeepFilterNet is not included. Existing DeepFilterNet config entries are
 migrated to RNNoise and it does not appear in the effect catalog.
 
+## Install
+
+### Automatic distro-aware installer
+
+Download and run the installer as your normal desktop user:
+
+```bash
+curl -fL \
+  https://raw.githubusercontent.com/DuskyProjects/WaveLinux/master/install.sh \
+  -o wavelinux6-install.sh
+chmod +x wavelinux6-install.sh
+./wavelinux6-install.sh
+```
+
+Do not run the whole installer with `sudo`. It requests administrator
+permission only when the detected package manager needs it.
+
+The installer resolves the newest published GitHub release, downloads
+`SHA256SUMS`, verifies the selected package, and then chooses:
+
+- Debian, Ubuntu, Linux Mint, Pop!_OS, KDE neon, elementary OS, and Zorin OS:
+  the release `.deb`, installed through `apt-get` with dependencies.
+- Fedora, RHEL-family distributions, and openSUSE: the release `.rpm`, installed
+  through `dnf`, `yum`, or `zypper` with dependencies.
+- Arch Linux, CachyOS, Manjaro, EndeavourOS, and Garuda: the release AppImage,
+  the required host packages through `pacman`, and separately installed
+  `wavelinux6-audio-core` and peripheral helper binaries extracted from the
+  AppImage.
+- Other x86_64 distributions: the AppImage fallback with a warning listing the
+  host runtime that may need to be installed manually.
+
+Install a specific release instead of the newest published release with:
+
+```bash
+./wavelinux6-install.sh --tag v6.0.0-alpha.1
+```
+
+Preview what it would choose without installing anything:
+
+```bash
+./wavelinux6-install.sh --dry-run
+```
+
+### Offline application payload / standalone installer
+
+A maintainer with a fully working local build can create one self-extracting
+installer containing that exact AppImage, audio core, peripheral helper,
+launcher, icons, profiles, dependency detector, and installation scripts:
+
+```bash
+yarn install
+yarn desktop:build
+yarn install:local
+bash scripts/build-standalone-installer.sh
+```
+
+The generated file is:
+
+```text
+dist/WaveLinux6_<version>_amd64_Installer.sh
+```
+
+Send that single file to the target computer. The recipient installs it as
+their normal desktop user:
+
+```bash
+chmod +x WaveLinux6_<version>_amd64_Installer.sh
+./WaveLinux6_<version>_amd64_Installer.sh
+```
+
+The WaveLinux application payload is embedded in the installer, so the target
+computer does not need the source tree, Rust, Node.js, or Yarn. The installer
+automatically detects `apt`, `dnf`, `pacman`, or `zypper` and may use the
+computer's configured package repositories to obtain missing system
+dependencies.
+
 ## Local Build
 
 WaveLinux requires a PipeWire desktop session with `pipewire-pulse` and
