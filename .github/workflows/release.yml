@@ -176,6 +176,7 @@ jobs:
       - name: Prepare release gate files
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_NAME: ${{ steps.version.outputs.release_name }}
         run: |
           mkdir -p target/release/gate/assets
           cp target/release/bundle/appimage/*.AppImage* target/release/gate/assets/
@@ -184,6 +185,16 @@ jobs:
           cp target/release/bundle/latest.json target/release/gate/assets/
           cp target/aur/wavelinux/PKGBUILD target/release/gate/assets/
           cp target/aur/wavelinux/.SRCINFO target/release/gate/assets/wavelinux.SRCINFO
+          printf 'Release: %s\nVersion: %s\nTag: v%s\nCommit: %s\n' \
+            "$RELEASE_NAME" "$VERSION" "$VERSION" "$GITHUB_SHA" \
+            > target/release/gate/assets/BUILD-INFO.txt
+          (
+            cd target/release/gate/assets
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS
+          )
           awk -v version="$VERSION" '
             $0 == "# WaveLinux " version { in_section = 1; found = 1 }
             in_section && /^# WaveLinux / && $0 != "# WaveLinux " version { exit }
