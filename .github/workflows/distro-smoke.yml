@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to test, such as v4.3.3. Use latest for the latest stable release."
+        description: "Release tag to test, such as v6.0.0. Use latest for the latest stable release."
         required: false
         default: latest
   workflow_run:
@@ -60,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distro: [debian13, ubuntu2404, fedora, arch]
+        distro: [debian13, ubuntu2404, fedora, arch, cachyos]
     steps:
       - uses: actions/checkout@v6
       - name: Smoke AppImage runtime installer on ${{ matrix.distro }}
@@ -77,7 +77,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distro: [ubuntu2404, fedora]
+        distro: [debian13, ubuntu2404, fedora]
     steps:
       - uses: actions/checkout@v6
       - name: Smoke native package install on ${{ matrix.distro }}

@@ -2,21 +2,19 @@
 set -euo pipefail
 
 INSTALL=0
-INSTALL_EFFECTS=0
 STRICT=0
 STRICT_RUNTIME=0
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSTALLED_PACKAGES=0
 
 usage() {
   cat <<'HELP'
 Check WaveLinux runtime and effect dependencies.
 
 Usage:
-  bash scripts/check-dependencies.sh [--install] [--install-effects] [--strict] [--strict-runtime]
+  bash scripts/check-dependencies.sh [--install] [--strict] [--strict-runtime]
 
 Environment:
   WAVELINUX_INSTALL_DEPS=1      Install missing runtime dependencies.
-  WAVELINUX_INSTALL_EFFECTS=1   Install missing effect packages.
 HELP
 }
 
@@ -24,9 +22,6 @@ for arg in "$@"; do
   case "$arg" in
     --install)
       INSTALL=1
-      ;;
-    --install-effects)
-      INSTALL_EFFECTS=1
       ;;
     --strict)
       STRICT=1
@@ -48,10 +43,6 @@ done
 
 if [[ "${WAVELINUX_INSTALL_DEPS:-0}" == "1" ]]; then
   INSTALL=1
-fi
-
-if [[ "${WAVELINUX_INSTALL_EFFECTS:-0}" == "1" ]]; then
-  INSTALL_EFFECTS=1
 fi
 
 command_exists() {
@@ -156,17 +147,6 @@ package_available() {
   esac
 }
 
-aur_package_available() {
-  local package="$1"
-  if command_exists paru; then
-    paru -Si "$package" >/dev/null 2>&1
-  elif command_exists yay; then
-    yay -Si "$package" >/dev/null 2>&1
-  else
-    return 1
-  fi
-}
-
 install_packages() {
   local manager="$1"
   shift
@@ -178,10 +158,10 @@ install_packages() {
   case "$manager" in
     apt)
       run_privileged apt-get update
-      run_privileged apt-get install -y "${packages[@]}"
+      run_privileged apt-get install -y --no-install-recommends "${packages[@]}"
       ;;
     dnf)
-      run_privileged dnf install -y "${packages[@]}"
+      run_privileged dnf install -y --setopt=install_weak_deps=False "${packages[@]}"
       ;;
     pacman)
       run_privileged pacman -Syu --needed --noconfirm "${packages[@]}"
@@ -196,60 +176,16 @@ install_packages() {
   esac
 }
 
-install_aur_packages() {
-  local packages=("$@")
-  if (( ${#packages[@]} == 0 )); then
-    return 0
-  fi
-  if command_exists paru; then
-    paru -S --needed --noconfirm "${packages[@]}"
-  elif command_exists yay; then
-    yay -S --needed --noconfirm "${packages[@]}"
-  else
-    echo "No AUR helper found; install manually: ${packages[*]}" >&2
-    return 1
-  fi
-}
-
-existing_ladspa_paths() {
-  local paths=()
-  if [[ -n "${LADSPA_PATH:-}" ]]; then
-    IFS=':' read -r -a paths <<< "$LADSPA_PATH"
-  fi
-  paths+=(
-    "${APPDIR:-}/usr/wavelinux-runtime/lib/ladspa"
-    "${APPDIR:-}/usr/lib/ladspa"
-    /usr/lib/ladspa
-    /usr/lib64/ladspa
-    /usr/local/lib/ladspa
-    /usr/local/lib64/ladspa
-    /usr/lib/x86_64-linux-gnu/ladspa
-    /usr/lib/aarch64-linux-gnu/ladspa
-    /usr/lib/arm-linux-gnueabihf/ladspa
-    "$ROOT_DIR/crates/app/appimage-extra/usr/wavelinux-runtime/lib/ladspa"
-  )
-  printf '%s\n' "${paths[@]}" | awk 'NF && !seen[$0]++'
-}
-
-ladspa_has_any() {
-  local pattern
-  while IFS= read -r root; do
-    [[ -d "$root" ]] || continue
-    for pattern in "$@"; do
-      compgen -G "$root/$pattern" >/dev/null 2>&1 && return 0
-    done
-  done < <(existing_ladspa_paths)
-  return 1
-}
-
 resolve_packages() {
   local manager="$1"
   shift
   local resolved=()
+  local -A seen=()
   local package
   for package in "$@"; do
-    if package_available "$manager" "$package"; then
+    if [[ -z "${seen[$package]+x}" ]] && package_available "$manager" "$package"; then
       resolved+=("$package")
+      seen["$package"]=1
     fi
   done
   printf '%s\n' "${resolved[@]}"
@@ -257,7 +193,7 @@ resolve_packages() {
 
 manager="$(detect_manager)"
 missing_commands=()
-for program in pipewire pactl wpctl pw-cli pw-dump; do
+for program in pipewire pactl wpctl pw-cli pw-dump pw-metadata pw-top; do
   if ! command_exists "$program"; then
     missing_commands+=("$program")
   fi
@@ -291,6 +227,18 @@ fi
 if ! library_available 'libdrm\.so\.2' /usr/lib/libdrm.so.2 /usr/lib64/libdrm.so.2 /usr/lib/x86_64-linux-gnu/libdrm.so.2; then
   missing_libraries+=("libdrm")
 fi
+if ! library_available 'libwayland-client\.so\.0' /usr/lib/libwayland-client.so.0 /usr/lib64/libwayland-client.so.0 /usr/lib/x86_64-linux-gnu/libwayland-client.so.0; then
+  missing_libraries+=("libwayland-client")
+fi
+if ! library_available 'libwayland-cursor\.so\.0' /usr/lib/libwayland-cursor.so.0 /usr/lib64/libwayland-cursor.so.0 /usr/lib/x86_64-linux-gnu/libwayland-cursor.so.0; then
+  missing_libraries+=("libwayland-cursor")
+fi
+if ! library_available 'libwayland-egl\.so\.1' /usr/lib/libwayland-egl.so.1 /usr/lib64/libwayland-egl.so.1 /usr/lib/x86_64-linux-gnu/libwayland-egl.so.1; then
+  missing_libraries+=("libwayland-egl")
+fi
+if ! library_available 'libwayland-server\.so\.0' /usr/lib/libwayland-server.so.0 /usr/lib64/libwayland-server.so.0 /usr/lib/x86_64-linux-gnu/libwayland-server.so.0; then
+  missing_libraries+=("libwayland-server")
+fi
 streamer_discovery_notes=()
 if [[ ! -d /sys/class/hidraw ]]; then
   streamer_discovery_notes+=("hidraw sysfs unavailable")
@@ -299,37 +247,139 @@ if [[ ! -r /proc/asound/seq/clients ]]; then
   streamer_discovery_notes+=("ALSA sequencer client list unavailable")
 fi
 
-runtime_candidates=()
-effect_candidates=()
-aur_effect_candidates=()
+audio_candidates=()
+streamer_candidates=()
+usb_candidates=()
+egl_candidates=()
+gl_candidates=()
+gbm_candidates=()
+drm_candidates=()
+wayland_client_candidates=()
+wayland_cursor_candidates=()
+wayland_egl_candidates=()
+wayland_server_candidates=()
+bwrap_candidates=()
+dbus_proxy_candidates=()
+xwayland_candidates=()
 
 case "$manager" in
   apt)
-    runtime_candidates=(pipewire wireplumber pipewire-pulse pipewire-bin pulseaudio-utils alsa-utils libwebkit2gtk-4.1-0 libayatana-appindicator3-1 libusb-1.0-0 bubblewrap xdg-dbus-proxy xwayland libegl1 libgl1 libgbm1 libdrm2 gstreamer1.0-plugins-base gstreamer1.0-plugins-good fonts-dejavu-core xdg-desktop-portal xdg-desktop-portal-gtk)
-    effect_candidates=(swh-plugins lsp-plugins-ladspa librnnoise-ladspa noise-suppression-for-voice)
+    audio_candidates=(pipewire wireplumber pipewire-pulse pipewire-bin pulseaudio-utils)
+    streamer_candidates=(alsa-utils)
+    usb_candidates=(libusb-1.0-0)
+    egl_candidates=(libegl1)
+    gl_candidates=(libgl1)
+    gbm_candidates=(libgbm1)
+    drm_candidates=(libdrm2)
+    wayland_client_candidates=(libwayland-client0)
+    wayland_cursor_candidates=(libwayland-cursor0)
+    wayland_egl_candidates=(libwayland-egl1)
+    wayland_server_candidates=(libwayland-server0)
+    bwrap_candidates=(bubblewrap)
+    dbus_proxy_candidates=(xdg-dbus-proxy)
+    xwayland_candidates=(xwayland)
     ;;
   dnf)
-    runtime_candidates=(pipewire pipewire-utils wireplumber pipewire-pulseaudio pulseaudio-utils alsa-utils webkit2gtk4.1 libappindicator-gtk3 libusb1 bubblewrap xdg-dbus-proxy xorg-x11-server-Xwayland mesa-libEGL mesa-libGL mesa-libgbm libdrm gstreamer1-plugins-base gstreamer1-plugins-good google-noto-sans-fonts xdg-desktop-portal xdg-desktop-portal-gtk)
-    effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise noise-suppression-for-voice)
+    audio_candidates=(pipewire pipewire-utils wireplumber pipewire-pulseaudio pulseaudio-utils)
+    streamer_candidates=(alsa-utils)
+    usb_candidates=(libusb1)
+    egl_candidates=(mesa-libEGL)
+    gl_candidates=(mesa-libGL)
+    gbm_candidates=(mesa-libgbm)
+    drm_candidates=(libdrm)
+    wayland_client_candidates=(libwayland-client)
+    wayland_cursor_candidates=(libwayland-cursor)
+    wayland_egl_candidates=(libwayland-egl)
+    wayland_server_candidates=(libwayland-server)
+    bwrap_candidates=(bubblewrap)
+    dbus_proxy_candidates=(xdg-dbus-proxy)
+    xwayland_candidates=(xorg-x11-server-Xwayland)
     ;;
   pacman)
-    runtime_candidates=(pipewire wireplumber pipewire-pulse libpulse alsa-utils webkit2gtk-4.1 gtk3 libayatana-appindicator libusb bubblewrap xdg-dbus-proxy xorg-xwayland mesa libglvnd gstreamer gst-plugins-base-libs gst-plugins-good noto-fonts xdg-desktop-portal xdg-desktop-portal-gtk)
-    effect_candidates=(swh-plugins noise-suppression-for-voice)
-    aur_effect_candidates=(noise-suppression-for-voice)
+    audio_candidates=(pipewire wireplumber pipewire-pulse libpulse)
+    streamer_candidates=(alsa-utils)
+    usb_candidates=(libusb)
+    egl_candidates=(libglvnd)
+    gl_candidates=(libglvnd)
+    gbm_candidates=(mesa)
+    drm_candidates=(libdrm)
+    wayland_client_candidates=(wayland)
+    wayland_cursor_candidates=(wayland)
+    wayland_egl_candidates=(wayland)
+    wayland_server_candidates=(wayland)
+    bwrap_candidates=(bubblewrap)
+    dbus_proxy_candidates=(xdg-dbus-proxy)
+    xwayland_candidates=(xorg-xwayland)
     ;;
   zypper)
-    runtime_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils alsa libwebkit2gtk-4_1-0 typelib-1_0-AyatanaAppIndicator3-0_1 libusb-1_0-0 bubblewrap xdg-dbus-proxy xwayland libwebkit2gtk-4_1-0 Mesa-libEGL1 Mesa-libGL1 libgbm1 libdrm2 gstreamer-plugins-base gstreamer-plugins-good google-noto-sans-fonts xdg-desktop-portal xdg-desktop-portal-gtk)
-    effect_candidates=(ladspa-swh-plugins lsp-plugins-ladspa rnnoise)
+    audio_candidates=(pipewire wireplumber pipewire-pulseaudio pulseaudio-utils)
+    streamer_candidates=(alsa)
+    usb_candidates=(libusb-1_0-0)
+    egl_candidates=(Mesa-libEGL1)
+    gl_candidates=(Mesa-libGL1)
+    gbm_candidates=(libgbm1)
+    drm_candidates=(libdrm2)
+    wayland_client_candidates=(libwayland-client0)
+    wayland_cursor_candidates=(libwayland-cursor0)
+    wayland_egl_candidates=(libwayland-egl1)
+    wayland_server_candidates=(libwayland-server0)
+    bwrap_candidates=(bubblewrap)
+    dbus_proxy_candidates=(xdg-dbus-proxy)
+    xwayland_candidates=(xwayland)
     ;;
 esac
 
-missing_effects=()
-if ! ladspa_has_any 'librnnoise_ladspa.so' 'rnnoise_ladspa.so'; then
-  missing_effects+=("RNNoise")
+runtime_candidates=()
+if (( ${#missing_commands[@]} > 0 )); then
+  runtime_candidates+=("${audio_candidates[@]}")
 fi
-if ! ladspa_has_any 'sc4_1882.so' 'gate_1410.so' 'fast_lookahead_limiter_1913.so' 'hard_limiter_1413.so'; then
-  missing_effects+=("SWH LADSPA dynamics")
+if (( ${#missing_streamer_commands[@]} > 0 )); then
+  runtime_candidates+=("${streamer_candidates[@]}")
 fi
+for library in "${missing_libraries[@]}"; do
+  case "$library" in
+    libusb-1.0)
+      runtime_candidates+=("${usb_candidates[@]}")
+      ;;
+    libEGL)
+      runtime_candidates+=("${egl_candidates[@]}")
+      ;;
+    libGL)
+      runtime_candidates+=("${gl_candidates[@]}")
+      ;;
+    libgbm)
+      runtime_candidates+=("${gbm_candidates[@]}")
+      ;;
+    libdrm)
+      runtime_candidates+=("${drm_candidates[@]}")
+      ;;
+    libwayland-client)
+      runtime_candidates+=("${wayland_client_candidates[@]}")
+      ;;
+    libwayland-cursor)
+      runtime_candidates+=("${wayland_cursor_candidates[@]}")
+      ;;
+    libwayland-egl)
+      runtime_candidates+=("${wayland_egl_candidates[@]}")
+      ;;
+    libwayland-server)
+      runtime_candidates+=("${wayland_server_candidates[@]}")
+      ;;
+  esac
+done
+for helper in "${missing_webkit_helpers[@]}"; do
+  case "$helper" in
+    bwrap)
+      runtime_candidates+=("${bwrap_candidates[@]}")
+      ;;
+    xdg-dbus-proxy)
+      runtime_candidates+=("${dbus_proxy_candidates[@]}")
+      ;;
+    Xwayland)
+      runtime_candidates+=("${xwayland_candidates[@]}")
+      ;;
+  esac
+done
 
 echo "WaveLinux dependency check"
 echo "Package manager: $manager"
@@ -352,11 +402,7 @@ else
   echo "WebKit/AppImage helpers missing: ${missing_webkit_helpers[*]}"
 fi
 
-if (( ${#missing_effects[@]} == 0 )); then
-  echo "Effect plugins: ok"
-else
-  echo "Effect plugins missing: ${missing_effects[*]}"
-fi
+echo "Native effects: bundled"
 if (( ${#streamer_discovery_notes[@]} == 0 )); then
   echo "Streamer device discovery: ok"
 else
@@ -373,30 +419,20 @@ if (( INSTALL == 1 && ( ${#missing_commands[@]} > 0 || ${#missing_streamer_comma
   if (( ${#packages[@]} > 0 )); then
     echo "Installing runtime packages: ${packages[*]}"
     install_packages "$manager" "${packages[@]}"
+    INSTALLED_PACKAGES=1
   else
     echo "No runtime package candidates were available for automatic install." >&2
   fi
 fi
 
-if (( INSTALL_EFFECTS == 1 && ${#missing_effects[@]} > 0 )); then
-  mapfile -t packages < <(resolve_packages "$manager" "${effect_candidates[@]}")
-  if (( ${#packages[@]} > 0 )); then
-    echo "Installing effect packages: ${packages[*]}"
-    install_packages "$manager" "${packages[@]}"
-  fi
-
-  if [[ "$manager" == "pacman" ]]; then
-    aur_packages=()
-    for package in "${aur_effect_candidates[@]}"; do
-      if aur_package_available "$package"; then
-        aur_packages+=("$package")
-      fi
-    done
-    if (( ${#aur_packages[@]} > 0 )); then
-      echo "Installing AUR effect packages: ${aur_packages[*]}"
-      install_aur_packages "${aur_packages[@]}"
-    fi
-  fi
+if (( INSTALLED_PACKAGES == 1 )); then
+  verify_args=()
+  (( STRICT == 1 )) && verify_args+=(--strict)
+  (( STRICT_RUNTIME == 1 )) && verify_args+=(--strict-runtime)
+  echo "Rechecking dependencies after package installation..."
+  exec env \
+    WAVELINUX_INSTALL_DEPS=0 \
+    bash "$0" "${verify_args[@]}"
 fi
 
 runtime_missing=0
@@ -404,15 +440,10 @@ if (( ${#missing_commands[@]} > 0 || ${#missing_streamer_commands[@]} > 0 || ${#
   runtime_missing=1
 fi
 
-effect_missing=0
-if (( ${#missing_effects[@]} > 0 )); then
-  effect_missing=1
-fi
-
 if (( STRICT_RUNTIME == 1 && runtime_missing == 1 )); then
   exit 1
 fi
 
-if (( STRICT == 1 && ( runtime_missing == 1 || effect_missing == 1 ) )); then
+if (( STRICT == 1 && runtime_missing == 1 )); then
   exit 1
 fi

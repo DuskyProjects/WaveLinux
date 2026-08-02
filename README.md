@@ -1,87 +1,101 @@
 # WaveLinux
 
 <!-- Keep this screenshot in the README as the permanent project preview. -->
-<img width="1917" height="1093" alt="image" src="https://github.com/user-attachments/assets/63e32eed-16fe-43be-b86c-6b172a88f3bb" />
+<img width="1917" height="1093" alt="WaveLinux mixer" src="https://github.com/user-attachments/assets/63e32eed-16fe-43be-b86c-6b172a88f3bb" />
 
 WaveLinux is a Linux-first creator audio mixer built with Rust, Tauri, React,
-TypeScript, and PipeWire. It creates virtual sources and mixes, routes app
-audio, applies open-source microphone effects, and provides selectable UI
-surfaces for Linux desktop audio workflows.
+TypeScript, and PipeWire. WaveLinux 6 provides persistent virtual channels,
+Monitor and Stream mixes, automatic application routing, live meters, and a
+native real-time microphone DSP core.
 
-WaveLinux targets standard Linux audio hardware first, with optional
-device-specific controls where the protocol is open enough to support safely.
-Stream Deck integration, proprietary marketplace effects, and hardware
-Clipguard behavior remain out of scope.
+WaveLinux 6 is currently an alpha development line. It replaces a local
+WaveLinux5 installation and intentionally uses a new `wavelinux6` application,
+configuration, and PipeWire namespace.
 
-## Highlights
+## Features
 
-- PipeWire/WirePlumber graph management with up to 5 virtual mixes.
-- App routing, saved app rules, per-source Monitor and Stream faders, and live
-  metering.
-- Microphone processing through open LADSPA/PipeWire effects, including
-  DeepFilterNet3, RNNoise, EQ, compressor, gate, and limiter entries.
-- Hardware profile matching for common USB, Bluetooth, PCI, and platform audio
-  endpoints.
-- Optional Elgato Wave XLR controls when supported hardware is detected.
-- Stream Deck-style HID and MIDI streamer device detection with safe mixer
-  bindings.
-- AppImage, deb, rpm, and AUR packaging with signed AppImage update checks.
+- Six persistent input buses with per-Monitor and per-Stream levels.
+- Event-driven application routing with saved routing rules.
+- Jack-aware microphone and speaker selection for USB, Bluetooth, HDA jack,
+  and internal devices.
+- Native RNNoise, high-pass, eight-band EQ, compressor, gate, limiter, and
+  Karaoke Stage processing in `wavelinux6-audio-core`.
+- Stable `wavelinux6-mic` and `wavelinux6_mix_stream_source` recording sources.
+- Live effect parameter and topology updates without replacing public client
+  nodes.
+- Adaptive 28/40/60/80/100/120 ms core buffering and Health diagnostics.
+- AppImage, deb, rpm, and AUR packaging with host-compatible PipeWire use.
 
-## Install
+DeepFilterNet is not included. Existing DeepFilterNet config entries are
+migrated to RNNoise and it does not appear in the effect catalog.
 
-Download the latest release:
+## Local Build
 
-```text
-https://github.com/DuskyProjects/WaveLinux/releases/latest
-```
-
-Available formats are AppImage, deb, rpm, and AUR metadata. AppImage is the
-portable build and primary self-update format.
-
-For a local install from a checkout:
+WaveLinux requires a PipeWire desktop session with `pipewire-pulse` and
+WirePlumber. From a checkout:
 
 ```bash
 yarn install
 yarn desktop:build
 yarn install:local
+wavelinux6
 ```
 
-Launch from the app menu or run:
+The local install uses:
+
+```text
+~/.local/bin/wavelinux6
+~/.local/bin/wavelinux6-audio-core
+~/.local/share/wavelinux6/
+~/.config/wavelinux6/
+```
+
+Run the complete safe test suite with:
 
 ```bash
-wavelinux5
+yarn test:all
 ```
+
+Build distributable AppImage, deb, and rpm artifacts in the pinned Debian
+builder, enforce the glibc compatibility ceiling, and stage the exact distro
+smoke assets with:
+
+```bash
+bash scripts/build-portable.sh
+```
+
+Live PipeWire tests are opt-in because they create and remove nodes in the
+current user session. See [Test suites](docs/testing.md).
 
 ## Documentation
 
-- [Architecture notes](docs/architecture.md)
-- [WaveLinux5 hardware acceleration](docs/wavelinux5-hardware-acceleration.md)
+- [Architecture](docs/architecture.md)
+- [Native audio core](docs/audio-core.md)
 - [Setup and development](docs/setup.md)
+- [Testing](docs/testing.md)
+- [Troubleshooting](docs/troubleshooting.md)
 - [Theme authoring](docs/themes.md)
-- [Test suites](docs/testing.md)
+- [Hardware profile runtime](docs/profiles.md)
 - [Hardware profile authoring](profiles/v1/README.md)
-- [Release notes](RELEASE_NOTES.md)
-- [License and open-source credits](LICENSE)
+- [DSP acceleration policy](docs/acceleration.md)
+- [Peripheral integrations](docs/integrations.md)
+- [WaveLinux 5 migration](docs/migration.md)
+- [Release procedure](docs/releasing.md)
+- [Release history](RELEASE_NOTES.md)
 
-## Requirements
+## Runtime Requirements
 
-WaveLinux targets PipeWire-based Linux desktops. It expects PipeWire,
-WirePlumber, pipewire-pulse, `pactl`, `wpctl`, `pw-cli`, `pw-dump`, and the
-normal desktop WebKit/GTK runtime pieces for your distro. Optional effect
-packages include SWH LADSPA plugins, RNNoise LADSPA/noise-suppression-for-voice,
-and DeepFilterNet3 LADSPA/PipeWire plugin support.
+WaveLinux expects PipeWire, WirePlumber, `pipewire-pulse`, `pactl`, `wpctl`,
+`pw-cli`, `pw-dump`, `pw-metadata`, and `pw-top`, plus the normal GTK/WebKit
+desktop runtime. Standard
+effects and RNNoise are bundled for release builds; installing microphone
+effects must not require administrator access.
 
-## Updates
-
-AppImage installs can check signed release metadata from inside Settings. Stable
-updates use the latest GitHub release feed; package-managed installs should
-update through their package manager.
-
-Release history lives in [RELEASE_NOTES.md](RELEASE_NOTES.md). The GitHub
-Releases page is kept focused on the latest downloadable release, while stable
-git tags remain as source history.
+AppImages deliberately use the host PipeWire client stack. Bundling a partial
+PipeWire or SPA module tree can make streams and meters disappear when its
+version differs from the host daemon.
 
 ## License
 
-WaveLinux is licensed under GPL-3.0-only. See [LICENSE](LICENSE) for license
-details and open-source credits.
+WaveLinux is licensed under GPL-3.0-only. See [LICENSE](LICENSE) for the license
+and open-source credits.

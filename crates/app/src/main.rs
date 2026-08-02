@@ -1,42 +1,107 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::backtrace::Backtrace;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 use time::format_description::well_known::Rfc3339;
+use wavelinux_app::{elgato, peripheral_protocol::ElgatoCommand, streamer_devices};
 use wavelinux_engine::{
     prewarm_hardware_profiles_from_xdg, EngineError, GraphDebugReport,
     HardwareProfilePrewarmReport, SoundCheckReport, WaveLinuxEngine,
 };
 use wavelinux_model::{
     app_display_name, graph_prefix, AppMatcher, AppRoute, AppStateSnapshot, AppVolumePreset,
-    Channel, ChannelInputMode, ChannelKind, EffectAvailability, EffectCatalog, EffectInstance,
-    FallbackHardwareProfile, HardwareProfileUiState, KnownApp, LatencyPolicy, LevelMeter, Mix,
-    MixBus, MixerConfig, MixerSettings, ReleaseChannel, RoutingPolicy, StreamerAction,
-    StreamerActionResult, StreamerBindingProfile, StreamerDeviceSummary, StreamerDevicesConfig,
-    StreamerLearnResult, StreamerPermissionStatus,
+    Channel, ChannelInputMode, ChannelKind, EffectInstance, FallbackHardwareProfile,
+    HardwareProfileUiState, KnownApp, LatencyPolicy, LevelMeter, Mix, MixBus, MixerConfig,
+    MixerSettings, ReleaseChannel, RoutingPolicy, StreamerAction, StreamerActionResult,
+    StreamerBindingProfile, StreamerDeviceSummary, StreamerDevicesConfig, StreamerLearnResult,
+    StreamerPermissionStatus,
 };
-
-mod elgato;
-mod streamer_devices;
 
 struct EngineState {
     engine: Arc<WaveLinuxEngine>,
+    meter_streaming_requested: Arc<AtomicBool>,
+    meter_streaming: Arc<AtomicBool>,
+    operation_revision: AtomicU64,
+    streamer_runtime: Arc<streamer_devices::StreamerRuntimeController>,
+}
+
+const STATE_DELTA_EVENT: &str = "wavelinux://state-delta";
+const METERS_EVENT: &str = "wavelinux://meters";
+const OPERATION_EVENT: &str = "wavelinux://operation";
+const OPERATION_PROTOCOL_VERSION: u16 = 1;
+const UI_EVENT_WAIT: Duration = Duration::from_secs(1);
+const IDLE_METER_INTERVAL: Duration = Duration::from_millis(250);
+const METER_RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
+const METER_FALLBACK_INTERVAL: Duration = Duration::from_millis(500);
+const METER_EVENT_MIN_DELTA: f32 = 0.004;
+
+#[derive(Debug, Clone, Serialize)]
+struct StateDeltaEvent {
+    revision: u64,
+    config_revision: u64,
+    graph_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config: Option<wavelinux_model::MixerConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    graph: Option<wavelinux_model::RuntimeGraph>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<Vec<wavelinux_model::Diagnostic>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engine: Option<wavelinux_model::EngineStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog: Option<wavelinux_model::EffectCatalog>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MetersEvent {
+    revision: u64,
+    meters: Vec<LevelMeter>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OperationEvent {
+    protocol_version: u16,
+    revision: u64,
+    request_id: String,
+    command: &'static str,
+    status: &'static str,
+    state_revision: u64,
+    config_revision: u64,
+    graph_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OperationResponse<T> {
+    protocol_version: u16,
+    revision: u64,
+    request_id: String,
+    command: &'static str,
+    status: &'static str,
+    state_revision: u64,
+    config_revision: u64,
+    graph_revision: u64,
+    value: T,
 }
 
 struct ProcessLock {
@@ -73,6 +138,8 @@ const WEBKIT_COMPOSITING_DISABLE_ENV: &str = "WEBKIT_DISABLE_COMPOSITING_MODE";
 const WEBKIT_SANDBOX_DISABLE_ENV: &str = "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS";
 const WEBKIT_WORKAROUNDS_DISABLE_ENV: &str = "WAVELINUX_DISABLE_WEBKIT_WORKAROUNDS";
 const WEBKIT_SANDBOX_KEEP_ENV: &str = "WAVELINUX_KEEP_WEBKIT_SANDBOX";
+const TOKIO_WORKER_THREADS_ENV: &str = "TOKIO_WORKER_THREADS";
+const DEFAULT_TOKIO_WORKER_THREADS: &str = "4";
 const RUNTIME_INSTALL_SKIP_ENV: &str = "WAVELINUX_SKIP_RUNTIME_INSTALL";
 const RUNTIME_INSTALL_FORCE_ENV: &str = "WAVELINUX_INSTALL_RUNTIME_ON_START";
 const RUNTIME_DEPS_ASSUME_ENV: &str = "WAVELINUX_ASSUME_RUNTIME_DEPS";
@@ -166,6 +233,40 @@ const PIPEWIRE_CLIENT_STACK_PROBES: &[(&str, &[&str])] = &[
         ],
     ),
 ];
+const WAYLAND_HOST_STACK_PROBES: &[(&str, &[&str])] = &[
+    (
+        "libwayland-client.so.0",
+        &[
+            "/usr/lib/libwayland-client.so.0",
+            "/usr/lib64/libwayland-client.so.0",
+            "/usr/lib/x86_64-linux-gnu/libwayland-client.so.0",
+        ],
+    ),
+    (
+        "libwayland-cursor.so.0",
+        &[
+            "/usr/lib/libwayland-cursor.so.0",
+            "/usr/lib64/libwayland-cursor.so.0",
+            "/usr/lib/x86_64-linux-gnu/libwayland-cursor.so.0",
+        ],
+    ),
+    (
+        "libwayland-egl.so.1",
+        &[
+            "/usr/lib/libwayland-egl.so.1",
+            "/usr/lib64/libwayland-egl.so.1",
+            "/usr/lib/x86_64-linux-gnu/libwayland-egl.so.1",
+        ],
+    ),
+    (
+        "libwayland-server.so.0",
+        &[
+            "/usr/lib/libwayland-server.so.0",
+            "/usr/lib64/libwayland-server.so.0",
+            "/usr/lib/x86_64-linux-gnu/libwayland-server.so.0",
+        ],
+    ),
+];
 const APT_RUNTIME_PACKAGES: &[&str] = &[
     "pipewire",
     "wireplumber",
@@ -183,6 +284,10 @@ const APT_RUNTIME_PACKAGES: &[&str] = &[
     "libgl1",
     "libgbm1",
     "libdrm2",
+    "libwayland-client0",
+    "libwayland-cursor0",
+    "libwayland-egl1",
+    "libwayland-server0",
     "gstreamer1.0-plugins-base",
     "gstreamer1.0-plugins-good",
     "fonts-dejavu-core",
@@ -200,6 +305,10 @@ const APT_APPIMAGE_HOST_PACKAGES: &[&str] = &[
     "libgl1",
     "libgbm1",
     "libdrm2",
+    "libwayland-client0",
+    "libwayland-cursor0",
+    "libwayland-egl1",
+    "libwayland-server0",
     "fonts-dejavu-core",
     "xdg-desktop-portal",
 ];
@@ -226,6 +335,10 @@ const DNF_RUNTIME_PACKAGES: &[&str] = &[
     "mesa-libGL",
     "mesa-libgbm",
     "libdrm",
+    "libwayland-client",
+    "libwayland-cursor",
+    "libwayland-egl",
+    "libwayland-server",
     "gstreamer1-plugins-base",
     "gstreamer1-plugins-good",
     "google-noto-sans-fonts",
@@ -243,6 +356,10 @@ const DNF_APPIMAGE_HOST_PACKAGES: &[&str] = &[
     "mesa-libGL",
     "mesa-libgbm",
     "libdrm",
+    "libwayland-client",
+    "libwayland-cursor",
+    "libwayland-egl",
+    "libwayland-server",
     "google-noto-sans-fonts",
     "xdg-desktop-portal",
 ];
@@ -265,6 +382,7 @@ const ARCH_RUNTIME_PACKAGES: &[&str] = &[
     "xorg-xwayland",
     "mesa",
     "libglvnd",
+    "wayland",
     "gtk3",
     "gstreamer",
     "gst-plugins-base-libs",
@@ -283,6 +401,7 @@ const ARCH_APPIMAGE_HOST_PACKAGES: &[&str] = &[
     "xorg-xwayland",
     "mesa",
     "libglvnd",
+    "wayland",
     "noto-fonts",
     "xdg-desktop-portal",
 ];
@@ -309,6 +428,10 @@ const ZYPPER_RUNTIME_PACKAGES: &[&str] = &[
     "Mesa-libGL1",
     "libgbm1",
     "libdrm2",
+    "libwayland-client0",
+    "libwayland-cursor0",
+    "libwayland-egl1",
+    "libwayland-server0",
     "gstreamer-plugins-base",
     "gstreamer-plugins-good",
     "google-noto-sans-fonts",
@@ -325,6 +448,10 @@ const ZYPPER_APPIMAGE_HOST_PACKAGES: &[&str] = &[
     "Mesa-libGL1",
     "libgbm1",
     "libdrm2",
+    "libwayland-client0",
+    "libwayland-cursor0",
+    "libwayland-egl1",
+    "libwayland-server0",
     "google-noto-sans-fonts",
     "xdg-desktop-portal",
 ];
@@ -334,11 +461,6 @@ const ZYPPER_PORTAL_BACKENDS: &[&str] = &[
     "xdg-desktop-portal-gnome",
     "xdg-desktop-portal-wlr",
 ];
-const RNNOISE_LADSPA_NAMES: &[&str] = &["librnnoise_ladspa.so", "rnnoise_ladspa.so"];
-const COMPRESSOR_LADSPA_NAMES: &[&str] = &["sc4_1882.so", "compressor.so"];
-const GATE_LADSPA_NAMES: &[&str] = &["gate_1410.so"];
-const LIMITER_LADSPA_NAMES: &[&str] = &["fast_lookahead_limiter_1913.so", "hard_limiter_1413.so"];
-
 fn prepare_appimage_bundled_runtime() {
     let Some(runtime_dir) = appimage_bundled_runtime_dir() else {
         return;
@@ -384,65 +506,6 @@ fn prepend_env_path(key: &str, path: PathBuf) {
     if let Ok(joined) = std::env::join_paths(paths) {
         std::env::set_var(key, joined);
     }
-}
-
-fn existing_ladspa_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(value) = std::env::var_os("LADSPA_PATH") {
-        paths.extend(std::env::split_paths(&value));
-    }
-    paths.extend([
-        PathBuf::from("/usr/lib/ladspa"),
-        PathBuf::from("/usr/lib64/ladspa"),
-        PathBuf::from("/usr/local/lib/ladspa"),
-        PathBuf::from("/usr/local/lib64/ladspa"),
-        PathBuf::from("/usr/lib/x86_64-linux-gnu/ladspa"),
-        PathBuf::from("/usr/lib/aarch64-linux-gnu/ladspa"),
-        PathBuf::from("/usr/lib/arm-linux-gnueabihf/ladspa"),
-    ]);
-
-    let mut seen = BTreeSet::new();
-    paths
-        .into_iter()
-        .filter(|path| seen.insert(path.clone()))
-        .collect()
-}
-
-fn ladspa_has_any(names: &[&str]) -> bool {
-    existing_ladspa_paths()
-        .into_iter()
-        .any(|root| root.is_dir() && names.iter().any(|name| root.join(name).is_file()))
-}
-
-fn missing_ladspa_effect_ids() -> Vec<String> {
-    let mut missing = Vec::new();
-    if !ladspa_has_any(RNNOISE_LADSPA_NAMES) {
-        push_unique(&mut missing, "rnnoise");
-    }
-    if !ladspa_has_any(COMPRESSOR_LADSPA_NAMES) {
-        push_unique(&mut missing, "compressor");
-    }
-    if !ladspa_has_any(GATE_LADSPA_NAMES) {
-        push_unique(&mut missing, "gate");
-    }
-    if !ladspa_has_any(LIMITER_LADSPA_NAMES) {
-        push_unique(&mut missing, "limiter");
-    }
-    missing
-}
-
-fn effect_names_from_ids(ids: &[String]) -> Vec<String> {
-    let catalog = EffectCatalog::default();
-    ids.iter()
-        .map(|id| {
-            catalog
-                .effects
-                .iter()
-                .find(|definition| &definition.id == id)
-                .map(|definition| definition.name.clone())
-                .unwrap_or_else(|| id.clone())
-        })
-        .collect()
 }
 
 fn apply_webkit_runtime_defaults() {
@@ -502,7 +565,15 @@ fn path_exists_or_symlink(path: &Path) -> bool {
 }
 
 fn missing_pipewire_client_stack() -> Vec<&'static str> {
-    PIPEWIRE_CLIENT_STACK_PROBES
+    missing_library_stack(PIPEWIRE_CLIENT_STACK_PROBES)
+}
+
+fn missing_wayland_host_stack() -> Vec<&'static str> {
+    missing_library_stack(WAYLAND_HOST_STACK_PROBES)
+}
+
+fn missing_library_stack<'a>(probes: &'a [(&'a str, &'a [&'a str])]) -> Vec<&'a str> {
+    probes
         .iter()
         .filter_map(|(name, candidates)| {
             candidates
@@ -584,6 +655,31 @@ fn appimage_bundled_pipewire_conflicts() -> Vec<String> {
 
         push_existing_path(root.join("pipewire-0.3"), &mut conflicts);
         push_existing_path(root.join("spa-0.2"), &mut conflicts);
+    }
+
+    conflicts.sort();
+    conflicts.dedup();
+    conflicts
+}
+
+fn appimage_bundled_wayland_conflicts() -> Vec<String> {
+    let Some(appdir) = std::env::var_os("APPDIR")
+        .map(PathBuf::from)
+        .or_else(appdir_from_current_exe)
+    else {
+        return Vec::new();
+    };
+
+    let mut conflicts = Vec::new();
+    for root in appimage_library_roots(&appdir) {
+        for prefix in [
+            "libwayland-client.so",
+            "libwayland-cursor.so",
+            "libwayland-egl.so",
+            "libwayland-server.so",
+        ] {
+            collect_entries_with_prefix(&root, prefix, &mut conflicts);
+        }
     }
 
     conflicts.sort();
@@ -677,11 +773,9 @@ fn print_runtime_dependency_report() -> i32 {
     let missing_helpers = missing_webkit_sandbox_helpers();
     let session_bus = session_bus_path_status();
     let missing_pipewire_stack = missing_pipewire_client_stack();
+    let missing_wayland_stack = missing_wayland_host_stack();
     let appimage_pipewire_conflicts = appimage_bundled_pipewire_conflicts();
-    let missing_effect_ids = missing_ladspa_effect_ids();
-    let missing_effect_names = effect_names_from_ids(&missing_effect_ids);
-    let (effect_packages, aur_effect_packages) =
-        resolve_effect_plugin_packages(manager, &missing_effect_ids);
+    let appimage_wayland_conflicts = appimage_bundled_wayland_conflicts();
 
     println!("WaveLinux runtime dependency check");
     println!("Package manager: {}", manager.id());
@@ -754,6 +848,15 @@ fn print_runtime_dependency_report() -> i32 {
         );
     }
 
+    if missing_wayland_stack.is_empty() {
+        println!("Host Wayland stack: ok");
+    } else {
+        println!(
+            "Host Wayland stack missing: {}",
+            missing_wayland_stack.join(" ")
+        );
+    }
+
     if appimage_pipewire_conflicts.is_empty() {
         println!("AppImage PipeWire bundle: ok");
     } else {
@@ -763,29 +866,16 @@ fn print_runtime_dependency_report() -> i32 {
         );
     }
 
-    if missing_effect_names.is_empty() {
-        println!("Effect plugins: ok");
+    if appimage_wayland_conflicts.is_empty() {
+        println!("AppImage Wayland bundle: ok");
     } else {
         println!(
-            "Effect plugins missing: {}",
-            missing_effect_names.join(", ")
+            "AppImage Wayland bundle conflicts: {}",
+            appimage_wayland_conflicts.join(" ")
         );
-        if !effect_packages.is_empty() {
-            println!(
-                "Effect install command: {}",
-                install_command_for_user(manager, &effect_packages)
-            );
-        }
-        if !aur_effect_packages.is_empty() {
-            println!(
-                "AUR effect install command: {}",
-                install_aur_command_for_user(&aur_effect_packages)
-            );
-        }
-        if effect_packages.is_empty() && aur_effect_packages.is_empty() {
-            println!("Effect install command: no known package candidates were available");
-        }
     }
+
+    println!("Standard effects: bundled in wavelinux6-audio-core");
 
     if !missing_helpers.is_empty() {
         println!(
@@ -798,7 +888,9 @@ fn print_runtime_dependency_report() -> i32 {
         && missing_arch.is_empty()
         && missing_helpers.is_empty()
         && missing_pipewire_stack.is_empty()
+        && missing_wayland_stack.is_empty()
         && appimage_pipewire_conflicts.is_empty()
+        && appimage_wayland_conflicts.is_empty()
         && !matches!(session_bus, Some((_, false)))
     {
         0
@@ -815,25 +907,10 @@ fn install_runtime_dependencies_from_cli() -> i32 {
     }
 
     let missing_runtime = missing_runtime_packages_for_manager(manager);
-    let missing_effect_ids = missing_ladspa_effect_ids();
-    let missing_effect_names = effect_names_from_ids(&missing_effect_ids);
-    let (effect_packages, aur_effect_packages) =
-        resolve_effect_plugin_packages(manager, &missing_effect_ids);
-    let mut packages = missing_runtime.clone();
-    for package in &effect_packages {
-        push_unique(&mut packages, package);
-    }
+    let packages = missing_runtime.clone();
 
-    if packages.is_empty() && aur_effect_packages.is_empty() {
-        if missing_effect_names.is_empty() {
-            println!("WaveLinux runtime packages and effect plugins are already installed.");
-        } else {
-            println!(
-                "WaveLinux runtime packages are installed, but these effect plugins are still missing: {}",
-                missing_effect_names.join(", ")
-            );
-            println!("No known package candidates were available for automatic install.");
-        }
+    if packages.is_empty() {
+        println!("WaveLinux runtime packages are already installed.");
         return 0;
     }
 
@@ -845,36 +922,11 @@ fn install_runtime_dependencies_from_cli() -> i32 {
     if !packages.is_empty() {
         println!("Command: {}", install_command_for_user(manager, &packages));
     }
-    if !aur_effect_packages.is_empty() {
-        println!(
-            "AUR command: {}",
-            install_aur_command_for_user(&aur_effect_packages)
-        );
-    }
-
-    let system_install = if packages.is_empty() {
-        Ok(Vec::new())
-    } else {
-        install_system_packages(manager, &packages)
-    };
-    match system_install {
+    match install_system_packages(manager, &packages) {
         Ok(_) => {
-            if !aur_effect_packages.is_empty() {
-                if let Err(err) = install_aur_packages(&aur_effect_packages) {
-                    eprintln!("WaveLinux setup: effect plugin AUR install failed: {err}");
-                }
-            }
             let missing_after = missing_runtime_packages_for_manager(manager);
-            let missing_effects_after = effect_names_from_ids(&missing_ladspa_effect_ids());
             if missing_after.is_empty() {
-                if missing_effects_after.is_empty() {
-                    println!("WaveLinux runtime dependency and effect plugin install completed.");
-                } else {
-                    println!(
-                        "WaveLinux runtime dependency install completed. Missing effect plugins after install: {}",
-                        missing_effects_after.join(", ")
-                    );
-                }
+                println!("WaveLinux runtime dependency install completed.");
                 0
             } else {
                 eprintln!(
@@ -908,96 +960,40 @@ fn ensure_runtime_dependencies_before_ui() {
     }
 
     let missing_runtime = missing_runtime_packages_for_manager(manager);
-    let missing_effect_ids = missing_ladspa_effect_ids();
-    let missing_effect_names = effect_names_from_ids(&missing_effect_ids);
-    let (effect_packages, aur_effect_packages) =
-        resolve_effect_plugin_packages(manager, &missing_effect_ids);
-    let mut packages = missing_runtime.clone();
-    for package in &effect_packages {
-        push_unique(&mut packages, package);
-    }
+    let packages = missing_runtime.clone();
 
-    if packages.is_empty() && aur_effect_packages.is_empty() {
+    if packages.is_empty() {
         return;
     }
 
-    let mut package_lines = Vec::new();
-    if !missing_runtime.is_empty() {
-        package_lines.push(format!("Runtime: {}", missing_runtime.join(" ")));
-    }
-    if !missing_effect_names.is_empty() {
-        package_lines.push(format!(
-            "Effect plugins: {}",
-            missing_effect_names.join(", ")
-        ));
-    }
-    let mut command_lines = Vec::new();
-    if !packages.is_empty() {
-        command_lines.push(install_command_for_user(manager, &packages));
-    }
-    if !aur_effect_packages.is_empty() {
-        command_lines.push(install_aur_command_for_user(&aur_effect_packages));
-    }
-    let commands = command_lines.join("\n");
+    let commands = install_command_for_user(manager, &packages);
     let prompt = format!(
         "WaveLinux needs setup packages for this Linux install.\n\nPackages:\n{}\n\nWaveLinux will ask for administrator permission and run:\n\n{}",
-        package_lines.join("\n"),
+        missing_runtime.join(" "),
         commands
     );
 
     if !confirm_runtime_dependency_install(&prompt) {
-        if missing_runtime.is_empty() {
-            show_runtime_setup_message(
-                "WaveLinux effect setup skipped",
-                "WaveLinux will continue launching, but missing LADSPA effect plugins will stay unavailable until installed.",
-                RuntimeSetupMessageKind::Info,
-            );
-            return;
-        } else {
-            let message = format!(
-                "WaveLinux setup was cancelled. Install these packages, then open WaveLinux again:\n\n{commands}"
-            );
-            show_runtime_setup_message(
-                "WaveLinux setup cancelled",
-                &message,
-                RuntimeSetupMessageKind::Error,
-            );
-            std::process::exit(1);
-        }
+        let message = format!(
+            "WaveLinux setup was cancelled. Install these packages, then open WaveLinux again:\n\n{commands}"
+        );
+        show_runtime_setup_message(
+            "WaveLinux setup cancelled",
+            &message,
+            RuntimeSetupMessageKind::Error,
+        );
+        std::process::exit(1);
     }
 
-    let system_install = if packages.is_empty() {
-        Ok(Vec::new())
-    } else {
-        install_system_packages(manager, &packages)
-    };
-    match system_install {
+    match install_system_packages(manager, &packages) {
         Ok(_) => {
-            if !aur_effect_packages.is_empty() {
-                if let Err(err) = install_aur_packages(&aur_effect_packages) {
-                    eprintln!("WaveLinux setup: effect plugin AUR install failed: {err}");
-                }
-            }
             let missing_after = missing_runtime_packages_for_manager(manager);
-            let missing_effects_after = effect_names_from_ids(&missing_ladspa_effect_ids());
             if missing_after.is_empty() {
-                if missing_effects_after.is_empty() {
-                    show_runtime_setup_message(
-                        "WaveLinux setup complete",
-                        "Runtime packages and LADSPA effect plugins were installed. WaveLinux will continue launching now.",
-                        RuntimeSetupMessageKind::Info,
-                    );
-                } else if !missing_effects_after.is_empty() && !missing_effect_ids.is_empty() {
-                    let message = format!(
-                        "WaveLinux will continue launching, but these effect plugins are still missing:\n\n{}",
-                        missing_effects_after.join(", ")
-                    );
-                    show_runtime_setup_message(
-                        "WaveLinux effect setup incomplete",
-                        &message,
-                        RuntimeSetupMessageKind::Info,
-                    );
-                }
+                show_runtime_setup_message(
+                    "WaveLinux setup complete",
+                    "Runtime packages were installed. WaveLinux will continue launching now.",
+                    RuntimeSetupMessageKind::Info,
+                );
             } else {
                 let message = format!(
                     "WaveLinux tried to install required packages, but these still look missing:\n\n{}\n\nManual command:\n{}",
@@ -1013,17 +1009,6 @@ fn ensure_runtime_dependencies_before_ui() {
             }
         }
         Err(err) => {
-            if missing_runtime.is_empty() {
-                let message = format!(
-                    "WaveLinux could not install missing effect plugins.\n\n{err}\n\nWaveLinux will continue launching, but those effects will stay unavailable."
-                );
-                show_runtime_setup_message(
-                    "WaveLinux effect setup failed",
-                    &message,
-                    RuntimeSetupMessageKind::Info,
-                );
-                return;
-            }
             let message = format!(
                 "WaveLinux could not install required runtime packages.\n\n{err}\n\nManual command:\n{commands}"
             );
@@ -1313,21 +1298,6 @@ struct UpdateInstallResult {
     message: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-struct EffectPluginInstallResult {
-    attempted: bool,
-    success: bool,
-    manager: String,
-    packages: Vec<String>,
-    aur_packages: Vec<String>,
-    missing_before: Vec<String>,
-    missing_after: Vec<String>,
-    stdout: String,
-    stderr: String,
-    message: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PackageManager {
     Apt,
@@ -1365,136 +1335,303 @@ fn observe_meters(engine: State<'_, EngineState>) -> Result<Vec<LevelMeter>, Str
 }
 
 #[tauri::command]
-fn create_mix(engine: State<'_, EngineState>, name: String) -> Result<Mix, String> {
-    tauri_result(engine.engine.create_mix(name))
+fn set_meter_streaming(
+    window: tauri::Window,
+    engine: State<'_, EngineState>,
+    enabled: bool,
+) -> bool {
+    engine
+        .meter_streaming_requested
+        .store(enabled, Ordering::Release);
+    let visible = window.is_visible().unwrap_or(true);
+    let minimized = window.is_minimized().unwrap_or(false);
+    let applied = enabled && visible && !minimized;
+    engine.meter_streaming.store(applied, Ordering::Release);
+    applied
 }
 
 #[tauri::command]
-fn rename_mix(engine: State<'_, EngineState>, mix_id: String, name: String) -> Result<Mix, String> {
-    tauri_result(engine.engine.rename_mix(mix_id, name))
+fn create_mix(
+    app: AppHandle,
+    engine: State<'_, EngineState>,
+    name: String,
+    request_id: Option<String>,
+) -> Result<OperationResponse<Mix>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "create_mix",
+        engine.engine.create_mix(name),
+    )
 }
 
 #[tauri::command]
-fn move_mix(engine: State<'_, EngineState>, mix_id: String, direction: i32) -> Result<Mix, String> {
-    tauri_result(engine.engine.move_mix(mix_id, direction))
+fn rename_mix(
+    app: AppHandle,
+    engine: State<'_, EngineState>,
+    mix_id: String,
+    name: String,
+    request_id: Option<String>,
+) -> Result<OperationResponse<Mix>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "rename_mix",
+        engine.engine.rename_mix(mix_id, name),
+    )
 }
 
 #[tauri::command]
-fn delete_mix(engine: State<'_, EngineState>, mix_id: String) -> Result<Mix, String> {
-    tauri_result(engine.engine.delete_mix(mix_id))
+fn move_mix(
+    app: AppHandle,
+    engine: State<'_, EngineState>,
+    mix_id: String,
+    direction: i32,
+    request_id: Option<String>,
+) -> Result<OperationResponse<Mix>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "move_mix",
+        engine.engine.move_mix(mix_id, direction),
+    )
+}
+
+#[tauri::command]
+fn delete_mix(
+    app: AppHandle,
+    engine: State<'_, EngineState>,
+    mix_id: String,
+    request_id: Option<String>,
+) -> Result<OperationResponse<Mix>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "delete_mix",
+        engine.engine.delete_mix(mix_id),
+    )
 }
 
 #[tauri::command]
 fn set_mix_volume(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     mix_id: String,
     volume: f32,
-) -> Result<Mix, String> {
-    tauri_result(engine.engine.set_mix_volume(mix_id, volume))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Mix>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_mix_volume",
+        engine.engine.set_mix_volume(mix_id, volume),
+    )
 }
 
 #[tauri::command]
 fn set_mix_mute(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     mix_id: String,
     muted: bool,
-) -> Result<Mix, String> {
-    tauri_result(engine.engine.set_mix_mute(mix_id, muted))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Mix>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_mix_mute",
+        engine.engine.set_mix_mute(mix_id, muted),
+    )
 }
 
 #[tauri::command]
 fn set_mix_icon(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     mix_id: String,
     icon: Option<String>,
-) -> Result<Mix, String> {
-    tauri_result(engine.engine.set_mix_icon(mix_id, icon))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Mix>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_mix_icon",
+        engine.engine.set_mix_icon(mix_id, icon),
+    )
 }
 
 #[tauri::command]
 fn set_channel_icon(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     icon: Option<String>,
-) -> Result<Channel, String> {
-    tauri_result(engine.engine.set_channel_icon(channel_id, icon))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_channel_icon",
+        engine.engine.set_channel_icon(channel_id, icon),
+    )
 }
 
 #[tauri::command]
 fn set_mix_monitor_output(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     mix_id: String,
     output: Option<String>,
-) -> Result<Mix, String> {
-    tauri_result(engine.engine.set_mix_monitor_output(mix_id, output))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Mix>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_mix_monitor_output",
+        engine.engine.set_mix_monitor_output(mix_id, output),
+    )
 }
 
 #[tauri::command]
 fn set_mix_outputs(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     mix_id: String,
     outputs: Vec<String>,
-) -> Result<Mix, String> {
-    tauri_result(engine.engine.set_mix_outputs(mix_id, outputs))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Mix>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_mix_outputs",
+        engine.engine.set_mix_outputs(mix_id, outputs),
+    )
 }
 
 #[tauri::command]
 fn create_channel(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     name: String,
     kind: ChannelKind,
-) -> Result<Channel, String> {
-    tauri_result(engine.engine.create_channel(name, kind))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "create_channel",
+        engine.engine.create_channel(name, kind),
+    )
 }
 
 #[tauri::command]
 fn rename_channel(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     name: String,
-) -> Result<Channel, String> {
-    tauri_result(engine.engine.rename_channel(channel_id, name))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "rename_channel",
+        engine.engine.rename_channel(channel_id, name),
+    )
 }
 
 #[tauri::command]
 fn move_channel(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     direction: i32,
-) -> Result<Channel, String> {
-    tauri_result(engine.engine.move_channel(channel_id, direction))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "move_channel",
+        engine.engine.move_channel(channel_id, direction),
+    )
 }
 
 #[tauri::command]
-fn delete_channel(engine: State<'_, EngineState>, channel_id: String) -> Result<Channel, String> {
-    tauri_result(engine.engine.delete_channel(channel_id))
+fn delete_channel(
+    app: AppHandle,
+    engine: State<'_, EngineState>,
+    channel_id: String,
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "delete_channel",
+        engine.engine.delete_channel(channel_id),
+    )
 }
 
 #[tauri::command]
 fn set_channel_linked(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     linked: bool,
-) -> Result<Channel, String> {
-    tauri_result(engine.engine.set_channel_linked(channel_id, linked))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_channel_linked",
+        engine.engine.set_channel_linked(channel_id, linked),
+    )
 }
 
 #[tauri::command]
 fn set_channel_input(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     source_device: Option<String>,
-) -> Result<Channel, String> {
-    tauri_result(engine.engine.set_channel_input(channel_id, source_device))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_channel_input",
+        engine.engine.set_channel_input(channel_id, source_device),
+    )
 }
 
 #[tauri::command]
 fn set_hardware_input_device(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     source_device: Option<String>,
-) -> Result<Channel, String> {
-    tauri_result(
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_hardware_input_device",
         engine
             .engine
             .set_hardware_input_device(channel_id, source_device),
@@ -1503,21 +1640,35 @@ fn set_hardware_input_device(
 
 #[tauri::command]
 fn set_channel_input_mode(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     input_mode: ChannelInputMode,
-) -> Result<Channel, String> {
-    tauri_result(engine.engine.set_channel_input_mode(channel_id, input_mode))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_channel_input_mode",
+        engine.engine.set_channel_input_mode(channel_id, input_mode),
+    )
 }
 
 #[tauri::command]
 fn set_channel_bus_enabled(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     mix_id: String,
     enabled: bool,
-) -> Result<MixBus, String> {
-    tauri_result(
+    request_id: Option<String>,
+) -> Result<OperationResponse<MixBus>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_channel_bus_enabled",
         engine
             .engine
             .set_channel_bus_enabled(channel_id, mix_id, enabled),
@@ -1526,10 +1677,18 @@ fn set_channel_bus_enabled(
 
 #[tauri::command]
 fn set_settings(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     settings: MixerSettings,
-) -> Result<MixerSettings, String> {
-    tauri_result(engine.engine.set_settings(settings))
+    request_id: Option<String>,
+) -> Result<OperationResponse<MixerSettings>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_settings",
+        engine.engine.set_settings(settings),
+    )
 }
 
 #[tauri::command]
@@ -1541,43 +1700,64 @@ fn list_hardware_profiles(
 
 #[tauri::command]
 fn set_device_hardware_profile(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     device_id: String,
     profile_id: Option<String>,
-) -> Result<HardwareProfileUiState, String> {
-    tauri_result(
-        engine
-            .engine
-            .set_device_hardware_profile(device_id, profile_id),
+    request_id: Option<String>,
+) -> Result<OperationResponse<HardwareProfileUiState>, String> {
+    let result = engine
+        .engine
+        .set_device_hardware_profile(device_id, profile_id);
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_device_hardware_profile",
+        result,
     )
 }
 
 #[tauri::command]
 fn set_fallback_hardware_profile(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     fallback_profile: FallbackHardwareProfile,
-) -> Result<HardwareProfileUiState, String> {
-    tauri_result(
-        engine
-            .engine
-            .set_fallback_hardware_profile(fallback_profile),
+    request_id: Option<String>,
+) -> Result<OperationResponse<HardwareProfileUiState>, String> {
+    let result = engine
+        .engine
+        .set_fallback_hardware_profile(fallback_profile);
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_fallback_hardware_profile",
+        result,
     )
 }
 
 #[tauri::command]
 fn set_hardware_profile_policy(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     profile_id: String,
     name: Option<String>,
     latency_policy: LatencyPolicy,
     routing_policy: RoutingPolicy,
-) -> Result<HardwareProfileUiState, String> {
-    tauri_result(engine.engine.set_hardware_profile_policy(
-        profile_id,
-        name,
-        latency_policy,
-        routing_policy,
-    ))
+    request_id: Option<String>,
+) -> Result<OperationResponse<HardwareProfileUiState>, String> {
+    let result =
+        engine
+            .engine
+            .set_hardware_profile_policy(profile_id, name, latency_policy, routing_policy);
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_hardware_profile_policy",
+        result,
+    )
 }
 
 #[tauri::command]
@@ -1595,10 +1775,12 @@ fn list_streamer_devices(
     });
     let bindings = if missing_profiles {
         let defaults = streamer_devices::default_profiles_for_devices(&devices, &state.config);
-        engine
+        let bindings = engine
             .engine
             .ensure_streamer_binding_profiles(defaults)
-            .map_err(|err| err.to_string())?
+            .map_err(|err| err.to_string())?;
+        engine.streamer_runtime.sync(Arc::clone(&engine.engine))?;
+        bindings
     } else {
         state.config.streamer_devices
     };
@@ -1637,10 +1819,12 @@ fn set_streamer_device_enabled(
             }
         }
     }
-    engine
+    let config = engine
         .engine
         .set_streamer_device_enabled(device_id, enabled)
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    engine.streamer_runtime.sync(Arc::clone(&engine.engine))?;
+    Ok(config)
 }
 
 #[tauri::command]
@@ -1648,10 +1832,12 @@ fn set_streamer_binding_profile(
     engine: State<'_, EngineState>,
     profile: StreamerBindingProfile,
 ) -> Result<StreamerBindingProfile, String> {
-    engine
+    let profile = engine
         .engine
         .set_streamer_binding_profile(profile)
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    engine.streamer_runtime.sync(Arc::clone(&engine.engine))?;
+    Ok(profile)
 }
 
 #[tauri::command]
@@ -1661,7 +1847,11 @@ fn learn_streamer_control(
 ) -> Result<StreamerLearnResult, String> {
     let state = engine.engine.get_state().map_err(|err| err.to_string())?;
     let devices = streamer_devices::discover_devices(&state);
-    streamer_devices::learn_control(&devices, &device_id)
+    let device = devices
+        .into_iter()
+        .find(|device| device.id == device_id)
+        .ok_or_else(|| "Streamer device is no longer detected".to_string())?;
+    engine.streamer_runtime.learn_control(device)
 }
 
 #[tauri::command]
@@ -1688,7 +1878,9 @@ fn read_elgato_wave_xlr(
     engine: State<'_, EngineState>,
 ) -> Result<elgato::ElgatoWaveXlrState, String> {
     ensure_elgato_wave_xlr_detected(&engine.engine)?;
-    elgato::read_wave_xlr_state().map_err(|err| err.to_string())
+    engine
+        .streamer_runtime
+        .run_elgato_command(&engine.engine, ElgatoCommand::ReadWaveXlr)
 }
 
 #[tauri::command]
@@ -1697,7 +1889,9 @@ fn set_elgato_wave_xlr_gain(
     gain_raw: u16,
 ) -> Result<elgato::ElgatoWaveXlrState, String> {
     ensure_elgato_wave_xlr_detected(&engine.engine)?;
-    elgato::set_wave_xlr_gain(gain_raw).map_err(|err| err.to_string())
+    engine
+        .streamer_runtime
+        .run_elgato_command(&engine.engine, ElgatoCommand::SetWaveXlrGain { gain_raw })
 }
 
 #[tauri::command]
@@ -1706,7 +1900,9 @@ fn set_elgato_wave_xlr_mute(
     muted: bool,
 ) -> Result<elgato::ElgatoWaveXlrState, String> {
     ensure_elgato_wave_xlr_detected(&engine.engine)?;
-    elgato::set_wave_xlr_mute(muted).map_err(|err| err.to_string())
+    engine
+        .streamer_runtime
+        .run_elgato_command(&engine.engine, ElgatoCommand::SetWaveXlrMute { muted })
 }
 
 #[tauri::command]
@@ -1715,7 +1911,10 @@ fn set_elgato_wave_xlr_hp_volume_db(
     db: f32,
 ) -> Result<elgato::ElgatoWaveXlrState, String> {
     ensure_elgato_wave_xlr_detected(&engine.engine)?;
-    elgato::set_wave_xlr_hp_volume_db(db).map_err(|err| err.to_string())
+    engine.streamer_runtime.run_elgato_command(
+        &engine.engine,
+        ElgatoCommand::SetWaveXlrHeadphoneVolume { db },
+    )
 }
 
 #[tauri::command]
@@ -1724,158 +1923,295 @@ fn set_elgato_wave_xlr_low_impedance(
     enabled: bool,
 ) -> Result<elgato::ElgatoWaveXlrState, String> {
     ensure_elgato_wave_xlr_detected(&engine.engine)?;
-    elgato::set_wave_xlr_low_impedance(enabled).map_err(|err| err.to_string())
+    engine.streamer_runtime.run_elgato_command(
+        &engine.engine,
+        ElgatoCommand::SetWaveXlrLowImpedance { enabled },
+    )
 }
 
 #[tauri::command]
 fn set_channel_volume(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     mix_id: String,
     volume: f32,
-) -> Result<MixBus, String> {
-    tauri_result(engine.engine.set_channel_volume(channel_id, mix_id, volume))
+    request_id: Option<String>,
+) -> Result<OperationResponse<MixBus>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_channel_volume",
+        engine.engine.set_channel_volume(channel_id, mix_id, volume),
+    )
 }
 
 #[tauri::command]
 fn set_channel_mute(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     mix_id: String,
     muted: bool,
-) -> Result<MixBus, String> {
-    tauri_result(engine.engine.set_channel_mute(channel_id, mix_id, muted))
+    request_id: Option<String>,
+) -> Result<OperationResponse<MixBus>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_channel_mute",
+        engine.engine.set_channel_mute(channel_id, mix_id, muted),
+    )
 }
 
 #[tauri::command]
 fn assign_app_to_channel(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     matcher: AppMatcher,
-) -> Result<AppRoute, String> {
-    tauri_result(engine.engine.assign_app_to_channel(channel_id, matcher))
+    request_id: Option<String>,
+) -> Result<OperationResponse<AppRoute>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "assign_app_to_channel",
+        engine.engine.assign_app_to_channel(channel_id, matcher),
+    )
 }
 
 #[tauri::command]
 fn remove_app_route(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     matcher: AppMatcher,
-) -> Result<Option<AppRoute>, String> {
-    tauri_result(engine.engine.remove_app_route(matcher))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Option<AppRoute>>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "remove_app_route",
+        engine.engine.remove_app_route(matcher),
+    )
 }
 
 #[tauri::command]
 fn set_app_volume_preset(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     matcher: AppMatcher,
     volume: f32,
-) -> Result<AppVolumePreset, String> {
-    tauri_result(engine.engine.set_app_volume_preset(matcher, volume))
+    request_id: Option<String>,
+) -> Result<OperationResponse<AppVolumePreset>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_app_volume_preset",
+        engine.engine.set_app_volume_preset(matcher, volume),
+    )
 }
 
 #[tauri::command]
 fn remove_app_volume_preset(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     matcher: AppMatcher,
-) -> Result<Option<AppVolumePreset>, String> {
-    tauri_result(engine.engine.remove_app_volume_preset(matcher))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Option<AppVolumePreset>>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "remove_app_volume_preset",
+        engine.engine.remove_app_volume_preset(matcher),
+    )
 }
 
 #[tauri::command]
 fn forget_app(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     matcher: AppMatcher,
-) -> Result<Option<KnownApp>, String> {
-    tauri_result(engine.engine.forget_app(matcher))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Option<KnownApp>>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "forget_app",
+        engine.engine.forget_app(matcher),
+    )
 }
 
 #[tauri::command]
 fn restore_app(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     matcher: AppMatcher,
-) -> Result<Option<KnownApp>, String> {
-    tauri_result(engine.engine.restore_app(matcher))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Option<KnownApp>>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "restore_app",
+        engine.engine.restore_app(matcher),
+    )
 }
 
 #[tauri::command]
 fn pin_app_identity(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     matcher: AppMatcher,
     label: String,
-) -> Result<KnownApp, String> {
-    tauri_result(engine.engine.pin_app_identity(matcher, label))
+    request_id: Option<String>,
+) -> Result<OperationResponse<KnownApp>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "pin_app_identity",
+        engine.engine.pin_app_identity(matcher, label),
+    )
 }
 
 #[tauri::command]
 fn merge_app_identity(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     source: AppMatcher,
     target: AppMatcher,
-) -> Result<KnownApp, String> {
-    tauri_result(engine.engine.merge_app_identity(source, target))
+    request_id: Option<String>,
+) -> Result<OperationResponse<KnownApp>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "merge_app_identity",
+        engine.engine.merge_app_identity(source, target),
+    )
 }
 
 #[tauri::command]
 fn reset_app_identity(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     matcher: AppMatcher,
-) -> Result<Option<KnownApp>, String> {
-    tauri_result(engine.engine.reset_app_identity(matcher))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Option<KnownApp>>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "reset_app_identity",
+        engine.engine.reset_app_identity(matcher),
+    )
 }
 
 #[tauri::command]
 fn move_app_stream(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     stream_id: String,
     channel_id: String,
-) -> Result<wavelinux_engine::CommandExecution, String> {
-    tauri_result(engine.engine.move_app_stream(stream_id, channel_id))
+    request_id: Option<String>,
+) -> Result<OperationResponse<wavelinux_engine::CommandExecution>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "move_app_stream",
+        engine.engine.move_app_stream(stream_id, channel_id),
+    )
 }
 
 #[tauri::command]
 fn move_app_stream_to_default(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     stream_id: String,
-) -> Result<wavelinux_engine::CommandExecution, String> {
-    tauri_result(engine.engine.move_app_stream_to_default(stream_id))
+    request_id: Option<String>,
+) -> Result<OperationResponse<wavelinux_engine::CommandExecution>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "move_app_stream_to_default",
+        engine.engine.move_app_stream_to_default(stream_id),
+    )
 }
 
 #[tauri::command]
 fn set_app_stream_volume(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     stream_id: String,
     volume: f32,
-) -> Result<wavelinux_engine::CommandExecution, String> {
-    tauri_result(engine.engine.set_app_stream_volume(stream_id, volume))
+    request_id: Option<String>,
+) -> Result<OperationResponse<wavelinux_engine::CommandExecution>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_app_stream_volume",
+        engine.engine.set_app_stream_volume(stream_id, volume),
+    )
 }
 
 #[tauri::command]
 fn set_app_stream_mute(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     stream_id: String,
     muted: bool,
-) -> Result<wavelinux_engine::CommandExecution, String> {
-    tauri_result(engine.engine.set_app_stream_mute(stream_id, muted))
+    request_id: Option<String>,
+) -> Result<OperationResponse<wavelinux_engine::CommandExecution>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_app_stream_mute",
+        engine.engine.set_app_stream_mute(stream_id, muted),
+    )
 }
 
 #[tauri::command]
 fn set_effect_chain(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     effects: Vec<EffectInstance>,
-) -> Result<Channel, String> {
-    tauri_result(engine.engine.set_effect_chain(channel_id, effects))
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_effect_chain",
+        engine.engine.set_effect_chain(channel_id, effects),
+    )
 }
 
 #[tauri::command]
 fn set_effect_param(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     instance_id: String,
     param_id: String,
     value: f32,
-) -> Result<Channel, String> {
-    tauri_result(
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_effect_param",
         engine
             .engine
             .set_effect_param(channel_id, instance_id, param_id, value),
@@ -1884,15 +2220,40 @@ fn set_effect_param(
 
 #[tauri::command]
 fn bypass_effect(
+    app: AppHandle,
     engine: State<'_, EngineState>,
     channel_id: String,
     instance_id: String,
     bypassed: bool,
-) -> Result<Channel, String> {
-    tauri_result(
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "bypass_effect",
         engine
             .engine
             .bypass_effect(channel_id, instance_id, bypassed),
+    )
+}
+
+#[tauri::command]
+fn set_channel_effects_enabled(
+    app: AppHandle,
+    engine: State<'_, EngineState>,
+    channel_id: String,
+    enabled: bool,
+    request_id: Option<String>,
+) -> Result<OperationResponse<Channel>, String> {
+    operation_result(
+        &app,
+        &engine,
+        request_id,
+        "set_channel_effects_enabled",
+        engine
+            .engine
+            .set_channel_effects_enabled(channel_id, enabled),
     )
 }
 
@@ -2159,125 +2520,65 @@ fn open_release_page(
         .map_err(|err| err.to_string())
 }
 
-#[tauri::command]
-fn install_effect_plugins(
-    engine: State<'_, EngineState>,
-) -> Result<EffectPluginInstallResult, String> {
-    let before = engine
-        .engine
-        .refresh_effect_availability()
-        .map_err(|err| err.to_string())?;
-    let missing_before = missing_effect_names(&before);
-    if missing_before.is_empty() {
-        return Ok(EffectPluginInstallResult {
-            attempted: false,
-            success: true,
-            manager: detect_package_manager().id().into(),
-            packages: Vec::new(),
-            aur_packages: Vec::new(),
-            missing_before,
-            missing_after: Vec::new(),
-            stdout: String::new(),
-            stderr: String::new(),
-            message: "All effect plugins are already installed and detected".into(),
-        });
-    }
-
-    let missing_ids = missing_effect_ids(&before);
-    let manager = detect_package_manager();
-    if manager == PackageManager::Unknown {
-        return Ok(EffectPluginInstallResult {
-            attempted: false,
-            success: false,
-            manager: manager.id().into(),
-            packages: Vec::new(),
-            aur_packages: Vec::new(),
-            missing_before,
-            missing_after: missing_effect_names(&before),
-            stdout: String::new(),
-            stderr: String::new(),
-            message: "No supported package manager was found. Install RNNoise and SWH LADSPA packages manually.".into(),
-        });
-    }
-
-    let (packages, aur_packages) = resolve_effect_plugin_packages(manager, &missing_ids);
-    if packages.is_empty() && aur_packages.is_empty() {
-        return Ok(EffectPluginInstallResult {
-            attempted: false,
-            success: false,
-            manager: manager.id().into(),
-            packages,
-            aur_packages,
-            missing_before,
-            missing_after: missing_effect_names(&before),
-            stdout: String::new(),
-            stderr: String::new(),
-            message: format!(
-                "No known installable packages were found for {}. Install the missing effect plugins manually.",
-                manager.id()
-            ),
-        });
-    }
-
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    let mut command_failed = None;
-
-    if !packages.is_empty() {
-        match install_system_packages(manager, &packages) {
-            Ok(output) => {
-                append_output(&mut stdout, &mut stderr, output);
-            }
-            Err(err) => {
-                command_failed = Some(err);
-            }
-        }
-    }
-
-    if command_failed.is_none() && !aur_packages.is_empty() {
-        match install_aur_packages(&aur_packages) {
-            Ok(output) => {
-                append_output(&mut stdout, &mut stderr, output);
-            }
-            Err(err) => {
-                command_failed = Some(err);
-            }
-        }
-    }
-
-    let after = engine
-        .engine
-        .refresh_effect_availability()
-        .map_err(|err| err.to_string())?;
-    let missing_after = missing_effect_names(&after);
-    let success = command_failed.is_none() && missing_after.is_empty();
-    let message = if let Some(err) = command_failed {
-        format!("Effect plugin install did not complete: {err}")
-    } else if missing_after.is_empty() {
-        "Effect plugins installed and detected. Repair audio if a running FX chain needs the new plugins.".into()
-    } else {
-        format!(
-            "Install finished, but WaveLinux still cannot verify: {}",
-            missing_after.join(", ")
-        )
-    };
-
-    Ok(EffectPluginInstallResult {
-        attempted: true,
-        success,
-        manager: manager.id().into(),
-        packages,
-        aur_packages,
-        missing_before,
-        missing_after,
-        stdout,
-        stderr,
-        message,
-    })
-}
-
 fn tauri_result<T>(result: Result<T, EngineError>) -> Result<T, String> {
     result.map_err(|err| err.to_string())
+}
+
+fn operation_result<T>(
+    app: &AppHandle,
+    engine: &EngineState,
+    request_id: Option<String>,
+    command: &'static str,
+    result: Result<T, EngineError>,
+) -> Result<OperationResponse<T>, String> {
+    let revision = engine.operation_revision.fetch_add(1, Ordering::AcqRel) + 1;
+    let request_id = request_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("backend-{revision}"));
+    let revisions = engine.engine.revisions();
+    match result {
+        Ok(value) => {
+            let event = OperationEvent {
+                protocol_version: OPERATION_PROTOCOL_VERSION,
+                revision,
+                request_id: request_id.clone(),
+                command,
+                status: "succeeded",
+                state_revision: revisions.state,
+                config_revision: revisions.config,
+                graph_revision: revisions.graph,
+                error: None,
+            };
+            let _ = app.emit(OPERATION_EVENT, event);
+            Ok(OperationResponse {
+                protocol_version: OPERATION_PROTOCOL_VERSION,
+                revision,
+                request_id,
+                command,
+                status: "succeeded",
+                state_revision: revisions.state,
+                config_revision: revisions.config,
+                graph_revision: revisions.graph,
+                value,
+            })
+        }
+        Err(err) => {
+            let error = err.to_string();
+            let event = OperationEvent {
+                protocol_version: OPERATION_PROTOCOL_VERSION,
+                revision,
+                request_id,
+                command,
+                status: "failed",
+                state_revision: revisions.state,
+                config_revision: revisions.config,
+                graph_revision: revisions.graph,
+                error: Some(error.clone()),
+            };
+            let _ = app.emit(OPERATION_EVENT, event);
+            Err(error)
+        }
+    }
 }
 
 fn ensure_elgato_wave_xlr_detected(engine: &WaveLinuxEngine) -> Result<(), String> {
@@ -2289,123 +2590,6 @@ fn ensure_elgato_wave_xlr_detected(engine: &WaveLinuxEngine) -> Result<(), Strin
         Ok(())
     } else {
         Err("Elgato Wave XLR controls are unavailable because no supported Elgato device is detected".into())
-    }
-}
-
-fn missing_effect_ids(availability: &[EffectAvailability]) -> Vec<String> {
-    availability
-        .iter()
-        .filter(|effect| !effect.available)
-        .map(|effect| effect.effect_id.clone())
-        .collect()
-}
-
-fn missing_effect_names(availability: &[EffectAvailability]) -> Vec<String> {
-    let catalog = EffectCatalog::default();
-    availability
-        .iter()
-        .filter(|effect| !effect.available)
-        .map(|effect| {
-            catalog
-                .effects
-                .iter()
-                .find(|definition| definition.id == effect.effect_id)
-                .map(|definition| definition.name.clone())
-                .unwrap_or_else(|| effect.effect_id.clone())
-        })
-        .collect()
-}
-
-fn resolve_effect_plugin_packages(
-    manager: PackageManager,
-    missing_ids: &[String],
-) -> (Vec<String>, Vec<String>) {
-    let mut packages = Vec::new();
-    let mut aur_packages = Vec::new();
-
-    if missing_ids.iter().any(|id| id == "rnnoise") {
-        match manager {
-            PackageManager::Apt => {
-                push_first_available_package(
-                    manager,
-                    &mut packages,
-                    &["librnnoise-ladspa", "noise-suppression-for-voice"],
-                );
-            }
-            PackageManager::Dnf => {
-                push_first_available_package(
-                    manager,
-                    &mut packages,
-                    &["noise-suppression-for-voice", "rnnoise"],
-                );
-            }
-            PackageManager::Pacman => {
-                push_first_available_package(
-                    manager,
-                    &mut packages,
-                    &["noise-suppression-for-voice"],
-                );
-                if packages
-                    .iter()
-                    .all(|package| package != "noise-suppression-for-voice")
-                {
-                    push_first_available_aur_package(
-                        &mut aur_packages,
-                        &["noise-suppression-for-voice"],
-                    );
-                }
-            }
-            PackageManager::Zypper => {
-                push_first_available_package(manager, &mut packages, &["rnnoise"]);
-            }
-            PackageManager::Unknown => {}
-        }
-    }
-
-    if missing_ids
-        .iter()
-        .any(|id| matches!(id.as_str(), "compressor" | "gate" | "limiter"))
-    {
-        match manager {
-            PackageManager::Apt => push_first_available_package(
-                manager,
-                &mut packages,
-                &["swh-plugins", "lsp-plugins-ladspa"],
-            ),
-            PackageManager::Dnf | PackageManager::Zypper => push_first_available_package(
-                manager,
-                &mut packages,
-                &["ladspa-swh-plugins", "lsp-plugins-ladspa"],
-            ),
-            PackageManager::Pacman => {
-                push_first_available_package(manager, &mut packages, &["swh-plugins"]);
-            }
-            PackageManager::Unknown => {}
-        }
-    }
-
-    (packages, aur_packages)
-}
-
-fn push_first_available_package(
-    manager: PackageManager,
-    packages: &mut Vec<String>,
-    candidates: &[&str],
-) {
-    if let Some(package) = candidates
-        .iter()
-        .find(|package| package_available(manager, package))
-    {
-        push_unique(packages, package);
-    }
-}
-
-fn push_first_available_aur_package(packages: &mut Vec<String>, candidates: &[&str]) {
-    if let Some(package) = candidates
-        .iter()
-        .find(|package| aur_package_available(package))
-    {
-        push_unique(packages, package);
     }
 }
 
@@ -2525,17 +2709,6 @@ fn install_command_for_user(manager: PackageManager, packages: &[String]) -> Str
     }
 }
 
-fn install_aur_command_for_user(packages: &[String]) -> String {
-    let package_list = packages.join(" ");
-    if command_exists("paru") {
-        format!("paru -S --needed {package_list}")
-    } else if command_exists("yay") {
-        format!("yay -S --needed {package_list}")
-    } else {
-        format!("install manually from AUR: {package_list}")
-    }
-}
-
 fn package_available(manager: PackageManager, package: &str) -> bool {
     let (program, args): (&str, Vec<&str>) = match manager {
         PackageManager::Apt => ("apt-cache", vec!["show", package]),
@@ -2548,16 +2721,6 @@ fn package_available(manager: PackageManager, package: &str) -> bool {
         PackageManager::Unknown => return false,
     };
     command_status_success(program, &args)
-}
-
-fn aur_package_available(package: &str) -> bool {
-    if command_exists("paru") {
-        command_status_success("paru", &["-Si", package])
-    } else if command_exists("yay") {
-        command_status_success("yay", &["-Si", package])
-    } else {
-        false
-    }
 }
 
 fn install_system_packages(
@@ -2594,20 +2757,6 @@ fn install_system_packages(
         PackageManager::Unknown => {}
     }
     Ok(outputs)
-}
-
-fn install_aur_packages(packages: &[String]) -> Result<Vec<Output>, String> {
-    let helper = if command_exists("paru") {
-        "paru"
-    } else if command_exists("yay") {
-        "yay"
-    } else {
-        return Err("No AUR helper found. Install paru or yay, or install the listed effect plugin packages manually.".into());
-    };
-
-    let mut args = vec!["-S".into(), "--needed".into(), "--noconfirm".into()];
-    args.extend(packages.iter().cloned());
-    Ok(vec![run_command_capture(helper, &args)?])
 }
 
 fn run_privileged_command(program: &str, args: &[String]) -> Result<Output, String> {
@@ -2713,13 +2862,6 @@ fn running_as_root() -> bool {
 
 fn stdin_is_terminal() -> bool {
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
-}
-
-fn append_output(stdout: &mut String, stderr: &mut String, outputs: Vec<Output>) {
-    for output in outputs {
-        stdout.push_str(&String::from_utf8_lossy(&output.stdout));
-        stderr.push_str(&String::from_utf8_lossy(&output.stderr));
-    }
 }
 
 fn ui_theme_preference_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2864,18 +3006,19 @@ fn current_update_version() -> semver::Version {
         .expect("package version is valid semver")
 }
 
-fn is_wavelinux5_build() -> bool {
-    env!("CARGO_PKG_VERSION").starts_with("5.")
+fn is_wavelinux6_build() -> bool {
+    env!("CARGO_PKG_VERSION").starts_with("6.")
 }
 
-fn apply_wavelinux5_env() {
-    if !is_wavelinux5_build() {
+fn apply_wavelinux6_env() {
+    if !is_wavelinux6_build() {
         return;
     }
-    set_env_default("WAVELINUX_XDG_APP_NAME", "WaveLinux5");
-    set_env_default("WAVELINUX_GRAPH_PREFIX", "wavelinux5");
-    set_env_default("WAVELINUX_GRAPH_PROPERTY_PREFIX", "wavelinux5");
-    set_env_default("WAVELINUX_APP_DISPLAY_NAME", "WaveLinux5");
+    set_env_default(TOKIO_WORKER_THREADS_ENV, DEFAULT_TOKIO_WORKER_THREADS);
+    set_env_default("WAVELINUX_XDG_APP_NAME", "WaveLinux6");
+    set_env_default("WAVELINUX_GRAPH_PREFIX", "wavelinux6");
+    set_env_default("WAVELINUX_GRAPH_PROPERTY_PREFIX", "wavelinux6");
+    set_env_default("WAVELINUX_APP_DISPLAY_NAME", "WaveLinux 6");
 }
 
 fn release_tag_update_version(tag: &str) -> Option<semver::Version> {
@@ -2956,17 +3099,38 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn acquire_process_lock() -> std::io::Result<Option<ProcessLock>> {
-    let lock_dir = std::env::var_os("XDG_RUNTIME_DIR")
+fn process_runtime_base_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let lock_path = lock_dir.join(format!("{}-5.lock", graph_prefix()));
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("wavelinux-{}", unsafe { libc::geteuid() }))
+        })
+}
+
+fn process_lock_path_for(runtime_base: &Path, prefix: &str) -> PathBuf {
+    runtime_base.join(prefix).join("app.lock")
+}
+
+fn ensure_private_runtime_dir(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn acquire_process_lock() -> std::io::Result<Option<ProcessLock>> {
+    let lock_path = process_lock_path_for(&process_runtime_base_dir(), &graph_prefix());
+    if let Some(lock_dir) = lock_path.parent() {
+        ensure_private_runtime_dir(lock_dir)?;
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(&lock_path)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result != 0 {
         let error = std::io::Error::last_os_error();
@@ -3057,11 +3221,155 @@ fn print_hardware_profile_prewarm_report(report: &HardwareProfilePrewarmReport) 
     }
 }
 
+fn spawn_ui_event_bridge(
+    app: AppHandle,
+    engine: Arc<WaveLinuxEngine>,
+    meter_streaming: Arc<AtomicBool>,
+) -> Vec<thread::JoinHandle<()>> {
+    let state_app = app.clone();
+    let state_engine = Arc::clone(&engine);
+    let state_worker = thread::Builder::new()
+        .name("wavelinux6-state-events".into())
+        .spawn(move || {
+            let Ok(mut previous) = state_engine.cached_state_snapshot() else {
+                return;
+            };
+            let mut revisions = state_engine.revisions();
+            while !state_engine.is_stopping() {
+                let next_revisions = state_engine.wait_for_change(revisions.state, UI_EVENT_WAIT);
+                if next_revisions.state == revisions.state {
+                    continue;
+                }
+                let Ok(next) = state_engine.cached_state_snapshot() else {
+                    revisions = next_revisions;
+                    continue;
+                };
+                let mut previous_graph = previous.graph.clone();
+                let mut next_graph = next.graph.clone();
+                previous_graph.meters.clear();
+                next_graph.meters.clear();
+                let event = StateDeltaEvent {
+                    revision: next_revisions.state,
+                    config_revision: next_revisions.config,
+                    graph_revision: next_revisions.graph,
+                    config: (next.config != previous.config).then(|| next.config.clone()),
+                    graph: (next_graph != previous_graph).then_some(next_graph),
+                    diagnostics: (next.diagnostics != previous.diagnostics)
+                        .then(|| next.diagnostics.clone()),
+                    engine: (next.engine != previous.engine).then(|| next.engine.clone()),
+                    catalog: (next.catalog != previous.catalog).then(|| next.catalog.clone()),
+                };
+                // Emit revision-only events as well. They let optimistic UI
+                // mutations prove that the backend revision was observed
+                // without paying for a redundant full-state snapshot.
+                let _ = state_app.emit(STATE_DELTA_EVENT, &event);
+                previous = next;
+                revisions = next_revisions;
+            }
+        })
+        .expect("failed to start WaveLinux state event bridge");
+
+    let meter_worker = thread::Builder::new()
+        .name("wavelinux6-meter-events".into())
+        .spawn(move || {
+            let mut revision = 0_u64;
+            let mut previous = Vec::new();
+            let mut stream = None;
+            let mut next_connect_at = Instant::now();
+            let mut next_fallback_at = Instant::now();
+            while !engine.is_stopping() {
+                let enabled = meter_streaming.load(Ordering::Acquire);
+                if !enabled {
+                    if stream.take().is_some() {
+                        engine.close_meter_stream();
+                    }
+                    if meter_event_changed(&previous, &[]) {
+                        revision = revision.saturating_add(1);
+                        let event = MetersEvent {
+                            revision,
+                            meters: Vec::new(),
+                        };
+                        let _ = app.emit(METERS_EVENT, &event);
+                        previous.clear();
+                    }
+                    thread::sleep(IDLE_METER_INTERVAL);
+                    continue;
+                }
+
+                let now = Instant::now();
+                if stream.is_none() && now >= next_connect_at {
+                    match engine.open_meter_stream() {
+                        Ok(client) => stream = Some(client),
+                        Err(_) => next_connect_at = now + METER_RECONNECT_INTERVAL,
+                    }
+                }
+
+                let meters = if let Some(client) = stream.as_mut() {
+                    match engine.read_meter_stream(client) {
+                        Ok(meters) => Some(meters),
+                        Err(_) => {
+                            stream = None;
+                            next_connect_at = Instant::now() + METER_RECONNECT_INTERVAL;
+                            None
+                        }
+                    }
+                } else if now >= next_fallback_at {
+                    engine.record_meter_fallback_poll();
+                    next_fallback_at = now + METER_FALLBACK_INTERVAL;
+                    Some(engine.observe_meters().unwrap_or_default())
+                } else {
+                    None
+                };
+                let Some(meters) = meters else {
+                    thread::sleep(Duration::from_millis(25));
+                    continue;
+                };
+                if meter_event_changed(&previous, &meters) {
+                    revision = revision.saturating_add(1);
+                    let event = MetersEvent {
+                        revision,
+                        meters: meters.clone(),
+                    };
+                    let _ = app.emit(METERS_EVENT, &event);
+                    previous = meters;
+                }
+            }
+            if stream.is_some() {
+                engine.close_meter_stream();
+            }
+        })
+        .expect("failed to start WaveLinux meter event bridge");
+
+    vec![state_worker, meter_worker]
+}
+
+fn meter_event_changed(previous: &[LevelMeter], next: &[LevelMeter]) -> bool {
+    previous.len() != next.len()
+        || previous.iter().zip(next).any(|(left, right)| {
+            left.node_id != right.node_id
+                || meter_value_changed(left.peak_left, right.peak_left)
+                || meter_value_changed(left.peak_right, right.peak_right)
+        })
+}
+
+fn meter_value_changed(previous: f32, next: f32) -> bool {
+    !previous.is_finite()
+        || !next.is_finite()
+        || (previous == 0.0) != (next == 0.0)
+        || (previous - next).abs() >= METER_EVENT_MIN_DELTA
+}
+
 fn main() {
-    apply_wavelinux5_env();
+    apply_wavelinux6_env();
+    install_process_panic_hook();
     prepare_appimage_bundled_runtime();
 
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|arg| arg == "--probe-binary") {
+        println!("WaveLinux 6 {} binary probe: ok", env!("CARGO_PKG_VERSION"));
+        return;
+    }
 
     if args.iter().any(|arg| {
         matches!(
@@ -3098,6 +3406,10 @@ fn main() {
     let shutdown_started = Arc::new(AtomicBool::new(false));
     let allow_exit = Arc::new(AtomicBool::new(false));
     let run_allow_exit = Arc::clone(&allow_exit);
+    let meter_streaming_requested = Arc::new(AtomicBool::new(false));
+    let meter_streaming = Arc::new(AtomicBool::new(false));
+    let meter_streaming_requested_for_window_events = Arc::clone(&meter_streaming_requested);
+    let meter_streaming_for_window_events = Arc::clone(&meter_streaming);
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -3110,6 +3422,7 @@ fn main() {
             get_state,
             observe_state,
             observe_meters,
+            set_meter_streaming,
             create_mix,
             rename_mix,
             move_mix,
@@ -3164,6 +3477,7 @@ fn main() {
             set_effect_chain,
             set_effect_param,
             bypass_effect,
+            set_channel_effects_enabled,
             run_sound_check,
             run_diagnostics,
             get_graph_debug_report,
@@ -3176,13 +3490,24 @@ fn main() {
             check_for_updates,
             install_update,
             open_release_page,
-            install_effect_plugins,
         ])
-        .on_window_event(move |window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(move |window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                meter_streaming_for_window_events.store(false, Ordering::Release);
                 api.prevent_close();
                 let _ = window.hide();
             }
+            tauri::WindowEvent::Focused(true) | tauri::WindowEvent::Resized(_) => {
+                let requested = meter_streaming_requested_for_window_events.load(Ordering::Acquire);
+                let visible = window.is_visible().unwrap_or(true);
+                let minimized = window.is_minimized().unwrap_or(false);
+                meter_streaming_for_window_events
+                    .store(requested && visible && !minimized, Ordering::Release);
+            }
+            tauri::WindowEvent::Destroyed => {
+                meter_streaming_for_window_events.store(false, Ordering::Release);
+            }
+            _ => {}
         })
         .build(tauri::generate_context!())
         .expect("error while building WaveLinux");
@@ -3201,11 +3526,18 @@ fn main() {
     let engine = WaveLinuxEngine::from_xdg_for_app_version(&app_log_version)
         .expect("failed to start WaveLinux engine");
     let background = engine.spawn_background();
-    let streamer_runtime = streamer_devices::StreamerDeviceRuntime::start(Arc::clone(&engine));
+    let streamer_runtime = Arc::new(streamer_devices::StreamerRuntimeController::default());
+    streamer_runtime
+        .sync(Arc::clone(&engine))
+        .expect("failed to initialize streamer device runtime");
     let run_engine = Arc::clone(&engine);
     let run_shutdown = Arc::clone(&shutdown_started);
     app.manage(EngineState {
         engine: Arc::clone(&engine),
+        meter_streaming_requested,
+        meter_streaming: Arc::clone(&meter_streaming),
+        operation_revision: AtomicU64::new(0),
+        streamer_runtime: Arc::clone(&streamer_runtime),
     });
     build_tray(
         app.handle(),
@@ -3214,6 +3546,8 @@ fn main() {
         Arc::clone(&allow_exit),
     )
     .expect("failed to build WaveLinux tray");
+    let ui_event_workers =
+        spawn_ui_event_bridge(app.handle().clone(), Arc::clone(&engine), meter_streaming);
 
     app.run(move |_app, event| match event {
         tauri::RunEvent::ExitRequested { api, .. } if !run_allow_exit.load(Ordering::SeqCst) => {
@@ -3225,15 +3559,120 @@ fn main() {
         _ => {}
     });
 
-    drop(streamer_runtime);
+    streamer_runtime.stop();
     engine.stop_background();
     let _ = background.join();
+    for worker in ui_event_workers {
+        let _ = worker.join();
+    }
     let _ = engine.cleanup_audio_graph();
+}
+
+fn install_process_panic_hook() {
+    std::panic::set_hook(Box::new(|panic| {
+        let thread = thread::current();
+        let thread_name = thread.name().unwrap_or("unnamed");
+        let payload = panic
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        let location = panic
+            .location()
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let record = format!(
+            "process=wavelinux6 pid={} thread={} location={} payload={} backtrace=\n{}\n",
+            std::process::id(),
+            thread_name,
+            location,
+            payload,
+            Backtrace::force_capture(),
+        );
+        eprintln!("wavelinux6-crash {record}");
+        let config_root = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+        if let Some(config_root) = config_root {
+            let directory = config_root.join(graph_prefix());
+            if fs::create_dir_all(&directory).is_ok() {
+                if let Ok(mut file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(directory.join("wavelinux-crash.log"))
+                {
+                    let _ = file.write_all(record.as_bytes());
+                    let _ = file.sync_data();
+                }
+            }
+        }
+    }));
 }
 
 #[cfg(test)]
 mod updater_tests {
     use super::*;
+
+    #[test]
+    fn process_lock_uses_versioned_runtime_namespace() {
+        let lock_path = process_lock_path_for(Path::new("/run/user/1000"), "wavelinux6");
+        assert_eq!(
+            lock_path,
+            PathBuf::from("/run/user/1000/wavelinux6/app.lock")
+        );
+        assert!(!lock_path.to_string_lossy().contains("-5.lock"));
+    }
+
+    #[test]
+    fn meter_events_coalesce_sub_visual_changes() {
+        let previous = vec![LevelMeter {
+            node_id: "hardware_in".into(),
+            peak_left: 0.2,
+            peak_right: 0.2,
+        }];
+        let mut next = previous.clone();
+        next[0].peak_left += METER_EVENT_MIN_DELTA * 0.5;
+        assert!(!meter_event_changed(&previous, &next));
+
+        next[0].peak_left += METER_EVENT_MIN_DELTA;
+        assert!(meter_event_changed(&previous, &next));
+    }
+
+    #[test]
+    fn meter_events_always_publish_zero_transitions() {
+        let previous = vec![LevelMeter {
+            node_id: "hardware_in".into(),
+            peak_left: METER_EVENT_MIN_DELTA * 0.5,
+            peak_right: 0.0,
+        }];
+        let next = vec![LevelMeter {
+            node_id: "hardware_in".into(),
+            peak_left: 0.0,
+            peak_right: 0.0,
+        }];
+        assert!(meter_event_changed(&previous, &next));
+    }
+
+    #[test]
+    fn main_window_can_subscribe_to_backend_events() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/main.json")).unwrap();
+        let permissions = capability["permissions"].as_array().unwrap();
+        for required in ["core:event:allow-listen", "core:event:allow-unlisten"] {
+            assert!(
+                permissions.iter().any(|permission| permission == required),
+                "missing {required} from the main-window capability"
+            );
+        }
+    }
 
     #[test]
     fn release_urls_follow_selected_channel() {

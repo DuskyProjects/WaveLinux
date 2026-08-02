@@ -1,40 +1,37 @@
-# WaveLinux Setup and Development
+# WaveLinux 6 Setup And Development
 
-This page collects the operational details that do not need to live on the
-front README.
+WaveLinux 6 targets PipeWire desktop sessions. The app can start missing user
+services, but it cannot replace missing host libraries or a distro configured
+for PulseAudio without PipeWire compatibility.
 
-For the engine, effect-routing, logging, and AppImage packaging design, see
-[Architecture notes](architecture.md).
+## Host Requirements
 
-## Install From A Release
+Required runtime pieces are:
 
-Download the latest release artifact:
+- PipeWire, `pipewire-pulse`, and WirePlumber;
+- `pactl`, `wpctl`, `pw-cli`, `pw-dump`, `pw-metadata`, and `pw-top`;
+- ALSA tools for legacy-device discovery;
+- GTK/WebKitGTK, portals, fonts, and graphics libraries required by Tauri;
+- RNNoise, supplied by the WaveLinux release/runtime bundle.
 
-```text
-https://github.com/DuskyProjects/WaveLinux/releases/latest
+Check the current host without changing it:
+
+```bash
+yarn deps:check
 ```
 
-Available formats:
+Request package installation through the supported distro helper:
 
-- AppImage: portable desktop build and primary self-update format.
-- deb: Debian and Ubuntu-family package.
-- rpm: Fedora/openSUSE-family package.
-- AUR metadata: Arch package recipe.
+```bash
+yarn deps:install
+```
 
-AppImage releases bundle WebKitGTK/GTK, GStreamer media support, WebKit sandbox
-helpers, libusb for optional Elgato controls, and supported LADSPA effect
-plugins present on the release builder. First launch still checks host-bound
-pieces such as PipeWire, desktop display/GL libraries, fonts, portals, and
-distro-provided effect packages.
+Package installation is an explicit privileged action. Standard WaveLinux
+effects are user-installed with the app and must not require `sudo`.
 
-PipeWire is intentionally host-bound for AppImage builds. Release packaging
-must not bundle `libpipewire-0.3.so*`, the GStreamer PipeWire plugin, or partial
-`pipewire-0.3`/`spa-0.2` module trees because version-mismatched client
-libraries can prevent live meters from creating PipeWire streams.
+## Build And Install
 
-## Local Install
-
-From a checkout:
+Install JavaScript dependencies and build the local AppImage:
 
 ```bash
 yarn install
@@ -42,239 +39,182 @@ yarn desktop:build
 yarn install:local
 ```
 
-The local installer places the AppImage and launcher here:
+`yarn desktop:build` is a host-native development build. Before sharing an
+artifact, use the pinned Debian builder instead:
 
 ```bash
-~/.local/share/wavelinux/WaveLinux_*_amd64.AppImage
-~/.local/bin/wavelinux
+WAVELINUX_REBUILD_PORTABLE_IMAGE=1 bash scripts/build-portable.sh
 ```
 
-It also installs the desktop entry and icons under the usual XDG user paths and
-seeds local hardware profiles into:
+The portable build uses Podman when available, otherwise Docker. Outputs remain
+under `target/portable/release`; after all package and glibc checks pass, the
+script promotes the packages to `target/release` and stages the exact files used
+by distro smoke tests under `target/release/smoke-assets`.
+
+The installer replaces local WaveLinux5 and installs:
+
+```text
+~/.local/bin/wavelinux6
+~/.local/bin/wavelinux6-audio-core
+~/.local/share/wavelinux6/WaveLinux6_<version>_amd64.AppImage
+~/.local/share/applications/wavelinux6.desktop
+~/.config/wavelinux6/config.json
+```
+
+Start it from the desktop menu or:
 
 ```bash
-~/.config/wavelinux/hardware-profiles/v1/local/wavelinux-local-seed
+wavelinux6
 ```
 
-WaveLinux5 installs side-by-side instead:
+The installer stops WaveLinux5/6 app and helper processes and unloads only
+WaveLinux-owned modules. It must never match unrelated PipeWire processes.
+
+Uninstall the local development build with:
 
 ```bash
-~/.local/share/wavelinux5/WaveLinux5_5.0.0_amd64.AppImage
-~/.local/bin/wavelinux5
-~/.config/wavelinux5/hardware-profiles/v1/local/wavelinux5-local-seed
+yarn uninstall:local
 ```
 
-## Runtime Checks
+## First Launch And Migration
 
-Check runtime dependencies and effect plugins:
+If no WaveLinux 6 config exists, startup can import WaveLinux5 schema data,
+normalize it to schema 14, rewrite owned node names to `wavelinux6`, and clear
+transient route ids. WaveLinux5 config and installation artifacts are removed
+after the new graph validates. There is no long-lived migration backup.
+
+DeepFilterNet effect entries migrate to RNNoise. DeepFilterNet packages or
+models are not downloaded.
+
+## AppImage Runtime Preflight
+
+Check a built AppImage directly:
 
 ```bash
-yarn deps:check
+APPIMAGE_EXTRACT_AND_RUN=1 \
+  target/release/bundle/appimage/WaveLinux6_6.0.0-alpha.1_amd64.AppImage \
+  --check-runtime-dependencies
 ```
 
-Install missing runtime dependencies and effect packages when a supported
-package manager is available:
+Request host package installation:
 
 ```bash
-yarn deps:install
+APPIMAGE_EXTRACT_AND_RUN=1 \
+  target/release/bundle/appimage/WaveLinux6_6.0.0-alpha.1_amd64.AppImage \
+  --install-runtime-dependencies
 ```
 
-Install only effect packages:
+Startup probes `pactl info`. If the user audio stack is stopped, the launcher
+tries PipeWire/Pulse/WirePlumber user services, then a non-systemd fallback. Set
+`WAVELINUX_SKIP_AUDIO_SERVICE_START=1` only when another supervisor owns those
+services.
+
+AppImages must not bundle `libpipewire-0.3`, the GStreamer PipeWire plugin, a
+partial `pipewire-0.3`/`spa-0.2` tree, or `libwayland*.so`. PipeWire and
+Wayland/EGL must use a matching host stack. Run:
 
 ```bash
-yarn effects:install
+bash scripts/sanitize-appimage-pipewire.sh --check <AppImage-or-AppDir>
+bash scripts/sanitize-appimage-wayland.sh --check <AppImage-or-AppDir>
 ```
 
-Run AppImage preflight manually:
+## ALSA-Only Applications
 
-```bash
-./WaveLinux_4.3.7_amd64.AppImage --check-runtime-dependencies
-./WaveLinux_4.3.7_amd64.AppImage --install-runtime-dependencies
-```
+PipeWire/Pulse applications should select `wavelinux6-mic` or
+`wavelinux6_mix_stream_source`. The local installer also maintains a marked,
+user-owned block in `~/.asoundrc` for ALSA-only applications.
 
-The runtime check reports the host PipeWire client stack and fails if an
-AppImage is shadowing it with bundled PipeWire libraries or modules.
-
-AppImage startup also probes `pactl info` before the UI opens. If packages are
-installed but the user audio stack is not running, WaveLinux tries to start
-`pipewire`, `pipewire-pulse`, and `wireplumber` through `systemctl --user`; on
-non-systemd sessions it falls back to launching those daemons directly. Set
-`WAVELINUX_SKIP_AUDIO_SERVICE_START=1` to disable this startup recovery.
-
-Use `WAVELINUX_SKIP_RUNTIME_INSTALL=1` to skip the AppImage preflight, or
-`WAVELINUX_ASSUME_RUNTIME_DEPS=1` when a packager has already provided all host
-runtime dependencies.
-
-## ALSA-Only Apps
-
-Most apps should see WaveLinux devices through PipeWire/PulseAudio. WaveLinux5
-also installs user-scoped ALSA aliases during local install so legacy capture
-tools can discover the test-line virtual sources through ALSA.
-
-To refresh the aliases manually:
+Refresh it with:
 
 ```bash
 yarn install:alsa-aliases
 ```
 
-This uses a marked block in `~/.asoundrc` so uninstall can remove only
-WaveLinux-owned aliases. For WaveLinux5, Audacity's ALSA host should then show
-entries such as `wavelinux5_mic`, `wavelinux5_mix_stream`,
-`wavelinux5_mix_monitor`, and `wavelinux5_channel_hardware_in`.
+Typical ALSA aliases are `wavelinux6_mic`, `wavelinux6_mix_stream`, and
+`wavelinux6_mix_monitor`. Prefer the PipeWire or Pulse host in Audacity when it
+is available; ALSA aliases are compatibility paths.
 
 ## Hardware Profiles
 
-Profile resolution prefers the safest local data first:
+Profile resolution prefers:
 
-- Local user profiles in `~/.config/wavelinux/hardware-profiles/v1/local`.
-- Remote profiles cached from the GitHub repo profile feed.
-- The editable safe generic default profile, `default.generic-audio`.
+1. user overrides under `~/.config/wavelinux6/hardware-profiles/v1/local`;
+2. signed cached catalog entries;
+3. profiles embedded from `profiles/v1/devices` at compile time;
+4. the safe generic profile.
 
-The Settings page includes Profiles under its tab bar. Editing a downloaded or
-seeded profile creates a safe local override under:
+See [profiles.md](profiles.md) for runtime behavior and
+[profiles/v1/README.md](../profiles/v1/README.md) before changing match rules,
+port availability policy, or device ranking.
 
-```bash
-~/.config/wavelinux/hardware-profiles/v1/local/wavelinux-user-overrides
-```
+## Development Commands
 
-For profile authoring, see [profiles/v1/README.md](../profiles/v1/README.md).
-
-## Elgato Controls
-
-When WaveLinux detects an Elgato audio device, Settings shows an Elgato tab.
-Wave XLR hardware controls are available there for microphone gain, mute,
-headphone volume, and low-impedance mode. The libusb control path is loaded only
-after a supported Wave XLR is detected.
-
-For zero-latency self monitoring on a Wave XLR, enable Hardware direct mic
-monitor in Settings > Sync and listen through the Wave XLR headphone output.
-
-## Streamer Device Bindings
-
-When WaveLinux detects supported streamer hardware, Settings shows a Streamers
-tab. Device discovery uses Linux sysfs, hidraw, PipeWire, and ALSA sequencer
-inspection first; WaveLinux only keeps hidraw devices open or starts `aseqdump`
-MIDI capture when a detected device has enabled bindings.
-
-Bindings can target mixer mute and volume controls, source-to-mix controls, and
-the safer stale-audio prune action.
-
-Packaged installs may include:
-
-```text
-packaging/udev/70-wavelinux-streamer-devices.rules
-```
-
-After installing udev rules manually, reload rules with your distribution's
-standard `udevadm control --reload-rules && udevadm trigger` flow and reconnect
-the device.
-
-## Testing Health Reports
-
-For beta testing and GitHub issues, use Settings > Health > Testing Health
-Report. It creates one copyable Markdown block with engine state, update
-channel/feed/status, diagnostics, audio device summaries, Elgato detection,
-streamer-device detection, and recent debug-log lines.
-
-## Development
-
-Install dependencies:
-
-```bash
-yarn install
-```
-
-Run the desktop app:
+Run the Tauri desktop in development mode:
 
 ```bash
 yarn dev
 ```
 
-Run the browser-only UI preview:
+Run only the web UI:
 
 ```bash
 yarn web:dev
 ```
 
-Dry-run audio graph commands without changing PipeWire:
+Render graph commands without mutating the host:
 
 ```bash
 WAVELINUX_DRY_RUN=1 yarn dev
 ```
 
-Run all safe checks:
+Run the safe validation suite:
 
 ```bash
 yarn test:all
 ```
 
-Run live PipeWire integration tests only when you are ready for the test suite
-to create, route, and clean up real audio nodes:
+Run live graph tests only in a disposable or explicitly prepared user audio
+session:
 
 ```bash
-WAVELINUX_RUN_LIVE_TESTS=1 cargo test -p wavelinux-engine -- --ignored --test-threads=1
+WAVELINUX_RUN_LIVE_TESTS=1 bash scripts/test-all.sh
 ```
 
-## Build And Release
+## Runtime Overrides
 
-Build web UI only:
+These are developer diagnostics, not normal user settings:
 
-```bash
-yarn web:build
+```text
+WAVELINUX_AUDIO_RUNTIME=pipewire_filter_chain|dsp_cpu|dsp_auto|dsp_accelerated
+WAVELINUX_DSP_PROVIDER=auto|cuda|openvino|migraphx|cpu
+WAVELINUX_DRY_RUN=1
+WAVELINUX_SKIP_AUDIO_SERVICE_START=1
 ```
 
-Build local desktop bundles:
+Provider probes do not activate production GPU processing. Keep the CPU path
+unless an isolated provider pack has passed workload qualification.
 
-```bash
-yarn desktop:build
-```
+## Build Pipeline
 
-The local and release build scripts sanitize the generated AppDir, rebuild the
-AppImage, and reject artifacts that contain bundled PipeWire client libraries,
-PipeWire GStreamer plugins, or partial SPA/PipeWire module trees.
+`yarn desktop:build` runs `scripts/build-local.sh`, which:
 
-If Tauri's cached linuxdeploy AppImage fails while stripping newer ELF sections,
-`scripts/build-local.sh` retries with
-`scripts/rebuild-appimage-with-host-strip.sh`. That fallback extracts
-linuxdeploy, replaces the embedded `strip` with the host `strip`, and reruns the
-GTK/GStreamer plugin pass before `scripts/finalize-appimage.sh` rebuilds the
-sanitized AppImage. For the full packaging flow, see
-[Architecture notes](architecture.md#appimage-packaging).
+1. builds `wavelinux6-audio-core` in release mode;
+2. stages the core and runtime libraries into the AppDir;
+3. runs the Tauri bundle build;
+4. retries linuxdeploy with host `strip` when required;
+5. removes host-incompatible PipeWire artifacts;
+6. rebuilds and verifies the final AppImage.
 
-Regenerate and stage AUR files:
+`scripts/build-portable.sh` runs that pipeline inside
+`containers/release/Containerfile`, verifies every embedded WaveLinux ELF
+against the configured glibc ceiling (2.39 by default), and runs package-content
+checks before promotion. The AppImage keeps its bundled Fontconfig library and
+configuration on the same builder baseline. A process-local, user-runtime
+sysroot isolates parser rules while links retain host fonts and writable user
+caches, so newer distro rules cannot break startup or flood logs with warnings.
+`--probe-binary` is an early, display-free executable
+probe used by clean distro containers; it verifies that the actual packaged
+binary can load, rather than accepting metadata alone.
 
-```bash
-yarn aur:build
-```
-
-Build signed release bundles and updater signatures:
-
-```bash
-yarn release:key
-yarn desktop:release
-```
-
-The GitHub release workflow builds AppImage, deb, rpm, updater metadata, and AUR
-package files when a `v*` tag is pushed. Hardware profiles are fetched from
-`profiles/v1` in the repository instead of being uploaded as release assets.
-Stable tags publish only the matching section from `RELEASE_NOTES.md`, prune
-older GitHub release pages, and keep stable git tags for source history.
-Testing tags containing `testing`, `beta`, `pre`, or `rc` publish to the moving
-`prerelease` GitHub release instead of the stable `latest` release.
-
-Required GitHub Actions secrets:
-
-- `TAURI_SIGNING_PRIVATE_KEY`
-- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-
-## Project Layout
-
-- `crates/app`: Tauri desktop shell and IPC commands.
-- `crates/engine`: config, diagnostics, graph orchestration, and state.
-- `crates/model`: shared data model and migrations.
-- `crates/pw`: PipeWire/PulseAudio command planning, parsing, and DSP rendering.
-- `profiles/v1`: hardware profile schema, examples, author docs, and device seeds.
-- `src`: React/TypeScript UI.
-- `docs`: architecture, setup, testing, and theme authoring docs.
-- `scripts`: installers, release helpers, dependency checks, and validation.
-- `packaging/aur`: Arch/AUR package metadata.
+Use `APPIMAGE_EXTRACT_AND_RUN=1` when FUSE is unavailable. Publishing and signing
+are separate release steps; a local alpha build must not be pushed implicitly.

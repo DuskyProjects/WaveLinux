@@ -3,7 +3,10 @@
 
 if [[ -z "${BASH_VERSION:-}" ]]; then
   echo "sanitize-runtime-env.sh requires bash" >&2
-  return 2 2>/dev/null || exit 2
+  if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 2
+  fi
+  exit 2
 fi
 
 wavelinux_sanitize_runtime_env() {

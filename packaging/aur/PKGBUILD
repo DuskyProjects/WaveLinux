@@ -1,6 +1,6 @@
 # Maintainer: WaveLinux contributors <https://github.com/DuskyProjects/WaveLinux>
 pkgname=wavelinux
-pkgver=4.3.7
+pkgver=6.0.0
 pkgrel=1
 pkgdesc="Rust and PipeWire creator audio mixer for Linux"
 arch=('x86_64')
@@ -17,6 +17,17 @@ depends=(
   'gtk3'
   'libayatana-appindicator'
   'libusb'
+  'bubblewrap'
+  'xdg-dbus-proxy'
+  'xorg-xwayland'
+  'mesa'
+  'libglvnd'
+  'wayland'
+  'gstreamer'
+  'gst-plugins-base-libs'
+  'gst-plugins-good'
+  'noto-fonts'
+  'xdg-desktop-portal'
 )
 makedepends=(
   'git'
@@ -28,11 +39,6 @@ makedepends=(
   'librsvg'
   'patchelf'
 )
-optdepends=(
-  'swh-plugins: LADSPA compressor, gate, and limiter support'
-  'noise-suppression-for-voice: RNNoise LADSPA noise suppression'
-  'deepfilternet: DeepFilterNet noise suppression when packaged with LADSPA support'
-)
 source=("$pkgname-$pkgver.tar.gz::https://github.com/DuskyProjects/WaveLinux/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
@@ -41,7 +47,8 @@ build() {
   yarn install --frozen-lockfile
   node node_modules/.bin/tsc --noEmit
   node node_modules/.bin/vite build
-  cargo build --release --locked -p wavelinux-app
+  cargo build --release --locked -p wavelinux-app --bin wavelinux6
+  cargo build --release --locked -p wavelinux-dsp --bin wavelinux6-audio-core
 }
 
 check() {
@@ -51,21 +58,24 @@ check() {
 
 package() {
   cd "WaveLinux-$pkgver"
-  install -Dm755 target/release/wavelinux-app "$pkgdir/usr/bin/wavelinux"
-  install -Dm644 crates/app/icons/icon.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/wavelinux.png"
-  install -Dm644 crates/app/icons/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/wavelinux.svg"
+  install -Dm755 target/release/wavelinux6 "$pkgdir/usr/bin/wavelinux6"
+  install -Dm755 target/release/wavelinux6-audio-core "$pkgdir/usr/bin/wavelinux6-audio-core"
+  install -Dm644 crates/app/icons/icon.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/wavelinux6.png"
+  install -Dm644 crates/app/icons/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/wavelinux6.svg"
+  install -Dm644 crates/app/appimage-extra/usr/share/metainfo/io.github.duskyprojects.WaveLinux6.appdata.xml \
+    "$pkgdir/usr/share/metainfo/io.github.duskyprojects.WaveLinux6.appdata.xml"
   install -Dm644 packaging/udev/70-wavelinux-streamer-devices.rules "$pkgdir/usr/lib/udev/rules.d/70-wavelinux-streamer-devices.rules"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 
-  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/wavelinux.desktop" <<'DESKTOP'
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/io.github.duskyprojects.WaveLinux6.desktop" <<'DESKTOP'
 [Desktop Entry]
 Type=Application
-Name=WaveLinux
+Name=WaveLinux 6
 Comment=Linux creator audio mixer
-Exec=wavelinux
-Icon=wavelinux
+Exec=wavelinux6
+Icon=wavelinux6
 Terminal=false
 Categories=Audio;AudioVideo;Mixer;
-StartupWMClass=io.github.duskyprojects.WaveLinux
+StartupWMClass=io.github.duskyprojects.WaveLinux6
 DESKTOP
 }

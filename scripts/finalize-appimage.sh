@@ -5,10 +5,13 @@ set -euo pipefail
 # AppDir, rebuild the AppImage, verify the sealed artifact, and optionally
 # recreate/sign updater artifacts.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APPIMAGE_DIR="$ROOT_DIR/target/release/bundle/appimage"
-PRODUCT_NAME="$(node -e 'console.log(require(process.argv[1]).productName || "WaveLinux5")' "$ROOT_DIR/crates/app/tauri.conf.json")"
-MAIN_BINARY_NAME="$(node -e 'console.log(require(process.argv[1]).mainBinaryName || "wavelinux5")' "$ROOT_DIR/crates/app/tauri.conf.json")"
-APP_IDENTIFIER="$(node -e 'console.log(require(process.argv[1]).identifier || "io.github.duskyprojects.WaveLinux5")' "$ROOT_DIR/crates/app/tauri.conf.json")"
+TARGET_DIR="${WAVELINUX_TARGET_DIR:-$ROOT_DIR/target/release}"
+APPIMAGE_DIR="$TARGET_DIR/bundle/appimage"
+PRODUCT_NAME="$(node -e 'console.log(require(process.argv[1]).productName || "WaveLinux6")' "$ROOT_DIR/crates/app/tauri.conf.json")"
+MAIN_BINARY_NAME="$(node -e 'console.log(require(process.argv[1]).mainBinaryName || "wavelinux6")' "$ROOT_DIR/crates/app/tauri.conf.json")"
+APP_IDENTIFIER="$(node -e 'console.log(require(process.argv[1]).identifier || "io.github.duskyprojects.WaveLinux6")' "$ROOT_DIR/crates/app/tauri.conf.json")"
+DESKTOP_FILE="$APP_IDENTIFIER.desktop"
+APPSTREAM_FILE="$APP_IDENTIFIER.appdata.xml"
 PACKAGE_VERSION="$(node -e 'console.log(require(process.argv[1]).version)' "$ROOT_DIR/package.json")"
 APPDIR="$APPIMAGE_DIR/${PRODUCT_NAME}.AppDir"
 PLUGIN="${LINUXDEPLOY_PLUGIN_APPIMAGE:-$HOME/.cache/tauri/linuxdeploy-plugin-appimage.AppImage}"
@@ -60,14 +63,27 @@ appimage="$APPIMAGE_DIR/${PRODUCT_NAME}_${PACKAGE_VERSION}_amd64.AppImage"
 ensure_appdir_identity() {
   rm -f \
     "$APPDIR/WaveLinux.desktop" \
+    "$APPDIR/WaveLinux5.desktop" \
+    "$APPDIR/$PRODUCT_NAME.desktop" \
     "$APPDIR/wavelinux.png" \
+    "$APPDIR/wavelinux5.png" \
     "$APPDIR/usr/bin/wavelinux" \
-    "$APPDIR/usr/share/applications/WaveLinux.desktop"
-  find "$APPDIR/usr/share/icons" -type f -name 'wavelinux.*' -delete 2>/dev/null || true
+    "$APPDIR/usr/bin/wavelinux5" \
+    "$APPDIR/usr/wavelinux-runtime/bin/wavelinux5-dsp-helper" \
+    "$APPDIR/usr/share/applications/WaveLinux.desktop" \
+    "$APPDIR/usr/share/applications/WaveLinux5.desktop" \
+    "$APPDIR/usr/share/applications/$PRODUCT_NAME.desktop" \
+    "$APPDIR/usr/share/applications/wavelinux5.desktop" \
+    "$APPDIR/usr/share/metainfo/WaveLinux6.appdata.xml" \
+    "$APPDIR/usr/share/metainfo/io.github.duskyprojects.WaveLinux6.metainfo.xml"
+  find "$APPDIR/usr/share/icons" -type f \
+    \( -name 'wavelinux.*' -o -name 'wavelinux5.*' \) -delete 2>/dev/null || true
+  find "$APPDIR" -depth -iname 'wavelinux5*' -delete 2>/dev/null || true
 
   install -d \
     "$APPDIR/usr/bin" \
     "$APPDIR/usr/share/applications" \
+    "$APPDIR/usr/share/metainfo" \
     "$APPDIR/usr/share/icons/hicolor/32x32/apps" \
     "$APPDIR/usr/share/icons/hicolor/128x128/apps" \
     "$APPDIR/usr/share/icons/hicolor/256x256/apps" \
@@ -78,8 +94,12 @@ ensure_appdir_identity() {
     echo "Run the Tauri build step before finalizing the AppImage." >&2
     exit 1
   fi
+  if find "$APPDIR" -iname 'wavelinux5*' -print -quit | grep -q .; then
+    echo "Stale WaveLinux5 identity remained in AppDir" >&2
+    exit 1
+  fi
 
-  cat >"$APPDIR/$PRODUCT_NAME.desktop" <<DESKTOP
+  cat >"$APPDIR/$DESKTOP_FILE" <<DESKTOP
 [Desktop Entry]
 Categories=AudioVideo;Audio;Music;
 Comment=Linux creator audio mixer
@@ -90,8 +110,8 @@ Name=$PRODUCT_NAME
 Terminal=false
 Type=Application
 DESKTOP
-  if [[ ! "$APPDIR/$PRODUCT_NAME.desktop" -ef "$APPDIR/usr/share/applications/$PRODUCT_NAME.desktop" ]]; then
-    install -m 0644 "$APPDIR/$PRODUCT_NAME.desktop" "$APPDIR/usr/share/applications/$PRODUCT_NAME.desktop"
+  if [[ ! "$APPDIR/$DESKTOP_FILE" -ef "$APPDIR/usr/share/applications/$DESKTOP_FILE" ]]; then
+    install -m 0644 "$APPDIR/$DESKTOP_FILE" "$APPDIR/usr/share/applications/$DESKTOP_FILE"
   fi
 
   install -m 0644 "$ROOT_DIR/crates/app/icons/32x32.png" "$APPDIR/usr/share/icons/hicolor/32x32/apps/$MAIN_BINARY_NAME.png"
@@ -99,6 +119,9 @@ DESKTOP
   install -m 0644 "$ROOT_DIR/crates/app/icons/128x128@2x.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/$MAIN_BINARY_NAME.png"
   install -m 0644 "$ROOT_DIR/crates/app/icons/icon.png" "$APPDIR/usr/share/icons/hicolor/512x512/apps/$MAIN_BINARY_NAME.png"
   install -m 0644 "$ROOT_DIR/crates/app/icons/128x128@2x.png" "$APPDIR/$MAIN_BINARY_NAME.png"
+  install -m 0644 \
+    "$ROOT_DIR/crates/app/appimage-extra/usr/share/metainfo/$APPSTREAM_FILE" \
+    "$APPDIR/usr/share/metainfo/$APPSTREAM_FILE"
 }
 
 remove_obsolete_runtime_artifacts() {
@@ -124,6 +147,7 @@ ensure_appdir_identity
 remove_obsolete_runtime_artifacts
 install_appimage_apprun
 "$ROOT_DIR/scripts/sanitize-appimage-pipewire.sh" --sanitize "$APPDIR"
+"$ROOT_DIR/scripts/sanitize-appimage-wayland.sh" --sanitize "$APPDIR"
 
 echo "Rebuilding sanitized AppImage: $appimage"
 rm -f "$appimage" "$appimage.sig" "$appimage.tar.gz" "$appimage.tar.gz.sig"
@@ -145,6 +169,7 @@ elif [[ -n "$generated" && "$generated" != "$appimage" ]]; then
 fi
 
 "$ROOT_DIR/scripts/sanitize-appimage-pipewire.sh" --check "$APPDIR" "$appimage"
+"$ROOT_DIR/scripts/sanitize-appimage-wayland.sh" --check "$APPDIR" "$appimage"
 
 sign_artifact() {
   local artifact="$1"

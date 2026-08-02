@@ -7,7 +7,10 @@ PASSWORD_PATH="${WAVELINUX_RELEASE_KEY_PASSWORD_FILE:-$KEY_PATH.password}"
 if [[ ! -f "$KEY_PATH" || ! -f "$PASSWORD_PATH" ]]; then
   echo "Missing release key or password." >&2
   echo "Run: bash scripts/generate-release-key.sh" >&2
-  return 1 2>/dev/null || exit 1
+  if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 1
+  fi
+  exit 1
 fi
 
 export TAURI_SIGNING_PRIVATE_KEY_PATH="$KEY_PATH"

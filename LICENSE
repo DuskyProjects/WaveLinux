@@ -36,15 +36,12 @@ Direct code, protocol, and runtime dependencies:
 | Rust support crates: anyhow, base64, directories, libc, serde, serde_json, tempfile, thiserror, time, url, uuid | MIT OR Apache-2.0 | Serialization, errors, paths, test files, URLs, timestamps, identifiers, and libc bindings. |
 | Rust support crate: include_dir | MIT | Embeds packaged hardware profile assets. |
 | Rust support crate: libloading | ISC | Lazy runtime loading for the optional libusb control path. |
+| [nnnoiseless](https://github.com/jneem/nnnoiseless) | BSD-3-Clause | Pure-Rust RNNoise inference used by the native WaveLinux audio core. |
 
-Open-source integrations that WaveLinux can detect, configure, bundle when
-available from the release builder, or install from distro packages:
+Open-source integrations and host tools that WaveLinux can detect or configure:
 
 | Project | License | Notes |
 | --- | --- | --- |
-| [SWH LADSPA plugins](https://github.com/swh/ladspa) | GPL-2.0 | Compressor, gate, and limiter plugin support bundled in AppImage releases when present on the builder, otherwise installed from distro packages. |
-| [noise-suppression-for-voice](https://github.com/werman/noise-suppression-for-voice) / RNNoise | GPL-3.0 | RNNoise LADSPA noise suppression support bundled in AppImage releases when present on the builder, otherwise installed from distro packages. |
-| [DeepFilterNet3 LADSPA/PipeWire plugins](https://github.com/Rikorose/DeepFilterNet) | MIT OR Apache-2.0 | DeepFilterNet noise suppression support bundled or installed when a distro package is available. |
 | [OpenDeck](https://github.com/nekename/OpenDeck) | GPL-3.0-or-later | Open-source Linux Stream Deck implementation used as a compatibility and udev-permission reference. |
 | [Bitfocus Companion](https://github.com/bitfocus/companion) | MIT | Open-source streamer surface ecosystem reference for Stream Deck, Loupedeck, X-keys, and similar devices. |
 | [GoXLR Utility](https://github.com/GoXLR-on-Linux/goxlr-utility) | MIT | Open-source GoXLR control software reference for Linux behavior and control-surface expectations. |

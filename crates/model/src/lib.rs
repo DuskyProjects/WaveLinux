@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CONFIG_VERSION: u32 = 10;
+pub const CONFIG_VERSION: u32 = 14;
 pub const MAX_MIXES: usize = 5;
 pub const MAX_SOFTWARE_CHANNELS: usize = 8;
 pub const MAX_HARDWARE_INPUTS: usize = 4;
@@ -15,6 +15,7 @@ pub const CHANNEL_LAYOUT: &str = "stereo";
 pub const GRAPH_PREFIX_ENV: &str = "WAVELINUX_GRAPH_PREFIX";
 pub const GRAPH_PROPERTY_PREFIX_ENV: &str = "WAVELINUX_GRAPH_PROPERTY_PREFIX";
 pub const APP_DISPLAY_NAME_ENV: &str = "WAVELINUX_APP_DISPLAY_NAME";
+const APP_HISTORY_SEEN_REFRESH_SECONDS: i64 = 15 * 60;
 
 pub type MixId = String;
 pub type ChannelId = String;
@@ -165,6 +166,8 @@ pub struct MixerSettings {
     pub release_channel: ReleaseChannel,
     #[serde(default)]
     pub optimization_mode: OptimizationMode,
+    #[serde(default)]
+    pub adaptive_latency: AdaptiveLatencySettings,
     #[serde(default, skip_serializing)]
     pub runtime_latency_policy: Option<LatencyPolicy>,
 }
@@ -187,6 +190,7 @@ impl Default for MixerSettings {
             auto_install_updates: false,
             release_channel: ReleaseChannel::Stable,
             optimization_mode: OptimizationMode::Performance,
+            adaptive_latency: AdaptiveLatencySettings::default(),
             runtime_latency_policy: None,
         }
     }
@@ -206,6 +210,42 @@ pub enum OptimizationMode {
     Performance,
     Safe,
     Advisory,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveLatencyTriggerMode {
+    Off,
+    AudioOnly,
+    CpuOnly,
+    #[default]
+    Hybrid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AdaptiveLatencySettings {
+    pub enabled: bool,
+    pub min_msec: u16,
+    pub max_msec: u16,
+    pub levels_msec: Vec<u16>,
+    pub trigger_mode: AdaptiveLatencyTriggerMode,
+}
+
+impl Default for AdaptiveLatencySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_msec: 28,
+            max_msec: 120,
+            levels_msec: default_adaptive_latency_levels(),
+            trigger_mode: AdaptiveLatencyTriggerMode::Hybrid,
+        }
+    }
+}
+
+fn default_adaptive_latency_levels() -> Vec<u16> {
+    vec![28, 40, 60, 80, 100, 120]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -345,6 +385,7 @@ impl MixerConfig {
             clamp_sync_delay_msec(self.settings.stream_sync_delay_msec);
         self.settings.monitor_sync_delay_msec =
             clamp_sync_delay_msec(self.settings.monitor_sync_delay_msec);
+        normalize_adaptive_latency_settings(&mut self.settings.adaptive_latency);
         self.migrate_legacy_mic_channel();
         self.normalize_hardware_input_name();
         self.ensure_system_channel();
@@ -375,6 +416,9 @@ impl MixerConfig {
                 normalize_effect_chain(std::mem::take(&mut channel.effects), &catalog, true)?;
             if previous_version < 10 && channel.kind.uses_hardware_slot() {
                 migrate_wavelinux5_voice_effect_defaults(&mut channel.effects, &catalog);
+            }
+            if previous_version < 11 && channel.kind.uses_hardware_slot() {
+                migrate_hardware_input_chain_to_rnnoise_default(&mut channel.effects, &catalog);
             }
         }
         self.normalize_app_identity();
@@ -1032,7 +1076,7 @@ impl MixerConfig {
             existing.media_name = media_name;
             changed = true;
         }
-        if seen_unix.saturating_sub(existing.last_seen_unix) >= 60 {
+        if seen_unix.saturating_sub(existing.last_seen_unix) >= APP_HISTORY_SEEN_REFRESH_SECONDS {
             existing.last_seen_unix = seen_unix;
             changed = true;
         }
@@ -1347,6 +1391,28 @@ impl MixerConfig {
         Ok(channel.clone())
     }
 
+    pub fn set_channel_effects_enabled(
+        &mut self,
+        channel_id: impl AsRef<str>,
+        enabled: bool,
+    ) -> Result<Channel, ModelError> {
+        let channel = self.channel_mut(channel_id.as_ref())?;
+        channel.effects_enabled = enabled;
+        if enabled
+            && !channel.effects.is_empty()
+            && channel.effects.iter().all(|effect| effect.bypassed)
+        {
+            for effect in &mut channel.effects {
+                effect.bypassed = false;
+            }
+            channel.effects = keep_one_single_instance_effect_per_channel(
+                std::mem::take(&mut channel.effects),
+                None,
+            );
+        }
+        Ok(channel.clone())
+    }
+
     pub fn channel_mut(&mut self, channel_id: &str) -> Result<&mut Channel, ModelError> {
         self.channels
             .iter_mut()
@@ -1580,6 +1646,8 @@ pub struct Channel {
     pub app_matchers: Vec<AppMatcher>,
     #[serde(default)]
     pub effects: Vec<EffectInstance>,
+    #[serde(default = "default_true")]
+    pub effects_enabled: bool,
 }
 
 impl Channel {
@@ -1601,6 +1669,7 @@ impl Channel {
             mix_buses: BTreeMap::new(),
             app_matchers: Vec::new(),
             effects: Vec::new(),
+            effects_enabled: true,
         }
     }
 
@@ -2209,8 +2278,10 @@ pub struct EffectDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginHint {
+    Native,
     PipeWireBuiltin,
     Ladspa { library_names: Vec<String> },
+    LadspaAll { library_names: Vec<String> },
     Lv2 { uri_hint: String },
 }
 
@@ -2243,43 +2314,49 @@ impl Default for EffectCatalog {
                 "rnnoise",
                 "Noise Suppression",
                 "RNNoise speech noise suppression",
-                PluginHint::Ladspa {
-                    library_names: vec!["librnnoise_ladspa.so".into(), "rnnoise_ladspa.so".into()],
-                },
+                PluginHint::Native,
                 vec![
                     param("vad_threshold", "VAD Threshold", 0.0, 99.0, 25.0, "%"),
                     param("hold_ms", "Hold Open", 0.0, 1000.0, 200.0, " ms"),
-                    param("lead_in_ms", "Lead-In", 0.0, 200.0, 0.0, " ms"),
+                    param(
+                        "minimum_voice_level_db",
+                        "Minimum Voice Level",
+                        -70.0,
+                        -20.0,
+                        -70.0,
+                        " dB",
+                    ),
+                    param("dry_mix", "Dry Mix", 0.0, 1.0, 0.0, ""),
                 ],
             ),
             effect(
                 "highpass",
                 "High-Pass Filter",
                 "Rumble removal",
-                PluginHint::PipeWireBuiltin,
+                PluginHint::Native,
                 vec![param("frequency_hz", "Cutoff", 20.0, 500.0, 80.0, " Hz")],
             ),
             effect(
                 "eq",
-                "3-Band EQ",
-                "Low, mid, and high tone shaping",
-                PluginHint::PipeWireBuiltin,
+                "8-Band EQ",
+                "Graphic tone shaping",
+                PluginHint::Native,
                 vec![
-                    param("low_freq_hz", "Low Freq", 40.0, 400.0, 120.0, " Hz"),
-                    param("low_gain_db", "Low Gain", -12.0, 12.0, 0.0, " dB"),
-                    param("mid_freq_hz", "Mid Freq", 300.0, 4000.0, 1000.0, " Hz"),
-                    param("mid_gain_db", "Mid Gain", -12.0, 12.0, 0.0, " dB"),
-                    param("high_freq_hz", "High Freq", 2000.0, 12000.0, 6000.0, " Hz"),
-                    param("high_gain_db", "High Gain", -12.0, 12.0, 0.0, " dB"),
+                    param("band_63_gain_db", "63", -12.0, 12.0, 0.0, " dB"),
+                    param("band_125_gain_db", "125", -12.0, 12.0, 0.0, " dB"),
+                    param("band_250_gain_db", "250", -12.0, 12.0, 0.0, " dB"),
+                    param("band_500_gain_db", "500", -12.0, 12.0, 0.0, " dB"),
+                    param("band_1k_gain_db", "1k", -12.0, 12.0, 0.0, " dB"),
+                    param("band_2k_gain_db", "2k", -12.0, 12.0, 0.0, " dB"),
+                    param("band_4k_gain_db", "4k", -12.0, 12.0, 0.0, " dB"),
+                    param("band_8k_gain_db", "8k", -12.0, 12.0, 0.0, " dB"),
                 ],
             ),
             effect(
                 "compressor",
                 "Compressor",
                 "Dynamic range control",
-                PluginHint::Ladspa {
-                    library_names: vec!["sc4_1882.so".into(), "compressor.so".into()],
-                },
+                PluginHint::Native,
                 vec![
                     param("threshold_db", "Threshold", -30.0, 0.0, -20.0, " dB"),
                     param("ratio", "Ratio", 1.0, 20.0, 4.0, ":1"),
@@ -2292,9 +2369,7 @@ impl Default for EffectCatalog {
                 "gate",
                 "Noise Gate",
                 "Attenuate quiet room tone",
-                PluginHint::Ladspa {
-                    library_names: vec!["gate_1410.so".into()],
-                },
+                PluginHint::Native,
                 vec![
                     param("threshold_db", "Threshold", -70.0, 0.0, -60.0, " dB"),
                     param("attack_ms", "Attack", 0.1, 100.0, 5.0, " ms"),
@@ -2307,15 +2382,42 @@ impl Default for EffectCatalog {
                 "limiter",
                 "Limiter",
                 "Brick-wall peak ceiling",
-                PluginHint::Ladspa {
-                    library_names: vec![
-                        "fast_lookahead_limiter_1913.so".into(),
-                        "hard_limiter_1413.so".into(),
-                    ],
-                },
+                PluginHint::Native,
                 vec![
                     param("input_gain_db", "Input Gain", -20.0, 20.0, 0.0, " dB"),
                     param("ceiling_db", "Ceiling", -20.0, 0.0, -1.0, " dB"),
+                ],
+            ),
+            effect(
+                "karaoke_stage",
+                "Karaoke Stage",
+                "Vocal doubler, slap echo, and room width",
+                PluginHint::Native,
+                vec![
+                    param("dry_mix", "Dry Mix", 0.0, 1.0, 0.78, ""),
+                    param(
+                        "tone_highpass_hz",
+                        "Tone Low Cut",
+                        20.0,
+                        1200.0,
+                        40.0,
+                        " Hz",
+                    ),
+                    param(
+                        "tone_lowpass_hz",
+                        "Tone High Cut",
+                        1200.0,
+                        20000.0,
+                        16000.0,
+                        " Hz",
+                    ),
+                    param("tone_gain_db", "Tone Drive", -12.0, 12.0, 0.0, " dB"),
+                    param("double_mix", "Double", 0.0, 1.0, 0.22, ""),
+                    param("double_delay_ms", "Double Delay", 8.0, 80.0, 28.0, " ms"),
+                    param("detune_cents", "Detune", 0.0, 25.0, 7.0, " cents"),
+                    param("room_size_m", "Room Size", 1.0, 120.0, 38.0, " m"),
+                    param("reverb_time_s", "Room Time", 0.1, 8.0, 2.4, " s"),
+                    param("room_level_db", "Room Level", -70.0, 0.0, -17.0, " dB"),
                 ],
             ),
         ];
@@ -2329,7 +2431,8 @@ impl Default for EffectCatalog {
                     &[
                         ("vad_threshold", 25.0),
                         ("hold_ms", 200.0),
-                        ("lead_in_ms", 0.0),
+                        ("minimum_voice_level_db", -70.0),
+                        ("dry_mix", 0.0),
                     ],
                 ),
                 preset(
@@ -2337,7 +2440,8 @@ impl Default for EffectCatalog {
                     &[
                         ("vad_threshold", 25.0),
                         ("hold_ms", 250.0),
-                        ("lead_in_ms", 0.0),
+                        ("minimum_voice_level_db", -70.0),
+                        ("dry_mix", 0.0),
                     ],
                 ),
                 preset(
@@ -2345,7 +2449,17 @@ impl Default for EffectCatalog {
                     &[
                         ("vad_threshold", 75.0),
                         ("hold_ms", 150.0),
-                        ("lead_in_ms", 0.0),
+                        ("minimum_voice_level_db", -70.0),
+                        ("dry_mix", 0.0),
+                    ],
+                ),
+                preset(
+                    "Near-field",
+                    &[
+                        ("vad_threshold", 85.0),
+                        ("hold_ms", 100.0),
+                        ("minimum_voice_level_db", -42.0),
+                        ("dry_mix", 0.0),
                     ],
                 ),
             ],
@@ -2366,34 +2480,40 @@ impl Default for EffectCatalog {
                 preset(
                     "Flat",
                     &[
-                        ("low_freq_hz", 120.0),
-                        ("low_gain_db", 0.0),
-                        ("mid_freq_hz", 1000.0),
-                        ("mid_gain_db", 0.0),
-                        ("high_freq_hz", 6000.0),
-                        ("high_gain_db", 0.0),
+                        ("band_63_gain_db", 0.0),
+                        ("band_125_gain_db", 0.0),
+                        ("band_250_gain_db", 0.0),
+                        ("band_500_gain_db", 0.0),
+                        ("band_1k_gain_db", 0.0),
+                        ("band_2k_gain_db", 0.0),
+                        ("band_4k_gain_db", 0.0),
+                        ("band_8k_gain_db", 0.0),
                     ],
                 ),
                 preset(
                     "Broadcast Voice",
                     &[
-                        ("low_freq_hz", 120.0),
-                        ("low_gain_db", -2.0),
-                        ("mid_freq_hz", 2500.0),
-                        ("mid_gain_db", 2.0),
-                        ("high_freq_hz", 8000.0),
-                        ("high_gain_db", 1.5),
+                        ("band_63_gain_db", -4.0),
+                        ("band_125_gain_db", -2.0),
+                        ("band_250_gain_db", -1.0),
+                        ("band_500_gain_db", 0.0),
+                        ("band_1k_gain_db", 1.0),
+                        ("band_2k_gain_db", 2.5),
+                        ("band_4k_gain_db", 2.0),
+                        ("band_8k_gain_db", 1.0),
                     ],
                 ),
                 preset(
                     "Warm Music",
                     &[
-                        ("low_freq_hz", 100.0),
-                        ("low_gain_db", 2.0),
-                        ("mid_freq_hz", 800.0),
-                        ("mid_gain_db", -1.0),
-                        ("high_freq_hz", 10000.0),
-                        ("high_gain_db", 2.0),
+                        ("band_63_gain_db", 2.0),
+                        ("band_125_gain_db", 1.5),
+                        ("band_250_gain_db", 0.5),
+                        ("band_500_gain_db", -0.5),
+                        ("band_1k_gain_db", -1.0),
+                        ("band_2k_gain_db", 0.0),
+                        ("band_4k_gain_db", 1.5),
+                        ("band_8k_gain_db", 2.0),
                     ],
                 ),
             ],
@@ -2459,13 +2579,23 @@ impl Default for EffectCatalog {
                     ],
                 ),
                 preset(
-                    "Noisy mic -30 dB",
+                    "Noisy room -30 dB",
                     &[
                         ("threshold_db", -30.0),
                         ("range_db", -70.0),
                         ("attack_ms", 1.0),
                         ("hold_ms", 60.0),
                         ("release_ms", 120.0),
+                    ],
+                ),
+                preset(
+                    "Nearby voices -20 dB",
+                    &[
+                        ("threshold_db", -20.0),
+                        ("range_db", -90.0),
+                        ("attack_ms", 1.0),
+                        ("hold_ms", 60.0),
+                        ("release_ms", 100.0),
                     ],
                 ),
             ],
@@ -2488,6 +2618,102 @@ impl Default for EffectCatalog {
                 ),
             ],
         );
+        set_presets(
+            &mut effects,
+            "karaoke_stage",
+            vec![
+                preset(
+                    "Small Room",
+                    &[
+                        ("dry_mix", 0.82),
+                        ("tone_highpass_hz", 40.0),
+                        ("tone_lowpass_hz", 16000.0),
+                        ("tone_gain_db", 0.0),
+                        ("double_mix", 0.16),
+                        ("double_delay_ms", 22.0),
+                        ("detune_cents", 4.0),
+                        ("room_size_m", 18.0),
+                        ("reverb_time_s", 1.4),
+                        ("room_level_db", -23.0),
+                    ],
+                ),
+                preset(
+                    "Karaoke Room",
+                    &[
+                        ("dry_mix", 0.78),
+                        ("tone_highpass_hz", 40.0),
+                        ("tone_lowpass_hz", 16000.0),
+                        ("tone_gain_db", 0.0),
+                        ("double_mix", 0.22),
+                        ("double_delay_ms", 28.0),
+                        ("detune_cents", 7.0),
+                        ("room_size_m", 38.0),
+                        ("reverb_time_s", 2.4),
+                        ("room_level_db", -17.0),
+                    ],
+                ),
+                preset(
+                    "Big Stage",
+                    &[
+                        ("dry_mix", 0.72),
+                        ("tone_highpass_hz", 40.0),
+                        ("tone_lowpass_hz", 16000.0),
+                        ("tone_gain_db", 0.0),
+                        ("double_mix", 0.32),
+                        ("double_delay_ms", 38.0),
+                        ("detune_cents", 10.0),
+                        ("room_size_m", 72.0),
+                        ("reverb_time_s", 3.8),
+                        ("room_level_db", -13.0),
+                    ],
+                ),
+                preset(
+                    "Old Radio Announcer",
+                    &[
+                        ("dry_mix", 0.92),
+                        ("tone_highpass_hz", 120.0),
+                        ("tone_lowpass_hz", 4600.0),
+                        ("tone_gain_db", 2.5),
+                        ("double_mix", 0.04),
+                        ("double_delay_ms", 18.0),
+                        ("detune_cents", 2.0),
+                        ("room_size_m", 9.0),
+                        ("reverb_time_s", 0.8),
+                        ("room_level_db", -31.0),
+                    ],
+                ),
+                preset(
+                    "Telephone",
+                    &[
+                        ("dry_mix", 1.0),
+                        ("tone_highpass_hz", 320.0),
+                        ("tone_lowpass_hz", 3400.0),
+                        ("tone_gain_db", 1.5),
+                        ("double_mix", 0.0),
+                        ("double_delay_ms", 18.0),
+                        ("detune_cents", 0.0),
+                        ("room_size_m", 3.0),
+                        ("reverb_time_s", 0.2),
+                        ("room_level_db", -70.0),
+                    ],
+                ),
+                preset(
+                    "Lo-Fi PA",
+                    &[
+                        ("dry_mix", 0.82),
+                        ("tone_highpass_hz", 180.0),
+                        ("tone_lowpass_hz", 6000.0),
+                        ("tone_gain_db", 3.0),
+                        ("double_mix", 0.1),
+                        ("double_delay_ms", 34.0),
+                        ("detune_cents", 3.0),
+                        ("room_size_m", 28.0),
+                        ("reverb_time_s", 1.8),
+                        ("room_level_db", -20.0),
+                    ],
+                ),
+            ],
+        );
 
         Self {
             effects,
@@ -2497,6 +2723,7 @@ impl Default for EffectCatalog {
                 "eq".into(),
                 "gate".into(),
                 "compressor".into(),
+                "karaoke_stage".into(),
                 "limiter".into(),
             ],
         }
@@ -2684,6 +2911,10 @@ pub struct DeviceInfo {
     pub description: String,
     #[serde(default = "default_true")]
     pub is_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_port: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<DevicePortInfo>,
     pub is_default: bool,
     pub is_virtual: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2718,6 +2949,18 @@ pub struct DeviceInfo {
     pub active_routing_policy: Option<RoutingPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_bluetooth_mic_policy: Option<BluetoothMicPolicy>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DevicePortInfo {
+    pub name: String,
+    pub description: String,
+    pub availability: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2800,12 +3043,176 @@ pub struct RuntimeGraph {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AudioCoreChannelStatus {
+    pub channel_id: String,
+    pub online: bool,
+    pub sample_rate_hz: u32,
+    pub target_latency_msec: u16,
+    pub current_buffer_frames: u64,
+    pub buffer_fill_msec: f32,
+    pub captured_frames: u64,
+    pub rendered_frames: u64,
+    pub dropped_frames: u64,
+    pub underrun_frames: u64,
+    pub underrun_delta: u64,
+    pub capture_callbacks: u64,
+    pub worker_running: bool,
+    pub worker_blocks: u64,
+    pub worker_queue_frames: u64,
+    pub worker_queue_capacity_frames: u64,
+    pub worker_overrun_frames: u64,
+    pub accelerator_provider: Option<String>,
+    pub accelerator_active_states: u32,
+    pub accelerator_provider_pids: Vec<u32>,
+    pub accelerator_provider_blocks: u64,
+    pub accelerator_fallback_blocks: u64,
+    pub accelerator_deadline_misses: u64,
+    pub accelerator_invalid_results: u64,
+    pub accelerator_stale_results: u64,
+    pub accelerator_disabled_states: u32,
+    pub accelerator_startup_failures: Vec<String>,
+    pub accelerator_last_failure: Option<String>,
+    pub last_process_micros: u64,
+    pub max_process_micros: u64,
+    pub chain_swaps: u64,
+    pub non_finite_blocks: u64,
+    pub non_finite_samples: u64,
+    pub non_finite_effect_mask: u64,
+    pub chain_recoveries: u64,
+    pub chain_swap_replacements: u64,
+    pub retired_chain_overflows: u64,
+    pub submitted_generation: u64,
+    pub acknowledged_generation: u64,
+    pub submitted_route_generation: u64,
+    pub applied_route_generation: u64,
+    pub input_target_node_name: Option<String>,
+    pub output_target_node_names: Vec<String>,
+    pub route_target_error: Option<String>,
+    pub rate_correction: f64,
+    pub error: Option<String>,
+}
+
+impl Default for AudioCoreChannelStatus {
+    fn default() -> Self {
+        Self {
+            channel_id: String::new(),
+            online: false,
+            sample_rate_hz: SAMPLE_RATE_HZ,
+            target_latency_msec: 28,
+            current_buffer_frames: 0,
+            buffer_fill_msec: 0.0,
+            captured_frames: 0,
+            rendered_frames: 0,
+            dropped_frames: 0,
+            underrun_frames: 0,
+            underrun_delta: 0,
+            capture_callbacks: 0,
+            worker_running: false,
+            worker_blocks: 0,
+            worker_queue_frames: 0,
+            worker_queue_capacity_frames: 0,
+            worker_overrun_frames: 0,
+            accelerator_provider: None,
+            accelerator_active_states: 0,
+            accelerator_provider_pids: Vec::new(),
+            accelerator_provider_blocks: 0,
+            accelerator_fallback_blocks: 0,
+            accelerator_deadline_misses: 0,
+            accelerator_invalid_results: 0,
+            accelerator_stale_results: 0,
+            accelerator_disabled_states: 0,
+            accelerator_startup_failures: Vec::new(),
+            accelerator_last_failure: None,
+            last_process_micros: 0,
+            max_process_micros: 0,
+            chain_swaps: 0,
+            non_finite_blocks: 0,
+            non_finite_samples: 0,
+            non_finite_effect_mask: 0,
+            chain_recoveries: 0,
+            chain_swap_replacements: 0,
+            retired_chain_overflows: 0,
+            submitted_generation: 0,
+            acknowledged_generation: 0,
+            submitted_route_generation: 0,
+            applied_route_generation: 0,
+            input_target_node_name: None,
+            output_target_node_names: Vec::new(),
+            route_target_error: None,
+            rate_correction: 1.0,
+            error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectRuntimeState {
+    #[default]
+    Grey,
+    Red,
+    Green,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EffectRuntimeStatus {
+    pub channel_id: ChannelId,
+    pub state: EffectRuntimeState,
+    pub selected_effect_count: usize,
+    pub desired_enabled: bool,
+    pub desired_generation: u64,
+    pub applied_generation: u64,
+    pub in_flight_generation: Option<u64>,
+    pub coalesced_requests: u64,
+    pub pending: bool,
+    pub core_healthy: bool,
+    pub control_socket: String,
+    pub last_error: Option<String>,
+}
+
+impl EffectRuntimeStatus {
+    pub fn resolve_state(&mut self) {
+        self.state = if self.selected_effect_count == 0 {
+            EffectRuntimeState::Grey
+        } else if self.desired_enabled
+            && self.core_healthy
+            && !self.pending
+            && self.applied_generation == self.desired_generation
+        {
+            EffectRuntimeState::Green
+        } else {
+            EffectRuntimeState::Red
+        };
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EngineStatus {
     pub dry_run: bool,
     pub healthy: bool,
     pub audio_graph_running: bool,
     pub message: String,
     pub last_refresh_unix: i64,
+    #[serde(default)]
+    pub adaptive_latency: AdaptiveLatencyStatus,
+    #[serde(default)]
+    pub audio_core: Vec<AudioCoreChannelStatus>,
+    #[serde(default)]
+    pub effects: Vec<EffectRuntimeStatus>,
+    #[serde(default)]
+    pub refresh: RuntimeRefreshStatus,
+    #[serde(default)]
+    pub pipewire_audio_health: PipeWireAudioHealthStatus,
+    #[serde(default)]
+    pub meter_transport: MeterTransportStatus,
+    #[serde(default)]
+    pub pipewire_registry: PipeWireRegistryStatus,
+    #[serde(default)]
+    pub peripheral_plugins: Vec<PeripheralPluginStatus>,
+    #[serde(default)]
+    pub accelerator_providers: Vec<AcceleratorProviderStatus>,
 }
 
 impl Default for EngineStatus {
@@ -2816,6 +3223,167 @@ impl Default for EngineStatus {
             audio_graph_running: false,
             message: "Ready".into(),
             last_refresh_unix: 0,
+            adaptive_latency: AdaptiveLatencyStatus::default(),
+            audio_core: Vec::new(),
+            effects: Vec::new(),
+            refresh: RuntimeRefreshStatus::default(),
+            pipewire_audio_health: PipeWireAudioHealthStatus::default(),
+            meter_transport: MeterTransportStatus::default(),
+            pipewire_registry: PipeWireRegistryStatus::default(),
+            peripheral_plugins: Vec::new(),
+            accelerator_providers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AcceleratorProviderStatus {
+    pub provider: String,
+    pub protocol_version: u16,
+    pub installed: bool,
+    pub valid: bool,
+    pub qualified: bool,
+    pub active: bool,
+    pub pack_version: Option<String>,
+    pub model_sha256: Option<String>,
+    pub hardware_fingerprint: String,
+    pub tested_unix: Option<i64>,
+    pub blocks: Option<u64>,
+    pub numerical_max_abs_error: Option<f64>,
+    pub deadline_misses: Option<u64>,
+    pub discontinuities: Option<u64>,
+    pub added_latency_msec: Option<f64>,
+    pub cpu_reduction_percent: Option<f64>,
+    pub fallback_validated: bool,
+    pub live_workload_validated: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeripheralPluginRuntimeState {
+    #[default]
+    Stopped,
+    Starting,
+    Ready,
+    Idle,
+    Error,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PeripheralPluginStatus {
+    pub kind: String,
+    pub state: PeripheralPluginRuntimeState,
+    pub protocol_version: u16,
+    pub pid: Option<u32>,
+    pub restarts: u64,
+    pub message: String,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct PipeWireRegistryStatus {
+    pub available: bool,
+    pub connected: bool,
+    pub initialized: bool,
+    pub generation: u64,
+    pub object_count: usize,
+    pub node_count: usize,
+    pub device_count: usize,
+    pub port_count: usize,
+    pub link_count: usize,
+    pub metadata_count: usize,
+    pub playback_stream_count: usize,
+    pub capture_stream_count: usize,
+    pub batches_received: u64,
+    pub objects_changed: u64,
+    pub direct_link_failures: u64,
+    pub direct_node_errors: u64,
+    pub reconnects: u64,
+    pub last_event_unix: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct MeterTransportStatus {
+    pub protocol_version: u16,
+    pub connected: bool,
+    pub slot_count: usize,
+    pub last_sequence: u64,
+    pub frames_received: u64,
+    pub connections: u64,
+    pub disconnects: u64,
+    pub fallback_polls: u64,
+    pub errors: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct RuntimeRefreshStatus {
+    pub total_refreshes: u64,
+    pub last_total_msec: u64,
+    pub peak_total_msec: u64,
+    pub last_phase_msec: BTreeMap<String, u64>,
+    pub snapshot_commands: u32,
+    pub snapshot_failures: u32,
+    pub route_mutations: u64,
+    pub deferred_route_mutations: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct PipeWireAudioHealthStatus {
+    pub monitor_available: bool,
+    pub profiler_available: bool,
+    pub profiler_samples: u64,
+    pub direct_errors: u64,
+    pub owned_direct_errors: u64,
+    pub warning_events: u64,
+    pub out_of_buffers: u64,
+    pub resyncs: u64,
+    pub link_failures: u64,
+    pub xruns: u64,
+    pub owned_events: u64,
+    pub last_event_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AdaptiveLatencyStatus {
+    pub enabled: bool,
+    pub target_msec: u16,
+    pub active_level: usize,
+    pub min_msec: u16,
+    pub max_msec: u16,
+    pub buffer_fill_msec: Option<f32>,
+    pub last_reason: String,
+    pub underrun_delta: u64,
+    pub pipewire_warning_delta: u64,
+    pub cpu_pressure: f32,
+    pub pipewire_quantum_frames: u32,
+    pub pipewire_quantum_floor_frames: u32,
+}
+
+impl Default for AdaptiveLatencyStatus {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            target_msec: 28,
+            active_level: 0,
+            min_msec: 28,
+            max_msec: 120,
+            buffer_fill_msec: None,
+            last_reason: "initial".into(),
+            underrun_delta: 0,
+            pipewire_warning_delta: 0,
+            cpu_pressure: 0.0,
+            pipewire_quantum_frames: 0,
+            pipewire_quantum_floor_frames: 0,
         }
     }
 }
@@ -2926,6 +3494,38 @@ fn normalize_latency_policy(policy: &mut LatencyPolicy) {
     policy.bluetooth_floor_msec = policy
         .bluetooth_floor_msec
         .map(|value| value.clamp(50, 500));
+}
+
+fn normalize_adaptive_latency_settings(settings: &mut AdaptiveLatencySettings) {
+    settings.min_msec = settings.min_msec.clamp(5, 500);
+    settings.max_msec = settings.max_msec.clamp(settings.min_msec, 500);
+    settings.levels_msec = std::mem::take(&mut settings.levels_msec)
+        .into_iter()
+        .map(|value| value.clamp(settings.min_msec, settings.max_msec))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if settings.levels_msec.is_empty() {
+        settings.levels_msec = default_adaptive_latency_levels()
+            .into_iter()
+            .map(|value| value.clamp(settings.min_msec, settings.max_msec))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
+    if !settings.levels_msec.contains(&settings.min_msec) {
+        settings.levels_msec.push(settings.min_msec);
+    }
+    if !settings.levels_msec.contains(&settings.max_msec) {
+        settings.levels_msec.push(settings.max_msec);
+    }
+    settings.levels_msec.sort_unstable();
+    settings.levels_msec.dedup();
+    if !settings.enabled {
+        settings.trigger_mode = AdaptiveLatencyTriggerMode::Off;
+    } else if settings.trigger_mode == AdaptiveLatencyTriggerMode::Off {
+        settings.trigger_mode = AdaptiveLatencyTriggerMode::Hybrid;
+    }
 }
 
 fn normalize_routing_policy(policy: &mut RoutingPolicy) {
@@ -3206,6 +3806,7 @@ fn normalize_effect_chain(
     for mut effect in effects {
         effect.effect_id = effect.effect_id.trim().to_string();
         migrate_removed_effect(&mut effect);
+        migrate_legacy_eq_params(&mut effect);
         let definition = match catalog
             .effects
             .iter()
@@ -3249,11 +3850,32 @@ fn migrate_removed_effect(effect: &mut EffectInstance) {
     effect.params = rnnoise_broadcast_params();
 }
 
+fn migrate_legacy_eq_params(effect: &mut EffectInstance) {
+    if effect.effect_id != "eq" || effect.params.contains_key("band_1k_gain_db") {
+        return;
+    }
+
+    let legacy_low = effect.params.get("low_gain_db").copied().unwrap_or(0.0);
+    let legacy_mid = effect.params.get("mid_gain_db").copied().unwrap_or(0.0);
+    let legacy_high = effect.params.get("high_gain_db").copied().unwrap_or(0.0);
+    effect.params = BTreeMap::from([
+        ("band_63_gain_db".into(), legacy_low),
+        ("band_125_gain_db".into(), legacy_low),
+        ("band_250_gain_db".into(), (legacy_low + legacy_mid) / 2.0),
+        ("band_500_gain_db".into(), legacy_mid),
+        ("band_1k_gain_db".into(), legacy_mid),
+        ("band_2k_gain_db".into(), legacy_mid),
+        ("band_4k_gain_db".into(), legacy_high),
+        ("band_8k_gain_db".into(), legacy_high),
+    ]);
+}
+
 fn rnnoise_broadcast_params() -> BTreeMap<String, f32> {
     BTreeMap::from([
         ("vad_threshold".into(), 25.0),
         ("hold_ms".into(), 200.0),
-        ("lead_in_ms".into(), 0.0),
+        ("minimum_voice_level_db".into(), -70.0),
+        ("dry_mix".into(), 0.0),
     ])
 }
 
@@ -3311,6 +3933,7 @@ fn single_instance_effect_group(effect_id: &str) -> Option<&'static str> {
         "eq" => Some("eq"),
         "compressor" => Some("compressor"),
         "gate" => Some("gate"),
+        "karaoke_stage" => Some("karaoke_stage"),
         "limiter" => Some("limiter"),
         _ => None,
     }
@@ -3353,6 +3976,7 @@ fn normalize_effect_params(
     definition: &EffectDefinition,
 ) -> BTreeMap<String, f32> {
     migrate_gate_room_mic_profile(&mut params, definition);
+    migrate_rnnoise_generated_raw_bleed(&mut params, definition);
     definition
         .params
         .iter()
@@ -3361,6 +3985,76 @@ fn normalize_effect_params(
             (param.id.clone(), clamp_param_value(value, param))
         })
         .collect()
+}
+
+fn migrate_rnnoise_generated_raw_bleed(
+    params: &mut BTreeMap<String, f32>,
+    definition: &EffectDefinition,
+) {
+    if definition.id != "rnnoise" || params.get("dry_mix").is_none_or(|dry| *dry <= 0.0) {
+        return;
+    }
+
+    let legacy_presets = [
+        [
+            ("vad_threshold", 25.0),
+            ("hold_ms", 200.0),
+            ("minimum_voice_level_db", -70.0),
+            ("dry_mix", 0.1),
+        ],
+        [
+            ("vad_threshold", 25.0),
+            ("hold_ms", 250.0),
+            ("minimum_voice_level_db", -70.0),
+            ("dry_mix", 0.12),
+        ],
+        [
+            ("vad_threshold", 75.0),
+            ("hold_ms", 150.0),
+            ("minimum_voice_level_db", -70.0),
+            ("dry_mix", 0.06),
+        ],
+    ];
+    let matches_legacy_preset = legacy_presets.iter().any(|preset| {
+        preset
+            .iter()
+            .all(|(id, expected)| param_matches_with_tolerance(params, id, *expected, 0.001))
+    });
+
+    let matches_legacy_slider = params
+        .get("vad_threshold")
+        .copied()
+        .map(|vad| ((vad - 25.0) / 70.0).clamp(0.0, 1.0))
+        .is_some_and(|amount| {
+            param_matches_with_tolerance(params, "hold_ms", 250.0 - 175.0 * amount, 0.51)
+                && param_matches_with_tolerance(
+                    params,
+                    "minimum_voice_level_db",
+                    -65.0 + 37.0 * amount,
+                    0.051,
+                )
+                && param_matches_with_tolerance(
+                    params,
+                    "dry_mix",
+                    (0.12 - 0.16 * amount).max(0.0),
+                    0.0011,
+                )
+        });
+
+    if matches_legacy_preset || matches_legacy_slider {
+        params.insert("dry_mix".into(), 0.0);
+    }
+}
+
+fn param_matches_with_tolerance(
+    params: &BTreeMap<String, f32>,
+    id: &str,
+    expected: f32,
+    tolerance: f32,
+) -> bool {
+    params
+        .get(id)
+        .is_some_and(|value| (*value - expected).abs() <= tolerance)
 }
 
 fn migrate_gate_room_mic_profile(
@@ -3396,6 +4090,26 @@ fn migrate_wavelinux5_voice_effect_defaults(
     catalog: &EffectCatalog,
 ) {
     migrate_hard_gate_profile_to_soft_default(effects);
+    reorder_standard_voice_effect_chain(effects, catalog);
+}
+
+fn migrate_hardware_input_chain_to_rnnoise_default(
+    effects: &mut Vec<EffectInstance>,
+    catalog: &EffectCatalog,
+) {
+    if effects.is_empty()
+        || effects.iter().any(|effect| effect.effect_id == "rnnoise")
+        || effects
+            .iter()
+            .any(|effect| !is_standard_voice_effect(&effect.effect_id))
+    {
+        return;
+    }
+
+    let mut rnnoise = EffectInstance::new("rnnoise");
+    rnnoise.name = Some("Noise Suppression".into());
+    rnnoise.params = rnnoise_broadcast_params();
+    effects.push(rnnoise);
     reorder_standard_voice_effect_chain(effects, catalog);
 }
 
@@ -3456,7 +4170,7 @@ fn reorder_standard_voice_effect_chain(effects: &mut Vec<EffectInstance>, catalo
 fn is_standard_voice_effect(effect_id: &str) -> bool {
     matches!(
         effect_id,
-        "highpass" | "rnnoise" | "eq" | "gate" | "compressor" | "limiter"
+        "highpass" | "rnnoise" | "eq" | "gate" | "compressor" | "karaoke_stage" | "limiter"
     )
 }
 
@@ -3653,7 +4367,26 @@ mod tests {
             .channels
             .iter()
             .any(|channel| channel.id == "system" && channel.kind == ChannelKind::System));
+        assert!(config.settings.adaptive_latency.enabled);
+        assert_eq!(config.settings.adaptive_latency.min_msec, 28);
+        assert_eq!(config.settings.adaptive_latency.max_msec, 120);
+        assert_eq!(
+            config.settings.adaptive_latency.levels_msec,
+            vec![28, 40, 60, 80, 100, 120]
+        );
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn adaptive_latency_settings_normalize_to_ordered_bounded_levels() {
+        let mut config = MixerConfig::default();
+        config.settings.adaptive_latency.min_msec = 40;
+        config.settings.adaptive_latency.max_msec = 20;
+        config.settings.adaptive_latency.levels_msec = vec![500, 1, 80, 80];
+        let normalized = config.normalized().unwrap();
+        assert_eq!(normalized.settings.adaptive_latency.min_msec, 40);
+        assert_eq!(normalized.settings.adaptive_latency.max_msec, 40);
+        assert_eq!(normalized.settings.adaptive_latency.levels_msec, vec![40]);
     }
 
     #[test]
@@ -4109,9 +4842,13 @@ mod tests {
         };
 
         assert!(config.remember_app_stream(&first, 100).unwrap().is_some());
-        assert!(config.remember_app_stream(&second, 200).unwrap().is_some());
+        let refreshed_at = 100 + APP_HISTORY_SEEN_REFRESH_SECONDS;
+        assert!(config
+            .remember_app_stream(&second, refreshed_at)
+            .unwrap()
+            .is_some());
         assert_eq!(config.app_history.len(), 1);
-        assert_eq!(config.app_history[0].last_seen_unix, 200);
+        assert_eq!(config.app_history[0].last_seen_unix, refreshed_at);
     }
 
     #[test]
@@ -4304,7 +5041,7 @@ mod tests {
         );
 
         let remembered = config
-            .remember_app_stream(&slack_stream, 200)
+            .remember_app_stream(&slack_stream, 100 + APP_HISTORY_SEEN_REFRESH_SECONDS)
             .unwrap()
             .unwrap();
         assert_eq!(remembered.display_name, "Work Slack");
@@ -4513,6 +5250,7 @@ mod tests {
             .collect();
         assert!(ids.contains("rnnoise"));
         assert!(!ids.contains("deepfilternet"));
+        assert!(ids.contains("karaoke_stage"));
         assert!(ids.contains("limiter"));
     }
 
@@ -4534,9 +5272,16 @@ mod tests {
         assert!(rnnoise.params.iter().any(|param| param.id == "hold_ms"
             && (param.max - 1000.0).abs() < f32::EPSILON
             && (param.default - 200.0).abs() < f32::EPSILON));
-        assert!(rnnoise.params.iter().any(|param| param.id == "lead_in_ms"
-            && (param.max - 200.0).abs() < f32::EPSILON
-            && (param.default - 0.0).abs() < f32::EPSILON));
+        assert!(rnnoise.params.iter().any(|param| {
+            param.id == "minimum_voice_level_db"
+                && (param.min + 70.0).abs() < f32::EPSILON
+                && (param.max + 20.0).abs() < f32::EPSILON
+                && (param.default + 70.0).abs() < f32::EPSILON
+        }));
+        assert!(rnnoise.params.iter().any(|param| param.id == "dry_mix"
+            && (param.min - 0.0).abs() < f32::EPSILON
+            && (param.max - 1.0).abs() < f32::EPSILON
+            && param.default.abs() < f32::EPSILON));
 
         let compressor = catalog
             .effects
@@ -4561,6 +5306,23 @@ mod tests {
         assert!(gate.params.iter().any(|param| param.id == "range_db"
             && (param.min + 90.0).abs() < f32::EPSILON
             && (param.default + 30.0).abs() < f32::EPSILON));
+
+        let eq = catalog
+            .effects
+            .iter()
+            .find(|effect| effect.id == "eq")
+            .unwrap();
+        assert_eq!(eq.name, "8-Band EQ");
+        assert_eq!(
+            eq.params
+                .iter()
+                .filter(|param| param.id.starts_with("band_"))
+                .count(),
+            8
+        );
+        assert!(eq.params.iter().any(|param| param.id == "band_8k_gain_db"
+            && (param.min + 12.0).abs() < f32::EPSILON
+            && (param.max - 12.0).abs() < f32::EPSILON));
     }
 
     #[test]
@@ -4575,7 +5337,35 @@ mod tests {
         assert_eq!(broadcast.name, "Broadcast");
         assert_eq!(broadcast.values.get("vad_threshold"), Some(&25.0));
         assert_eq!(broadcast.values.get("hold_ms"), Some(&200.0));
-        assert_eq!(broadcast.values.get("lead_in_ms"), Some(&0.0));
+        assert_eq!(broadcast.values.get("minimum_voice_level_db"), Some(&-70.0));
+        assert_eq!(broadcast.values.get("dry_mix"), Some(&0.0));
+        let near_field = rnnoise
+            .presets
+            .iter()
+            .find(|preset| preset.name == "Near-field")
+            .unwrap();
+        assert_eq!(near_field.values.get("vad_threshold"), Some(&85.0));
+        assert_eq!(near_field.values.get("hold_ms"), Some(&100.0));
+        assert_eq!(
+            near_field.values.get("minimum_voice_level_db"),
+            Some(&-42.0)
+        );
+        assert_eq!(near_field.values.get("dry_mix"), Some(&0.0));
+        let gate = catalog
+            .effects
+            .iter()
+            .find(|effect| effect.id == "gate")
+            .unwrap();
+        let nearby_voices = gate
+            .presets
+            .iter()
+            .find(|preset| preset.name == "Nearby voices -20 dB")
+            .unwrap();
+        assert_eq!(nearby_voices.values.get("threshold_db"), Some(&-20.0));
+        assert_eq!(nearby_voices.values.get("range_db"), Some(&-90.0));
+        assert_eq!(nearby_voices.values.get("attack_ms"), Some(&1.0));
+        assert_eq!(nearby_voices.values.get("hold_ms"), Some(&60.0));
+        assert_eq!(nearby_voices.values.get("release_ms"), Some(&100.0));
         let eq = catalog
             .effects
             .iter()
@@ -4585,6 +5375,50 @@ mod tests {
             .presets
             .iter()
             .any(|preset| preset.name == "Broadcast Voice"));
+        let voice_style = catalog
+            .effects
+            .iter()
+            .find(|effect| effect.id == "karaoke_stage")
+            .unwrap();
+        assert!(voice_style
+            .presets
+            .iter()
+            .any(|preset| preset.name == "Old Radio Announcer"));
+        assert!(voice_style
+            .params
+            .iter()
+            .any(|param| param.id == "tone_lowpass_hz"));
+    }
+
+    #[test]
+    fn legacy_three_band_eq_params_migrate_to_eight_band() {
+        let mut config = MixerConfig {
+            version: 11,
+            ..MixerConfig::default()
+        };
+        let mut eq = EffectInstance::new("eq");
+        eq.params = BTreeMap::from([
+            ("low_gain_db".into(), -2.0),
+            ("mid_gain_db".into(), 3.0),
+            ("high_gain_db".into(), 1.5),
+        ]);
+        config.channels[0].effects = vec![eq];
+
+        let config = config.normalized().unwrap();
+        let eq = config.channels[0].effects.first().unwrap();
+
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(eq.params.get("band_63_gain_db"), Some(&-2.0));
+        assert_eq!(eq.params.get("band_125_gain_db"), Some(&-2.0));
+        assert_eq!(eq.params.get("band_250_gain_db"), Some(&0.5));
+        assert_eq!(eq.params.get("band_500_gain_db"), Some(&3.0));
+        assert_eq!(eq.params.get("band_1k_gain_db"), Some(&3.0));
+        assert_eq!(eq.params.get("band_2k_gain_db"), Some(&3.0));
+        assert_eq!(eq.params.get("band_4k_gain_db"), Some(&1.5));
+        assert_eq!(eq.params.get("band_8k_gain_db"), Some(&1.5));
+        assert!(!eq.params.contains_key("low_gain_db"));
+        assert!(!eq.params.contains_key("mid_gain_db"));
+        assert!(!eq.params.contains_key("high_gain_db"));
     }
 
     #[test]
@@ -4629,8 +5463,49 @@ mod tests {
         assert_eq!(effect.name.as_deref(), Some("Noise Suppression"));
         assert_eq!(effect.params.get("vad_threshold"), Some(&25.0));
         assert_eq!(effect.params.get("hold_ms"), Some(&200.0));
-        assert_eq!(effect.params.get("lead_in_ms"), Some(&0.0));
+        assert_eq!(effect.params.get("minimum_voice_level_db"), Some(&-70.0));
+        assert_eq!(effect.params.get("dry_mix"), Some(&0.0));
         assert!(!effect.params.contains_key("attenuation_limit_db"));
+    }
+
+    #[test]
+    fn generated_rnnoise_strength_migrates_to_zero_raw_bleed() {
+        let mut config = MixerConfig::default();
+        let mut rnnoise = EffectInstance::new("rnnoise");
+        rnnoise.params = BTreeMap::from([
+            ("vad_threshold".into(), 37.6),
+            ("hold_ms".into(), 219.0),
+            ("minimum_voice_level_db".into(), -58.3),
+            ("dry_mix".into(), 0.091),
+        ]);
+
+        let channel = config
+            .set_effect_chain("hardware_in", vec![rnnoise])
+            .unwrap();
+        let params = &channel.effects[0].params;
+
+        assert_eq!(params.get("vad_threshold"), Some(&37.6));
+        assert_eq!(params.get("hold_ms"), Some(&219.0));
+        assert_eq!(params.get("minimum_voice_level_db"), Some(&-58.3));
+        assert_eq!(params.get("dry_mix"), Some(&0.0));
+    }
+
+    #[test]
+    fn advanced_rnnoise_dry_mix_is_not_migrated() {
+        let mut config = MixerConfig::default();
+        let mut rnnoise = EffectInstance::new("rnnoise");
+        rnnoise.params = BTreeMap::from([
+            ("vad_threshold".into(), 51.0),
+            ("hold_ms".into(), 333.0),
+            ("minimum_voice_level_db".into(), -49.0),
+            ("dry_mix".into(), 0.25),
+        ]);
+
+        let channel = config
+            .set_effect_chain("hardware_in", vec![rnnoise])
+            .unwrap();
+
+        assert_eq!(channel.effects[0].params.get("dry_mix"), Some(&0.25));
     }
 
     #[test]
@@ -4682,8 +5557,10 @@ mod tests {
 
     #[test]
     fn legacy_wavelinux5_voice_chain_migrates_to_safe_order_and_gate() {
-        let mut config = MixerConfig::default();
-        config.version = 9;
+        let mut config = MixerConfig {
+            version: 9,
+            ..MixerConfig::default()
+        };
         let channel = config
             .channels
             .iter_mut()
@@ -4730,6 +5607,69 @@ mod tests {
             .unwrap();
         assert_eq!(gate.params.get("threshold_db"), Some(&-60.0));
         assert_eq!(gate.params.get("range_db"), Some(&-30.0));
+    }
+
+    #[test]
+    fn legacy_partial_hardware_voice_chain_adds_rnnoise_default() {
+        let mut config = MixerConfig {
+            version: 10,
+            ..MixerConfig::default()
+        };
+        let channel = config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        channel.effects = vec![
+            EffectInstance::new("highpass"),
+            EffectInstance::new("eq"),
+            EffectInstance::new("compressor"),
+            EffectInstance::new("limiter"),
+        ];
+
+        let normalized = config.normalized().unwrap();
+        let effects = &normalized
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap()
+            .effects;
+        let ids = effects
+            .iter()
+            .map(|effect| effect.effect_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            vec!["highpass", "rnnoise", "eq", "compressor", "limiter"]
+        );
+        let rnnoise = effects
+            .iter()
+            .find(|effect| effect.effect_id == "rnnoise")
+            .unwrap();
+        assert_eq!(rnnoise.name.as_deref(), Some("Noise Suppression"));
+        assert_eq!(rnnoise.params.get("vad_threshold"), Some(&25.0));
+        assert_eq!(rnnoise.params.get("hold_ms"), Some(&200.0));
+        assert_eq!(rnnoise.params.get("minimum_voice_level_db"), Some(&-70.0));
+        assert_eq!(rnnoise.params.get("dry_mix"), Some(&0.0));
+    }
+
+    #[test]
+    fn legacy_empty_hardware_voice_chain_stays_empty() {
+        let config = MixerConfig {
+            version: 10,
+            ..MixerConfig::default()
+        };
+
+        let normalized = config.normalized().unwrap();
+        let effects = &normalized
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap()
+            .effects;
+
+        assert!(effects.is_empty());
     }
 
     #[test]
@@ -4822,10 +5762,10 @@ mod tests {
         let mut config = MixerConfig::default();
         let mut first = EffectInstance::new("eq");
         first.instance_id = "eq-old".into();
-        first.params.insert("mid_gain_db".into(), -3.0);
+        first.params.insert("band_1k_gain_db".into(), -3.0);
         let mut second = EffectInstance::new("eq");
         second.instance_id = "eq-new".into();
-        second.params.insert("mid_gain_db".into(), 2.0);
+        second.params.insert("band_1k_gain_db".into(), 2.0);
 
         let channel = config
             .set_effect_chain("hardware_in", vec![first, second])
@@ -4834,7 +5774,7 @@ mod tests {
 
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].instance_id, "eq-new");
-        assert_eq!(effects[0].params.get("mid_gain_db"), Some(&2.0));
+        assert_eq!(effects[0].params.get("band_1k_gain_db"), Some(&2.0));
     }
 
     #[test]
@@ -4855,6 +5795,57 @@ mod tests {
         assert_eq!(effects.len(), 1);
         assert!(!effects[0].bypassed);
         assert_eq!(effects[0].instance_id, "rnnoise-gentle");
+    }
+
+    #[test]
+    fn channel_effect_enable_preserves_selected_effects_and_restores_bypassed_chain() {
+        let mut config = MixerConfig::default();
+        let mut effect = EffectInstance::new("rnnoise");
+        effect.params.insert("vad_threshold".into(), 72.0);
+        config
+            .set_effect_chain("hardware_in", vec![effect])
+            .unwrap();
+
+        let disabled = config
+            .set_channel_effects_enabled("hardware_in", false)
+            .unwrap();
+        assert!(!disabled.effects_enabled);
+        assert_eq!(disabled.effects.len(), 1);
+        assert_eq!(disabled.effects[0].params.get("vad_threshold"), Some(&72.0));
+
+        config
+            .bypass_effect("hardware_in", disabled.effects[0].instance_id.clone(), true)
+            .unwrap();
+        let enabled = config
+            .set_channel_effects_enabled("hardware_in", true)
+            .unwrap();
+        assert!(enabled.effects_enabled);
+        assert!(!enabled.effects[0].bypassed);
+    }
+
+    #[test]
+    fn effect_runtime_state_requires_latest_healthy_acknowledgement() {
+        let mut status = EffectRuntimeStatus {
+            channel_id: "hardware_in".into(),
+            selected_effect_count: 1,
+            desired_enabled: true,
+            desired_generation: 8,
+            applied_generation: 7,
+            core_healthy: true,
+            pending: true,
+            ..EffectRuntimeStatus::default()
+        };
+        status.resolve_state();
+        assert_eq!(status.state, EffectRuntimeState::Red);
+
+        status.pending = false;
+        status.applied_generation = 8;
+        status.resolve_state();
+        assert_eq!(status.state, EffectRuntimeState::Green);
+
+        status.selected_effect_count = 0;
+        status.resolve_state();
+        assert_eq!(status.state, EffectRuntimeState::Grey);
     }
 
     #[test]

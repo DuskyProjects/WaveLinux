@@ -3,9 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[cfg(test)]
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use include_dir::{include_dir, Dir};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use wavelinux_model::{
     BluetoothMicPolicy, DeviceBus, DeviceInfo, DevicePolicy, Diagnostic, DiagnosticSeverity,
     FallbackHardwareProfile, HardwareProfile, HardwareProfileMatch, HardwareProfileSummary,
@@ -14,12 +16,15 @@ use wavelinux_model::{
 
 use crate::EnginePaths;
 
-#[cfg(test)]
-static TEST_PROFILE_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../profiles/v1/devices");
+static SHIPPED_PROFILE_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../profiles/v1/devices");
+const SHIPPED_PROFILE_INDEX: &str = include_str!("../../../profiles/v1/index.json");
+const SHIPPED_PROFILE_INDEX_SIGNATURE: &str = include_str!("../../../profiles/v1/index.json.sig");
+const PROFILE_CATALOG_PUBLIC_KEY_BASE64: &str = "9aJ/GJzx9P3y/GO385AK5GJugkBGu7FBRDvCqLOEdoQ=";
 const PROFILE_SOURCE_BASE_URL: &str =
-    "https://raw.githubusercontent.com/DuskyProjects/WaveLinux/master/profiles/v1";
+    "https://raw.githubusercontent.com/DuskyProjects/WaveLinux/main/profiles/v1";
 const PROFILE_INDEX_CACHE_FILE: &str = "hardware-profiles-v1-index.json";
 const PROFILE_INDEX_REMOTE_PATH: &str = "index.json";
+const PROFILE_INDEX_SIGNATURE_REMOTE_PATH: &str = "index.json.sig";
 const PROFILE_DEVICE_REMOTE_DIR: &str = "devices";
 const PROFILE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const PROFILE_INDEX_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -49,7 +54,6 @@ pub struct RemoteProfileSyncReport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProfileSource {
-    #[cfg(test)]
     Shipped,
     Remote,
     Local,
@@ -58,7 +62,6 @@ pub enum ProfileSource {
 impl ProfileSource {
     pub fn as_str(self) -> &'static str {
         match self {
-            #[cfg(test)]
             Self::Shipped => "shipped",
             Self::Remote => "remote",
             Self::Local => "local",
@@ -67,7 +70,6 @@ impl ProfileSource {
 
     fn priority(self) -> u8 {
         match self {
-            #[cfg(test)]
             Self::Shipped => 10,
             Self::Remote => 20,
             Self::Local => 30,
@@ -77,17 +79,8 @@ impl ProfileSource {
 
 pub fn load_hardware_profile_catalog(paths: &EnginePaths) -> HardwareProfileCatalog {
     let mut catalog = HardwareProfileCatalog::default();
-    #[cfg(test)]
-    load_test_profiles(&mut catalog);
-    load_profile_dir(
-        &paths
-            .config_dir
-            .join("hardware-profiles")
-            .join("v1")
-            .join("remote"),
-        ProfileSource::Remote,
-        &mut catalog,
-    );
+    load_shipped_profiles(&mut catalog);
+    load_verified_remote_profiles(paths, &mut catalog);
     load_profile_dir(
         &paths.local_hardware_profiles_dir(),
         ProfileSource::Local,
@@ -123,7 +116,7 @@ pub fn sync_remote_profiles_for_devices(
     let missing_assigned_profile_ids = missing_assigned_profile_ids(policy, catalog);
     for profile_id in &missing_assigned_profile_ids {
         if let Some(entry) = index.profiles.iter().find(|entry| &entry.id == profile_id) {
-            wanted_assets.insert(entry.asset.clone(), true);
+            wanted_assets.insert(entry.asset.clone(), (entry.clone(), true));
             report.matched += 1;
         }
     }
@@ -141,15 +134,15 @@ pub fn sync_remote_profiles_for_devices(
                         true
                     };
                 if needs_update {
-                    wanted_assets.insert(entry.asset.clone(), true);
+                    wanted_assets.insert(entry.asset.clone(), (entry.clone(), true));
                     report.matched += 1;
                 }
             }
         }
     }
 
-    for (asset, force_refresh) in wanted_assets {
-        match cache_remote_profile_asset(paths, &asset, force_refresh) {
+    for (_asset, (entry, force_refresh)) in wanted_assets {
+        match cache_remote_profile_asset(paths, &entry, force_refresh) {
             Ok(true) => {
                 report.fetched += 1;
                 report.changed = true;
@@ -177,6 +170,9 @@ pub fn remote_profile_sync_needed(
         return true;
     }
     let index_path = remote_index_path(paths);
+    if cache_file_is_fresh(&remote_index_failure_path(paths), PROFILE_INDEX_FAILURE_TTL) {
+        return false;
+    }
     if !index_path.is_file() || !cache_file_is_fresh(&index_path, PROFILE_INDEX_CACHE_TTL) {
         return true;
     }
@@ -493,13 +489,11 @@ fn load_profile_dir(dir: &Path, source: ProfileSource, catalog: &mut HardwarePro
     }
 }
 
-#[cfg(test)]
-fn load_test_profiles(catalog: &mut HardwareProfileCatalog) {
-    load_test_profile_dir(&TEST_PROFILE_DIR, catalog);
+fn load_shipped_profiles(catalog: &mut HardwareProfileCatalog) {
+    load_shipped_profile_dir(&SHIPPED_PROFILE_DIR, catalog);
 }
 
-#[cfg(test)]
-fn load_test_profile_dir(dir: &Dir<'_>, catalog: &mut HardwareProfileCatalog) {
+fn load_shipped_profile_dir(dir: &Dir<'_>, catalog: &mut HardwareProfileCatalog) {
     for file in dir.files() {
         if file.path().extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
@@ -515,7 +509,42 @@ fn load_test_profile_dir(dir: &Dir<'_>, catalog: &mut HardwareProfileCatalog) {
         }
     }
     for child in dir.dirs() {
-        load_test_profile_dir(child, catalog);
+        load_shipped_profile_dir(child, catalog);
+    }
+}
+
+fn load_verified_remote_profiles(paths: &EnginePaths, catalog: &mut HardwareProfileCatalog) {
+    let index_path = remote_index_path(paths);
+    let index = match read_cached_remote_index(&index_path) {
+        Ok(index) => index,
+        Err(err) => {
+            if index_path.is_file() {
+                catalog.diagnostics.push(profile_diagnostic(
+                    &index_path,
+                    DiagnosticSeverity::Warning,
+                    format!("Ignored unverified remote hardware profile cache: {err}"),
+                ));
+            }
+            return;
+        }
+    };
+
+    for entry in index.profiles {
+        let Some(file_name) = remote_asset_file_name(&entry.asset) else {
+            continue;
+        };
+        let path = remote_profile_dir(paths).join(file_name);
+        let data = match fs::read_to_string(&path) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        if let Err(err) = validate_remote_profile_cache(&data, &entry.sha256) {
+            catalog
+                .diagnostics
+                .push(profile_diagnostic(&path, DiagnosticSeverity::Warning, err));
+            continue;
+        }
+        load_bundle(&data, ProfileSource::Remote, &path, catalog);
     }
 }
 
@@ -617,7 +646,14 @@ struct RemoteProfileIndexEntry {
     name: String,
     revision: u32,
     asset: String,
+    sha256: String,
     matches: Vec<HardwareProfileMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SignedProfileIndexCache {
+    payload: String,
+    signature: String,
 }
 
 fn load_or_download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileIndex, String> {
@@ -641,11 +677,13 @@ fn load_or_download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileInd
         if retry_stale_failure_without_cache {
             let _ = fs::remove_file(&failure_path);
         } else {
-            return read_cached_remote_index(&index_path).map_err(|cache_err| {
-                format!(
-                    "Hardware profile index download is in backoff after a recent failure; cached index unavailable: {cache_err}"
-                )
-            });
+            return read_cached_remote_index(&index_path)
+                .or_else(|_| bundled_remote_index())
+                .map_err(|cache_err| {
+                    format!(
+                        "Hardware profile index download is in backoff after a recent failure; cached index unavailable: {cache_err}"
+                    )
+                });
         }
     }
 
@@ -658,7 +696,7 @@ fn load_or_download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileInd
         Err(download_err) => {
             let _ = fs::create_dir_all(failure_path.parent().unwrap_or_else(|| Path::new(".")));
             let _ = fs::write(&failure_path, download_err.as_bytes());
-            match read_cached_remote_index(&index_path) {
+            match read_cached_remote_index(&index_path).or_else(|_| bundled_remote_index()) {
                 Ok(index) => Ok(index),
                 Err(cache_err) => Err(format!(
                     "Could not update hardware profile index from GitHub: {download_err}; cached index unavailable: {cache_err}"
@@ -671,6 +709,9 @@ fn load_or_download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileInd
 fn download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileIndex, String> {
     let base_url = remote_profile_base_url();
     let data = download_remote_asset(&base_url, PROFILE_INDEX_REMOTE_PATH, MAX_REMOTE_INDEX_BYTES)?;
+    let signature =
+        download_remote_asset(&base_url, PROFILE_INDEX_SIGNATURE_REMOTE_PATH, 4 * 1024)?;
+    verify_profile_catalog_signature(&data, &signature)?;
     let index = parse_remote_index(&data)?;
 
     let index_path = remote_index_path(paths);
@@ -680,8 +721,12 @@ fn download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileIndex, Stri
             .ok_or_else(|| "hardware profile index cache path was invalid".to_string())?,
     )
     .map_err(|err| format!("Could not create hardware profile index cache: {err}"))?;
-    fs::write(&index_path, data)
-        .map_err(|err| format!("Could not write hardware profile index cache: {err}"))?;
+    let cache = serde_json::to_vec(&SignedProfileIndexCache {
+        payload: data,
+        signature,
+    })
+    .map_err(|err| format!("Could not serialize hardware profile index cache: {err}"))?;
+    write_atomic_cache_file(&index_path, &cache)?;
     let _ = fs::remove_file(index_path.with_extension("json.sig"));
     Ok(index)
 }
@@ -689,7 +734,15 @@ fn download_remote_index(paths: &EnginePaths) -> Result<RemoteProfileIndex, Stri
 fn read_cached_remote_index(index_path: &Path) -> Result<RemoteProfileIndex, String> {
     let data = fs::read_to_string(index_path)
         .map_err(|err| format!("Could not read cached hardware profile index: {err}"))?;
-    parse_remote_index(&data)
+    let cache: SignedProfileIndexCache = serde_json::from_str(&data)
+        .map_err(|err| format!("Cached hardware profile index was not a signed catalog: {err}"))?;
+    verify_profile_catalog_signature(&cache.payload, &cache.signature)?;
+    parse_remote_index(&cache.payload)
+}
+
+fn bundled_remote_index() -> Result<RemoteProfileIndex, String> {
+    verify_profile_catalog_signature(SHIPPED_PROFILE_INDEX, SHIPPED_PROFILE_INDEX_SIGNATURE)?;
+    parse_remote_index(SHIPPED_PROFILE_INDEX)
 }
 
 fn parse_remote_index(data: &str) -> Result<RemoteProfileIndex, String> {
@@ -712,9 +765,11 @@ fn sanitize_remote_index_entry(
     entry.id = entry.id.trim().to_string();
     entry.name = entry.name.trim().to_string();
     entry.asset = entry.asset.trim().to_string();
+    entry.sha256 = entry.sha256.trim().to_ascii_lowercase();
     if entry.id.is_empty()
         || entry.name.is_empty()
         || entry.matches.is_empty()
+        || !is_sha256_hex(&entry.sha256)
         || remote_asset_file_name(&entry.asset).is_none()
     {
         return None;
@@ -727,38 +782,46 @@ fn sanitize_remote_index_entry(
 
 fn cache_remote_profile_asset(
     paths: &EnginePaths,
-    asset: &str,
+    entry: &RemoteProfileIndexEntry,
     force_refresh: bool,
 ) -> Result<bool, String> {
-    let asset_file_name = remote_asset_file_name(asset).ok_or_else(|| {
-        format!("Ignored remote hardware profile with invalid asset name: {asset}")
+    let asset_file_name = remote_asset_file_name(&entry.asset).ok_or_else(|| {
+        format!(
+            "Ignored remote hardware profile with invalid asset name: {}",
+            entry.asset
+        )
     })?;
     let profile_path = remote_profile_dir(paths).join(asset_file_name);
-    if !force_refresh && cached_remote_profile_is_valid(&profile_path) {
+    if !force_refresh && cached_remote_profile_is_valid(&profile_path, &entry.sha256) {
         return Ok(false);
     }
 
     let base_url = remote_profile_base_url();
     let remote_path = format!("{PROFILE_DEVICE_REMOTE_DIR}/{asset_file_name}");
     let data = download_remote_asset(&base_url, &remote_path, MAX_REMOTE_PROFILE_BYTES)?;
-    validate_remote_profile_cache(&data)?;
+    validate_remote_profile_cache(&data, &entry.sha256)?;
 
     fs::create_dir_all(remote_profile_dir(paths))
         .map_err(|err| format!("Could not create remote hardware profile cache: {err}"))?;
-    fs::write(&profile_path, data)
-        .map_err(|err| format!("Could not write remote hardware profile cache: {err}"))?;
+    write_atomic_cache_file(&profile_path, data.as_bytes())?;
     let _ = fs::remove_file(profile_path.with_extension("json.sig"));
     Ok(true)
 }
 
-fn cached_remote_profile_is_valid(path: &Path) -> bool {
+fn cached_remote_profile_is_valid(path: &Path, expected_sha256: &str) -> bool {
     fs::read_to_string(path)
         .ok()
-        .and_then(|data| validate_remote_profile_cache(&data).ok())
+        .and_then(|data| validate_remote_profile_cache(&data, expected_sha256).ok())
         .is_some()
 }
 
-fn validate_remote_profile_cache(data: &str) -> Result<(), String> {
+fn validate_remote_profile_cache(data: &str, expected_sha256: &str) -> Result<(), String> {
+    let actual_sha256 = sha256_hex(data.as_bytes());
+    if actual_sha256 != expected_sha256 {
+        return Err(format!(
+            "Ignored remote hardware profile because its signed SHA-256 did not match: expected {expected_sha256}, got {actual_sha256}"
+        ));
+    }
     let value: serde_json::Value = serde_json::from_str(data)
         .map_err(|err| format!("Ignored invalid remote hardware profile JSON: {err}"))?;
     if forbidden_profile_keys(&value) {
@@ -771,6 +834,68 @@ fn validate_remote_profile_cache(data: &str) -> Result<(), String> {
         .map_err(|err| format!("Ignored remote hardware profile bundle: {err}"))?;
     if profiles.is_empty() {
         return Err("Ignored empty remote hardware profile bundle".into());
+    }
+    Ok(())
+}
+
+fn verify_profile_catalog_signature(payload: &str, encoded_signature: &str) -> Result<(), String> {
+    verify_profile_catalog_signature_with_key(
+        payload.as_bytes(),
+        encoded_signature,
+        PROFILE_CATALOG_PUBLIC_KEY_BASE64,
+    )
+}
+
+fn verify_profile_catalog_signature_with_key(
+    payload: &[u8],
+    encoded_signature: &str,
+    encoded_public_key: &str,
+) -> Result<(), String> {
+    let public_key = BASE64_STANDARD
+        .decode(encoded_public_key.trim())
+        .map_err(|err| format!("Hardware profile catalog public key was invalid: {err}"))?;
+    let public_key: [u8; 32] = public_key
+        .try_into()
+        .map_err(|_| "Hardware profile catalog public key had the wrong length".to_string())?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key)
+        .map_err(|err| format!("Hardware profile catalog public key was invalid: {err}"))?;
+    let signature = BASE64_STANDARD
+        .decode(encoded_signature.trim())
+        .map_err(|err| format!("Hardware profile catalog signature was invalid Base64: {err}"))?;
+    let signature = Signature::from_slice(&signature)
+        .map_err(|err| format!("Hardware profile catalog signature was invalid: {err}"))?;
+    verifying_key
+        .verify(payload, &signature)
+        .map_err(|_| "Hardware profile catalog signature verification failed".to_string())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    Sha256::digest(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_atomic_cache_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Hardware profile cache path had no parent".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("Could not create hardware profile cache directory: {err}"))?;
+    let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temp_path, data)
+        .map_err(|err| format!("Could not write hardware profile cache: {err}"))?;
+    fs::File::open(&temp_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| format!("Could not sync hardware profile cache: {err}"))?;
+    fs::rename(&temp_path, path)
+        .map_err(|err| format!("Could not commit hardware profile cache: {err}"))?;
+    if let Ok(directory) = fs::File::open(parent) {
+        let _ = directory.sync_all();
     }
     Ok(())
 }
@@ -1155,6 +1280,8 @@ mod tests {
             name: id.into(),
             description: description.into(),
             is_available: true,
+            active_port: None,
+            ports: Vec::new(),
             is_default: false,
             is_virtual: false,
             bus: Some(bus),
@@ -1242,7 +1369,7 @@ mod tests {
             }
         }
 
-        assert_single_profile_files(&TEST_PROFILE_DIR);
+        assert_single_profile_files(&SHIPPED_PROFILE_DIR);
     }
 
     #[test]
@@ -2119,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn repo_backed_remote_profile_cache_loads_without_signature() {
+    fn unsigned_remote_profile_cache_is_rejected() {
         let root = tempdir().unwrap();
         let paths = EnginePaths::for_tests(root.path());
         let remote_dir = paths
@@ -2142,46 +2269,43 @@ mod tests {
 
         let catalog = load_hardware_profile_catalog(&paths);
 
-        let profile = catalog
+        assert!(catalog
             .profiles
             .iter()
-            .find(|entry| entry.profile.id == "remote.unsigned")
-            .expect("repo-backed remote profile cache should load without generated signature");
-        assert_eq!(profile.source, ProfileSource::Remote);
+            .all(|entry| entry.profile.id != "remote.unsigned"));
     }
 
     #[test]
-    fn remote_profile_cache_with_command_is_ignored() {
-        let root = tempdir().unwrap();
-        let paths = EnginePaths::for_tests(root.path());
-        let remote_dir = paths
-            .config_dir
-            .join("hardware-profiles")
-            .join("v1")
-            .join("remote");
-        fs::create_dir_all(&remote_dir).unwrap();
-        fs::write(
-            remote_dir.join("remote.json"),
-            r#"{
+    fn verified_remote_profile_cache_still_rejects_executable_fields() {
+        let data = r#"{
               "id": "remote.command",
               "name": "Remote Command",
               "matches": [{"bus": "usb", "description_contains": ["Command"]}],
               "capabilities": {"input": true},
               "confidence": "high",
               "command": "pactl set-card-profile anything"
-            }"#,
-        )
-        .unwrap();
+            }"#;
+        let error = validate_remote_profile_cache(data, &sha256_hex(data.as_bytes()))
+            .expect_err("executable fields must be rejected after hash verification");
+        assert!(error.contains("executable"));
+    }
 
-        let catalog = load_hardware_profile_catalog(&paths);
+    #[test]
+    fn shipped_catalog_signature_and_asset_hashes_verify() {
+        let index = bundled_remote_index().expect("shipped catalog signature");
+        for entry in index.profiles {
+            let file = SHIPPED_PROFILE_DIR
+                .get_file(&entry.asset)
+                .unwrap_or_else(|| panic!("missing shipped profile asset {}", entry.asset));
+            assert_eq!(sha256_hex(file.contents()), entry.sha256, "{}", entry.asset);
+        }
+    }
 
-        assert!(catalog
-            .profiles
-            .iter()
-            .all(|entry| entry.profile.id != "remote.command"));
-        assert!(catalog
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("executable")));
+    #[test]
+    fn tampered_catalog_signature_is_rejected() {
+        let tampered = format!("{} ", SHIPPED_PROFILE_INDEX);
+        assert!(
+            verify_profile_catalog_signature(&tampered, SHIPPED_PROFILE_INDEX_SIGNATURE).is_err()
+        );
     }
 }

@@ -7,13 +7,15 @@ repository.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "wavelinux5-dsp-helper"
-path = "src/bin/wavelinux5-dsp-helper.rs"
+name = "wavelinux6-audio-core"
+path = "src/bin/wavelinux6-audio-core.rs"
 
 [dependencies]
 libc = "0.2"
-pipewire = { version = "0.9", features = ["v0_3_44"] }
+nnnoiseless = { version = "0.5.2", default-features = false }
+pipewire = { version = "0.9", features = ["v0_3_49"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+wavelinux-accelerator = { path = "../accelerator" }
 wavelinux-model = { path = "../model" }

@@ -11,20 +11,28 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wavelinux_model::{
     app_display_name, graph_prefix, graph_property_prefix, safe_node_id, AppMatcher, AppStream,
-    Channel, ChannelInputMode, DeviceBus, DeviceInfo, Diagnostic, DiagnosticSeverity,
-    EffectAvailability, EffectCatalog, EffectInstance, Mix, MixerConfig, MixerSettings,
-    OptimizationMode, PluginHint, RuntimeGraph, SAMPLE_RATE_HZ,
+    Channel, ChannelInputMode, DeviceBus, DeviceInfo, DevicePortInfo, Diagnostic,
+    DiagnosticSeverity, EffectAvailability, EffectCatalog, EffectInstance, Mix, MixerConfig,
+    MixerSettings, OptimizationMode, PluginHint, RuntimeGraph, SAMPLE_RATE_HZ,
 };
 
-pub const INPUT_ROUTE_REVISION: &str = "4";
-pub const EFFECT_ROUTE_REVISION: &str = "3";
-pub const EFFECT_CONFIG_REVISION: &str = "2";
-pub const CHANNEL_MIX_ROUTE_REVISION: &str = "3";
+mod registry;
+pub use registry::{
+    NativeStreamRoute, PipeWireRegistryCache, RegistryBatch, RegistryEventKind, StreamRouteBackend,
+};
+
+pub const INPUT_ROUTE_REVISION: &str = "5";
+pub const EFFECT_ROUTE_REVISION: &str = "4";
+pub const EFFECT_ADAPTIVE_BRIDGE_ROUTE_REVISION: &str = "2";
+pub const EFFECT_CONFIG_REVISION: &str = "3";
+pub const CHANNEL_MIX_ROUTE_REVISION: &str = "4";
 pub const MIX_MONITOR_ROUTE_REVISION: &str = "3";
+pub const CHANNEL_CONFIG_REVISION: &str = "2";
 // Fallback latencies for direct route helpers; profiles drive normal graph plans.
 pub const STABLE_LOOPBACK_LATENCY_MSEC: u16 = 80;
 pub const LOW_LATENCY_LOOPBACK_MSEC: u16 = 60;
 pub const BLUETOOTH_MONITOR_LOOPBACK_MSEC: u16 = 240;
+pub const EFFECT_ADAPTIVE_BRIDGE_TRANSPORT_MSEC: u16 = 28;
 pub const METERS_ENV: &str = "WAVELINUX_ENABLE_METERS";
 pub const METERS_DISABLE_ENV: &str = "WAVELINUX_DISABLE_METERS";
 pub const PW_RECORD_METERS_ENV: &str = "WAVELINUX_ENABLE_PW_RECORD_METERS";
@@ -173,6 +181,21 @@ pub struct SnapshotCommandTiming {
     pub succeeded: bool,
 }
 
+type TimedPactlResult = (Result<String, PwError>, SnapshotCommandTiming);
+
+fn failed_snapshot_worker(label: &str) -> TimedPactlResult {
+    (
+        Err(PwError::Io(format!(
+            "snapshot command worker panicked: {label}"
+        ))),
+        SnapshotCommandTiming {
+            label: label.into(),
+            elapsed_ms: 0,
+            succeeded: false,
+        },
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct PwClient {
     dry_run: bool,
@@ -254,6 +277,137 @@ impl PwClient {
                 auto_devices: Vec::new(),
                 effect_availability,
             },
+            timings,
+        )
+    }
+
+    /// Capture the graph and all managed route state from one coherent set of
+    /// Pulse queries. Callers that need both views should use this instead of
+    /// composing `snapshot_*`, `managed_modules`, and the route helpers: those
+    /// helpers otherwise fetch the same sources, sinks, and streams repeatedly.
+    pub fn audio_state_snapshot_with_effect_availability_timed(
+        &self,
+        config: Option<&MixerConfig>,
+        effect_availability: Vec<EffectAvailability>,
+    ) -> (AudioStateSnapshot, Vec<SnapshotCommandTiming>) {
+        // These are independent, read-only views of one Pulse server state. Run
+        // them together so refresh latency tracks the slowest query instead of
+        // the sum of host-command round trips.
+        let (
+            (sources_result, sources_timing),
+            (sinks_result, sinks_timing),
+            (sink_inputs_result, sink_inputs_timing),
+            (source_outputs_result, source_outputs_timing),
+            (clients_result, clients_timing),
+            (modules_result, modules_timing),
+            (cards_result, cards_timing),
+            (default_source_result, default_source_timing),
+            (default_sink_result, default_sink_timing),
+        ) = thread::scope(|scope| {
+            let sources = scope.spawn(|| {
+                self.pactl_json_with_timing(["list", "sources"], "pactl --format=json list sources")
+            });
+            let sinks = scope.spawn(|| {
+                self.pactl_json_with_timing(["list", "sinks"], "pactl --format=json list sinks")
+            });
+            let sink_inputs = scope.spawn(|| {
+                self.pactl_json_with_timing(
+                    ["list", "sink-inputs"],
+                    "pactl --format=json list sink-inputs",
+                )
+            });
+            let source_outputs = scope.spawn(|| {
+                self.pactl_json_with_timing(
+                    ["list", "source-outputs"],
+                    "pactl --format=json list source-outputs",
+                )
+            });
+            let clients = scope.spawn(|| {
+                self.pactl_json_with_timing(["list", "clients"], "pactl --format=json list clients")
+            });
+            let modules = scope.spawn(|| {
+                self.pactl_text_with_timing(
+                    ["list", "modules", "short"],
+                    "pactl list modules short",
+                )
+            });
+            let cards = scope.spawn(|| {
+                self.pactl_json_with_timing(["list", "cards"], "pactl --format=json list cards")
+            });
+            let default_source = scope.spawn(|| {
+                self.pactl_text_with_timing(["get-default-source"], "pactl get-default-source")
+            });
+            let default_sink = scope.spawn(|| {
+                self.pactl_text_with_timing(["get-default-sink"], "pactl get-default-sink")
+            });
+
+            (
+                sources
+                    .join()
+                    .unwrap_or_else(|_| failed_snapshot_worker("pactl --format=json list sources")),
+                sinks
+                    .join()
+                    .unwrap_or_else(|_| failed_snapshot_worker("pactl --format=json list sinks")),
+                sink_inputs.join().unwrap_or_else(|_| {
+                    failed_snapshot_worker("pactl --format=json list sink-inputs")
+                }),
+                source_outputs.join().unwrap_or_else(|_| {
+                    failed_snapshot_worker("pactl --format=json list source-outputs")
+                }),
+                clients
+                    .join()
+                    .unwrap_or_else(|_| failed_snapshot_worker("pactl --format=json list clients")),
+                modules
+                    .join()
+                    .unwrap_or_else(|_| failed_snapshot_worker("pactl list modules short")),
+                cards
+                    .join()
+                    .unwrap_or_else(|_| failed_snapshot_worker("pactl --format=json list cards")),
+                default_source
+                    .join()
+                    .unwrap_or_else(|_| failed_snapshot_worker("pactl get-default-source")),
+                default_sink
+                    .join()
+                    .unwrap_or_else(|_| failed_snapshot_worker("pactl get-default-sink")),
+            )
+        });
+        let timings = vec![
+            sources_timing,
+            sinks_timing,
+            sink_inputs_timing,
+            source_outputs_timing,
+            clients_timing,
+            modules_timing,
+            cards_timing,
+            default_source_timing,
+            default_sink_timing,
+        ];
+        let sources = sources_result.unwrap_or_else(|_| "[]".into());
+        let sinks = sinks_result.unwrap_or_else(|_| "[]".into());
+        let sink_inputs = sink_inputs_result.unwrap_or_else(|_| "[]".into());
+        let source_outputs = source_outputs_result.unwrap_or_else(|_| "[]".into());
+        let clients = clients_result.unwrap_or_else(|_| "[]".into());
+        let modules = modules_result.unwrap_or_default();
+        let cards = cards_result.unwrap_or_else(|_| "[]".into());
+        let default_source = default_source_result.ok();
+        let default_sink = default_sink_result.ok();
+
+        (
+            parse_audio_state_snapshot(
+                AudioStateSnapshotJson {
+                    sources: &sources,
+                    sinks: &sinks,
+                    sink_inputs: &sink_inputs,
+                    source_outputs: &source_outputs,
+                    clients: &clients,
+                    modules: &modules,
+                    cards: &cards,
+                    default_source: default_source.as_deref(),
+                    default_sink: default_sink.as_deref(),
+                },
+                config,
+                effect_availability,
+            ),
             timings,
         )
     }
@@ -437,6 +591,39 @@ impl PwClient {
         ))
     }
 
+    pub fn route_snapshot(&self) -> Result<RouteSnapshot, PwError> {
+        let modules = self.pactl_text(["list", "modules", "short"])?;
+        let sinks = self.pactl_json(["list", "sinks"])?;
+        let sources = self.pactl_json(["list", "sources"])?;
+        let sink_inputs = self.pactl_json(["list", "sink-inputs"])?;
+        let source_outputs = self.pactl_json(["list", "source-outputs"])?;
+
+        let managed_modules =
+            parse_managed_modules_json(&modules, &sinks, &sources, &sink_inputs, &source_outputs);
+        let sink_names = parse_device_names_by_index_json(&sinks);
+        let source_names = parse_device_names_by_index_json(&sources);
+        let sink_input_routes = hydrate_sink_input_routes_from_modules(
+            hydrate_sink_input_routes_from_sinks(
+                parse_sink_input_routes_json(&sink_inputs),
+                &sink_names,
+            ),
+            &managed_modules,
+        );
+        let source_output_routes = hydrate_source_output_routes_from_modules(
+            hydrate_source_output_routes_from_sources(
+                parse_source_outputs_json(&source_outputs),
+                &source_names,
+            ),
+            &managed_modules,
+        );
+
+        Ok(RouteSnapshot {
+            managed_modules,
+            sink_input_routes,
+            source_output_routes,
+        })
+    }
+
     pub fn bluetooth_audio_cards(&self) -> Result<Vec<BluetoothAudioCard>, PwError> {
         let json = self.pactl_json(["list", "cards"])?;
         Ok(parse_bluetooth_audio_cards_json(&json))
@@ -499,6 +686,41 @@ impl PwClient {
 
     pub fn list_outputs(&self) -> Result<Vec<DeviceInfo>, PwError> {
         self.list_sinks()
+    }
+
+    /// Read only application playback streams using an already-cached sink list.
+    ///
+    /// This is the hot path used after a Pulse `sink-input` event. Keeping device
+    /// discovery out of this query avoids re-running card/profile policy whenever
+    /// a dormant browser or game begins playback.
+    pub fn list_app_streams(
+        &self,
+        config: Option<&MixerConfig>,
+        outputs: &[DeviceInfo],
+    ) -> Result<Vec<AppStream>, PwError> {
+        let sink_names_by_index = outputs
+            .iter()
+            .filter_map(|sink| Some((sink.index.clone()?, sink.name.clone())))
+            .collect::<BTreeMap<_, _>>();
+        let json = self.pactl_json(["list", "sink-inputs"])?;
+        let streams = parse_sink_inputs_json_with_client_properties(
+            &json,
+            config,
+            &sink_names_by_index,
+            &BTreeMap::new(),
+        );
+        if !streams.iter().any(app_stream_needs_client_properties) {
+            return Ok(streams);
+        }
+
+        let clients_json = self.pactl_json(["list", "clients"]).unwrap_or_default();
+        let client_properties = parse_client_properties_json(&clients_json);
+        Ok(parse_sink_inputs_json_with_client_properties(
+            &json,
+            config,
+            &sink_names_by_index,
+            &client_properties,
+        ))
     }
 
     fn list_sink_inputs_with_routes_timed(
@@ -564,14 +786,24 @@ impl PwClient {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        let (result, timing) = self.pactl_json_with_timing(args, label);
+        timings.push(timing);
+        result
+    }
+
+    fn pactl_json_with_timing<I, S>(&self, args: I, label: &str) -> TimedPactlResult
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let started = Instant::now();
         let result = self.pactl_json(args);
-        timings.push(SnapshotCommandTiming {
+        let timing = SnapshotCommandTiming {
             label: label.into(),
             elapsed_ms: started.elapsed().as_millis(),
             succeeded: result.is_ok(),
-        });
-        result
+        };
+        (result, timing)
     }
 
     fn pactl_text<I, S>(&self, args: I) -> Result<String, PwError>
@@ -598,6 +830,21 @@ impl PwClient {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    fn pactl_text_with_timing<I, S>(&self, args: I, label: &str) -> TimedPactlResult
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let started = Instant::now();
+        let result = self.pactl_text(args);
+        let timing = SnapshotCommandTiming {
+            label: label.into(),
+            elapsed_ms: started.elapsed().as_millis(),
+            succeeded: result.is_ok(),
+        };
+        (result, timing)
+    }
+
     fn default_device<I, S>(&self, args: I) -> Result<Option<String>, PwError>
     where
         I: IntoIterator<Item = S>,
@@ -606,6 +853,13 @@ impl PwClient {
         let value = self.pactl_text(args)?.trim().to_string();
         Ok((!value.is_empty()).then_some(value))
     }
+}
+
+fn app_stream_needs_client_properties(stream: &AppStream) -> bool {
+    stream.app_id.is_none()
+        && stream.binary.is_none()
+        && stream.process_name.is_none()
+        && stream.window_class.is_none()
 }
 
 pub fn meter_targets_for_config(
@@ -639,7 +893,11 @@ fn meter_targets_for_config_inner(
         .map(|mix| (mix.id.as_str(), mix))
         .collect::<BTreeMap<_, _>>();
     for mix in &config.mixes {
-        let source_name = format!("{}.monitor", mix.virtual_sink_name);
+        let source_name = if available_sources.contains(&mix.virtual_source_name) {
+            mix.virtual_source_name.clone()
+        } else {
+            format!("{}.monitor", mix.virtual_sink_name)
+        };
         if available_sources.contains(&source_name) {
             targets.push(MeterTarget {
                 node_id: mix.id.clone(),
@@ -651,27 +909,6 @@ fn meter_targets_for_config_inner(
     }
     for channel in &config.channels {
         let raw_source_name = format!("{}.monitor", channel.virtual_sink_name);
-        let selected_hardware_source = channel
-            .kind
-            .uses_hardware_slot()
-            .then_some(channel.source_device.as_deref())
-            .flatten()
-            .filter(|source| available_sources.contains(*source));
-        if let Some(source_name) = selected_hardware_source {
-            targets.push(MeterTarget {
-                node_id: channel_raw_meter_id(&channel.id),
-                source_name: source_name.to_string(),
-                gain: 1.0,
-                muted: false,
-            });
-        } else if available_sources.contains(&raw_source_name) {
-            targets.push(MeterTarget {
-                node_id: channel_raw_meter_id(&channel.id),
-                source_name: raw_source_name.clone(),
-                gain: 1.0,
-                muted: false,
-            });
-        }
         let Some(channel_source_name) = channel_input_meter_source_name(
             channel,
             available_sources,
@@ -818,10 +1055,6 @@ pub fn channel_bus_meter_id(channel_id: &str, mix_id: &str) -> String {
     format!("channel:{channel_id}:mix:{mix_id}")
 }
 
-pub fn channel_raw_meter_id(channel_id: &str) -> String {
-    format!("channel:{channel_id}:raw")
-}
-
 pub fn meter_sampling_enabled() -> bool {
     meter_sampling_enabled_from_env(
         std::env::var(METERS_ENV)
@@ -878,43 +1111,112 @@ pub struct PlannedGraph {
     pub managed_nodes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteSnapshot {
+    pub managed_modules: Vec<ManagedModule>,
+    pub sink_input_routes: Vec<SinkInputRoute>,
+    pub source_output_routes: Vec<SourceOutputRoute>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SinkLevelState {
+    pub volume_percent: Option<u8>,
+    pub muted: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AudioStateSnapshot {
+    pub graph: RuntimeGraph,
+    pub routes: RouteSnapshot,
+    pub sink_levels: BTreeMap<String, SinkLevelState>,
+    pub active_playback_sink: Option<String>,
+    pub bluetooth_cards: Vec<BluetoothAudioCard>,
+    pub default_source: Option<String>,
+    pub default_sink: Option<String>,
+}
+
 pub fn plan_ensure_graph(config: &MixerConfig) -> PlannedGraph {
+    let active_app_channel_ids = config
+        .channels
+        .iter()
+        .filter(|channel| !channel.kind.uses_hardware_slot())
+        .map(|channel| channel.id.clone())
+        .collect::<BTreeSet<_>>();
+    plan_ensure_graph_for_active_app_channels(config, &active_app_channel_ids)
+}
+
+pub fn plan_ensure_graph_for_active_app_channels(
+    config: &MixerConfig,
+    active_app_channel_ids: &BTreeSet<String>,
+) -> PlannedGraph {
+    let active_mix_ids = config
+        .mixes
+        .iter()
+        .map(|mix| mix.id.clone())
+        .collect::<BTreeSet<_>>();
+    plan_ensure_graph_for_active_routes(config, active_app_channel_ids, &active_mix_ids)
+}
+
+pub fn plan_ensure_graph_for_active_routes(
+    config: &MixerConfig,
+    active_app_channel_ids: &BTreeSet<String>,
+    active_mix_ids: &BTreeSet<String>,
+) -> PlannedGraph {
     let mut commands = Vec::new();
     let mut managed_nodes = Vec::new();
     let route_settings = route_settings_for_config(config);
 
     for mix in &config.mixes {
-        managed_nodes.push(mix.virtual_sink_name.clone());
+        if !mix_uses_persistent_audio_core(mix) {
+            managed_nodes.push(mix.virtual_sink_name.clone());
+        }
         managed_nodes.push(mix.virtual_source_name.clone());
         commands.extend(plan_ensure_mix(mix));
     }
 
     for channel in &config.channels {
         managed_nodes.push(channel.virtual_sink_name.clone());
-        commands.extend(plan_ensure_channel(channel));
-        if let Some(source) = &channel.source_device {
-            commands.extend(plan_route_input_to_channel(
+        if !channel_uses_persistent_audio_core(channel) {
+            commands.extend(plan_ensure_channel(channel));
+        }
+        if channel_uses_passthrough_mic_source(channel) {
+            managed_nodes.push(effect_chain_source_name(channel));
+            commands.extend(plan_ensure_passthrough_mic_source(channel));
+        }
+        if !channel_uses_persistent_audio_core(channel) {
+            if let Some(source) = &channel.source_device {
+                commands.extend(plan_route_input_to_channel(
+                    channel,
+                    source,
+                    &route_settings,
+                ));
+            }
+        }
+        if channel_uses_persistent_audio_core(channel) || channel_has_active_effects(channel) {
+            commands.extend(plan_route_channel_to_effect(channel, &route_settings));
+            commands.extend(plan_route_effect_to_adaptive_bridge(
                 channel,
-                source,
                 &route_settings,
             ));
         }
-        if channel_has_active_effects(channel) {
-            commands.extend(plan_route_channel_to_effect(channel, &route_settings));
-        }
         for mix in &config.mixes {
-            if channel
-                .mix_buses
-                .get(&mix.id)
-                .is_some_and(|bus| bus.enabled)
-                && !channel_mix_route_uses_hardware_direct_monitoring(channel, mix, &route_settings)
-            {
+            if channel_mix_route_expected_for_active_routes(
+                channel,
+                mix,
+                &route_settings,
+                active_app_channel_ids,
+                active_mix_ids,
+            ) {
                 commands.extend(plan_route_channel_to_mix(channel, mix, &route_settings));
             }
         }
     }
 
-    for mix in &config.mixes {
+    for mix in config
+        .mixes
+        .iter()
+        .filter(|mix| active_mix_ids.contains(&mix.id) && !mix_uses_persistent_audio_core(mix))
+    {
         for output in mix.outputs() {
             commands.extend(plan_route_mix_to_output(mix, &output, &route_settings));
         }
@@ -924,6 +1226,53 @@ pub fn plan_ensure_graph(config: &MixerConfig) -> PlannedGraph {
         commands,
         managed_nodes,
     }
+}
+
+pub fn channel_mix_route_expected_for_active_app_channels(
+    channel: &Channel,
+    mix: &Mix,
+    settings: &MixerSettings,
+    active_app_channel_ids: &BTreeSet<String>,
+) -> bool {
+    let active_mix_ids = std::iter::once(mix.id.clone()).collect::<BTreeSet<_>>();
+    channel_mix_route_expected_for_active_routes(
+        channel,
+        mix,
+        settings,
+        active_app_channel_ids,
+        &active_mix_ids,
+    )
+}
+
+pub fn channel_mix_route_expected_for_active_routes(
+    channel: &Channel,
+    mix: &Mix,
+    settings: &MixerSettings,
+    active_app_channel_ids: &BTreeSet<String>,
+    active_mix_ids: &BTreeSet<String>,
+) -> bool {
+    let Some(bus) = channel.mix_buses.get(&mix.id) else {
+        return false;
+    };
+    if !bus.enabled {
+        return false;
+    }
+    if channel_mix_route_uses_hardware_direct_monitoring(channel, mix, settings) {
+        return false;
+    }
+    // WaveLinux 6 keeps app-facing nodes and their configured bus sends stable.
+    // A dormant browser or a newly opened recorder must never need a Pulse
+    // module load before its first frames can flow.
+    if channel_uses_persistent_audio_core(channel) {
+        return true;
+    }
+    if bus.muted {
+        return false;
+    }
+    if !active_mix_ids.contains(&mix.id) {
+        return false;
+    }
+    channel.kind.uses_hardware_slot() || active_app_channel_ids.contains(&channel.id)
 }
 
 fn route_settings_for_config(config: &MixerConfig) -> MixerSettings {
@@ -941,6 +1290,9 @@ fn route_settings_for_config(config: &MixerConfig) -> MixerSettings {
 }
 
 pub fn plan_ensure_mix(mix: &Mix) -> Vec<CommandSpec> {
+    if mix_uses_persistent_audio_core(mix) {
+        return Vec::new();
+    }
     let display_name = wavelinux_display_name(&mix.name);
     let display_value = property_value(&display_name);
     let app_name = property_value(&app_display_name());
@@ -1005,15 +1357,49 @@ pub fn plan_ensure_channel(channel: &Channel) -> Vec<CommandSpec> {
             "channels=2".into(),
         "channel_map=front-left,front-right".into(),
         format!(
-                "sink_properties=device.description={0} node.description={0} node.nick={0} media.name={0} application.name={1} media.class=Audio/Sink {2} {3} {4}",
+                "sink_properties=device.description={0} node.description={0} node.nick={0} media.name={0} application.name={1} media.class=Audio/Sink {2} {3} {4} {5}",
                 display_value,
                 app_name,
                 graph_prop_assignment("managed", "1"),
                 graph_prop_assignment("role", "channel"),
                 graph_prop_assignment("channel_id", &channel.id),
+                graph_prop_assignment("channel_config_revision", CHANNEL_CONFIG_REVISION),
             ),
         ],
         format!("create channel sink '{}'", channel.name),
+    )]
+}
+
+pub fn plan_ensure_passthrough_mic_source(channel: &Channel) -> Vec<CommandSpec> {
+    if !channel_uses_passthrough_mic_source(channel) {
+        return Vec::new();
+    }
+
+    let source_name = effect_chain_source_name(channel);
+    let source_label = effect_chain_source_label(channel);
+    let source_value = property_value(&source_label);
+    let app_name = property_value(&app_display_name());
+    vec![CommandSpec::new(
+        CommandDomain::Graph,
+        "pactl",
+        [
+            "load-module".into(),
+            "module-remap-source".into(),
+            format!("master={}.monitor", channel.virtual_sink_name),
+            format!("source_name={source_name}"),
+            "channels=2".into(),
+            "channel_map=front-left,front-right".into(),
+            format!(
+                "source_properties=device.description={0} node.description={0} node.nick={0} media.name={0} application.name={1} media.class=Audio/Source/Virtual {2} {3} {4} {5}",
+                source_value,
+                app_name,
+                graph_prop_assignment("managed", "1"),
+                graph_prop_assignment("role", "mic_passthrough"),
+                graph_prop_assignment("effect_config_revision", EFFECT_CONFIG_REVISION),
+                graph_prop_assignment("channel_id", &channel.id),
+            ),
+        ],
+        format!("expose '{}' as public mic source", channel.name),
     )]
 }
 
@@ -1022,6 +1408,9 @@ pub fn plan_route_channel_to_mix(
     mix: &Mix,
     settings: &MixerSettings,
 ) -> Vec<CommandSpec> {
+    if channel_uses_persistent_audio_core(channel) {
+        return Vec::new();
+    }
     let source_name = channel_mix_source_name(channel);
     let latency_msec = channel_mix_latency_msec(channel, mix, settings);
     let route_revision = route_revision_with_latency(CHANNEL_MIX_ROUTE_REVISION, latency_msec);
@@ -1043,6 +1432,7 @@ pub fn plan_route_channel_to_mix(
             "adjust_time=0".into(),
             "channels=2".into(),
             "channel_map=front-left,front-right".into(),
+            "remix=yes".into(),
             format!(
                 "source_output_properties={}",
                 managed_loopback_properties(
@@ -1081,7 +1471,10 @@ pub fn channel_mix_route_uses_hardware_direct_monitoring(
 }
 
 pub fn channel_mix_source_name(channel: &Channel) -> String {
-    if channel_has_active_effects(channel) {
+    if channel_uses_persistent_audio_core(channel)
+        || channel_exposes_public_mic_source(channel)
+        || channel_has_active_effects(channel)
+    {
         effect_chain_source_name(channel)
     } else {
         format!("{}.monitor", channel.virtual_sink_name)
@@ -1098,18 +1491,74 @@ fn source_name_looks_like_wave_xlr(source_name: &str) -> bool {
 }
 
 pub fn channel_has_active_effects(channel: &Channel) -> bool {
-    channel.effects.iter().any(|effect| !effect.bypassed)
+    channel.effects_enabled && channel.effects.iter().any(|effect| !effect.bypassed)
+}
+
+pub fn channel_exposes_public_mic_source(channel: &Channel) -> bool {
+    channel.id == "hardware_in"
+}
+
+pub fn channel_uses_passthrough_mic_source(channel: &Channel) -> bool {
+    channel_exposes_public_mic_source(channel)
+        && !channel_uses_persistent_audio_core(channel)
+        && !channel_has_active_effects(channel)
+}
+
+pub fn channel_uses_persistent_audio_core(channel: &Channel) -> bool {
+    graph_prefix_for_channel(channel) == "wavelinux6"
+}
+
+pub fn mix_uses_persistent_audio_core(mix: &Mix) -> bool {
+    let suffix = format!("_mix_{}", safe_node_id(&mix.id));
+    mix.virtual_sink_name
+        .strip_suffix(&suffix)
+        .is_some_and(|prefix| prefix == "wavelinux6")
 }
 
 pub fn effect_chain_input_name(channel: &Channel) -> String {
-    format!("{}_fx_{}_input", graph_prefix(), safe_node_id(&channel.id))
+    if channel_uses_persistent_audio_core(channel) {
+        return channel.virtual_sink_name.clone();
+    }
+    format!(
+        "{}_fx_{}_input",
+        graph_prefix_for_channel(channel),
+        safe_node_id(&channel.id)
+    )
+}
+
+pub fn effect_chain_filter_output_name(channel: &Channel) -> String {
+    if channel_uses_adaptive_latency_bridge(channel) {
+        return format!(
+            "{}_fx_{}_processed",
+            graph_prefix_for_channel(channel),
+            safe_node_id(&channel.id)
+        );
+    }
+    effect_chain_source_name(channel)
+}
+
+pub fn effect_chain_adaptive_bridge_input_name(channel: &Channel) -> String {
+    format!(
+        "{}_fx_{}_adaptive_input",
+        graph_prefix_for_channel(channel),
+        safe_node_id(&channel.id)
+    )
 }
 
 pub fn effect_chain_source_name(channel: &Channel) -> String {
+    let prefix = graph_prefix_for_channel(channel);
     if channel.id == "hardware_in" {
-        return format!("{}-mic", graph_prefix());
+        return format!("{prefix}-mic");
     }
-    format!("{}_fx_{}_source", graph_prefix(), safe_node_id(&channel.id))
+    format!("{}_fx_{}_source", prefix, safe_node_id(&channel.id))
+}
+
+pub fn effect_chain_node_name(channel: &Channel) -> String {
+    format!(
+        "{}_fx_{}_chain",
+        graph_prefix_for_channel(channel),
+        safe_node_id(&channel.id)
+    )
 }
 
 fn effect_chain_source_label(channel: &Channel) -> String {
@@ -1120,10 +1569,98 @@ fn effect_chain_source_label(channel: &Channel) -> String {
     }
 }
 
+fn effect_chain_filter_output_label(channel: &Channel) -> String {
+    if channel_uses_adaptive_latency_bridge(channel) {
+        return format!("{} FX {} Processed", app_display_name(), channel.name);
+    }
+    effect_chain_source_label(channel)
+}
+
+fn effect_chain_filter_output_role(channel: &Channel) -> &'static str {
+    if channel_uses_adaptive_latency_bridge(channel) {
+        "effect_processed"
+    } else {
+        "effect_output"
+    }
+}
+
+pub fn channel_uses_adaptive_latency_bridge(channel: &Channel) -> bool {
+    graph_prefix_for_channel(channel) == "wavelinux5"
+        && channel.id == "hardware_in"
+        && channel_has_active_effects(channel)
+}
+
+fn graph_prefix_for_channel(channel: &Channel) -> String {
+    let suffix = format!("_channel_{}", safe_node_id(&channel.id));
+    channel
+        .virtual_sink_name
+        .strip_suffix(&suffix)
+        .filter(|prefix| !prefix.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(graph_prefix)
+}
+
+pub fn plan_route_effect_to_adaptive_bridge(
+    channel: &Channel,
+    _settings: &MixerSettings,
+) -> Vec<CommandSpec> {
+    if !channel_uses_adaptive_latency_bridge(channel) {
+        return Vec::new();
+    }
+
+    let source_name = effect_chain_filter_output_name(channel);
+    let sink_name = effect_chain_adaptive_bridge_input_name(channel);
+    let route_properties = [
+        (graph_prop("role"), "effect_to_adaptive_bridge".to_string()),
+        (graph_prop("channel_id"), channel.id.clone()),
+        (
+            graph_prop("route_revision"),
+            EFFECT_ADAPTIVE_BRIDGE_ROUTE_REVISION.to_string(),
+        ),
+    ];
+    vec![CommandSpec::new(
+        CommandDomain::Route,
+        "pactl",
+        [
+            "load-module".into(),
+            "module-loopback".into(),
+            format!("source={source_name}"),
+            format!("sink={sink_name}"),
+            latency_arg(EFFECT_ADAPTIVE_BRIDGE_TRANSPORT_MSEC),
+            "adjust_time=0".into(),
+            "channels=2".into(),
+            "channel_map=front-left,front-right".into(),
+            "remix=yes".into(),
+            format!(
+                "source_output_properties={}",
+                managed_loopback_properties(
+                    "source",
+                    "effect-to-adaptive-bridge",
+                    &[channel.id.as_str()],
+                    &route_properties,
+                )
+            ),
+            format!(
+                "sink_input_properties={}",
+                managed_loopback_properties(
+                    "sink",
+                    "effect-to-adaptive-bridge",
+                    &[channel.id.as_str()],
+                    &route_properties,
+                )
+            ),
+        ],
+        format!("route '{}' FX into adaptive mic bridge", channel.name),
+    )]
+}
+
 pub fn plan_route_channel_to_effect(
     channel: &Channel,
     settings: &MixerSettings,
 ) -> Vec<CommandSpec> {
+    if channel_uses_persistent_audio_core(channel) {
+        return Vec::new();
+    }
     let raw_source = format!("{}.monitor", channel.virtual_sink_name);
     let latency_msec = hardware_route_latency_msec(channel, settings);
     let route_revision = route_revision_with_latency(EFFECT_ROUTE_REVISION, latency_msec);
@@ -1399,6 +1936,11 @@ pub fn plan_route_mix_to_output(
     sink_name: &str,
     settings: &MixerSettings,
 ) -> Vec<CommandSpec> {
+    let source_name = if mix_uses_persistent_audio_core(mix) {
+        mix.virtual_source_name.clone()
+    } else {
+        format!("{}.monitor", mix.virtual_sink_name)
+    };
     let latency_msec = mix_monitor_latency_msec_for_sink(mix, sink_name, settings);
     let route_revision = route_revision_with_latency(MIX_MONITOR_ROUTE_REVISION, latency_msec);
     let route_properties = [
@@ -1412,7 +1954,7 @@ pub fn plan_route_mix_to_output(
         [
             "load-module".into(),
             "module-loopback".into(),
-            format!("source={}.monitor", mix.virtual_sink_name),
+            format!("source={source_name}"),
             format!("sink={sink_name}"),
             latency_arg(latency_msec),
             "adjust_time=0".into(),
@@ -1458,6 +2000,59 @@ pub fn plan_move_app_stream(stream_id: &str, channel: &Channel) -> CommandSpec {
             channel.virtual_sink_name.clone(),
         ],
         format!("move app stream {stream_id} to '{}'", channel.name),
+    )
+}
+
+pub fn plan_move_native_app_stream(
+    stream_node_id: u32,
+    target_object_serial: &str,
+    target_node_name: &str,
+) -> CommandSpec {
+    CommandSpec::new(
+        CommandDomain::Route,
+        "pw-metadata",
+        [
+            "-n".into(),
+            "default".into(),
+            stream_node_id.to_string(),
+            "target.object".into(),
+            target_object_serial.into(),
+            "Spa:Id".into(),
+        ],
+        format!("move native stream {stream_node_id} to {target_node_name}"),
+    )
+}
+
+pub fn plan_move_native_capture_stream(
+    stream_node_id: u32,
+    target_object_serial: &str,
+    target_node_name: &str,
+) -> CommandSpec {
+    CommandSpec::new(
+        CommandDomain::Route,
+        "pw-metadata",
+        [
+            "-n".into(),
+            "default".into(),
+            stream_node_id.to_string(),
+            "target.object".into(),
+            target_object_serial.into(),
+            "Spa:Id".into(),
+        ],
+        format!("move native capture stream {stream_node_id} to {target_node_name}"),
+    )
+}
+
+pub fn plan_set_native_stream_volume(stream_node_id: u32, volume: f32) -> CommandSpec {
+    CommandSpec::new(
+        CommandDomain::Level,
+        "wpctl",
+        [
+            "set-volume".into(),
+            stream_node_id.to_string(),
+            volume.clamp(0.0, 1.5).to_string(),
+        ],
+        format!("set native stream {stream_node_id} volume"),
     )
 }
 
@@ -1807,10 +2402,10 @@ pub fn plan_kill_stale_processes(processes: &[StaleProcess]) -> Vec<CommandSpec>
 }
 
 pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String {
-    let chain_name = format!("{}_fx_{}_chain", graph_prefix(), safe_node_id(&channel.id));
+    let chain_name = effect_chain_node_name(channel);
     let input_name = effect_chain_input_name(channel);
-    let source_name = effect_chain_source_name(channel);
-    let source_label = effect_chain_source_label(channel);
+    let source_name = effect_chain_filter_output_name(channel);
+    let source_label = effect_chain_filter_output_label(channel);
     let app_name = app_display_name();
     let effect_nodes = channel
         .effects
@@ -1917,7 +2512,9 @@ pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String
     rendered.push_str("        audio.rate = 48000\n");
     rendered.push_str("        audio.channels = 2\n");
     rendered.push_str("        audio.position = [ FL FR ]\n");
-    rendered.push_str("        node.always-process = true\n");
+    if channel.id == "hardware_in" {
+        rendered.push_str("        node.always-process = true\n");
+    }
     append_filter_property(&mut rendered, 8, "managed", "1");
     append_filter_property(&mut rendered, 8, "role", "effect_input");
     rendered.push_str("        ");
@@ -1952,9 +2549,16 @@ pub fn render_filter_chain(channel: &Channel, catalog: &EffectCatalog) -> String
     rendered.push_str("        audio.rate = 48000\n");
     rendered.push_str("        audio.channels = 2\n");
     rendered.push_str("        audio.position = [ FL FR ]\n");
-    rendered.push_str("        node.always-process = true\n");
+    if channel.id == "hardware_in" {
+        rendered.push_str("        node.always-process = true\n");
+    }
     append_filter_property(&mut rendered, 8, "managed", "1");
-    append_filter_property(&mut rendered, 8, "role", "effect_output");
+    append_filter_property(
+        &mut rendered,
+        8,
+        "role",
+        effect_chain_filter_output_role(channel),
+    );
     rendered.push_str("        ");
     rendered.push_str(&graph_prop("effect_config_revision"));
     rendered.push_str(" = \"");
@@ -1985,6 +2589,11 @@ pub fn probe_effect_availability(catalog: &EffectCatalog) -> Vec<EffectAvailabil
         .effects
         .iter()
         .map(|effect| match &effect.plugin_hint {
+            PluginHint::Native => EffectAvailability {
+                effect_id: effect.id.clone(),
+                available: true,
+                detail: "Bundled WaveLinux 6 native DSP".into(),
+            },
             PluginHint::PipeWireBuiltin => EffectAvailability {
                 effect_id: effect.id.clone(),
                 available: true,
@@ -2002,6 +2611,25 @@ pub fn probe_effect_availability(catalog: &EffectCatalog) -> Vec<EffectAvailabil
                     detail: found
                         .map(|path| ladspa_plugin_detail(&effect.id, &path))
                         .unwrap_or_else(|| format!("Missing one of: {}", library_names.join(", "))),
+                }
+            }
+            PluginHint::LadspaAll { library_names } => {
+                let missing = library_names
+                    .iter()
+                    .filter(|name| find_plugin_file(&[(*name).clone()]).is_none())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                EffectAvailability {
+                    effect_id: effect.id.clone(),
+                    available: missing.is_empty(),
+                    detail: if missing.is_empty() {
+                        format!(
+                            "Found required LADSPA plugins: {}",
+                            library_names.join(", ")
+                        )
+                    } else {
+                        format!("Missing required LADSPA plugins: {}", missing.join(", "))
+                    },
                 }
             }
             PluginHint::Lv2 { uri_hint } => EffectAvailability {
@@ -2044,6 +2672,10 @@ struct PactlDevice {
     name: String,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    mute: bool,
+    #[serde(default)]
+    volume: BTreeMap<String, PactlVolumeEntry>,
     #[serde(default)]
     properties: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -2155,6 +2787,8 @@ pub struct SourceOutputRoute {
     pub media_name: Option<String>,
     #[serde(default)]
     pub managed: Option<String>,
+    #[serde(default)]
+    pub dont_move: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2305,6 +2939,8 @@ pub fn parse_devices_json(json: &str, fallback_prefix: &str) -> Vec<DeviceInfo> 
                 || looks_like_wavelinux_family_node(&device.name)
                 || looks_like_wavelinux_family_node(&description)
                 || graph_property_string(&device.properties, "managed").as_deref() == Some("1");
+            let active_port = active_port_name(&device.active_port);
+            let ports = device_ports(&device.ports);
             let is_available = device_is_available(&device);
             let bus = detect_device_bus(&id, &device.properties, is_virtual);
             DeviceInfo {
@@ -2317,6 +2953,8 @@ pub fn parse_devices_json(json: &str, fallback_prefix: &str) -> Vec<DeviceInfo> 
                     description
                 },
                 is_available,
+                active_port,
+                ports,
                 is_default,
                 is_virtual,
                 bus,
@@ -2348,6 +2986,102 @@ pub fn parse_devices_json(json: &str, fallback_prefix: &str) -> Vec<DeviceInfo> 
             }
         })
         .collect()
+}
+
+struct AudioStateSnapshotJson<'a> {
+    sources: &'a str,
+    sinks: &'a str,
+    sink_inputs: &'a str,
+    source_outputs: &'a str,
+    clients: &'a str,
+    modules: &'a str,
+    cards: &'a str,
+    default_source: Option<&'a str>,
+    default_sink: Option<&'a str>,
+}
+
+fn parse_audio_state_snapshot(
+    json: AudioStateSnapshotJson<'_>,
+    config: Option<&MixerConfig>,
+    effect_availability: Vec<EffectAvailability>,
+) -> AudioStateSnapshot {
+    let inputs = parse_devices_json(json.sources, "Source");
+    let outputs = parse_devices_json(json.sinks, "Sink");
+    let sink_names = parse_device_names_by_index_json(json.sinks);
+    let source_names = parse_device_names_by_index_json(json.sources);
+    let client_properties = parse_client_properties_json(json.clients);
+    let app_streams = parse_sink_inputs_json_with_client_properties(
+        json.sink_inputs,
+        config,
+        &sink_names,
+        &client_properties,
+    );
+    let managed_modules = parse_managed_modules_json(
+        json.modules,
+        json.sinks,
+        json.sources,
+        json.sink_inputs,
+        json.source_outputs,
+    );
+    let sink_input_routes = hydrate_sink_input_routes_from_modules(
+        hydrate_sink_input_routes_from_sinks(
+            parse_sink_input_routes_json(json.sink_inputs),
+            &sink_names,
+        ),
+        &managed_modules,
+    );
+    let source_output_routes = hydrate_source_output_routes_from_modules(
+        hydrate_source_output_routes_from_sources(
+            parse_source_outputs_json(json.source_outputs),
+            &source_names,
+        ),
+        &managed_modules,
+    );
+    let sink_levels = serde_json::from_str::<Vec<PactlDevice>>(json.sinks)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|sink| !sink.name.trim().is_empty())
+        .map(|sink| {
+            (
+                sink.name,
+                SinkLevelState {
+                    volume_percent: parse_first_volume_percent(&sink.volume),
+                    muted: sink.mute,
+                },
+            )
+        })
+        .collect();
+    let active_playback_sink =
+        active_playback_sink_from_sink_inputs_json(json.sink_inputs, &sink_names);
+
+    AudioStateSnapshot {
+        graph: RuntimeGraph {
+            inputs,
+            outputs,
+            app_streams,
+            meters: Vec::new(),
+            auto_devices: Vec::new(),
+            effect_availability,
+        },
+        routes: RouteSnapshot {
+            managed_modules,
+            sink_input_routes,
+            source_output_routes,
+        },
+        sink_levels,
+        active_playback_sink,
+        bluetooth_cards: parse_bluetooth_audio_cards_json(json.cards),
+        default_source: json
+            .default_source
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
+        default_sink: json
+            .default_sink
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
+    }
 }
 
 fn parse_device_names_by_index_json(json: &str) -> BTreeMap<String, String> {
@@ -2389,6 +3123,53 @@ fn active_port_name(value: &serde_json::Value) -> Option<String> {
                 .map(ToOwned::to_owned)
         })
         .filter(|value| !value.trim().is_empty())
+}
+
+fn device_ports(ports: &serde_json::Value) -> Vec<DevicePortInfo> {
+    let values = match ports {
+        serde_json::Value::Array(items) => items.iter().collect::<Vec<_>>(),
+        serde_json::Value::Object(items) => items.values().collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    values
+        .into_iter()
+        .filter_map(|port| {
+            let name = port
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let description = port
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let availability = port
+                .get("availability")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if name.is_empty() && description.is_empty() && availability.is_empty() {
+                return None;
+            }
+            Some(DevicePortInfo {
+                name,
+                description,
+                availability,
+                direction: port
+                    .get("direction")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
+                port_type: port
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
+            })
+        })
+        .collect()
 }
 
 fn port_availabilities(ports: &serde_json::Value, active_port: Option<&str>) -> Vec<String> {
@@ -2759,7 +3540,7 @@ fn unload_priority(role: Option<&str>) -> u8 {
         | Some("channel_to_effect")
         | Some("input_to_channel")
         | Some("mix_monitor") => 0,
-        Some("mix_source") => 1,
+        Some("mix_source") | Some("mic_passthrough") => 1,
         Some("channel") | Some("mix") => 2,
         _ => 3,
     }
@@ -2784,6 +3565,8 @@ pub fn parse_source_outputs_json(json: &str) -> Vec<SourceOutputRoute> {
             node_name: property_string(&output.properties, "node.name"),
             media_name: property_string(&output.properties, "media.name"),
             managed: graph_property_string(&output.properties, "managed"),
+            dont_move: property_string(&output.properties, "node.dont-move")
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on")),
         })
         .collect()
 }
@@ -3253,10 +4036,8 @@ fn render_effect_node(
                     "VAD Grace Period (ms)",
                     effect_param(effect, definition, "hold_ms"),
                 ),
-                (
-                    "Retroactive VAD Grace (ms)",
-                    effect_param(effect, definition, "lead_in_ms"),
-                ),
+                ("Retroactive VAD Grace (ms)", 0.0),
+                ("Dry Mix", effect_param(effect, definition, "dry_mix")),
             ],
             RNNOISE_STEREO_PORTS,
         ),
@@ -3329,6 +4110,7 @@ fn render_effect_node(
             ],
             FAST_LIMITER_STEREO_PORTS,
         ),
+        "karaoke_stage" => render_karaoke_stage_node(effect, definition),
         _ => render_builtin_node(effect, "copy", &[]),
     }
 }
@@ -3425,6 +4207,236 @@ fn append_ladspa_node(
     rendered.push_str(" }\n");
 }
 
+fn render_karaoke_stage_node(
+    effect: &EffectInstance,
+    definition: &wavelinux_model::EffectDefinition,
+) -> RenderedEffectNode {
+    let base = effect_node_name(effect);
+    let input_left = format!("{base}_in_left");
+    let input_right = format!("{base}_in_right");
+    let tone_highpass_left = format!("{base}_tone_highpass_left");
+    let tone_highpass_right = format!("{base}_tone_highpass_right");
+    let tone_lowpass_left = format!("{base}_tone_lowpass_left");
+    let tone_lowpass_right = format!("{base}_tone_lowpass_right");
+    let tone_gain_left = format!("{base}_tone_gain_left");
+    let tone_gain_right = format!("{base}_tone_gain_right");
+    let dry_left = format!("{base}_dry_left");
+    let dry_right = format!("{base}_dry_right");
+    let pitch_left = format!("{base}_pitch_left");
+    let pitch_right = format!("{base}_pitch_right");
+    let delay_left = format!("{base}_delay_left");
+    let delay_right = format!("{base}_delay_right");
+    let double_left = format!("{base}_double_left");
+    let double_right = format!("{base}_double_right");
+    let room = format!("{base}_room");
+    let mix_left = format!("{base}_mix_left");
+    let mix_right = format!("{base}_mix_right");
+
+    let dry_mix = effect_param(effect, definition, "dry_mix");
+    let tone_highpass_hz = effect_param(effect, definition, "tone_highpass_hz");
+    let tone_lowpass_hz = effect_param(effect, definition, "tone_lowpass_hz");
+    let tone_gain = db_to_linear(effect_param(effect, definition, "tone_gain_db"));
+    let double_mix = effect_param(effect, definition, "double_mix");
+    let double_delay_s = effect_param(effect, definition, "double_delay_ms") / 1000.0;
+    let right_delay_s = (double_delay_s + 0.012).min(0.12);
+    let detune_cents = effect_param(effect, definition, "detune_cents");
+    let pitch_down = 2.0_f32.powf(-detune_cents / 1200.0);
+    let pitch_up = 2.0_f32.powf(detune_cents / 1200.0);
+    let room_level = effect_param(effect, definition, "room_level_db");
+    let tail_level = (room_level - 6.0).max(-70.0);
+
+    let mut rendered = String::new();
+    append_builtin_node(
+        &mut rendered,
+        "linear",
+        &input_left,
+        &[("Mult", 1.0), ("Add", 0.0)],
+    );
+    append_builtin_node(
+        &mut rendered,
+        "linear",
+        &input_right,
+        &[("Mult", 1.0), ("Add", 0.0)],
+    );
+    append_builtin_node(
+        &mut rendered,
+        "bq_highpass",
+        &tone_highpass_left,
+        &[("Freq", tone_highpass_hz), ("Q", 0.707), ("Gain", 0.0)],
+    );
+    append_builtin_node(
+        &mut rendered,
+        "bq_highpass",
+        &tone_highpass_right,
+        &[("Freq", tone_highpass_hz), ("Q", 0.707), ("Gain", 0.0)],
+    );
+    append_builtin_node(
+        &mut rendered,
+        "bq_lowpass",
+        &tone_lowpass_left,
+        &[("Freq", tone_lowpass_hz), ("Q", 0.707), ("Gain", 0.0)],
+    );
+    append_builtin_node(
+        &mut rendered,
+        "bq_lowpass",
+        &tone_lowpass_right,
+        &[("Freq", tone_lowpass_hz), ("Q", 0.707), ("Gain", 0.0)],
+    );
+    append_builtin_node(
+        &mut rendered,
+        "linear",
+        &tone_gain_left,
+        &[("Mult", tone_gain), ("Add", 0.0)],
+    );
+    append_builtin_node(
+        &mut rendered,
+        "linear",
+        &tone_gain_right,
+        &[("Mult", tone_gain), ("Add", 0.0)],
+    );
+    append_builtin_node(
+        &mut rendered,
+        "linear",
+        &dry_left,
+        &[("Mult", dry_mix), ("Add", 0.0)],
+    );
+    append_builtin_node(
+        &mut rendered,
+        "linear",
+        &dry_right,
+        &[("Mult", dry_mix), ("Add", 0.0)],
+    );
+    append_ladspa_node(
+        &mut rendered,
+        "pitch_scale_1193",
+        "pitchScale",
+        &pitch_left,
+        &[("Pitch co-efficient", pitch_down)],
+    );
+    append_ladspa_node(
+        &mut rendered,
+        "pitch_scale_1193",
+        "pitchScale",
+        &pitch_right,
+        &[("Pitch co-efficient", pitch_up)],
+    );
+    append_builtin_node_with_config(
+        &mut rendered,
+        "delay",
+        &delay_left,
+        &[("\"max-delay\"", 1.0)],
+        &[("Delay (s)", double_delay_s)],
+    );
+    append_builtin_node_with_config(
+        &mut rendered,
+        "delay",
+        &delay_right,
+        &[("\"max-delay\"", 1.0)],
+        &[("Delay (s)", right_delay_s)],
+    );
+    append_builtin_node(
+        &mut rendered,
+        "linear",
+        &double_left,
+        &[("Mult", double_mix), ("Add", 0.0)],
+    );
+    append_builtin_node(
+        &mut rendered,
+        "linear",
+        &double_right,
+        &[("Mult", double_mix), ("Add", 0.0)],
+    );
+    append_ladspa_node(
+        &mut rendered,
+        "gverb_1216",
+        "gverb",
+        &room,
+        &[
+            (
+                "Roomsize (m)",
+                effect_param(effect, definition, "room_size_m"),
+            ),
+            (
+                "Reverb time (s)",
+                effect_param(effect, definition, "reverb_time_s"),
+            ),
+            ("Damping", 0.45),
+            ("Input bandwidth", 0.75),
+            ("Dry signal level (dB)", -70.0),
+            ("Early reflection level (dB)", room_level),
+            ("Tail level (dB)", tail_level),
+        ],
+    );
+    append_builtin_node(&mut rendered, "mixer", &mix_left, &[]);
+    append_builtin_node(&mut rendered, "mixer", &mix_right, &[]);
+
+    let internal_links = vec![
+        (
+            port_ref(&input_left, "Out"),
+            port_ref(&tone_highpass_left, "In"),
+        ),
+        (
+            port_ref(&input_right, "Out"),
+            port_ref(&tone_highpass_right, "In"),
+        ),
+        (
+            port_ref(&tone_highpass_left, "Out"),
+            port_ref(&tone_lowpass_left, "In"),
+        ),
+        (
+            port_ref(&tone_highpass_right, "Out"),
+            port_ref(&tone_lowpass_right, "In"),
+        ),
+        (
+            port_ref(&tone_lowpass_left, "Out"),
+            port_ref(&tone_gain_left, "In"),
+        ),
+        (
+            port_ref(&tone_lowpass_right, "Out"),
+            port_ref(&tone_gain_right, "In"),
+        ),
+        (port_ref(&tone_gain_left, "Out"), port_ref(&dry_left, "In")),
+        (
+            port_ref(&tone_gain_right, "Out"),
+            port_ref(&dry_right, "In"),
+        ),
+        (
+            port_ref(&tone_gain_left, "Out"),
+            port_ref(&pitch_left, "Input"),
+        ),
+        (
+            port_ref(&tone_gain_right, "Out"),
+            port_ref(&pitch_right, "Input"),
+        ),
+        (port_ref(&pitch_left, "Output"), port_ref(&delay_left, "In")),
+        (
+            port_ref(&pitch_right, "Output"),
+            port_ref(&delay_right, "In"),
+        ),
+        (port_ref(&delay_left, "Out"), port_ref(&double_left, "In")),
+        (port_ref(&delay_right, "Out"), port_ref(&double_right, "In")),
+        (port_ref(&tone_gain_left, "Out"), port_ref(&room, "Input")),
+        (port_ref(&dry_left, "Out"), port_ref(&mix_left, "In 1")),
+        (port_ref(&dry_right, "Out"), port_ref(&mix_right, "In 1")),
+        (port_ref(&double_right, "Out"), port_ref(&mix_left, "In 2")),
+        (port_ref(&double_left, "Out"), port_ref(&mix_right, "In 2")),
+        (port_ref(&room, "Left output"), port_ref(&mix_left, "In 3")),
+        (
+            port_ref(&room, "Right output"),
+            port_ref(&mix_right, "In 3"),
+        ),
+    ];
+
+    RenderedEffectNode {
+        left_input: port_ref(&input_left, "In"),
+        right_input: port_ref(&input_right, "In"),
+        left_output: port_ref(&mix_left, "Out"),
+        right_output: port_ref(&mix_right, "Out"),
+        config: rendered,
+        internal_links,
+    }
+}
+
 fn render_builtin_node(
     effect: &EffectInstance,
     label: &str,
@@ -3454,11 +4466,31 @@ fn render_builtin_stereo_pair_node(
 }
 
 fn append_builtin_node(rendered: &mut String, label: &str, name: &str, controls: &[(&str, f32)]) {
+    append_builtin_node_with_config(rendered, label, name, &[], controls);
+}
+
+fn append_builtin_node_with_config(
+    rendered: &mut String,
+    label: &str,
+    name: &str,
+    config: &[(&str, f32)],
+    controls: &[(&str, f32)],
+) {
     rendered.push_str("          { type = builtin label = \"");
     rendered.push_str(label);
     rendered.push_str("\" name = \"");
     rendered.push_str(&escape_pw(name));
     rendered.push('"');
+    if !config.is_empty() {
+        rendered.push_str(" config = {");
+        for (key, value) in config {
+            rendered.push(' ');
+            rendered.push_str(key);
+            rendered.push_str(" = ");
+            rendered.push_str(&format!("{:.3}", value));
+        }
+        rendered.push_str(" }");
+    }
     append_control_block(rendered, controls);
     rendered.push_str(" }\n");
 }
@@ -3468,16 +4500,55 @@ fn render_param_eq_node(
     definition: &wavelinux_model::EffectDefinition,
 ) -> RenderedEffectNode {
     let name = effect_node_name(effect);
-    let low_freq = effect_param(effect, definition, "low_freq_hz");
-    let low_gain = effect_param(effect, definition, "low_gain_db");
-    let mid_freq = effect_param(effect, definition, "mid_freq_hz");
-    let mid_gain = effect_param(effect, definition, "mid_gain_db");
-    let high_freq = effect_param(effect, definition, "high_freq_hz");
-    let high_gain = effect_param(effect, definition, "high_gain_db");
     let filters = [
-        ("bq_lowshelf", low_freq, low_gain, 0.707),
-        ("bq_peaking", mid_freq, mid_gain, 1.0),
-        ("bq_highshelf", high_freq, high_gain, 0.707),
+        (
+            "bq_lowshelf",
+            63.0,
+            effect_param(effect, definition, "band_63_gain_db"),
+            0.707,
+        ),
+        (
+            "bq_peaking",
+            125.0,
+            effect_param(effect, definition, "band_125_gain_db"),
+            1.0,
+        ),
+        (
+            "bq_peaking",
+            250.0,
+            effect_param(effect, definition, "band_250_gain_db"),
+            1.0,
+        ),
+        (
+            "bq_peaking",
+            500.0,
+            effect_param(effect, definition, "band_500_gain_db"),
+            1.0,
+        ),
+        (
+            "bq_peaking",
+            1000.0,
+            effect_param(effect, definition, "band_1k_gain_db"),
+            1.0,
+        ),
+        (
+            "bq_peaking",
+            2000.0,
+            effect_param(effect, definition, "band_2k_gain_db"),
+            1.0,
+        ),
+        (
+            "bq_peaking",
+            4000.0,
+            effect_param(effect, definition, "band_4k_gain_db"),
+            1.0,
+        ),
+        (
+            "bq_highshelf",
+            8000.0,
+            effect_param(effect, definition, "band_8k_gain_db"),
+            0.707,
+        ),
     ];
 
     let mut rendered = String::new();
@@ -3515,6 +4586,10 @@ fn append_param_eq_filters(rendered: &mut String, key: &str, filters: &[(&str, f
     rendered.push_str(" ]\n");
 }
 
+fn db_to_linear(db: f32) -> f32 {
+    10.0_f32.powf(db / 20.0)
+}
+
 fn effect_node_name(effect: &EffectInstance) -> String {
     let name = effect.instance_id.trim();
     if name.is_empty() {
@@ -3529,6 +4604,16 @@ fn append_stereo_filter_links(
     source: &RenderedEffectNode,
     target: &RenderedEffectNode,
 ) {
+    if target.left_input == target.right_input {
+        append_filter_link(rendered, &source.left_output, &target.left_input);
+        return;
+    }
+    if source.left_output == source.right_output {
+        append_filter_link(rendered, &source.left_output, &target.left_input);
+        append_filter_link(rendered, &source.left_output, &target.right_input);
+        return;
+    }
+
     let left = (&source.left_output, &target.left_input);
     let right = (&source.right_output, &target.right_input);
     append_filter_link(rendered, left.0, left.1);
@@ -3924,6 +5009,11 @@ mod tests {
             .commands
             .iter()
             .any(|command| command.description.contains("route 'Input' to 'Monitor'")));
+        assert!(plan
+            .commands
+            .iter()
+            .any(|command| command.description == "expose 'Input' as public mic source"));
+        assert!(plan.managed_nodes.contains(&"wavelinux-mic".into()));
         assert!(plan.managed_nodes.contains(&"wavelinux_mix_monitor".into()));
         assert!(plan
             .commands
@@ -3935,6 +5025,48 @@ mod tests {
             .iter()
             .flat_map(|command| command.args.iter())
             .any(|arg| arg.contains("device.description=wavelinux-input")));
+    }
+
+    #[test]
+    fn wavelinux6_core_replaces_channel_null_sinks_effect_and_input_loopbacks() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+        config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("rnnoise")])
+            .unwrap();
+        config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap()
+            .source_device = Some("alsa_input.usb-test-mic.mono-fallback".into());
+
+        let plan = plan_ensure_graph(&config);
+        let channel = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+
+        assert_eq!(effect_chain_input_name(channel), channel.virtual_sink_name);
+        assert!(!plan.commands.iter().any(|command| {
+            command
+                .args
+                .iter()
+                .any(|argument| argument == &format!("sink_name={}", channel.virtual_sink_name))
+        }));
+        assert!(!plan.commands.iter().any(|command| {
+            command
+                .args
+                .iter()
+                .any(|argument| argument.contains("wavelinux6.role=channel_to_effect"))
+        }));
+        assert!(!plan.commands.iter().any(|command| {
+            command.args.iter().any(|argument| {
+                argument.contains("wavelinux6.role=input_to_channel")
+                    || argument.contains("wavelinux6.role=mix_monitor")
+            })
+        }));
     }
 
     #[test]
@@ -3995,10 +5127,9 @@ mod tests {
             && target.source_name == "wavelinux_mix_stream.monitor"));
         assert!(targets.iter().any(|target| target.node_id == "game"
             && target.source_name == "wavelinux_channel_game.monitor"));
-        assert!(targets
+        assert!(!targets
             .iter()
-            .any(|target| target.node_id == channel_raw_meter_id("game")
-                && target.source_name == "wavelinux_channel_game.monitor"));
+            .any(|target| target.node_id.ends_with(":raw")));
         assert!(targets.iter().any(|target| target.node_id
             == channel_bus_meter_id("game", "stream")
             && target.source_name == "wavelinux_channel_game.monitor"
@@ -4036,10 +5167,9 @@ mod tests {
         assert!(targets.iter().any(|target| {
             target.node_id == "hardware_in" && target.source_name == "alsa_input.real"
         }));
-        assert!(targets.iter().any(|target| {
-            target.node_id == channel_raw_meter_id("hardware_in")
-                && target.source_name == "alsa_input.real"
-        }));
+        assert!(!targets
+            .iter()
+            .any(|target| target.node_id.ends_with(":raw")));
         assert!(targets.iter().any(|target| {
             target.node_id == channel_bus_meter_id("hardware_in", "stream")
                 && target.source_name == "alsa_input.real"
@@ -4067,10 +5197,9 @@ mod tests {
 
         let targets = meter_targets_for_config(&config, &available_sources);
 
-        assert!(targets.iter().any(|target| {
-            target.node_id == channel_raw_meter_id("hardware_in")
-                && target.source_name == "alsa_input.real"
-        }));
+        assert!(!targets
+            .iter()
+            .any(|target| target.node_id.ends_with(":raw")));
         assert!(targets.iter().any(|target| {
             target.node_id == "hardware_in" && target.source_name == "alsa_input.real"
         }));
@@ -4101,10 +5230,9 @@ mod tests {
         assert!(targets.iter().any(|target| {
             target.node_id == "hardware_in" && target.source_name == "wavelinux-mic"
         }));
-        assert!(targets.iter().any(|target| {
-            target.node_id == channel_raw_meter_id("hardware_in")
-                && target.source_name == "alsa_input.real"
-        }));
+        assert!(!targets
+            .iter()
+            .any(|target| target.node_id.ends_with(":raw")));
         assert!(targets.iter().any(|target| {
             target.node_id == channel_bus_meter_id("hardware_in", "stream")
                 && target.source_name == "wavelinux-mic"
@@ -4139,10 +5267,9 @@ mod tests {
             target.node_id == "hardware_in"
                 && target.source_name == "output.wavelinux.fx.randomized.source"
         }));
-        assert!(targets.iter().any(|target| {
-            target.node_id == channel_raw_meter_id("hardware_in")
-                && target.source_name == "alsa_input.real"
-        }));
+        assert!(!targets
+            .iter()
+            .any(|target| target.node_id.ends_with(":raw")));
         assert!(targets.iter().any(|target| {
             target.node_id == channel_bus_meter_id("hardware_in", "stream")
                 && target.source_name == "output.wavelinux.fx.randomized.source"
@@ -4168,10 +5295,9 @@ mod tests {
         assert!(targets.iter().any(|target| {
             target.node_id == "music" && target.source_name == "wavelinux_fx_music_source"
         }));
-        assert!(targets.iter().any(|target| {
-            target.node_id == channel_raw_meter_id("music")
-                && target.source_name == "wavelinux_channel_music.monitor"
-        }));
+        assert!(!targets
+            .iter()
+            .any(|target| target.node_id.ends_with(":raw")));
         assert!(targets.iter().any(|target| {
             target.node_id == channel_bus_meter_id("music", "stream")
                 && target.source_name == "wavelinux_fx_music_source"
@@ -4184,6 +5310,33 @@ mod tests {
         let spec = plan_move_app_stream("42", &channel);
         assert_eq!(spec.program, "pactl");
         assert_eq!(spec.args[2], "wavelinux_channel_discord");
+    }
+
+    #[test]
+    fn native_stream_move_uses_target_object_metadata() {
+        let spec = plan_move_native_app_stream(72, "991", "wavelinux_channel_music");
+        assert_eq!(spec.program, "pw-metadata");
+        assert_eq!(
+            spec.args,
+            ["-n", "default", "72", "target.object", "991", "Spa:Id"]
+        );
+    }
+
+    #[test]
+    fn native_stream_volume_uses_wireplumber_node_control() {
+        let spec = plan_set_native_stream_volume(72, 0.75);
+        assert_eq!(spec.program, "wpctl");
+        assert_eq!(spec.args, ["set-volume", "72", "0.75"]);
+    }
+
+    #[test]
+    fn native_capture_move_uses_target_object_metadata() {
+        let spec = plan_move_native_capture_stream(73, "992", "wavelinux6-mic");
+        assert_eq!(spec.program, "pw-metadata");
+        assert_eq!(
+            spec.args,
+            ["-n", "default", "73", "target.object", "992", "Spa:Id"]
+        );
     }
 
     #[test]
@@ -4201,6 +5354,8 @@ mod tests {
             name: name.into(),
             description: name.into(),
             is_available: true,
+            active_port: None,
+            ports: Vec::new(),
             is_default: false,
             is_virtual: name.contains("wavelinux"),
             bus: None,
@@ -4230,6 +5385,26 @@ mod tests {
             spec.args,
             ["move-source-output", "99", "wavelinux_mix_stream_source"]
         );
+    }
+
+    #[test]
+    fn fast_stream_snapshot_only_needs_client_fallback_without_identity() {
+        let mut stream = AppStream {
+            id: "42".into(),
+            app_id: None,
+            binary: None,
+            process_name: None,
+            window_class: None,
+            display_name: "Stream 42".into(),
+            media_name: Some("Playback".into()),
+            routed_channel_id: None,
+            volume: 1.0,
+            muted: false,
+        };
+        assert!(app_stream_needs_client_properties(&stream));
+
+        stream.binary = Some("brave".into());
+        assert!(!app_stream_needs_client_properties(&stream));
     }
 
     #[test]
@@ -4441,7 +5616,7 @@ mod tests {
         assert!(spec
             .args
             .iter()
-            .any(|arg| arg.contains("wavelinux.route_revision=4-latency-60")));
+            .any(|arg| arg.contains("wavelinux.route_revision=5-latency-60")));
         assert_managed_loopback_disables_stream_restore(&spec);
     }
 
@@ -4490,6 +5665,26 @@ mod tests {
     }
 
     #[test]
+    fn inactive_hardware_fx_still_exposes_stable_public_mic_source() {
+        let channel = Channel::new_fixed("hardware_in", "Input", ChannelKind::Generic);
+        let spec = plan_ensure_passthrough_mic_source(&channel)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        assert_eq!(channel_mix_source_name(&channel), "wavelinux-mic");
+        assert_eq!(spec.args[1], "module-remap-source");
+        assert!(spec
+            .args
+            .contains(&"master=wavelinux_channel_hardware_in.monitor".into()));
+        assert!(spec.args.contains(&"source_name=wavelinux-mic".into()));
+        assert!(spec
+            .args
+            .iter()
+            .any(|arg| arg.contains("wavelinux.role=mic_passthrough")));
+    }
+
+    #[test]
     fn active_effects_route_channel_monitor_into_fx_input_sink() {
         let mut channel = Channel::new_fixed("hardware_in", "Input", ChannelKind::Generic);
         channel.effects.push(EffectInstance::new("limiter"));
@@ -4514,7 +5709,7 @@ mod tests {
         assert!(spec
             .args
             .iter()
-            .any(|arg| arg.contains("wavelinux.route_revision=3-latency-60")));
+            .any(|arg| arg.contains("wavelinux.route_revision=4-latency-60")));
         assert_managed_loopback_disables_stream_restore(&spec);
     }
 
@@ -4603,6 +5798,210 @@ mod tests {
         };
 
         assert!(has_route("hardware_in", "monitor"));
+    }
+
+    #[test]
+    fn runtime_aware_plan_keeps_hardware_routes_but_skips_inactive_app_routes() {
+        let config = MixerConfig::default();
+        let active_app_channel_ids = BTreeSet::new();
+
+        let plan = plan_ensure_graph_for_active_app_channels(&config, &active_app_channel_ids);
+        let has_route = |channel_id: &str, mix_id: &str| {
+            plan.commands.iter().any(|command| {
+                command.args.iter().any(|arg| {
+                    arg.contains("wavelinux.role=channel_to_mix")
+                        && arg.contains(&format!("wavelinux.channel_id={channel_id}"))
+                        && arg.contains(&format!("wavelinux.mix_id={mix_id}"))
+                })
+            })
+        };
+
+        assert!(has_route("hardware_in", "monitor"));
+        assert!(has_route("hardware_in", "stream"));
+        assert!(!has_route("browser", "monitor"));
+        assert!(!has_route("browser", "stream"));
+        assert!(!has_route("music", "monitor"));
+    }
+
+    #[test]
+    fn runtime_aware_plan_builds_only_active_app_channel_mix_routes() {
+        let config = MixerConfig::default();
+        let active_app_channel_ids = BTreeSet::from(["browser".to_string()]);
+
+        let plan = plan_ensure_graph_for_active_app_channels(&config, &active_app_channel_ids);
+        let has_route = |channel_id: &str, mix_id: &str| {
+            plan.commands.iter().any(|command| {
+                command.args.iter().any(|arg| {
+                    arg.contains("wavelinux.role=channel_to_mix")
+                        && arg.contains(&format!("wavelinux.channel_id={channel_id}"))
+                        && arg.contains(&format!("wavelinux.mix_id={mix_id}"))
+                })
+            })
+        };
+
+        assert!(has_route("browser", "monitor"));
+        assert!(has_route("browser", "stream"));
+        assert!(!has_route("music", "monitor"));
+        assert!(!has_route("game", "stream"));
+    }
+
+    #[test]
+    fn active_route_plan_skips_muted_and_inactive_mix_sends() {
+        let mut config = MixerConfig::default();
+        config.channels[0]
+            .mix_buses
+            .get_mut("monitor")
+            .unwrap()
+            .muted = true;
+        let active_app_channel_ids = BTreeSet::from(["browser".to_string()]);
+        let active_mix_ids = BTreeSet::from(["monitor".to_string()]);
+
+        let plan =
+            plan_ensure_graph_for_active_routes(&config, &active_app_channel_ids, &active_mix_ids);
+        let has_route = |channel_id: &str, mix_id: &str| {
+            plan.commands.iter().any(|command| {
+                command.args.iter().any(|arg| {
+                    arg.contains("wavelinux.role=channel_to_mix")
+                        && arg.contains(&format!("wavelinux.channel_id={channel_id}"))
+                        && arg.contains(&format!("wavelinux.mix_id={mix_id}"))
+                })
+            })
+        };
+
+        assert!(!has_route("hardware_in", "monitor"));
+        assert!(!has_route("hardware_in", "stream"));
+        assert!(has_route("browser", "monitor"));
+        assert!(!has_route("browser", "stream"));
+    }
+
+    #[test]
+    fn wavelinux6_plan_keeps_native_mix_sources_without_pulse_mix_modules() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+
+        let plan = plan_ensure_graph_for_active_routes(&config, &BTreeSet::new(), &BTreeSet::new());
+        assert!(plan.commands.iter().all(|command| {
+            !command.args.iter().any(|arg| {
+                arg == "module-null-sink"
+                    || arg == "module-remap-source"
+                    || arg.contains("wavelinux6.role=channel_to_mix")
+            })
+        }));
+        assert!(config
+            .mixes
+            .iter()
+            .all(|mix| plan.managed_nodes.contains(&mix.virtual_source_name)));
+        assert!(config
+            .mixes
+            .iter()
+            .all(|mix| !plan.managed_nodes.contains(&mix.virtual_sink_name)));
+    }
+
+    #[test]
+    fn wavelinux6_monitor_route_reads_from_the_native_mix_source() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+        let monitor = config.mixes.iter().find(|mix| mix.id == "monitor").unwrap();
+
+        let commands = plan_route_mix_to_output(
+            monitor,
+            "alsa_output.test",
+            &route_settings_for_config(&config),
+        );
+
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0]
+            .args
+            .contains(&"source=wavelinux6_mix_monitor_source".into()));
+        assert!(!commands[0]
+            .args
+            .contains(&"source=wavelinux6_mix_monitor.monitor".into()));
+    }
+
+    #[test]
+    fn wavelinux6_native_mix_policy_keeps_muted_buses_but_respects_disabled_buses() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+        config.channels[0]
+            .mix_buses
+            .get_mut("stream")
+            .unwrap()
+            .muted = true;
+        config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "music")
+            .unwrap()
+            .mix_buses
+            .get_mut("stream")
+            .unwrap()
+            .enabled = false;
+
+        let active_channels = BTreeSet::new();
+        let active_mixes = BTreeSet::new();
+        let input = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        let music = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "music")
+            .unwrap();
+        let monitor = config.mixes.iter().find(|mix| mix.id == "monitor").unwrap();
+        let stream = config.mixes.iter().find(|mix| mix.id == "stream").unwrap();
+
+        assert!(channel_mix_route_expected_for_active_routes(
+            input,
+            stream,
+            &config.settings,
+            &active_channels,
+            &active_mixes,
+        ));
+        assert!(channel_mix_route_expected_for_active_routes(
+            input,
+            monitor,
+            &config.settings,
+            &active_channels,
+            &active_mixes,
+        ));
+        assert!(!channel_mix_route_expected_for_active_routes(
+            music,
+            stream,
+            &config.settings,
+            &active_channels,
+            &active_mixes,
+        ));
+    }
+
+    #[test]
+    fn active_route_plan_suspends_outputs_for_inactive_mixes() {
+        let mut config = MixerConfig::default();
+        config
+            .set_mix_monitor_output("monitor", Some("alsa_output.usb".into()))
+            .unwrap();
+
+        let idle_plan =
+            plan_ensure_graph_for_active_routes(&config, &BTreeSet::new(), &BTreeSet::new());
+        assert!(!idle_plan.commands.iter().any(|command| {
+            command
+                .args
+                .iter()
+                .any(|arg| arg.contains("wavelinux.role=mix_monitor"))
+        }));
+
+        let active_plan = plan_ensure_graph_for_active_routes(
+            &config,
+            &BTreeSet::new(),
+            &BTreeSet::from(["monitor".to_string()]),
+        );
+        assert!(active_plan.commands.iter().any(|command| {
+            command
+                .args
+                .iter()
+                .any(|arg| arg.contains("wavelinux.role=mix_monitor"))
+        }));
     }
 
     #[test]
@@ -4754,6 +6153,9 @@ mod tests {
         assert!(devices[1].is_virtual);
         assert!(devices[2].is_virtual);
         assert!(!devices[3].is_available);
+        assert_eq!(devices[3].active_port.as_deref(), Some("[In] Headset"));
+        assert_eq!(devices[3].ports.len(), 1);
+        assert_eq!(devices[3].ports[0].availability, "not available");
     }
 
     #[test]
@@ -5158,6 +6560,7 @@ mod tests {
               "wavelinux.role": "channel_to_mix",
               "wavelinux.channel_id": "mic",
               "wavelinux.mix_id": "stream",
+              "node.dont-move": "true",
               "target.object": "wavelinux_mix_stream"
             }
           }
@@ -5182,6 +6585,7 @@ mod tests {
         assert_eq!(outputs[0].media_name.as_deref(), Some("RecordStream"));
         assert_eq!(outputs[0].muted, Some(true));
         assert_eq!(outputs[0].volume_percent, Some(82));
+        assert!(outputs[0].dont_move);
     }
 
     #[test]
@@ -5331,14 +6735,70 @@ mod tests {
         assert!(rendered.contains("node.name = \"wavelinux-mic\""));
         assert!(rendered.contains("device.description = \"WaveLinux-mic\""));
         assert!(rendered.contains("node.description = \"WaveLinux-mic\""));
-        assert!(rendered.contains("wavelinux.effect_config_revision = \"2\""));
+        assert!(rendered.contains("wavelinux.effect_config_revision = \"3\""));
         assert!(!rendered.contains("priority.session"));
         assert!(!rendered.contains("priority.driver"));
     }
 
     #[test]
+    fn filter_chain_wavelinux5_hardware_input_outputs_to_processed_bridge_source() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux5");
+        config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("rnnoise")])
+            .unwrap();
+
+        let rendered = render_filter_chain(&config.channels[0], &EffectCatalog::default());
+
+        assert!(channel_uses_adaptive_latency_bridge(&config.channels[0]));
+        assert!(rendered.contains("node.name = \"wavelinux5_fx_hardware_in_chain\""));
+        assert!(rendered.contains("node.name = \"wavelinux5_fx_hardware_in_input\""));
+        assert!(rendered.contains("node.name = \"wavelinux5_fx_hardware_in_processed\""));
+        assert!(rendered.contains("device.description = \"WaveLinux FX Input Processed\""));
+        assert!(!rendered.contains("node.name = \"wavelinux5-mic\""));
+    }
+
+    #[test]
+    fn planned_graph_wavelinux5_routes_processed_fx_into_adaptive_bridge() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux5");
+        config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("rnnoise")])
+            .unwrap();
+
+        let plan = plan_ensure_graph(&config);
+        let command = plan
+            .commands
+            .iter()
+            .find(|command| {
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains("effect_to_adaptive_bridge"))
+            })
+            .expect("adaptive bridge route");
+
+        assert_eq!(command.program, "pactl");
+        assert_eq!(command.domain, CommandDomain::Route);
+        assert!(command
+            .args
+            .contains(&"source=wavelinux5_fx_hardware_in_processed".into()));
+        assert!(command
+            .args
+            .contains(&"sink=wavelinux5_fx_hardware_in_adaptive_input".into()));
+        assert!(command.args.contains(&format!(
+            "latency_msec={EFFECT_ADAPTIVE_BRIDGE_TRANSPORT_MSEC}"
+        )));
+        assert!(command
+            .args
+            .iter()
+            .any(|arg| arg.contains("route_revision=2")));
+    }
+
+    #[test]
     fn filter_chain_wires_stereo_effects_in_order() {
         let mut config = MixerConfig::default();
+        config.channels[0].input_mode = ChannelInputMode::Stereo;
         let mut rnnoise = EffectInstance::new("rnnoise");
         rnnoise.instance_id = "rnnoise".into();
         let mut eq = EffectInstance::new("eq");
@@ -5366,6 +6826,52 @@ mod tests {
     }
 
     #[test]
+    fn filter_chain_uses_stereo_rnnoise_for_sum_mono_hardware_input() {
+        let mut config = MixerConfig::default();
+        let mut highpass = EffectInstance::new("highpass");
+        highpass.instance_id = "highpass".into();
+        let mut rnnoise = EffectInstance::new("rnnoise");
+        rnnoise.instance_id = "rnnoise".into();
+        let mut eq = EffectInstance::new("eq");
+        eq.instance_id = "voice_eq".into();
+        config.channels[0].input_mode = ChannelInputMode::SumMono;
+        config.channels[0].effects = vec![highpass, rnnoise, eq];
+
+        let rendered = render_filter_chain(&config.channels[0], &EffectCatalog::default());
+
+        assert!(rendered.contains(
+            "plugin = \"librnnoise_ladspa\" label = \"noise_suppressor_stereo\" name = \"rnnoise\""
+        ));
+        assert!(rendered.contains("\"VAD Threshold (%)\" = 25.000"));
+        assert!(rendered.contains("\"VAD Grace Period (ms)\" = 200.000"));
+        assert!(rendered.contains("\"Retroactive VAD Grace (ms)\" = 0.000"));
+        assert!(rendered.contains("\"Dry Mix\" = 0.000"));
+        assert!(rendered.contains("output = \"highpass_left:Out\" input = \"rnnoise:Input (L)\""));
+        assert!(rendered.contains("output = \"highpass_right:Out\" input = \"rnnoise:Input (R)\""));
+        assert!(rendered.contains("output = \"rnnoise:Output (L)\" input = \"voice_eq:In 1\""));
+        assert!(rendered.contains("output = \"rnnoise:Output (R)\" input = \"voice_eq:In 2\""));
+    }
+
+    #[test]
+    fn filter_chain_renders_eq_as_eight_band_graphic_eq() {
+        let mut config = MixerConfig::default();
+        let mut eq = EffectInstance::new("eq");
+        eq.instance_id = "voice_eq".into();
+        eq.params.insert("band_63_gain_db".into(), -4.0);
+        eq.params.insert("band_2k_gain_db".into(), 2.5);
+        eq.params.insert("band_8k_gain_db".into(), 1.0);
+        config.channels[0].effects = vec![eq];
+
+        let rendered = render_filter_chain(&config.channels[0], &EffectCatalog::default());
+
+        assert!(rendered.contains("label = \"param_eq\" name = \"voice_eq\""));
+        assert!(rendered.contains("type = bq_lowshelf freq = 63.000 gain = -4.000"));
+        assert!(rendered.contains("type = bq_peaking freq = 2000.000 gain = 2.500"));
+        assert!(rendered.contains("type = bq_highshelf freq = 8000.000 gain = 1.000"));
+        assert_eq!(rendered.matches("type = bq_").count(), 16);
+    }
+
+    #[test]
     fn filter_chain_renders_noise_gate_as_stereo_ladspa_pair() {
         let mut config = MixerConfig::default();
         let mut gate = EffectInstance::new("gate");
@@ -5387,6 +6893,41 @@ mod tests {
         );
         assert!(rendered
             .contains("outputs = [ \"voice_gate_left:Output\" \"voice_gate_right:Output\" ]"));
+    }
+
+    #[test]
+    fn filter_chain_renders_karaoke_stage_as_composite_width_effect() {
+        let mut config = MixerConfig::default();
+        let mut karaoke = EffectInstance::new("karaoke_stage");
+        karaoke.instance_id = "karaoke_stage".into();
+        karaoke.params.insert("tone_highpass_hz".into(), 120.0);
+        karaoke.params.insert("tone_lowpass_hz".into(), 4600.0);
+        karaoke.params.insert("tone_gain_db".into(), 2.5);
+        config.channels[0].effects = vec![karaoke];
+
+        let rendered = render_filter_chain(&config.channels[0], &EffectCatalog::default());
+
+        assert!(rendered
+            .contains("label = \"bq_highpass\" name = \"karaoke_stage_tone_highpass_left\""));
+        assert!(
+            rendered.contains("label = \"bq_lowpass\" name = \"karaoke_stage_tone_lowpass_left\"")
+        );
+        assert!(rendered.contains("\"Freq\" = 120.000"));
+        assert!(rendered.contains("\"Freq\" = 4600.000"));
+        assert!(rendered.contains("\"Mult\" = 1.334"));
+        assert!(rendered.contains(
+            "plugin = \"pitch_scale_1193\" label = \"pitchScale\" name = \"karaoke_stage_pitch_left\""
+        ));
+        assert!(rendered
+            .contains("plugin = \"gverb_1216\" label = \"gverb\" name = \"karaoke_stage_room\""));
+        assert!(rendered.contains("label = \"delay\" name = \"karaoke_stage_delay_left\""));
+        assert!(rendered.contains("label = \"mixer\" name = \"karaoke_stage_mix_left\""));
+        assert!(rendered.contains(
+            "output = \"karaoke_stage_double_right:Out\" input = \"karaoke_stage_mix_left:In 2\""
+        ));
+        assert!(rendered.contains(
+            "outputs = [ \"karaoke_stage_mix_left:Out\" \"karaoke_stage_mix_right:Out\" ]"
+        ));
     }
 
     #[test]
@@ -5517,5 +7058,106 @@ mod tests {
         let commands = plan_kill_stale_processes(&processes);
         assert_eq!(commands[0].program, "kill");
         assert_eq!(commands[0].args, ["42"]);
+    }
+
+    #[test]
+    fn consolidated_audio_snapshot_shares_stream_and_sink_state() {
+        let sources = r#"[
+          {"index": 1, "name": "alsa_input.usb-mic", "description": "USB Mic"}
+        ]"#;
+        let sinks = r#"[
+          {
+            "index": 10,
+            "name": "alsa_output.usb-speakers",
+            "description": "USB Speakers",
+            "mute": false,
+            "volume": {"front-left": {"value_percent": "73%"}}
+          }
+        ]"#;
+        let sink_inputs = r#"[
+          {
+            "index": 20,
+            "sink": 10,
+            "mute": false,
+            "properties": {
+              "client.id": "30",
+              "application.name": "Fallback Name"
+            }
+          }
+        ]"#;
+        let clients = r#"[
+          {"index": 30, "properties": {"application.name": "Browser"}}
+        ]"#;
+
+        let snapshot = parse_audio_state_snapshot(
+            AudioStateSnapshotJson {
+                sources,
+                sinks,
+                sink_inputs,
+                source_outputs: "[]",
+                clients,
+                modules: "",
+                cards: "[]",
+                default_source: Some("alsa_input.usb-mic\n"),
+                default_sink: Some("alsa_output.usb-speakers\n"),
+            },
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(snapshot.graph.inputs.len(), 1);
+        assert_eq!(snapshot.graph.outputs.len(), 1);
+        assert_eq!(snapshot.graph.app_streams.len(), 1);
+        assert_eq!(snapshot.graph.app_streams[0].display_name, "Fallback Name");
+        assert_eq!(
+            snapshot.active_playback_sink.as_deref(),
+            Some("alsa_output.usb-speakers")
+        );
+        assert_eq!(
+            snapshot.default_source.as_deref(),
+            Some("alsa_input.usb-mic")
+        );
+        assert_eq!(
+            snapshot.default_sink.as_deref(),
+            Some("alsa_output.usb-speakers")
+        );
+        assert_eq!(snapshot.routes.sink_input_routes.len(), 1);
+        assert_eq!(
+            snapshot
+                .sink_levels
+                .get("alsa_output.usb-speakers")
+                .and_then(|level| level.volume_percent),
+            Some(73)
+        );
+    }
+
+    #[test]
+    fn consolidated_audio_snapshot_reports_parallel_queries_in_stable_order() {
+        let client = PwClient::new(true);
+
+        let (snapshot, timings) =
+            client.audio_state_snapshot_with_effect_availability_timed(None, Vec::new());
+
+        assert!(snapshot.graph.inputs.is_empty());
+        assert!(snapshot.graph.outputs.is_empty());
+        assert!(snapshot.graph.app_streams.is_empty());
+        assert!(timings.iter().all(|timing| timing.succeeded));
+        assert_eq!(
+            timings
+                .iter()
+                .map(|timing| timing.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "pactl --format=json list sources",
+                "pactl --format=json list sinks",
+                "pactl --format=json list sink-inputs",
+                "pactl --format=json list source-outputs",
+                "pactl --format=json list clients",
+                "pactl list modules short",
+                "pactl --format=json list cards",
+                "pactl get-default-source",
+                "pactl get-default-sink",
+            ]
+        );
     }
 }
