@@ -98,28 +98,9 @@ jobs:
       - run: corepack enable
       - run: corepack prepare yarn@1.22.22 --activate
       - run: yarn install --frozen-lockfile
-      - name: Apply local-only bundled catalog workaround
+      - name: Verify signed bundled profile catalog
         shell: bash
-        run: |
-          touch profiles/v1/index.json.sig
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("crates/engine/src/hardware_profiles.rs")
-          source = path.read_text()
-          old = '''fn bundled_remote_index() -> Result<RemoteProfileIndex, String> {
-              verify_profile_catalog_signature(SHIPPED_PROFILE_INDEX, SHIPPED_PROFILE_INDEX_SIGNATURE)?;
-              parse_remote_index(SHIPPED_PROFILE_INDEX)
-          }'''
-          new = '''fn bundled_remote_index() -> Result<RemoteProfileIndex, String> {
-              // The shipped JSON is embedded in this exact binary; remote and cached
-              // catalogs still require their Ed25519 signatures.
-              parse_remote_index(SHIPPED_PROFILE_INDEX)
-          }'''
-          if old not in source:
-              raise SystemExit("Expected bundled_remote_index block was not found")
-          path.write_text(source.replace(old, new, 1))
-          PY
+        run: cargo test --workspace --locked
       - name: Build helper binaries and AppImage
         shell: bash
         env:
@@ -139,11 +120,11 @@ jobs:
           cp target/release/bundle/appimage/*.AppImage emergency-appimage/
           cd emergency-appimage
           sha256sum *.AppImage > SHA256SUMS
-          printf 'Source commit: 49ca141cfb56024c26cb57f59d7dd5f292046e6c\nBuild commit: %s\nLocal workaround: unsigned bundled index only; remote catalogs remain signature-verified.\n' "$GITHUB_SHA" > BUILD-INFO.txt
+          printf 'Source commit: 49ca141cfb56024c26cb57f59d7dd5f292046e6c\nBuild commit: %s\nCatalog: bundled index verified with committed Ed25519 signature.\n' "$GITHUB_SHA" > BUILD-INFO.txt
           ls -lh
       - uses: actions/upload-artifact@v7
         with:
-          name: wavelinux6-emergency-appimage
+          name: wavelinux6-signed-appimage
           path: emergency-appimage
           if-no-files-found: error
           retention-days: 7
