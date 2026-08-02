@@ -2,27 +2,44 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use wavelinux_engine::WaveLinuxEngine;
+use wavelinux_engine::{EnginePaths, WaveLinuxEngine};
 use wavelinux_model::{
-    safe_node_id, AppStateSnapshot, DeviceInfo, MixBus, MixerConfig, StreamerAction,
-    StreamerActionResult, StreamerBinding, StreamerBindingProfile, StreamerControlKind,
-    StreamerDeviceCapabilities, StreamerDeviceFamily, StreamerDeviceSummary, StreamerDevicesConfig,
-    StreamerLearnResult, StreamerPermissionStatus, StreamerTransport,
+    safe_node_id, AppStateSnapshot, DeviceInfo, MixBus, MixerConfig, PeripheralPluginRuntimeState,
+    PeripheralPluginStatus, StreamerAction, StreamerActionResult, StreamerBinding,
+    StreamerBindingProfile, StreamerControlKind, StreamerDeviceCapabilities, StreamerDeviceFamily,
+    StreamerDeviceSummary, StreamerDevicesConfig, StreamerLearnResult, StreamerPermissionStatus,
+    StreamerTransport,
 };
 
-const STREAMER_POLL_MS: u64 = 800;
+use crate::peripheral_protocol::{
+    read_message, validate_protocol, write_message, ElgatoCommand, HostMessage, PeripheralKind,
+    PluginMessage, PluginState, PERIPHERAL_PROTOCOL_VERSION,
+};
+
+const STREAMER_POLL_MS: u64 = 2_000;
+const STREAMER_IDLE_SLEEP_MS: u64 = 400;
 const HID_READ_SLEEP_MS: u64 = 35;
 const HID_EVENT_DEBOUNCE_MS: u64 = 180;
 const MIDI_EVENT_DEBOUNCE_MS: u64 = 80;
 const LEARN_TIMEOUT: Duration = Duration::from_secs(7);
+const PLUGIN_ACCEPT_TIMEOUT: Duration = Duration::from_secs(4);
+const PLUGIN_RESTART_BACKOFF: Duration = Duration::from_secs(2);
+const PLUGIN_CONFIG_REFRESH: Duration = Duration::from_millis(500);
+const PLUGIN_EVENT_QUEUE_CAPACITY: usize = 64;
+const PLUGIN_COMMAND_QUEUE_CAPACITY: usize = 8;
+const PERIPHERAL_HELPER_ENV: &str = "WAVELINUX_PERIPHERAL_PLUGIN";
+const PERIPHERAL_HELPER_BINARY: &str = "wavelinux6-peripheral-plugin";
+static PERIPHERAL_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
     "APPDIR",
     "APPIMAGE",
@@ -65,15 +82,99 @@ pub struct StreamerDeviceRuntime {
     handle: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Default)]
+pub struct StreamerRuntimeController {
+    runtimes: Mutex<BTreeMap<PeripheralKind, StreamerDeviceRuntime>>,
+    elgato_command: Mutex<()>,
+    learn_command: Mutex<()>,
+}
+
+impl StreamerRuntimeController {
+    pub fn sync(&self, engine: Arc<WaveLinuxEngine>) -> Result<(), String> {
+        let config = engine
+            .streamer_devices_config()
+            .map_err(|err| err.to_string())?;
+        let desired = desired_peripheral_kinds(&config);
+        let mut stopped = Vec::new();
+        {
+            let mut runtimes = self
+                .runtimes
+                .lock()
+                .map_err(|_| "streamer runtime lock was poisoned".to_string())?;
+
+            let stale = runtimes
+                .keys()
+                .copied()
+                .filter(|kind| !desired.contains(kind))
+                .collect::<Vec<_>>();
+            for kind in stale {
+                if let Some(runtime) = runtimes.remove(&kind) {
+                    stopped.push(runtime);
+                }
+            }
+
+            for kind in desired {
+                if let std::collections::btree_map::Entry::Vacant(entry) = runtimes.entry(kind) {
+                    let runtime = StreamerDeviceRuntime::start(Arc::clone(&engine), kind)?;
+                    entry.insert(runtime);
+                }
+            }
+        }
+        drop(stopped);
+        Ok(())
+    }
+
+    pub fn stop(&self) {
+        let runtimes = self
+            .runtimes
+            .lock()
+            .ok()
+            .map(|mut runtimes| std::mem::take(&mut *runtimes))
+            .unwrap_or_default();
+        drop(runtimes);
+    }
+
+    pub fn run_elgato_command(
+        &self,
+        engine: &WaveLinuxEngine,
+        command: ElgatoCommand,
+    ) -> Result<crate::elgato::ElgatoWaveXlrState, String> {
+        let _command = self
+            .elgato_command
+            .lock()
+            .map_err(|_| "Elgato command lock was poisoned".to_string())?;
+        run_isolated_elgato_command(engine, command)
+    }
+
+    pub fn learn_control(
+        &self,
+        device: StreamerDeviceSummary,
+    ) -> Result<StreamerLearnResult, String> {
+        let _command = self
+            .learn_command
+            .lock()
+            .map_err(|_| "peripheral learn lock was poisoned".to_string())?;
+        run_isolated_learn_command(device)
+    }
+}
+
 impl StreamerDeviceRuntime {
-    pub fn start(engine: Arc<WaveLinuxEngine>) -> Self {
+    pub fn start(engine: Arc<WaveLinuxEngine>, kind: PeripheralKind) -> Result<Self, String> {
+        let runtime_dir = EnginePaths::from_xdg()
+            .map_err(|error| error.to_string())?
+            .runtime_dir
+            .join("peripherals");
+        ensure_private_plugin_dir(&runtime_dir).map_err(|error| error.to_string())?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let handle = thread::Builder::new()
-            .name("wavelinux-streamer-devices".into())
-            .spawn(move || run_streamer_runtime(engine, thread_stop))
-            .ok();
-        Self { stop, handle }
+            .name(format!("wavelinux-peripheral-{}", kind.as_str()))
+            .spawn(move || run_plugin_supervisor(engine, kind, runtime_dir, thread_stop))
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
     }
 }
 
@@ -118,7 +219,7 @@ pub fn native_bindings_available(device: &StreamerDeviceSummary) -> bool {
     ) && device.permission_status == StreamerPermissionStatus::Ready
 }
 
-pub fn learn_control(
+fn learn_control_direct(
     devices: &[StreamerDeviceSummary],
     device_id: &str,
 ) -> Result<StreamerLearnResult, String> {
@@ -359,35 +460,689 @@ fn set_channel_volume(
     ))
 }
 
-fn run_streamer_runtime(engine: Arc<WaveLinuxEngine>, stop: Arc<AtomicBool>) {
-    let mut hid_readers: BTreeMap<String, HidReader> = BTreeMap::new();
-    let mut midi_readers: BTreeMap<String, MidiReader> = BTreeMap::new();
-    let mut last_discovery = Instant::now() - Duration::from_millis(STREAMER_POLL_MS);
-    while !stop.load(Ordering::SeqCst) {
-        if last_discovery.elapsed() >= Duration::from_millis(STREAMER_POLL_MS) {
-            if let Ok(state) = engine.get_state() {
-                let current_devices = discover_devices(&state);
-                sync_hid_readers(
-                    &mut hid_readers,
-                    &current_devices,
-                    &state.config.streamer_devices,
-                );
-                sync_midi_readers(
-                    &mut midi_readers,
-                    &current_devices,
-                    &state.config.streamer_devices,
-                );
+#[cfg(test)]
+fn streamer_runtime_needed(config: &StreamerDevicesConfig) -> bool {
+    !desired_peripheral_kinds(config).is_empty()
+}
+
+fn desired_peripheral_kinds(config: &StreamerDevicesConfig) -> BTreeSet<PeripheralKind> {
+    config
+        .profiles
+        .values()
+        .filter(|profile| profile.enabled && !profile.bindings.is_empty())
+        .filter_map(|profile| peripheral_kind_from_device_id(&profile.device_id))
+        .collect()
+}
+
+fn peripheral_kind_from_device_id(device_id: &str) -> Option<PeripheralKind> {
+    if device_id.starts_with("hid:") {
+        Some(PeripheralKind::Hid)
+    } else if device_id.starts_with("midi:") {
+        Some(PeripheralKind::Midi)
+    } else {
+        None
+    }
+}
+
+fn ensure_private_plugin_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+fn run_isolated_elgato_command(
+    engine: &WaveLinuxEngine,
+    command: ElgatoCommand,
+) -> Result<crate::elgato::ElgatoWaveXlrState, String> {
+    let runtime_dir = EnginePaths::from_xdg()
+        .map_err(|error| error.to_string())?
+        .runtime_dir
+        .join("peripherals");
+    ensure_private_plugin_dir(&runtime_dir).map_err(|error| error.to_string())?;
+    let request_id = PERIPHERAL_REQUEST_ID.fetch_add(1, Ordering::Relaxed) + 1;
+    let socket_path = runtime_dir.join(format!("elgato-{}-{request_id}.sock", std::process::id()));
+    let _ = fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).map_err(|error| error.to_string())?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())?;
+    let _socket_guard = SocketPathGuard(socket_path.clone());
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    report_plugin_status(
+        engine,
+        PeripheralKind::Elgato,
+        PeripheralPluginRuntimeState::Starting,
+        None,
+        0,
+        "starting isolated Elgato command",
+        None,
+    );
+
+    let mut child = spawn_peripheral_helper(PeripheralKind::Elgato, &socket_path)?;
+    let result = (|| {
+        let mut stream = accept_plugin_connection(&listener, &AtomicBool::new(false))?;
+        if !peer_is_current_user(&stream) {
+            return Err("Elgato plugin peer is owned by another user".into());
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| error.to_string())?;
+        let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
+        let hello = read_message::<PluginMessage>(&mut reader)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Elgato plugin closed before its handshake".to_string())?;
+        let plugin_pid = validate_plugin_hello(&hello, PeripheralKind::Elgato)?;
+        report_plugin_status(
+            engine,
+            PeripheralKind::Elgato,
+            PeripheralPluginRuntimeState::Ready,
+            Some(plugin_pid),
+            0,
+            "isolated Elgato command connected",
+            None,
+        );
+        write_message(
+            &mut stream,
+            &HostMessage::ElgatoRequest {
+                protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+                request_id,
+                command,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let response = read_message::<PluginMessage>(&mut reader)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Elgato plugin closed before responding".to_string())?;
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        match response {
+            PluginMessage::ElgatoResponse {
+                protocol_version,
+                request_id: response_id,
+                state,
+                error,
+            } => {
+                validate_protocol(protocol_version).map_err(|error| error.to_string())?;
+                if response_id != request_id {
+                    return Err("Elgato response request id did not match".into());
+                }
+                match (state, error) {
+                    (Some(state), None) => Ok((state, plugin_pid)),
+                    (_, Some(error)) => Err(error),
+                    _ => Err("Elgato response contained neither state nor error".into()),
+                }
             }
-            last_discovery = Instant::now();
+            _ => Err("Elgato plugin returned an unexpected response".into()),
+        }
+    })();
+    stop_child(&mut child);
+
+    match result {
+        Ok((state, plugin_pid)) => {
+            report_plugin_status(
+                engine,
+                PeripheralKind::Elgato,
+                PeripheralPluginRuntimeState::Idle,
+                Some(plugin_pid),
+                0,
+                "isolated Elgato command completed",
+                None,
+            );
+            Ok(state)
+        }
+        Err(error) => {
+            report_plugin_status(
+                engine,
+                PeripheralKind::Elgato,
+                PeripheralPluginRuntimeState::Error,
+                None,
+                0,
+                "isolated Elgato command failed",
+                Some(error.clone()),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn run_isolated_learn_command(
+    device: StreamerDeviceSummary,
+) -> Result<StreamerLearnResult, String> {
+    let kind = match device.transport {
+        StreamerTransport::Hid => PeripheralKind::Hid,
+        StreamerTransport::Midi => PeripheralKind::Midi,
+        StreamerTransport::AudioProfile | StreamerTransport::Bridge => {
+            return Ok(StreamerLearnResult {
+                device_id: device.id,
+                control_id: None,
+                control_kind: StreamerControlKind::Unknown,
+                message: "This device does not expose a native control event adapter.".into(),
+            });
+        }
+    };
+    if peripheral_kind_from_device_id(&device.id) != Some(kind) {
+        return Err("peripheral learn device id does not match its transport".into());
+    }
+    let runtime_dir = EnginePaths::from_xdg()
+        .map_err(|error| error.to_string())?
+        .runtime_dir
+        .join("peripherals");
+    ensure_private_plugin_dir(&runtime_dir).map_err(|error| error.to_string())?;
+    let request_id = PERIPHERAL_REQUEST_ID.fetch_add(1, Ordering::Relaxed) + 1;
+    let socket_path = runtime_dir.join(format!(
+        "learn-{}-{}-{request_id}.sock",
+        kind.as_str(),
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).map_err(|error| error.to_string())?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())?;
+    let _socket_guard = SocketPathGuard(socket_path.clone());
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+
+    let mut child = spawn_peripheral_helper(kind, &socket_path)?;
+    let result = (|| {
+        let mut stream = accept_plugin_connection(&listener, &AtomicBool::new(false))?;
+        if !peer_is_current_user(&stream) {
+            return Err("peripheral learn plugin peer is owned by another user".into());
+        }
+        stream
+            .set_read_timeout(Some(LEARN_TIMEOUT + Duration::from_secs(2)))
+            .map_err(|error| error.to_string())?;
+        let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
+        let hello = read_message::<PluginMessage>(&mut reader)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "peripheral learn plugin closed before its handshake".to_string())?;
+        validate_plugin_hello(&hello, kind)?;
+        write_message(
+            &mut stream,
+            &HostMessage::LearnRequest {
+                protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+                request_id,
+                device,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let response = read_message::<PluginMessage>(&mut reader)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "peripheral learn plugin closed before responding".to_string())?;
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        match response {
+            PluginMessage::LearnResponse {
+                protocol_version,
+                request_id: response_id,
+                result,
+                error,
+            } => {
+                validate_protocol(protocol_version).map_err(|error| error.to_string())?;
+                if response_id != request_id {
+                    return Err("peripheral learn response request id did not match".into());
+                }
+                match (result, error) {
+                    (Some(result), None) => Ok(result),
+                    (_, Some(error)) => Err(error),
+                    _ => Err("peripheral learn response contained neither result nor error".into()),
+                }
+            }
+            _ => Err("peripheral learn plugin returned an unexpected response".into()),
+        }
+    })();
+    stop_child(&mut child);
+    result
+}
+
+fn run_plugin_supervisor(
+    engine: Arc<WaveLinuxEngine>,
+    kind: PeripheralKind,
+    runtime_dir: PathBuf,
+    stop: Arc<AtomicBool>,
+) {
+    let mut restarts = 0;
+    while !stop.load(Ordering::Acquire) {
+        report_plugin_status(
+            &engine,
+            kind,
+            PeripheralPluginRuntimeState::Starting,
+            None,
+            restarts,
+            "starting isolated peripheral reader",
+            None,
+        );
+        if let Err(error) = run_plugin_session(&engine, kind, &runtime_dir, &stop, restarts) {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            restarts += 1;
+            report_plugin_status(
+                &engine,
+                kind,
+                PeripheralPluginRuntimeState::Error,
+                None,
+                restarts,
+                "isolated peripheral reader failed",
+                Some(error.clone()),
+            );
+            eprintln!(
+                "WaveLinux {} peripheral plugin session failed: {error}",
+                kind.as_str()
+            );
+        }
+        sleep_until_stopped(&stop, PLUGIN_RESTART_BACKOFF);
+    }
+    report_plugin_status(
+        &engine,
+        kind,
+        PeripheralPluginRuntimeState::Stopped,
+        None,
+        restarts,
+        "peripheral reader is stopped",
+        None,
+    );
+}
+
+enum PluginReaderEvent {
+    Message(PluginMessage),
+    Closed,
+    Failed(String),
+}
+
+fn run_plugin_session(
+    engine: &Arc<WaveLinuxEngine>,
+    kind: PeripheralKind,
+    runtime_dir: &Path,
+    stop: &Arc<AtomicBool>,
+    restarts: u64,
+) -> Result<(), String> {
+    let socket_path = runtime_dir.join(format!("{}.sock", kind.as_str()));
+    let _ = fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).map_err(|error| error.to_string())?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())?;
+    let _socket_guard = SocketPathGuard(socket_path.clone());
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+
+    let mut child = spawn_peripheral_helper(kind, &socket_path)?;
+    let stream = match accept_plugin_connection(&listener, stop) {
+        Ok(stream) => stream,
+        Err(error) => {
+            stop_child(&mut child);
+            return Err(error);
+        }
+    };
+    if !peer_is_current_user(&stream) {
+        stop_child(&mut child);
+        return Err("peripheral plugin peer is owned by another user".into());
+    }
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| error.to_string())?;
+    let mut handshake_reader =
+        BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
+    let hello = read_message::<PluginMessage>(&mut handshake_reader)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "peripheral plugin closed before its handshake".to_string())?;
+    let plugin_pid = validate_plugin_hello(&hello, kind)?;
+    report_plugin_status(
+        engine,
+        kind,
+        PeripheralPluginRuntimeState::Ready,
+        Some(plugin_pid),
+        restarts,
+        "isolated peripheral reader connected",
+        None,
+    );
+    handshake_reader
+        .get_mut()
+        .set_read_timeout(None)
+        .map_err(|error| error.to_string())?;
+
+    let (event_tx, event_rx) = mpsc::sync_channel(PLUGIN_EVENT_QUEUE_CAPACITY);
+    let reader_handle = spawn_plugin_reader(handshake_reader, event_tx, kind)?;
+    let mut writer = stream;
+    let mut last_config = None;
+    let mut last_config_check = Instant::now() - PLUGIN_CONFIG_REFRESH;
+    let mut last_events = BTreeMap::new();
+    let mut session_error = None;
+
+    while !stop.load(Ordering::Acquire) {
+        if last_config_check.elapsed() >= PLUGIN_CONFIG_REFRESH {
+            match engine.streamer_devices_config() {
+                Ok(config) => {
+                    if last_config.as_ref() != Some(&config) {
+                        let message = HostMessage::Configure {
+                            protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+                            config: config.clone(),
+                        };
+                        if let Err(error) = write_message(&mut writer, &message) {
+                            session_error = Some(error.to_string());
+                            break;
+                        }
+                        last_config = Some(config);
+                    }
+                }
+                Err(error) => {
+                    session_error = Some(error.to_string());
+                    break;
+                }
+            }
+            last_config_check = Instant::now();
         }
 
-        for reader in hid_readers.values_mut() {
-            reader.poll(&engine);
+        match event_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(PluginReaderEvent::Message(message)) => {
+                if let Err(error) = handle_plugin_message(
+                    engine,
+                    kind,
+                    message,
+                    &mut last_events,
+                    plugin_pid,
+                    restarts,
+                ) {
+                    session_error = Some(error);
+                    break;
+                }
+            }
+            Ok(PluginReaderEvent::Closed) => {
+                session_error = Some("peripheral plugin disconnected".into());
+                break;
+            }
+            Ok(PluginReaderEvent::Failed(error)) => {
+                session_error = Some(error);
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                session_error = Some("peripheral plugin event reader stopped".into());
+                break;
+            }
         }
-        for reader in midi_readers.values_mut() {
-            reader.poll(&engine);
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                session_error = Some(format!("peripheral plugin exited with {status}"));
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                session_error = Some(error.to_string());
+                break;
+            }
         }
-        thread::sleep(Duration::from_millis(HID_READ_SLEEP_MS));
+    }
+
+    let _ = write_message(
+        &mut writer,
+        &HostMessage::Shutdown {
+            protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+        },
+    );
+    let _ = writer.shutdown(std::net::Shutdown::Both);
+    stop_child(&mut child);
+    let _ = reader_handle.join();
+
+    if stop.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err(session_error.unwrap_or_else(|| "peripheral plugin session ended".into()))
+    }
+}
+
+fn spawn_peripheral_helper(kind: PeripheralKind, socket_path: &Path) -> Result<Child, String> {
+    let program = std::env::var_os(PERIPHERAL_HELPER_ENV)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| PERIPHERAL_HELPER_BINARY.into());
+    let mut command = Command::new(program);
+    sanitize_host_command_env(&mut command);
+    command
+        .args(["--kind", kind.as_str(), "--socket"])
+        .arg(socket_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("could not start {PERIPHERAL_HELPER_BINARY}: {error}"))
+}
+
+fn accept_plugin_connection(
+    listener: &UnixListener,
+    stop: &AtomicBool,
+) -> Result<UnixStream, String> {
+    let deadline = Instant::now() + PLUGIN_ACCEPT_TIMEOUT;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Err("peripheral plugin startup was cancelled".into());
+        }
+        match listener.accept() {
+            Ok((stream, _)) => return Ok(stream),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if Instant::now() >= deadline {
+            return Err("peripheral plugin did not connect before the startup timeout".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn validate_plugin_hello(message: &PluginMessage, expected: PeripheralKind) -> Result<u32, String> {
+    let PluginMessage::Hello {
+        protocol_version,
+        kind,
+        pid,
+        ..
+    } = message
+    else {
+        return Err("peripheral plugin sent an event before its handshake".into());
+    };
+    validate_protocol(*protocol_version).map_err(|error| error.to_string())?;
+    if *kind != expected {
+        return Err(format!(
+            "peripheral plugin kind mismatch: expected {}, received {}",
+            expected.as_str(),
+            kind.as_str()
+        ));
+    }
+    Ok(*pid)
+}
+
+fn spawn_plugin_reader(
+    mut reader: BufReader<UnixStream>,
+    tx: SyncSender<PluginReaderEvent>,
+    kind: PeripheralKind,
+) -> Result<thread::JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name(format!("wavelinux-peripheral-{}-reader", kind.as_str()))
+        .spawn(move || loop {
+            let event = match read_message::<PluginMessage>(&mut reader) {
+                Ok(Some(message)) => PluginReaderEvent::Message(message),
+                Ok(None) => PluginReaderEvent::Closed,
+                Err(error) => PluginReaderEvent::Failed(error.to_string()),
+            };
+            let terminal = !matches!(event, PluginReaderEvent::Message(_));
+            match tx.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) if !terminal => {}
+                Err(TrySendError::Full(event)) => {
+                    let _ = tx.send(event);
+                }
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+            if terminal {
+                break;
+            }
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn handle_plugin_message(
+    engine: &Arc<WaveLinuxEngine>,
+    kind: PeripheralKind,
+    message: PluginMessage,
+    last_events: &mut BTreeMap<String, Instant>,
+    plugin_pid: u32,
+    restarts: u64,
+) -> Result<(), String> {
+    match message {
+        PluginMessage::Event {
+            protocol_version,
+            device_id,
+            control_id,
+            value,
+        } => {
+            validate_protocol(protocol_version).map_err(|error| error.to_string())?;
+            if peripheral_kind_from_device_id(&device_id) != Some(kind) {
+                return Err(format!(
+                    "{} plugin emitted an event for a different transport: {device_id}",
+                    kind.as_str()
+                ));
+            }
+            let config = engine
+                .streamer_devices_config()
+                .map_err(|error| error.to_string())?;
+            let Some(profile) = config
+                .profiles
+                .get(&device_id)
+                .filter(|profile| profile.enabled)
+            else {
+                return Ok(());
+            };
+            dispatch_binding(
+                engine,
+                &device_id,
+                profile,
+                last_events,
+                &control_id,
+                value,
+                debounce_for_kind(kind),
+            );
+            Ok(())
+        }
+        PluginMessage::Status {
+            protocol_version,
+            kind: status_kind,
+            state,
+            message,
+        } => {
+            validate_protocol(protocol_version).map_err(|error| error.to_string())?;
+            if status_kind != kind {
+                return Err("peripheral status kind did not match its session".into());
+            }
+            if state == PluginState::Error {
+                eprintln!(
+                    "WaveLinux {} peripheral plugin reported an error: {message}",
+                    kind.as_str()
+                );
+            }
+            let runtime_state = match state {
+                PluginState::Ready => PeripheralPluginRuntimeState::Ready,
+                PluginState::Idle => PeripheralPluginRuntimeState::Idle,
+                PluginState::Error => PeripheralPluginRuntimeState::Error,
+                PluginState::Stopping => PeripheralPluginRuntimeState::Stopped,
+            };
+            report_plugin_status(
+                engine,
+                kind,
+                runtime_state,
+                Some(plugin_pid),
+                restarts,
+                &message,
+                (state == PluginState::Error).then_some(message.clone()),
+            );
+            Ok(())
+        }
+        PluginMessage::Hello { .. } => Err("peripheral plugin repeated its handshake".into()),
+        PluginMessage::ElgatoResponse { .. } => {
+            Err("HID/MIDI plugin returned an Elgato response".into())
+        }
+        PluginMessage::LearnResponse { .. } => {
+            Err("persistent plugin returned an unsolicited learn response".into())
+        }
+    }
+}
+
+fn report_plugin_status(
+    engine: &WaveLinuxEngine,
+    kind: PeripheralKind,
+    state: PeripheralPluginRuntimeState,
+    pid: Option<u32>,
+    restarts: u64,
+    message: &str,
+    last_error: Option<String>,
+) {
+    engine.set_peripheral_plugin_status(PeripheralPluginStatus {
+        kind: kind.as_str().into(),
+        state,
+        protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+        pid,
+        restarts,
+        message: message.into(),
+        last_error,
+    });
+}
+
+fn debounce_for_kind(kind: PeripheralKind) -> Duration {
+    match kind {
+        PeripheralKind::Hid => Duration::from_millis(HID_EVENT_DEBOUNCE_MS),
+        PeripheralKind::Midi => Duration::from_millis(MIDI_EVENT_DEBOUNCE_MS),
+        PeripheralKind::Elgato => Duration::ZERO,
+    }
+}
+
+fn stop_child(child: &mut Child) {
+    for _ in 0..20 {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn sleep_until_stopped(stop: &AtomicBool, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn peer_is_current_user(stream: &UnixStream) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let mut credentials = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast(),
+                &mut size,
+            )
+        };
+        result == 0 && credentials.uid == unsafe { libc::geteuid() }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stream;
+        true
+    }
+}
+
+struct SocketPathGuard(PathBuf);
+
+impl Drop for SocketPathGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -467,6 +1222,271 @@ fn sync_midi_readers(
     }
 }
 
+enum HostReaderEvent {
+    Message(HostMessage),
+    Closed,
+    Failed(String),
+}
+
+pub fn run_peripheral_plugin(kind: PeripheralKind, socket_path: &Path) -> Result<(), String> {
+    let stream = UnixStream::connect(socket_path).map_err(|error| error.to_string())?;
+    let mut writer = stream.try_clone().map_err(|error| error.to_string())?;
+    write_message(
+        &mut writer,
+        &PluginMessage::Hello {
+            protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+            kind,
+            pid: std::process::id(),
+            capabilities: match kind {
+                PeripheralKind::Hid => vec!["hidraw_events".into()],
+                PeripheralKind::Midi => vec!["alsa_midi_events".into()],
+                PeripheralKind::Elgato => vec!["wave_xlr_control".into()],
+            },
+        },
+    )
+    .map_err(|error| error.to_string())?;
+
+    if kind == PeripheralKind::Elgato {
+        return run_elgato_plugin(stream, writer);
+    }
+
+    let (command_tx, command_rx) = mpsc::sync_channel(PLUGIN_COMMAND_QUEUE_CAPACITY);
+    let command_handle = spawn_host_reader(BufReader::new(stream), command_tx, kind)?;
+    let mut config = StreamerDevicesConfig::default();
+    let mut hid_readers = BTreeMap::new();
+    let mut midi_readers = BTreeMap::new();
+    let mut last_discovery = Instant::now() - Duration::from_millis(STREAMER_POLL_MS);
+    let mut last_state = None;
+    let mut stopping = false;
+
+    while !stopping {
+        loop {
+            match command_rx.try_recv() {
+                Ok(HostReaderEvent::Message(HostMessage::Configure {
+                    protocol_version,
+                    config: next,
+                })) => {
+                    validate_protocol(protocol_version).map_err(|error| error.to_string())?;
+                    config = next.normalized();
+                    last_discovery = Instant::now() - Duration::from_millis(STREAMER_POLL_MS);
+                }
+                Ok(HostReaderEvent::Message(HostMessage::Shutdown { protocol_version })) => {
+                    validate_protocol(protocol_version).map_err(|error| error.to_string())?;
+                    stopping = true;
+                    break;
+                }
+                Ok(HostReaderEvent::Message(HostMessage::ElgatoRequest { .. })) => {
+                    return Err("Elgato request was sent to a HID/MIDI plugin".into());
+                }
+                Ok(HostReaderEvent::Message(HostMessage::LearnRequest {
+                    protocol_version,
+                    request_id,
+                    device,
+                })) => {
+                    validate_protocol(protocol_version).map_err(|error| error.to_string())?;
+                    if peripheral_kind_from_device_id(&device.id) != Some(kind) {
+                        return Err("peripheral learn request transport did not match".into());
+                    }
+                    let result = learn_control_direct(std::slice::from_ref(&device), &device.id);
+                    let (result, error) = match result {
+                        Ok(result) => (Some(result), None),
+                        Err(error) => (None, Some(error)),
+                    };
+                    write_message(
+                        &mut writer,
+                        &PluginMessage::LearnResponse {
+                            protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+                            request_id,
+                            result,
+                            error,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                    stopping = true;
+                    break;
+                }
+                Ok(HostReaderEvent::Closed) => {
+                    stopping = true;
+                    break;
+                }
+                Ok(HostReaderEvent::Failed(error)) => return Err(error),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    stopping = true;
+                    break;
+                }
+            }
+        }
+        if stopping {
+            break;
+        }
+
+        if last_discovery.elapsed() >= Duration::from_millis(STREAMER_POLL_MS) {
+            match kind {
+                PeripheralKind::Hid => {
+                    let mut devices = discover_hidraw_devices();
+                    apply_config_to_device_list(&mut devices, &config);
+                    sync_hid_readers(&mut hid_readers, &devices, &config);
+                    midi_readers.clear();
+                }
+                PeripheralKind::Midi => {
+                    let mut devices = discover_midi_devices();
+                    apply_config_to_device_list(&mut devices, &config);
+                    sync_midi_readers(&mut midi_readers, &devices, &config);
+                    hid_readers.clear();
+                }
+                PeripheralKind::Elgato => unreachable!(),
+            }
+            last_discovery = Instant::now();
+        }
+
+        let mut events = Vec::with_capacity(16);
+        for reader in hid_readers.values_mut() {
+            reader.poll(&mut events);
+        }
+        for reader in midi_readers.values_mut() {
+            reader.poll(&mut events);
+        }
+        for (device_id, event) in events {
+            write_message(
+                &mut writer,
+                &PluginMessage::Event {
+                    protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+                    device_id,
+                    control_id: event.control_id,
+                    value: event.value,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
+        let reader_count = hid_readers.len() + midi_readers.len();
+        let state = if reader_count == 0 {
+            PluginState::Idle
+        } else {
+            PluginState::Ready
+        };
+        if last_state != Some(state) {
+            write_message(
+                &mut writer,
+                &PluginMessage::Status {
+                    protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+                    kind,
+                    state,
+                    message: if reader_count == 0 {
+                        "waiting for an enabled configured device".into()
+                    } else {
+                        format!("reading {reader_count} configured device(s)")
+                    },
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            last_state = Some(state);
+        }
+
+        let sleep_msec = if reader_count == 0 {
+            STREAMER_IDLE_SLEEP_MS
+        } else {
+            HID_READ_SLEEP_MS
+        };
+        thread::sleep(Duration::from_millis(sleep_msec));
+    }
+
+    let _ = write_message(
+        &mut writer,
+        &PluginMessage::Status {
+            protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+            kind,
+            state: PluginState::Stopping,
+            message: "peripheral plugin is stopping".into(),
+        },
+    );
+    let _ = writer.shutdown(std::net::Shutdown::Both);
+    let _ = command_handle.join();
+    Ok(())
+}
+
+fn run_elgato_plugin(stream: UnixStream, mut writer: UnixStream) -> Result<(), String> {
+    let mut reader = BufReader::new(stream);
+    let request = read_message::<HostMessage>(&mut reader)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Elgato host disconnected before sending a command".to_string())?;
+    let HostMessage::ElgatoRequest {
+        protocol_version,
+        request_id,
+        command,
+    } = request
+    else {
+        return Err("Elgato plugin received an unsupported host command".into());
+    };
+    validate_protocol(protocol_version).map_err(|error| error.to_string())?;
+    let result = execute_elgato_command(command);
+    let (state, error) = match result {
+        Ok(state) => (Some(state), None),
+        Err(error) => (None, Some(error)),
+    };
+    write_message(
+        &mut writer,
+        &PluginMessage::ElgatoResponse {
+            protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+            request_id,
+            state,
+            error,
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn execute_elgato_command(
+    command: ElgatoCommand,
+) -> Result<crate::elgato::ElgatoWaveXlrState, String> {
+    match command {
+        ElgatoCommand::ReadWaveXlr => crate::elgato::read_wave_xlr_state(),
+        ElgatoCommand::SetWaveXlrGain { gain_raw } => crate::elgato::set_wave_xlr_gain(gain_raw),
+        ElgatoCommand::SetWaveXlrMute { muted } => crate::elgato::set_wave_xlr_mute(muted),
+        ElgatoCommand::SetWaveXlrHeadphoneVolume { db } => {
+            crate::elgato::set_wave_xlr_hp_volume_db(db)
+        }
+        ElgatoCommand::SetWaveXlrLowImpedance { enabled } => {
+            crate::elgato::set_wave_xlr_low_impedance(enabled)
+        }
+    }
+    .map_err(|error| error.to_string())
+}
+
+fn spawn_host_reader(
+    mut reader: BufReader<UnixStream>,
+    tx: SyncSender<HostReaderEvent>,
+    kind: PeripheralKind,
+) -> Result<thread::JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name(format!("wavelinux-peripheral-{}-commands", kind.as_str()))
+        .spawn(move || loop {
+            let event = match read_message::<HostMessage>(&mut reader) {
+                Ok(Some(message)) => HostReaderEvent::Message(message),
+                Ok(None) => HostReaderEvent::Closed,
+                Err(error) => HostReaderEvent::Failed(error.to_string()),
+            };
+            let terminal = !matches!(event, HostReaderEvent::Message(_));
+            if tx.send(event).is_err() || terminal {
+                break;
+            }
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn apply_config_to_device_list(
+    devices: &mut [StreamerDeviceSummary],
+    config: &StreamerDevicesConfig,
+) {
+    for device in devices {
+        device.enabled = config
+            .profiles
+            .get(&device.id)
+            .is_some_and(|profile| profile.enabled && !profile.bindings.is_empty());
+    }
+}
+
 struct HidReader {
     device_id: String,
     file: File,
@@ -488,7 +1508,7 @@ impl HidReader {
         })
     }
 
-    fn poll(&mut self, engine: &Arc<WaveLinuxEngine>) {
+    fn poll(&mut self, events: &mut Vec<(String, StreamerControlEvent)>) {
         let mut buffer = [0_u8; 128];
         loop {
             match self.file.read(&mut buffer) {
@@ -497,7 +1517,7 @@ impl HidReader {
                     let report = &buffer[..size];
                     if let Some(control_id) = control_id_from_report(&self.previous, report) {
                         self.previous = report.to_vec();
-                        self.dispatch(engine, &control_id);
+                        self.dispatch(events, &control_id);
                     } else {
                         self.previous = report.to_vec();
                     }
@@ -508,15 +1528,15 @@ impl HidReader {
         }
     }
 
-    fn dispatch(&mut self, engine: &Arc<WaveLinuxEngine>, control_id: &str) {
-        dispatch_binding(
-            engine,
+    fn dispatch(&mut self, events: &mut Vec<(String, StreamerControlEvent)>, control_id: &str) {
+        queue_binding_event(
             &self.device_id,
             &self.profile,
             &mut self.last_event,
             control_id,
             None,
             Duration::from_millis(HID_EVENT_DEBOUNCE_MS),
+            events,
         );
     }
 }
@@ -544,25 +1564,29 @@ impl MidiReader {
         })
     }
 
-    fn poll(&mut self, engine: &Arc<WaveLinuxEngine>) {
+    fn poll(&mut self, events: &mut Vec<(String, StreamerControlEvent)>) {
         loop {
             match self.capture.try_recv() {
-                Ok(event) => self.dispatch(engine, event),
+                Ok(event) => self.dispatch(events, event),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
         }
     }
 
-    fn dispatch(&mut self, engine: &Arc<WaveLinuxEngine>, event: StreamerControlEvent) {
-        dispatch_binding(
-            engine,
+    fn dispatch(
+        &mut self,
+        events: &mut Vec<(String, StreamerControlEvent)>,
+        event: StreamerControlEvent,
+    ) {
+        queue_binding_event(
             &self.device_id,
             &self.profile,
             &mut self.last_event,
             &event.control_id,
             event.value,
             Duration::from_millis(MIDI_EVENT_DEBOUNCE_MS),
+            events,
         );
     }
 }
@@ -639,6 +1663,35 @@ impl Drop for MidiCapture {
     }
 }
 
+fn queue_binding_event(
+    device_id: &str,
+    profile: &StreamerBindingProfile,
+    last_event: &mut BTreeMap<String, Instant>,
+    control_id: &str,
+    value: Option<f32>,
+    debounce: Duration,
+    events: &mut Vec<(String, StreamerControlEvent)>,
+) {
+    let Some(binding) = profile
+        .bindings
+        .iter()
+        .find(|binding| binding.control_id == control_id)
+    else {
+        return;
+    };
+    let debounce = effective_binding_debounce(binding, value, debounce);
+    if event_is_debounced(last_event, control_id, debounce) {
+        return;
+    }
+    events.push((
+        device_id.to_string(),
+        StreamerControlEvent {
+            control_id: control_id.to_string(),
+            value,
+        },
+    ));
+}
+
 fn dispatch_binding(
     engine: &Arc<WaveLinuxEngine>,
     device_id: &str,
@@ -648,7 +1701,6 @@ fn dispatch_binding(
     value: Option<f32>,
     debounce: Duration,
 ) {
-    let now = Instant::now();
     let Some(binding) = profile
         .bindings
         .iter()
@@ -657,26 +1709,48 @@ fn dispatch_binding(
     else {
         return;
     };
-    let debounce = if value.is_some()
+    let debounce = effective_binding_debounce(&binding, value, debounce);
+    let event_key = format!("{device_id}\0{control_id}");
+    if event_is_debounced(last_event, &event_key, debounce) {
+        return;
+    }
+    let _ = run_action_with_value(engine, binding.action, value).map_err(|err| {
+        eprintln!("WaveLinux streamer action failed for {device_id} {control_id}: {err}");
+    });
+}
+
+fn effective_binding_debounce(
+    binding: &StreamerBinding,
+    value: Option<f32>,
+    debounce: Duration,
+) -> Duration {
+    if value.is_some()
         && matches!(
             &binding.action,
             StreamerAction::MixVolumeSetFromControl { .. }
                 | StreamerAction::ChannelVolumeSetFromControl { .. }
-        ) {
+        )
+    {
         Duration::ZERO
     } else {
         debounce
-    };
+    }
+}
+
+fn event_is_debounced(
+    last_event: &mut BTreeMap<String, Instant>,
+    event_key: &str,
+    debounce: Duration,
+) -> bool {
+    let now = Instant::now();
     if last_event
-        .get(control_id)
+        .get(event_key)
         .is_some_and(|last| now.duration_since(*last) < debounce)
     {
-        return;
+        return true;
     }
-    last_event.insert(control_id.to_string(), now);
-    let _ = run_action_with_value(engine, binding.action, value).map_err(|err| {
-        eprintln!("WaveLinux streamer action failed for {device_id} {control_id}: {err}");
-    });
+    last_event.insert(event_key.to_string(), now);
+    false
 }
 
 fn set_nonblocking(file: &File) -> io::Result<()> {
@@ -1496,6 +2570,123 @@ fn sanitize_host_command_env(command: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    static TEST_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn test_runtime_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "wavelinux6-{name}-{}-{}",
+            std::process::id(),
+            TEST_RUNTIME_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn peripheral_runtime_stays_idle_without_enabled_bindings() {
+        assert!(!streamer_runtime_needed(&StreamerDevicesConfig::default()));
+
+        let mut profile = StreamerBindingProfile::new("hid:test".into());
+        profile.enabled = false;
+        profile.bindings.push(StreamerBinding {
+            control_id: "button:1".into(),
+            ..StreamerBinding::default()
+        });
+        let config = StreamerDevicesConfig {
+            profiles: BTreeMap::from([(profile.device_id.clone(), profile)]),
+            ..StreamerDevicesConfig::default()
+        };
+        assert!(!streamer_runtime_needed(&config));
+    }
+
+    #[test]
+    fn peripheral_runtime_starts_for_enabled_binding() {
+        let mut profile = StreamerBindingProfile::new("hid:test".into());
+        profile.bindings.push(StreamerBinding {
+            control_id: "button:1".into(),
+            ..StreamerBinding::default()
+        });
+        let config = StreamerDevicesConfig {
+            profiles: BTreeMap::from([(profile.device_id.clone(), profile)]),
+            ..StreamerDevicesConfig::default()
+        };
+        assert!(streamer_runtime_needed(&config));
+    }
+
+    #[test]
+    fn peripheral_runtime_starts_only_requested_transports() {
+        let binding = StreamerBinding {
+            control_id: "control:1".into(),
+            ..StreamerBinding::default()
+        };
+        let mut hid = StreamerBindingProfile::new("hid:test".into());
+        hid.bindings.push(binding.clone());
+        let mut midi = StreamerBindingProfile::new("midi:test".into());
+        midi.bindings.push(binding.clone());
+        let mut audio = StreamerBindingProfile::new("audio:test".into());
+        audio.bindings.push(binding);
+        let config = StreamerDevicesConfig {
+            profiles: BTreeMap::from([
+                (hid.device_id.clone(), hid),
+                (midi.device_id.clone(), midi),
+                (audio.device_id.clone(), audio),
+            ]),
+            ..StreamerDevicesConfig::default()
+        };
+
+        assert_eq!(
+            desired_peripheral_kinds(&config),
+            BTreeSet::from([PeripheralKind::Hid, PeripheralKind::Midi])
+        );
+    }
+
+    #[test]
+    fn peripheral_helper_handshakes_and_stops_cleanly() {
+        let runtime_dir = test_runtime_dir("peripheral-protocol");
+        ensure_private_plugin_dir(&runtime_dir).unwrap();
+        assert_eq!(
+            fs::metadata(&runtime_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let socket_path = runtime_dir.join("hid.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let helper_socket = socket_path.clone();
+        let helper =
+            thread::spawn(move || run_peripheral_plugin(PeripheralKind::Hid, &helper_socket));
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+        let hello = read_message::<PluginMessage>(&mut reader).unwrap().unwrap();
+        validate_plugin_hello(&hello, PeripheralKind::Hid).unwrap();
+        write_message(
+            &mut stream,
+            &HostMessage::Configure {
+                protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+                config: StreamerDevicesConfig::default(),
+            },
+        )
+        .unwrap();
+        let status = read_message::<PluginMessage>(&mut reader).unwrap().unwrap();
+        assert!(matches!(
+            status,
+            PluginMessage::Status {
+                kind: PeripheralKind::Hid,
+                state: PluginState::Idle,
+                ..
+            }
+        ));
+        write_message(
+            &mut stream,
+            &HostMessage::Shutdown {
+                protocol_version: PERIPHERAL_PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        drop(stream);
+
+        assert!(helper.join().unwrap().is_ok());
+        let _ = fs::remove_dir_all(runtime_dir);
+    }
 
     #[test]
     fn no_hidraw_devices_when_sysfs_is_absent_or_empty() {

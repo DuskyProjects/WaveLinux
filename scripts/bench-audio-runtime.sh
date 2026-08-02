@@ -2,20 +2,20 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HELPER="${WAVELINUX_DSP_HELPER:-$ROOT_DIR/target/release/wavelinux5-dsp-helper}"
+HELPER="${WAVELINUX_DSP_HELPER:-$ROOT_DIR/target/release/wavelinux6-audio-core}"
 FRAMES="${WAVELINUX_BENCH_FRAMES:-240000}"
 SAMPLE_RATE="${WAVELINUX_BENCH_SAMPLE_RATE:-48000}"
 OUT_DIR="${WAVELINUX_BENCH_OUT_DIR:-$ROOT_DIR/target/bench}"
 OUT_FILE="$OUT_DIR/audio-runtime-$(date +%Y%m%d-%H%M%S).jsonl"
-MODES=(pipewire_filter_chain dsp_cpu dsp_auto)
+read -r -a MODES <<< "${WAVELINUX_BENCH_MODES:-dsp_cpu}"
 
 install -d "$OUT_DIR"
 
 if [[ ! -x "$HELPER" ]]; then
-  (cd "$ROOT_DIR" && cargo build --release -p wavelinux-dsp --bin wavelinux5-dsp-helper)
+  (cd "$ROOT_DIR" && cargo build --release -p wavelinux-dsp --bin wavelinux6-audio-core)
 fi
 
-echo "WaveLinux5 audio runtime benchmark"
+echo "WaveLinux6 audio runtime benchmark"
 echo "helper=$HELPER"
 echo "frames=$FRAMES sample_rate=$SAMPLE_RATE"
 echo "output=$OUT_FILE"
@@ -47,11 +47,15 @@ done
 cat <<'NOTE'
 
 Benchmark gate:
-  Keep the accelerated path experimental until dsp_auto shows at least 30%
-  lower helper CPU than pipewire_filter_chain on the hardware input chain,
-  with no latency regression and no new PipeWire underruns/errors.
+  The current fixture measures the implemented native CPU chain. Accelerator
+  runtime probes are diagnostics only and are not a performance comparison.
+  WAVELINUX_BENCH_MODES may exercise status reporting, but every mode still
+  runs the same CPU fixture until a qualified provider pack is implemented.
 
-For live underrun checks, run this benchmark while WaveLinux5 is routing the
+  Do not mark a provider accelerated until its real workload shows at least 30%
+  lower active-core CPU with no latency regression or new underruns/errors.
+
+For live underrun checks, run this benchmark while WaveLinux6 is routing the
 hardware input chain and compare with:
   journalctl --user --since "5 minutes ago" | grep -Ei "pipewire|underrun|xrun|error"
 NOTE

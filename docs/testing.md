@@ -1,82 +1,164 @@
-# WaveLinux Test Suites
+# WaveLinux 6 Test Suites
 
-WaveLinux keeps all default tests dry-run and safe for CI. They must not create,
-move, or unload live PipeWire nodes unless a test is explicitly marked ignored.
+Default tests are dry-run and must not create, move, or unload live PipeWire
+nodes. Live integration tests are ignored unless explicitly enabled.
 
-Run the full safe suite:
+## Safe Suite
 
-```sh
+Run the same local gate used before packaging:
+
+```bash
 bash scripts/test-all.sh
 ```
 
-Run live PipeWire regression tests only when you are ready to mutate the current
-user audio graph:
+It covers Rust formatting/tests, Clippy, frontend type/build checks, shell syntax,
+ALSA alias isolation, profile validation, packaging metadata, and AppImage rules
+available on the host. Missing optional host tools are reported explicitly.
 
-```sh
-WAVELINUX_RUN_LIVE_TESTS=1 bash scripts/test-all.sh
+Useful focused commands:
+
+```bash
+cargo test -p wavelinux-dsp
+cargo test -p wavelinux-model
+cargo test -p wavelinux-pw
+cargo test -p wavelinux-engine
+cargo test -p wavelinux-accelerator --all-features --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+yarn web:build
 ```
 
 ## Coverage Map
 
-- `wavelinux-model`: config migration and normalization, app identity
-  pin/merge/reset, wrapper app matching, device
-  policy, effect catalog ranges, and legacy preset compatibility.
-- `wavelinux-pw`: PipeWire/PulseAudio command planning, managed module parsing,
-  app stream identity enrichment, source-output and sink-input route hydration,
-  effect-chain rendering, plugin detection, and cleanup planning.
-- `wavelinux-engine`: graph idempotency, stale route rescue, hotplug policy,
-  Bluetooth profile rotation, targeted effect rebuilds, effect diagnostics,
-  meter smoothing, app routing, and ignored live graph tests.
-- Frontend: TypeScript and Vite builds catch IPC shape drift and UI compile
-  regressions.
-- Shell helpers: ALSA alias install/remove tests run against a temporary
-  `.asoundrc` and never touch the real user audio config.
+- `wavelinux-dsp`: native nodes, mono RNNoise, near-field gating, chain state,
+  denormal handling, control buffering, adaptive latency, and provider policy.
+- `wavelinux-model`: schema migration, effect catalog/defaults, namespaces,
+  device ranking, app identity, and DeepFilterNet-to-RNNoise migration.
+- `wavelinux-pw`: snapshot parsing, route planning, ownership, filter config,
+  stream identity, and cleanup safety.
+- `wavelinux-engine`: reconciliation, graph idempotency, hotplug, jack
+  availability, fallback/restore, route backoff, effect coalescing, meter state,
+  hardware profiles, Health, and process matching.
+- `wavelinux-accelerator`: pack ownership/hash validation, machine-local
+  qualification, fixed shared-memory queues, RNNoise numerical fixtures,
+  isolated ONNX inference, provider termination, and exact CPU state fallback.
+- Frontend: Vitest/React Testing Library covers effect-strength mapping and UI
+  state contracts; Playwright covers FX scrolling and desktop layouts at 100,
+  125, and 150% scaling; TypeScript and Vite protect production IPC/build
+  contracts.
+- Shell: installers, process matching, dependency logic, and ALSA alias edits.
 
-The ignored live tests cover the parts that cannot be proven in CI: virtual node
-creation, volume/mute mutation, stale cleanup, per-channel music metering, and
-PipeWire filter-chain startup/cleanup.
+## Live PipeWire Tests
 
-Focused engine regressions worth running while touching graph refresh, effects,
-or default-input repair:
+Live tests mutate the current user audio graph. Close recording/streaming work
+or use an isolated PipeWire session first:
 
-```sh
-cargo test -p wavelinux-engine stale_runtime_refresh_uses_cached_state_when_refresh_busy
-cargo test -p wavelinux-engine effect_sync_requeues_when_graph_mutation_is_busy
-cargo test -p wavelinux-engine failed_capture_moves_are_backed_off_by_source_output_id
+```bash
+WAVELINUX_RUN_LIVE_TESTS=1 \
+  cargo test -p wavelinux-engine -- --ignored --test-threads=1
 ```
 
-## Distro Smoke
+Acceptance scenarios include:
 
-Release smoke tests run the published assets in clean containers for the main
-Linux families WaveLinux supports:
+- dormant browser stream activation and first-play routing;
+- Monitor and Stream aggregation;
+- `wavelinux6-mic` in Discord and Audacity;
+- mono/USB/HDA microphone hotplug and 750 ms restoration debounce;
+- rapid effect edits without public-node loss;
+- live 28 -> 120 -> 28 ms latency changes without graph repair;
+- stable node ownership alongside unrelated host nodes.
 
-```sh
-bash scripts/distro-smoke.sh --all --target appimage --release-tag v5.0.0-testing.1
-bash scripts/distro-smoke.sh --distro fedora --target native --release-tag v5.0.0-testing.1
+## DSP Benchmark
+
+Run the deterministic offline fixture:
+
+```bash
+bash scripts/bench-audio-runtime.sh
 ```
 
-The AppImage target downloads the release AppImage, runs
-`--install-runtime-dependencies`, and then verifies
-`--check-runtime-dependencies` on current Debian, Ubuntu, Fedora, and Arch. The
-native target installs the release deb or rpm with the distro package manager
-and then runs the same runtime check on Ubuntu and Fedora. Debian 12 is older
-than the current release artifact glibc baseline, so it is intentionally not a
-release smoke target.
+Results are written under `target/bench`. Compare release builds on the same
+machine and power state. The fixture catches algorithmic regressions but cannot
+detect every real-time failure.
 
-AppImage smoke also asserts that the artifact does not bundle PipeWire client
-libraries, the GStreamer PipeWire plugin, or partial PipeWire/SPA module trees.
-WaveLinux meters use the host PipeWire stack to avoid client/module version
-mismatches.
+For a live run, record process CPU and inspect:
 
-For moving testing releases, the smoke helper defaults to WaveLinux5 artifact
-names. If a moving tag such as `prerelease` is used, pass the built artifact
-version explicitly:
-
-```sh
-WAVELINUX_SMOKE_ARTIFACT_VERSION=5.0.0 bash scripts/distro-smoke.sh --all --target appimage --release-tag prerelease
+```bash
+tail -f ~/.config/wavelinux6/wavelinux6-audio-core.log
+journalctl --user -f -u pipewire -u pipewire-pulse -u wireplumber
 ```
 
-Containers are not full desktop sessions, so the smoke harness accepts the
-container-only `bwrap usable sandbox` warning after package installation. It
-still fails if runtime packages, WebKit helpers, PipeWire tools, ALSA tools, or
-required graphics libraries are missing.
+Healthy core stats have zero dropped/underrun frames and callback time well
+below the quantum budget. Near-silent microphone audio is a required benchmark
+case because recursive filters can expose denormal-number regressions that loud
+fixtures do not.
+
+## Stress Gate
+
+Before promotion from alpha/beta, run a 60-minute test covering concurrent disk,
+network, and CPU load while recording the Stream and microphone sources. Analyze
+the recording for discontinuities and retain logs.
+
+Required outcomes:
+
+- zero WaveLinux-owned underruns or dropped frames;
+- no `out of buffers`, unexplained link failures, rebuilds, or silent intervals;
+- app routing p95 below 100 ms;
+- audio readiness below 2 seconds;
+- RT callback p99 below 25% of its quantum budget;
+- at least 30% active-core CPU reduction from the recorded WaveLinux5 baseline;
+- no microphone latency regression.
+
+The current alpha has not completed the full 60-minute automated gate.
+
+## Packaging And Distro Smoke
+
+Build and validate portable local packages:
+
+```bash
+bash scripts/build-portable.sh
+bash scripts/check-package-contents.sh target/portable/release/bundle
+```
+
+The package gate extracts the AppImage, deb, and rpm, checks their identity and
+required helpers, and rejects embedded WaveLinux binaries newer than the glibc
+2.39 ceiling. It also rejects bundled PipeWire and Wayland client libraries
+that must match the host. Distro smoke then invokes the packaged app's
+`--probe-binary` path, so a dynamically unloadable executable cannot pass on
+metadata alone.
+
+Run the exact locally staged artifacts across the supported matrix:
+
+```bash
+version="$(node -e 'console.log(require("./package.json").version)')"
+WAVELINUX_SMOKE_ARTIFACT_VERSION="$version" \
+WAVELINUX_SMOKE_LOCAL_ASSET_DIR="$PWD/target/release/smoke-assets" \
+  bash scripts/distro-smoke.sh --all --target appimage --release-tag "v$version"
+```
+
+Repeat with `--target native` for Debian, Ubuntu, and Fedora. Arch uses the
+AppImage/AUR path and intentionally skips native package installation.
+
+Published prerelease assets can be tested in supported containers with:
+
+```bash
+bash scripts/distro-smoke.sh --all --target appimage \
+  --release-tag <waveLinux6-prerelease-tag>
+```
+
+The smoke harness checks Debian 13, Ubuntu 24.04, current Fedora, Arch, and
+CachyOS AppImage paths plus supported native deb/rpm paths. CachyOS additionally
+launches the real WebKit window as a non-root user under Xvfb and rejects blank
+or renderer-crashed screenshots. Containers do not replace live desktop audio
+sessions.
+
+## Regression Checklist
+
+For every runtime change:
+
+1. Run focused tests while editing.
+2. Run the complete safe suite.
+3. Build the release AppImage.
+4. Install locally through `scripts/install-local.sh`.
+5. Confirm public nodes, meters, selected devices, Stream aggregation, core
+   stats, and current logs.
+6. Keep the app running for user acceptance.
+7. Do not push or publish until explicitly approved.

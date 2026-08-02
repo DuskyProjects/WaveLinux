@@ -59,7 +59,7 @@ The easiest way to find the theme folder is inside the app:
 On current Linux desktop builds the folder is usually:
 
 ```bash
-~/.config/io.github.duskyprojects.WaveLinux/themes
+~/.config/io.github.duskyprojects.WaveLinux6/themes
 ```
 
 The selected theme preference is stored by the app shell next to that config

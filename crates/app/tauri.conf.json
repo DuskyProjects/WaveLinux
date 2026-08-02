@@ -1,9 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "WaveLinux5",
-  "mainBinaryName": "wavelinux5",
-  "version": "5.0.3",
-  "identifier": "io.github.duskyprojects.WaveLinux5",
+  "productName": "WaveLinux6",
+  "mainBinaryName": "wavelinux6",
+  "version": "6.0.0-alpha.1",
+  "identifier": "io.github.duskyprojects.WaveLinux6",
   "build": {
     "beforeDevCommand": "cd .. && node node_modules/.bin/vite --port 1420",
     "beforeBuildCommand": "cd .. && node node_modules/.bin/tsc && node node_modules/.bin/vite build",
@@ -14,7 +14,7 @@
     "enableGTKAppId": true,
     "windows": [
       {
-        "title": "WaveLinux5",
+        "title": "WaveLinux 6",
         "width": 1280,
         "height": 820,
         "minWidth": 960,
@@ -39,16 +39,21 @@
     ],
     "category": "Music",
     "shortDescription": "Linux creator audio mixer",
-    "longDescription": "WaveLinux5 is a Rust and PipeWire creator audio mixer for Linux.",
+    "longDescription": "WaveLinux 6 is a Rust and PipeWire creator audio mixer for Linux.",
     "linux": {
       "appimage": {
         "bundleMediaFramework": true,
         "files": {
           "/usr/lib": "appimage-extra/usr/lib",
+          "/usr/share/metainfo": "appimage-extra/usr/share/metainfo",
           "/usr/wavelinux-runtime": "appimage-extra/usr/wavelinux-runtime"
         }
       },
       "deb": {
+        "files": {
+          "/usr/bin/wavelinux6-audio-core": "../../target/release/wavelinux6-audio-core",
+          "/usr/bin/wavelinux6-peripheral-plugin": "../../target/release/wavelinux6-peripheral-plugin"
+        },
         "depends": [
           "pipewire",
           "wireplumber",
@@ -66,15 +71,23 @@
           "libgl1",
           "libgbm1",
           "libdrm2",
+          "libwayland-client0",
+          "libwayland-cursor0",
+          "libwayland-egl1",
+          "libwayland-server0",
           "gstreamer1.0-plugins-base",
           "gstreamer1.0-plugins-good",
           "fonts-dejavu-core",
           "xdg-desktop-portal",
           "xdg-desktop-portal-gtk"
         ],
-        "recommends": ["swh-plugins", "librnnoise-ladspa"]
+        "recommends": []
       },
       "rpm": {
+        "files": {
+          "/usr/bin/wavelinux6-audio-core": "../../target/release/wavelinux6-audio-core",
+          "/usr/bin/wavelinux6-peripheral-plugin": "../../target/release/wavelinux6-peripheral-plugin"
+        },
         "depends": [
           "pipewire",
           "pipewire-utils",
@@ -92,13 +105,17 @@
           "mesa-libGL",
           "mesa-libgbm",
           "libdrm",
+          "libwayland-client",
+          "libwayland-cursor",
+          "libwayland-egl",
+          "libwayland-server",
           "gstreamer1-plugins-base",
           "gstreamer1-plugins-good",
           "google-noto-sans-fonts",
           "xdg-desktop-portal",
           "xdg-desktop-portal-gtk"
         ],
-        "recommends": ["ladspa-swh-plugins", "lsp-plugins-ladspa", "rnnoise"]
+        "recommends": []
       }
     }
   },

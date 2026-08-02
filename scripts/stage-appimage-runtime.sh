@@ -7,9 +7,10 @@ BIN_DIR="$OUT_DIR/bin"
 LIB_DIR="$OUT_DIR/lib"
 LADSPA_DIR="$LIB_DIR/ladspa"
 STARTUP_LIB_DIR="$ROOT_DIR/crates/app/appimage-extra/usr/lib"
+FONTCONFIG_DIR="$OUT_DIR/etc/fonts"
 
-rm -rf "$BIN_DIR" "$LIB_DIR" "$STARTUP_LIB_DIR"
-install -d "$BIN_DIR" "$LIB_DIR" "$LADSPA_DIR" "$STARTUP_LIB_DIR"
+rm -rf "$BIN_DIR" "$LIB_DIR" "$STARTUP_LIB_DIR" "$FONTCONFIG_DIR"
+install -d "$BIN_DIR" "$LIB_DIR" "$LADSPA_DIR" "$STARTUP_LIB_DIR" "$FONTCONFIG_DIR/conf.d"
 touch "$BIN_DIR/.gitkeep" "$LIB_DIR/.gitkeep" "$LADSPA_DIR/.gitkeep" "$STARTUP_LIB_DIR/.gitkeep"
 
 stage_binary() {
@@ -63,71 +64,27 @@ stage_startup_library() {
   echo "Warning: AppImage startup library not found: $output_name" >&2
 }
 
-existing_ladspa_paths() {
-  local paths=()
-  if [[ -n "${LADSPA_PATH:-}" ]]; then
-    IFS=':' read -r -a paths <<< "$LADSPA_PATH"
-  fi
-  paths+=(
-    /usr/lib/ladspa
-    /usr/lib64/ladspa
-    /usr/local/lib/ladspa
-    /usr/local/lib64/ladspa
-    /usr/lib/x86_64-linux-gnu/ladspa
-    /usr/lib/aarch64-linux-gnu/ladspa
-    /usr/lib/arm-linux-gnueabihf/ladspa
-  )
-  printf '%s\n' "${paths[@]}" | awk 'NF && !seen[$0]++'
-}
-
-stage_ladspa_plugins() {
-  local label="$1"
-  shift
-  local root pattern path basename staged=0
-  local -A seen=()
-  while IFS= read -r root; do
-    [[ -d "$root" ]] || continue
-    for pattern in "$@"; do
-      for path in "$root"/$pattern; do
-        [[ -f "$path" ]] || continue
-        basename="$(basename "$path")"
-        [[ -n "${seen[$basename]:-}" ]] && continue
-        seen[$basename]=1
-        install -m 0644 "$path" "$LADSPA_DIR/$basename"
-        echo "Staged AppImage LADSPA plugin: $basename"
-        staged=1
-      done
-    done
-  done < <(existing_ladspa_paths)
-
-  if (( staged == 0 )); then
-    if [[ "${WAVELINUX_STAGE_LADSPA_WARN_MISSING:-1}" == "1" ]]; then
-      echo "Warning: AppImage LADSPA plugin not found: $label" >&2
-    fi
-    return 1
-  fi
-  return 0
-}
-
-stage_rnnoise_ladspa_plugin() {
-  if [[ "${WAVELINUX_FORCE_BUILD_RNNOISE_LADSPA:-0}" != "1" ]] \
-    && WAVELINUX_STAGE_LADSPA_WARN_MISSING=0 stage_ladspa_plugins "RNNoise" \
-      librnnoise_ladspa.so \
-      rnnoise_ladspa.so; then
+stage_fontconfig_configuration() {
+  if [[ ! -r /etc/fonts/fonts.conf \
+    || ! -d /etc/fonts/conf.d \
+    || ! -d /usr/share/fontconfig/conf.avail ]]; then
+    echo "Warning: matching AppImage Fontconfig configuration was not found" >&2
     return 0
   fi
 
-  if "$ROOT_DIR/scripts/build-rnnoise-ladspa.sh" "$LADSPA_DIR/librnnoise_ladspa.so"; then
-    return 0
-  fi
-
-  echo "Warning: AppImage LADSPA plugin not found or built: RNNoise" >&2
-  if [[ "${WAVELINUX_REQUIRE_RNNOISE_LADSPA:-0}" == "1" ]]; then
-    exit 1
-  fi
+  install -d "$FONTCONFIG_DIR/conf.avail"
+  install -m 0644 /etc/fonts/fonts.conf "$FONTCONFIG_DIR/fonts.conf"
+  while IFS= read -r -d '' config; do
+    install -m 0644 "$config" "$FONTCONFIG_DIR/conf.d/$(basename "$config")"
+  done < <(find -L /etc/fonts/conf.d -maxdepth 1 -type f -print0)
+  while IFS= read -r -d '' config; do
+    install -m 0644 "$config" "$FONTCONFIG_DIR/conf.avail/$(basename "$config")"
+  done < <(find -L /usr/share/fontconfig/conf.avail -maxdepth 1 -type f -print0)
+  echo "Staged AppImage Fontconfig configuration"
 }
 
-stage_repo_binary wavelinux5-dsp-helper
+stage_repo_binary wavelinux6-audio-core
+stage_repo_binary wavelinux6-peripheral-plugin
 install -m 0755 "$ROOT_DIR/scripts/check-dependencies.sh" "$BIN_DIR/check-dependencies.sh"
 echo "Staged AppImage runtime helper: check-dependencies.sh"
 stage_binary bwrap
@@ -236,13 +193,4 @@ stage_startup_library libX11-xcb.so.1 \
   /usr/lib64/libX11-xcb.so.1 \
   /usr/lib/libX11-xcb.so.1
 
-stage_rnnoise_ladspa_plugin
-
-stage_ladspa_plugins "SWH voice effects" \
-  sc4_1882.so \
-  compressor.so \
-  gate_1410.so \
-  fast_lookahead_limiter_1913.so \
-  hard_limiter_1413.so \
-  pitch_scale_1193.so \
-  gverb_1216.so
+stage_fontconfig_configuration

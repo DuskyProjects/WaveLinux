@@ -94,6 +94,7 @@ export interface Channel {
   mix_buses: Record<string, MixBus>;
   app_matchers: AppMatcher[];
   effects: EffectInstance[];
+  effects_enabled: boolean;
 }
 
 export interface AppRoute {
@@ -425,6 +426,74 @@ export interface AdaptiveLatencyStatus {
   underrun_delta: number;
   pipewire_warning_delta: number;
   cpu_pressure: number;
+  pipewire_quantum_frames: number;
+  pipewire_quantum_floor_frames: number;
+}
+
+export interface AudioCoreChannelStatus {
+  channel_id: string;
+  online: boolean;
+  sample_rate_hz: number;
+  target_latency_msec: number;
+  current_buffer_frames: number;
+  buffer_fill_msec: number;
+  captured_frames: number;
+  rendered_frames: number;
+  dropped_frames: number;
+  underrun_frames: number;
+  underrun_delta: number;
+  capture_callbacks: number;
+  worker_running: boolean;
+  worker_blocks: number;
+  worker_queue_frames: number;
+  worker_queue_capacity_frames: number;
+  worker_overrun_frames: number;
+  accelerator_provider?: string | null;
+  accelerator_active_states: number;
+  accelerator_provider_pids: number[];
+  accelerator_provider_blocks: number;
+  accelerator_fallback_blocks: number;
+  accelerator_deadline_misses: number;
+  accelerator_invalid_results: number;
+  accelerator_stale_results: number;
+  accelerator_disabled_states: number;
+  accelerator_startup_failures: string[];
+  accelerator_last_failure?: string | null;
+  last_process_micros: number;
+  max_process_micros: number;
+  chain_swaps: number;
+  non_finite_blocks: number;
+  non_finite_samples: number;
+  non_finite_effect_mask: number;
+  chain_recoveries: number;
+  chain_swap_replacements: number;
+  retired_chain_overflows: number;
+  submitted_generation: number;
+  acknowledged_generation: number;
+  submitted_route_generation: number;
+  applied_route_generation: number;
+  input_target_node_name?: string | null;
+  output_target_node_names: string[];
+  route_target_error?: string | null;
+  rate_correction: number;
+  error?: string | null;
+}
+
+export type EffectRuntimeState = "grey" | "red" | "green";
+
+export interface EffectRuntimeStatus {
+  channel_id: string;
+  state: EffectRuntimeState;
+  selected_effect_count: number;
+  desired_enabled: boolean;
+  desired_generation: number;
+  applied_generation: number;
+  in_flight_generation?: number | null;
+  coalesced_requests: number;
+  pending: boolean;
+  core_healthy: boolean;
+  control_socket: string;
+  last_error?: string | null;
 }
 
 export interface EffectParamDefinition {
@@ -471,6 +540,114 @@ export interface EngineStatus {
   message: string;
   last_refresh_unix: number;
   adaptive_latency: AdaptiveLatencyStatus;
+  audio_core: AudioCoreChannelStatus[];
+  effects: EffectRuntimeStatus[];
+  refresh: RuntimeRefreshStatus;
+  pipewire_audio_health: PipeWireAudioHealthStatus;
+  meter_transport: MeterTransportStatus;
+  pipewire_registry: PipeWireRegistryStatus;
+  peripheral_plugins: PeripheralPluginStatus[];
+  accelerator_providers: AcceleratorProviderStatus[];
+}
+
+export interface AcceleratorProviderStatus {
+  provider: string;
+  protocol_version: number;
+  installed: boolean;
+  valid: boolean;
+  qualified: boolean;
+  active: boolean;
+  pack_version?: string | null;
+  model_sha256?: string | null;
+  hardware_fingerprint: string;
+  tested_unix?: number | null;
+  blocks?: number | null;
+  numerical_max_abs_error?: number | null;
+  deadline_misses?: number | null;
+  discontinuities?: number | null;
+  added_latency_msec?: number | null;
+  cpu_reduction_percent?: number | null;
+  fallback_validated: boolean;
+  live_workload_validated: boolean;
+  detail: string;
+}
+
+export type PeripheralPluginRuntimeState =
+  | "stopped"
+  | "starting"
+  | "ready"
+  | "idle"
+  | "error";
+
+export interface PeripheralPluginStatus {
+  kind: string;
+  state: PeripheralPluginRuntimeState;
+  protocol_version: number;
+  pid?: number | null;
+  restarts: number;
+  message: string;
+  last_error?: string | null;
+}
+
+export interface PipeWireRegistryStatus {
+  available: boolean;
+  connected: boolean;
+  initialized: boolean;
+  generation: number;
+  object_count: number;
+  node_count: number;
+  device_count: number;
+  port_count: number;
+  link_count: number;
+  metadata_count: number;
+  playback_stream_count: number;
+  capture_stream_count: number;
+  batches_received: number;
+  objects_changed: number;
+  direct_link_failures: number;
+  direct_node_errors: number;
+  reconnects: number;
+  last_event_unix: number;
+  last_error?: string | null;
+}
+
+export interface MeterTransportStatus {
+  protocol_version: number;
+  connected: boolean;
+  slot_count: number;
+  last_sequence: number;
+  frames_received: number;
+  connections: number;
+  disconnects: number;
+  fallback_polls: number;
+  errors: number;
+  last_error?: string | null;
+}
+
+export interface RuntimeRefreshStatus {
+  total_refreshes: number;
+  last_total_msec: number;
+  peak_total_msec: number;
+  last_phase_msec: Record<string, number>;
+  snapshot_commands: number;
+  snapshot_failures: number;
+  route_mutations: number;
+  deferred_route_mutations: number;
+}
+
+export interface PipeWireAudioHealthStatus {
+  monitor_available: boolean;
+  profiler_available: boolean;
+  profiler_samples: number;
+  direct_errors: number;
+  owned_direct_errors: number;
+  warning_events: number;
+  out_of_buffers: number;
+  resyncs: number;
+  link_failures: number;
+  xruns: number;
+  owned_events: number;
+  last_event_unix?: number | null;
 }
 
 export interface AppStateSnapshot {
@@ -608,18 +785,5 @@ export interface UpdateInfo {
 export interface UpdateInstallResult {
   installed: boolean;
   version?: string | null;
-  message: string;
-}
-
-export interface EffectPluginInstallResult {
-  attempted: boolean;
-  success: boolean;
-  manager: string;
-  packages: string[];
-  aur_packages: string[];
-  missing_before: string[];
-  missing_after: string[];
-  stdout: string;
-  stderr: string;
   message: string;
 }

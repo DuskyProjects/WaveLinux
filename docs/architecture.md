@@ -1,267 +1,291 @@
-# WaveLinux Architecture Notes
+# WaveLinux 6 Architecture
 
-This document is the maintenance map for WaveLinux. It explains how the
-desktop shell, Rust engine, PipeWire graph planning, effect chains, logs, and
-packaging scripts fit together so future changes can preserve the behavior that
-keeps the app responsive.
+This document describes the current WaveLinux 6 alpha implementation. It is a
+maintenance map, not a statement that every item in the long-term WaveLinux 6
+design is complete. The final section records the remaining architectural work.
 
-For setup commands, see [setup.md](setup.md). For test commands, see
-[testing.md](testing.md).
+See [setup.md](setup.md), [testing.md](testing.md), and
+[audio-core.md](audio-core.md) for operational detail. Profile trust,
+acceleration, integrations, migration, and release boundaries have dedicated
+runbooks linked from the project README.
 
 ## Repository Map
 
-- `src`: React and TypeScript UI.
-- `crates/app`: Tauri shell and IPC boundary.
-- `crates/dsp`: WaveLinux5 experimental DSP helper, provider probing, CPU DSP
-  nodes, and fixture benchmarks.
-- `crates/engine`: runtime state, diagnostics, hardware profiles, graph repair,
-  app routing, effect process supervision, and log maintenance.
-- `crates/pw`: PipeWire/PulseAudio snapshot parsing, command planning, and
-  filter-chain config rendering.
-- `crates/model`: shared model types, defaults, and migrations.
-- `profiles/v1`: hardware profile schema, device seeds, and authoring docs.
-- `scripts`: local install, build, release, dependency, and packaging helpers.
-- `docs`: developer-facing setup, testing, theme, and architecture notes.
-
-## Runtime Ownership
-
-`WaveLinuxEngine` is the main owner of mutable runtime state. It keeps the saved
-`MixerConfig` and live `RuntimeCache` behind `RwLock`s and coordinates PipeWire
-mutations with a small set of mutexes:
-
-- `runtime_refresh`: serializes full snapshots and runtime-cache refreshes.
-- `audio_commands`: serializes live graph mutations such as repair, stream
-  moves, route creation, cleanup, volume/mute writes, and effect-route sync.
-- `deferred_graph_repair`: debounces config-triggered repair requests.
-- `deferred_effect_sync`: debounces per-channel effect changes and merges channel
-  ids that change close together.
-- `capture_move_failures`: remembers failed capture-stream moves so repeated
-  default-input repairs do not hammer PipeWire with the same failing command.
-
-The important rule is that state reads must stay responsive while graph
-mutations are running. UI state refreshes use cached state when another refresh
-is already in progress. Deferred background jobs that need to mutate the graph
-try to take `audio_commands`; if it is busy, they log the condition and requeue
-instead of blocking.
-
-## Graph Lifecycle
-
-The engine builds a graph view by asking `PwClient` for PipeWire, PulseAudio,
-and effect availability snapshots. The raw saved config is then adjusted in
-layers before graph commands are planned:
-
-1. Hardware profiles apply safer defaults for known devices.
-2. Unhealthy effect chains are temporarily bypassed for routing decisions.
-3. Effects that are unavailable in the live graph are bypassed in the effective
-   audio config.
-4. PipeWire commands are planned from the effective config and the live graph.
-
-Startup and repair use the same basic shape:
-
-1. Snapshot the live graph.
-2. Restore Bluetooth A2DP profile when needed.
-3. Prune stale WaveLinux-owned nodes.
-4. Start or restart effect filter-chain helpers.
-5. Create virtual channel, mix, monitor, and route modules.
-6. Apply saved levels, mutes, default input, and app routes.
-7. Refresh runtime state and meter targets from the live graph.
-
-`audio_commands` must wrap any live PipeWire mutation that can overlap another
-mutation. Direct user actions that already happen on command paths may wait for
-the lock with a timeout. Deferred repair and effect sync use the non-blocking
-path and requeue when the graph is busy.
-
-## Effect Chains
-
-Effect chains are rendered as PipeWire filter-chain configs under:
-
-```text
-~/.local/share/wavelinux/effects/wavelinux-chain-<channel>.conf
-```
-
-Each active chain is started with:
-
-```text
-pipewire -c <generated-chain-config>
-```
-
-The effect process writes stdout and stderr to:
-
-```text
-~/.config/wavelinux/wavelinux-chain-<channel>.log
-```
-
-The engine tracks helper child processes when it starts them. It also scans for
-stale helper commands during repair so it can clean up helpers from previous
-runs or older app versions.
-
-Effect changes follow this flow:
-
-1. The config update schedules `schedule_effect_graph_sync_many`.
-2. Effect config files are rebuilt after a short debounce.
-3. If the WaveLinux graph is running, the sync tries to take `audio_commands`.
-4. If another graph mutation is running, the sync logs a requeue and schedules
-   itself again.
-5. Once the lock is available, stale helpers are killed, old endpoints are given
-   a bounded wait to disappear, fresh helpers are started, and fresh endpoints
-   are given a bounded wait to appear.
-6. Routes for the affected channels are rebuilt. If the effect helper fails to
-   start or endpoints do not appear, the channel is routed through its raw
-   monitor for that sync.
-
-This non-blocking requeue behavior is important. An effect edit can happen while
-automatic graph repair is already fixing a hotplug/default-device event. The
-effect sync must not wait indefinitely behind that repair thread, and repair must
-not wait indefinitely behind effect sync.
-
-The logs that show a healthy busy-graph effect change look like this:
-
-```text
-[effects.sync] effect chain changed; syncing affected channels: music
-[effects.sync] graph mutation already in progress; deferring effect route sync
-[effects.sync] effect route sync requeued; graph mutation is still running
-```
-
-After the current mutation finishes, the requeued sync should run and either log
-the planned commands or log an explicit effect startup/route error. If those
-requeue lines are missing on a build that freezes after applying EQ or another
-effect, check the effect-sync locking path first.
-
-## Stream Routing And Backoff
-
-App playback streams and capture streams can appear, disappear, and reuse ids
-while PipeWire is changing. The engine avoids repeatedly moving the same failing
-capture stream by remembering a failure signature made from the source-output id
-and route details. A later command with the same id but a different signature is
-treated as new work and is allowed through.
-
-Capture move backoff grows exponentially and is capped at 30 minutes. A
-successful move clears the remembered failure for that source-output id.
-
-## Logs And Diagnostics
-
-The primary engine log is:
-
-```text
-~/.config/wavelinux/wavelinux-engine.log
-```
-
-Effect helper logs are:
-
-```text
-~/.config/wavelinux/wavelinux-chain-<channel>.log
-```
-
-Logs rotate when they exceed 2 MiB. The engine keeps four rotated files per log
-and rotates current logs when the app version changes. Settings > Health >
-Testing Health Report includes the engine log path, a compact runtime summary,
-diagnostics, and recent debug-log lines.
-
-Useful log areas:
-
-| Area | Meaning |
+| Path | Responsibility |
 | --- | --- |
-| `runtime.refresh` | Full live graph snapshot and runtime-cache refresh. |
-| `hotplug.device` | Device/default-source changes noticed by polling. |
-| `repair.auto` | Debounced automatic repair after config or device changes. |
-| `repair.*` | Startup or explicit graph repair phases. |
-| `effects.sync` | Effect-chain config writes, helper restart, and route rebuild. |
-| `effects.process` | Effect helper process lifecycle and health warnings. |
-| `default.input` | Controlled microphone/default-input capture moves. |
-| `route.streams` | App playback route moves. |
-| `meters.supervisor` | Meter target refresh and helper stream supervision. |
-| `audio.lock` | Timed waits for the graph mutation lock. |
+| `src` | React mixer UI, state store, themes, and Tauri IPC client. |
+| `crates/app` | Tauri process, command boundary, tray, and backend event pump. |
+| `crates/model` | Schema 14 config, runtime models, defaults, and migrations. |
+| `crates/pw` | PipeWire/Pulse snapshots, graph planning, and command rendering. |
+| `crates/engine` | Runtime reconciliation, routing, devices, effects, Health, and logs. |
+| `crates/dsp` | Native DSP library and `wavelinux6-audio-core`. |
+| `profiles/v1` | Signed hardware-profile schema, index, and local seeds. |
+| `scripts` | Builds, local install, dependency checks, packaging, and smoke tests. |
 
-For a freeze report, collect the last 100 engine lines and any matching effect
-helper log:
+## Identity And State
 
-```sh
-tail -n 100 ~/.config/wavelinux/wavelinux-engine.log
-ls ~/.config/wavelinux/wavelinux-chain-*.log
-tail -n 100 ~/.config/wavelinux/wavelinux-chain-music.log
-```
-
-WaveLinux5 uses separate paths and node ownership:
+WaveLinux 6 uses these identities exclusively:
 
 ```text
-~/.config/wavelinux5/wavelinux-engine.log
-~/.config/wavelinux5/wavelinux5-chain-<channel>.log
-~/.local/share/wavelinux5/effects/wavelinux5-chain-<channel>.conf
+product:       WaveLinux6
+display name:  WaveLinux 6
+binary:        wavelinux6
+audio core:    wavelinux6-audio-core
+identifier:    io.github.duskyprojects.WaveLinux6
+config:        ~/.config/wavelinux6/config.json
+data:          ~/.local/share/wavelinux6
+runtime:       $XDG_RUNTIME_DIR/wavelinux6
 ```
 
-Its graph nodes use the `wavelinux5_*` namespace and dynamic `wavelinux5.*`
-PipeWire properties. Stable WaveLinux keeps using `wavelinux_*` and
-`wavelinux.*`. See [wavelinux5-hardware-acceleration.md](wavelinux5-hardware-acceleration.md)
-for the test-line runtime modes and benchmark gate.
+Config schema 14 is normalized on load. The first WaveLinux 6 launch can import
+a WaveLinux5 config transactionally, rewrite owned node names, remove transient
+route ids, validate the WaveLinux 6 graph, and then remove WaveLinux5 artifacts.
+Legacy DeepFilterNet entries migrate to RNNoise; DeepFilterNet is not a runtime
+effect.
 
-## Startup Audio Preflight
+## Runtime Owners
 
-Before the Tauri UI opens, AppImage launches verify that `pactl info` can reach
-the host PipeWire/PulseAudio server. Installed packages alone are not enough for
-WaveLinux to build virtual sinks; `pipewire-pulse` must be running in the user
-session.
+`WaveLinuxEngine` owns saved `MixerConfig` and live `RuntimeCache`. Its main
+coordination boundaries are:
 
-If `pactl info` fails, the app tries `systemctl --user start` for
-`pipewire.socket`, `pipewire-pulse.socket`, `pipewire.service`,
-`pipewire-pulse.service`, and `wireplumber.service`. On non-systemd sessions it
-falls back to starting `pipewire`, `pipewire-pulse`, and `wireplumber`
-directly. If the probe still fails, startup stops with an explicit setup error.
+- `audio_commands`: serializes PipeWire/Pulse graph mutations.
+- `runtime_refresh`: prevents overlapping expensive host snapshots.
+- `deferred_graph_repair`: coalesces repeated graph repair requests.
+- `deferred_effect_sync`: implements per-channel latest-wins effect updates.
+- route failure maps: apply bounded backoff to stale stream ids.
 
-Disable this recovery only for packaging tests or unusual host supervision with
-`WAVELINUX_SKIP_AUDIO_SERVICE_START=1`.
+Background work must not make UI reads wait on a graph mutation. State callers
+receive the last coherent snapshot when a refresh is already active. Deferred
+mutations requeue when `audio_commands` is busy.
 
-## AppImage Packaging
+Normal stream and device routing is event-driven through one persistent
+PipeWire registry monitor. The immutable registry cache tracks nodes, devices,
+ports, links, clients, defaults, and metadata generations. A 120-second
+watchdog performs a cache-backed recovery audit if an event was lost; it is not
+the old two-second polling loop.
 
-WaveLinux AppImages bundle the desktop stack needed by Tauri/WebKitGTK and
-GStreamer, but they intentionally do not bundle PipeWire client libraries,
-PipeWire GStreamer plugins, or partial `pipewire-0.3`/`spa-0.2` module trees.
-Meters and routing use the host PipeWire stack; mixing bundled client libraries
-with host modules can prevent live streams from appearing.
+Read-only refreshes project one registry generation into a coherent
+`AudioStateSnapshot`. Graph, device, route, level, and active-output decisions
+reuse that result. Native streams move through WirePlumber `target.object`
+metadata; `pactl` is retained for clients whose `client.api` is
+`pipewire-pulse`. A healthy refresh does not issue a second host snapshot.
 
-The local build path is:
+The binary meter socket is independent of control traffic. Health also reads
+direct error deltas from one persistent PipeWire profiler subscription;
+journal monitoring remains supplemental context rather than the source of
+truth for adaptive latency.
+
+## Current Audio Graph
+
+Startup uses one persistent native PipeWire graph. Pulse compatibility commands
+remain only for moving third-party Pulse streams and managing app-facing
+defaults:
+
+1. `wavelinux6-audio-core` creates every channel sink and processed source on
+   one PipeWire connection and main loop.
+2. Each channel capture callback publishes into a fixed-capacity raw queue. A
+   non-real-time channel worker runs DSP into the processed history while the
+   stable source renders from the current latency tap.
+3. Native Monitor and Stream mix sources read those histories directly and
+   apply smoothed atomic bus and master gains. No channel-to-mix loopback is
+   created.
+4. The hardware-input capture stream targets the selected physical microphone
+   directly without changing the public `wavelinux6-mic` source.
+5. The native Monitor playback stream targets the selected physical output
+   directly and can retarget without replacing the public Monitor source.
+6. Third-party Pulse streams are moved to the native channel sinks as they
+   appear. The native node set is present before those streams become active.
+
+The WaveLinux 6 graph does not use Pulse null sinks, remap sources, per-bus
+loopbacks, or physical-endpoint `module-loopback` bridges.
+
+Important public nodes include:
 
 ```text
-yarn desktop:build
-  -> scripts/build-local.sh
-     -> scripts/stage-appimage-runtime.sh
-     -> tauri build
-     -> scripts/rebuild-appimage-with-host-strip.sh, only if Tauri bundling fails
-     -> scripts/finalize-appimage.sh
-        -> scripts/sanitize-appimage-pipewire.sh --sanitize
-        -> linuxdeploy AppImage plugin rebuild
-        -> scripts/sanitize-appimage-pipewire.sh --check
+wavelinux6-mic
+wavelinux6_mix_monitor_source
+wavelinux6_mix_stream_source
+wavelinux6_channel_hardware_in
+wavelinux6_channel_music
+wavelinux6_channel_game
+wavelinux6_channel_chat
+wavelinux6_channel_browser
+wavelinux6_channel_system
 ```
 
-`scripts/rebuild-appimage-with-host-strip.sh` exists because Tauri's cached
-`linuxdeploy-x86_64.AppImage` can contain an older `strip` binary that fails on
-newer ELF sections such as `.relr.dyn`. The fallback extracts linuxdeploy,
-replaces its embedded `strip` with the host `strip`, symlinks the cached GTK and
-GStreamer plugins into a temporary plugin directory, and reruns linuxdeploy
-against the existing AppDir.
+Owned modules and nodes carry `wavelinux6.*` properties. Cleanup and repair must
+never match an unowned node merely because its display label is similar.
 
-`scripts/finalize-appimage.sh --updater` also recreates the `.AppImage.tar.gz`
-updater archive and signs refreshed artifacts when the Tauri signing environment
-is present.
+## Audio Core
 
-In environments without FUSE, run AppImage tooling with:
+The core has one process, one PipeWire client/main loop, and independent stream
+pairs per logical channel. Each channel retains its own capture stream, stable
+playback source, fixed-capacity raw queue and stereo history, non-real-time DSP
+worker, preallocated scratch, chain state, and control socket. Sharing the
+PipeWire connection removes redundant client and event-loop threads without
+coupling channel DSP state. Empty channels use a bulk-zero playback path and do
+not run DSP.
 
-```sh
-APPIMAGE_EXTRACT_AND_RUN=1 yarn desktop:build
+The real-time callback must not allocate, lock, run effects, start subprocesses,
+access the filesystem, or log. It only converts and publishes input frames.
+Prepared chains arrive through atomic pointer exchange to the DSP worker.
+Topology and input-mode changes process old and new chains together for a 20 ms
+equal-power crossfade; the public source remains present.
+
+Filter state is flushed below `1e-20` at block boundaries. This is required:
+subnormal floating-point state previously raised an idle microphone chain from
+roughly 2-3% to nearly 50% of one CPU core.
+
+Per-channel Unix control sockets support diagnostics, target-latency changes,
+and chain swaps. They are blocking event-driven listeners with bounded client
+I/O timeouts, so idle control threads do not poll.
+
+See [audio-core.md](audio-core.md) for protocol and DSP details.
+
+## Effects
+
+Native effects are RNNoise, high-pass, eight-band EQ, compressor, gate,
+limiter, and Karaoke Stage. RNNoise uses one state for mono microphones and
+duplicates the processed result to the stereo public source. Standard effects
+except EQ and Karaoke expose exactly one user-facing Strength control. Existing
+advanced parameter values remain schema-compatible and are normalized when the
+Strength control is changed.
+
+Parameter edits update saved config and schedule a debounced channel sync.
+The core prepares the replacement chain off the callback, replaces pending
+work with the newest revision, and crossfades when ready. A burst of edits must
+not unload modules or remove a public source.
+
+## Devices And Routing
+
+Automatic device ranking is:
+
+1. USB input/output
+2. Bluetooth headphones
+3. internal headphone jack
+4. internal headset microphone
+5. internal microphone
+6. internal speakers
+
+An HDA jack whose active port is explicitly `not available` is unroutable.
+`availability unknown` remains eligible for USB and platform devices that do
+not report jack state. A selected unavailable microphone falls back temporarily
+and is restored only after 750 ms of stable availability.
+
+Playback stream events are settled briefly and coalesced before routing. The
+engine uses Pulse compatibility commands only to move third-party Pulse
+streams; it preserves stream volume across failed moves.
+
+## Adaptive Latency
+
+Core channels support live targets of 28, 40, 60, 80, 100, and 120 ms. A target
+command changes the core buffer tap and PipeWire rate correction without
+changing node ids or route revisions. A 20 ms dual-tap crossfade covers target
+changes and overwrite recovery.
+
+The controller raises latency from underrun evidence or sustained pressure and
+recovers with 30-second clean and 15-second step hysteresis. Health reports
+target, fill, rate correction, process time, dropped frames, and underruns.
+
+Adaptive changes happen inside the persistent channel and mix taps. Changing a
+target does not replace the direct native physical streams, unload a module, or
+change graph topology.
+
+## Frontend State Delivery
+
+The UI bootstraps once from the backend and then consumes:
+
+- `wavelinux://state-delta` for config and runtime revisions.
+- `wavelinux://meters` for visibility-aware meter updates.
+- `wavelinux://operation` for versioned mutation success/failure acknowledgements.
+
+High-frequency mixer, routing, stream, settings, and effect mutations include a
+frontend-generated request id. Their command response and operation event carry
+the operation protocol version plus monotonic operation, state, config, and
+graph revisions. The frontend keeps its optimistic update on success and uses
+the existing authoritative refresh path to revert a rejected mutation.
+
+`src/state.ts` exposes selector-based `useSyncExternalStore` hooks. Meter bars
+interpolate attack and release at display refresh rate and update compositor
+transforms directly instead of rerendering the full mixer. WaveLinux 6 channel
+and mix callbacks publish peak/RMS snapshots through atomics already owned by
+the persistent audio core. A non-real-time core thread streams all logical slots
+at 30 Hz over meter protocol v1 while the mixer is visible, so displaying it
+does not create PipeWire recorder clients or repeatedly open and parse JSON
+control requests. Mix snapshots are exact while a mix source is consumed and
+are estimated from channel values plus current bus/master gains while idle.
+
+The older shared PipeWire reader remains a compatibility fallback for legacy
+graph namespaces. Its callback publishes RMS samples through atomics and does
+not take a mutex or allocate. Browser-only demo data is loaded through a
+development-build dynamic import and is absent from production bundles.
+
+Tauri's Tokio runtime defaults to four worker threads because audio processing,
+core control, and engine reconciliation use dedicated threads. This avoids a
+CPU-count-sized idle executor pool on high-core-count systems. Advanced users
+can override the default with `TOKIO_WORKER_THREADS` before launch.
+
+## Logs And Health
+
+```text
+~/.config/wavelinux6/wavelinux-engine.log
+~/.config/wavelinux6/wavelinux6-audio-core.log
+~/.config/wavelinux6/wavelinux6-chain-<channel>.log
 ```
 
-## Change Checklist
+Logs rotate at bounded sizes. Startup identity logs include app version,
+AppImage path, config/data paths, and installed-version comparison. Relevant
+areas are `repair.*`, `runtime.refresh`, `route.streams`, `hotplug.*`,
+`effects.sync`, `meters.supervisor`, and `default.input`.
 
-Before changing graph mutation, routing, effects, or packaging behavior:
+The Health report should be the first debugging artifact. It includes refresh
+phase timing, recent PipeWire warnings, route repairs, core process latency,
+adaptive buffering, and archived effect failures with timestamps.
 
-- Keep live PipeWire mutations under `audio_commands`.
-- Use the non-blocking try-lock and requeue pattern for deferred/background
-  graph work.
-- Do not make UI state reads wait behind long graph mutations or refreshes.
-- Preserve the effect fallback that routes a channel raw when FX endpoints do
-  not appear.
-- Preserve the AppImage rule that PipeWire client artifacts stay host-bound.
-- Add focused engine tests for new lock, debounce, retry, or backoff behavior.
-- Run at least `cargo test -p wavelinux-engine` for engine changes.
-- Run `bash -n` over changed shell scripts for packaging changes.
-- Run `yarn desktop:build` or `bash scripts/build-local.sh` before shipping
-  AppImage packaging changes.
+## Packaging
+
+AppImages bundle the UI stack, `wavelinux6-audio-core`,
+`wavelinux6-peripheral-plugin`, RNNoise, and standard effects. They deliberately
+exclude PipeWire client libraries, GStreamer PipeWire plugins, partial
+SPA/PipeWire module trees, and Wayland client libraries. Those must match the
+host PipeWire daemon and Mesa/EGL driver stack.
+
+`scripts/build-local.sh` stages runtime assets, runs Tauri, sanitizes the AppDir,
+and rebuilds the final AppImage. Distributable artifacts are built through the
+pinned `scripts/build-portable.sh` container path and must pass embedded-binary
+glibc and package-content probes before promotion. `scripts/install-local.sh` stops only known
+WaveLinux5/6 processes, unloads owned modules, installs WaveLinux 6 into user
+XDG paths, and removes the replaced WaveLinux5 installation.
+
+## Remaining Architecture Work
+
+These WaveLinux 6 plan items are not complete and must not be described as
+shipping features:
+
+- Replace the current persistent `pw-dump` registry adapter with an in-process
+  PipeWire registry binding after its cross-distro behavior is covered by the
+  isolated integration suite. Reconciliation already uses the immutable cache,
+  and native stream moves no longer depend on Pulse compatibility ids.
+- Continue splitting the large engine and `App.tsx`; the external state store,
+  vertical EQ, and Health report are already isolated, while routing, devices,
+  effects, settings, and mixer views still share the root module.
+- Expand frontend Vitest/React Testing Library and Playwright interaction,
+  screenshot, focus, and broader mobile coverage beyond the active scaling and
+  FX-scroll regression suite.
+- Qualify isolated CUDA, OpenVINO, and AMD provider packs on representative
+  hardware. Qualified RNNoise neural stages can run on channel workers with
+  exact CPU fallback; ordinary filters, dynamics, delays, and mixing remain CPU.
+- Complete the final 60-minute audio discontinuity stress gate for the exact
+  stable release artifact.
+
+## Change Rules
+
+- Preserve stable public node names during parameter and effect changes.
+- Keep allocations, locks, logging, subprocesses, and file I/O out of RT code.
+- Keep every graph mutation under `audio_commands` and coalesce redundant work.
+- Treat explicit unavailable HDA ports as unroutable without rejecting unknown
+  USB availability.
+- Preserve host-bound PipeWire libraries in every AppImage.
+- Add regression tests for any migration, routing, retry, or DSP behavior.
+- Do not publish an alpha until local audio, safe tests, package checks, and
+  distro smoke gates pass.

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.duskyprojects.WaveLinux6</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>WaveLinux 6</name>
+  <summary>Creator audio mixer for PipeWire desktops</summary>
+  <developer id="io.github.duskyprojects">
+    <name>DuskyProjects</name>
+  </developer>
+  <description>
+    <p>
+      WaveLinux 6 provides persistent virtual audio channels, live effects,
+      application routing, stream mixes, and hardware-aware device selection.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.duskyprojects.WaveLinux6.desktop</launchable>
+  <url type="homepage">https://github.com/DuskyProjects/WaveLinux</url>
+  <provides>
+    <binary>wavelinux6</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+</component>

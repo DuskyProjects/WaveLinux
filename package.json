@@ -1,6 +1,6 @@
 {
-  "name": "wavelinux5",
-  "version": "5.0.3",
+  "name": "wavelinux6",
+  "version": "6.0.0-alpha.1",
   "private": true,
   "license": "GPL-3.0-only",
   "type": "module",
@@ -12,15 +12,16 @@
     "desktop:release": "bash scripts/build-release.sh",
     "aur:build": "bash scripts/build-aur.sh",
     "deps:check": "bash scripts/check-dependencies.sh",
-    "deps:install": "WAVELINUX_INSTALL_DEPS=1 WAVELINUX_INSTALL_EFFECTS=1 bash scripts/check-dependencies.sh",
-    "effects:install": "WAVELINUX_INSTALL_EFFECTS=1 bash scripts/check-dependencies.sh",
+    "deps:install": "WAVELINUX_INSTALL_DEPS=1 bash scripts/check-dependencies.sh",
     "install:local": "bash scripts/install-local.sh",
     "install:alsa-aliases": "bash scripts/install-alsa-aliases.sh",
     "uninstall:local": "bash scripts/uninstall-local.sh",
     "replace:local": "bash scripts/uninstall-local.sh && bash scripts/build-local.sh && bash scripts/install-local.sh",
     "release:key": "bash scripts/generate-release-key.sh",
     "release:sign": "bash scripts/sign-release-artifacts.sh",
+    "test": "vitest run",
     "test:all": "bash scripts/test-all.sh",
+    "test:e2e": "playwright test",
     "tauri:dev": "cd crates/app && ../../node_modules/.bin/tauri dev",
     "tauri:build": "bash scripts/build-local.sh",
     "web:dev": "vite --port 1420",
@@ -34,12 +35,18 @@
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@tauri-apps/cli": "^2.0.0",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "@types/react": "^19.2.15",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.0.0",
+    "jsdom": "^29.1.1",
     "typescript": "^5.7.0",
-    "vite": "^7.3.6"
+    "vite": "^7.3.6",
+    "vitest": "^3.2.7"
   },
   "resolutions": {
     "@babel/core": "7.29.7",

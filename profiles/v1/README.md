@@ -1,81 +1,105 @@
 # WaveLinux Hardware Profiles v1
 
-WaveLinux hardware profiles are JSON files that help the backend pick safe, fast audio settings automatically when matching audio hardware appears.
+Hardware profiles are declarative JSON records that let WaveLinux select safe
+device priorities, Bluetooth policy, and latency floors without hard-coding a
+specific computer. They never execute commands or modify host configuration.
 
-Profile source files live as one device per file in:
+## Catalog Layers
 
-```text
-profiles/v1/devices/*.json
+Profiles are merged in this order, with the later layer taking precedence when
+the same profile id has a newer or equal revision:
+
+1. shipped profiles embedded from `profiles/v1/devices/*.json` at compile time;
+2. verified remote profiles cached under
+   `~/.config/wavelinux6/hardware-profiles/v1/remote`;
+3. user profiles under
+   `~/.config/wavelinux6/hardware-profiles/v1/local`.
+
+The safe generic fallback remains available when nothing matches. A remote
+failure never removes the embedded or last-known-good catalog.
+
+Each file in `devices` contains one profile object. Bundled
+`{ "profiles": [...] }` files are accepted only for local compatibility; use
+one-device files for shipped and remote changes so ownership and review remain
+clear.
+
+## Signed Remote Updates
+
+Production builds fetch `profiles/v1/index.json` and `index.json.sig` from the
+WaveLinux repository only when a detected device needs a missing or newer
+profile. The index is verified with the profile-catalog Ed25519 public key
+compiled into `crates/engine/src/hardware_profiles.rs`. Every index entry also
+contains the SHA-256 digest of its device asset; an asset is cached only when
+its path, size, digest, schema, and profile id all match the signed entry.
+
+The index cache has a 24-hour TTL, download failures back off for 30 minutes,
+and network operations have a five-second timeout. Set
+`WAVELINUX_DISABLE_PROFILE_DOWNLOADS=1` to use only shipped and local profiles.
+`WAVELINUX_PROFILE_BASE_URL` is a developer/test override and does not change
+signature verification.
+
+Prewarm matching devices without opening the UI or mutating the audio graph:
+
+```bash
+wavelinux6 --prewarm-hardware-profiles
 ```
 
-These files are the canonical GitHub-hosted profile feed and local testing data;
-they are not embedded into the app binary or uploaded as release assets. Device
-files should contain a single profile object, not a `{ "profiles": [...] }`
-bundle. Local experiments may still be loaded as bundles, but one-device files
-are preferred because they make review, ownership, and community fixes much
-easier.
+The command reports installed matches and newly fetched assets. Normal startup
+runs the same synchronization asynchronously.
 
-The app downloads the lightweight index from the repository when it sees an
-unmatched audio device:
+## Authoring
 
-```text
-profiles/v1/index.json
-```
+Start from `examples/local-usb-microphone.json`. Prefer exact `vendor_id` and
+`product_id` rules plus audio-specific PipeWire/ALSA text. Receivers, docks,
+webcams, and capture cards often expose non-audio interfaces with the same USB
+identity, so a VID/PID rule alone may be unsafe.
 
-When an index entry matches detected hardware, WaveLinux downloads only that
-matching profile from `profiles/v1/devices/` over HTTPS and caches it in
-`~/.config/wavelinux/hardware-profiles/v1/remote/`. It does not ship or load a
-full built-in profile catalog.
+Important fields:
 
-Installers may run `wavelinux --prewarm-hardware-profiles` after install. That command performs a read-only audio hardware check, downloads any matching repo-hosted remote profiles into the same cache, and exits without opening the UI or changing PipeWire routing. Its `matched` counter reports currently installed local or remote profile matches for detected endpoints, while `fetched` reports newly downloaded remote profile assets. If hardware, PipeWire, or GitHub is unavailable during install, WaveLinux logs the reason and retries from the normal background detector when the app starts.
-
-Local profiles go here:
-
-```text
-~/.config/wavelinux/hardware-profiles/v1/local/*.json
-```
-
-Profiles are data only. They cannot run commands, install files, edit PipeWire/WirePlumber config, or override WaveLinux hard guardrails. In particular, local profiles cannot force a Bluetooth headset microphone when doing so would switch the device to HFP/HSP and degrade A2DP playback.
-
-Use `examples/local-usb-microphone.json` as a starting point. Prefer exact `vendor_id` and `product_id` matches when the device is a known audio endpoint. Profiles must describe an audio input and/or output endpoint; HID receivers, keyboards, mice, lighting controllers, video-only webcams, Bluetooth controllers, and other non-audio hardware do not belong in this catalog. For receivers, docks, webcams, and capture devices that can expose different USB interfaces in different modes, include audio identity text such as PipeWire node names, ALSA descriptions, or `Wireless Microphone RX`-style source names so WaveLinux does not treat a control/firmware interface as a microphone. Broad profiles without meaningful match rules are ignored.
-
-## Important Fields
-
-- `matches`: device identity rules, such as bus, vendor/product ID, node-name text, description text, driver text, or Bluetooth modalias text.
-- `capabilities`: whether the audio endpoint is input, output, duplex, USB audio class, Bluetooth A2DP, Bluetooth HFP, or true duplex A2DP. At least one of `input` or `output` must be true.
-- `latency_policy`: conservative and low-latency loopback choices in milliseconds.
-- `routing_policy`: auto-selection priorities and whether the device should be considered for input/output.
-- `bluetooth_mic_policy`: Bluetooth microphone safety policy. Use `never_if_hfp` for normal Bluetooth headsets.
-- `codec_policy`: preferred/avoided Bluetooth codecs plus optional
-  `latency_floor_msec` values keyed by codec, such as `aac`, `ldac`, and
-  `sbc_xq`.
+- `id`, `revision`, and `name`: stable identity and update ordering.
+- `matches`: bus, vendor/product id, node, description, driver, ALSA, or
+  Bluetooth modalias criteria.
+- `capabilities`: input/output/duplex, USB audio, and Bluetooth capabilities.
+- `latency_policy`: conservative and low-latency route floors in milliseconds.
+- `routing_policy`: input/output eligibility and safe priority adjustments.
+- `bluetooth_mic_policy`: normally `never_if_hfp` for consumer headsets.
+- `codec_policy`: preferred/avoided codecs and codec-specific latency floors.
 - `confidence`: `low`, `medium`, or `high`.
 
-## Bluetooth Latency Floors
+At least one audio input or output capability is required. Profiles containing
+fields such as `command`, `exec`, `shell`, `script`, or `hook` are rejected.
+Local profiles cannot bypass unavailable HDA jack handling or force an HFP/HSP
+microphone when doing so would degrade active A2DP playback.
 
-Bluetooth profiles should preserve the best stable A2DP codec without adding so
-much WaveLinux loopback buffering that video and gameplay become visibly
-delayed. Do not use SBC as the first crackle fix when AAC, SBC-XQ, or LDAC is
-available; raise the codec latency floor only as much as that endpoint needs.
+## Bluetooth Floors
 
-Use these performance-first floors unless a device-specific trace proves another
-value is required. Keep floors low enough that routed browser/video audio is not
-obviously out of sync:
+Use measured endpoint-specific values. The normal starting ranges are:
 
-- `aac`: 80-140 ms
-- `sbc_xq`: 100-160 ms
-- `sbc`: 70-120 ms
-- `ldac`: 120-180 ms
+| Codec | Suggested floor |
+| --- | --- |
+| AAC | 80-140 ms |
+| SBC-XQ | 100-160 ms |
+| SBC | 70-120 ms |
+| LDAC | 120-180 ms |
 
-LDAC is quality-first, not latency-first. Profiles should avoid maximum-bitrate
-LDAC modes on unstable links and should keep HFP/HSP out of music playback. If
-an endpoint still crackles under desktop load, prefer a small profile-specific
-floor increase over broad 240-300 ms defaults.
+Prefer a small profile-specific increase over broad 240-300 ms defaults. LDAC
+is quality-first, not latency-first; avoid maximum-bitrate modes on unstable
+links.
 
-## Guardrails
+## Validation And Signing
 
-WaveLinux ignores profiles that contain executable fields such as `command`, `exec`, `shell`, `script`, or `hook`.
+Run profile and catalog tests through:
 
-WaveLinux also ignores profiles that do not describe an audio input or output endpoint.
+```bash
+bash scripts/test-all.sh
+```
 
-WaveLinux also clamps unsafe Bluetooth microphone policies. If a profile describes a Bluetooth HFP device without true duplex A2DP support, the backend treats its microphone policy as `never_if_hfp`.
+Release maintainers update hashes/revisions in `index.json`, then sign the
+exact index bytes with the dedicated catalog key:
+
+```bash
+bash scripts/sign-profile-catalog.sh
+```
+
+Never commit the private signing key. A profile change is incomplete until the
+index digest, signature, shipped-catalog tests, and distro package checks pass.

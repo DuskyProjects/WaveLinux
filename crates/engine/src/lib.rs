@@ -3,14 +3,16 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::mem;
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -24,40 +26,56 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 use wavelinux_model::{
     app_display_name, apply_graph_namespace, graph_prefix, graph_property_prefix,
-    AdaptiveLatencyStatus, AppMatcher, AppRoute, AppStateSnapshot, AppStream, AppVolumePreset,
-    AutoDeviceKind, AutoDeviceReason, Channel, ChannelInputMode, ChannelKind, DeviceInfo,
-    Diagnostic, DiagnosticSeverity, EffectAvailability, EffectCatalog, EffectInstance,
-    EngineStatus, FallbackHardwareProfile, HardwareProfile, HardwareProfileUiState, KnownApp,
-    LatencyPolicy, LevelMeter, Mix, MixerConfig, MixerSettings, ModelError, ResolvedAutoDevice,
-    RoutingPolicy, RuntimeGraph, StreamerBindingProfile, StreamerDevicesConfig,
+    AcceleratorProviderStatus, AdaptiveLatencyStatus, AppMatcher, AppRoute, AppStateSnapshot,
+    AppStream, AppVolumePreset, AudioCoreChannelStatus, AutoDeviceKind, AutoDeviceReason, Channel,
+    ChannelInputMode, ChannelKind, DeviceInfo, Diagnostic, DiagnosticSeverity, EffectAvailability,
+    EffectCatalog, EffectInstance, EffectRuntimeState, EffectRuntimeStatus, EngineStatus,
+    FallbackHardwareProfile, HardwareProfile, HardwareProfileUiState, KnownApp, LatencyPolicy,
+    LevelMeter, MeterTransportStatus, Mix, MixerConfig, MixerSettings, ModelError,
+    PeripheralPluginStatus, PipeWireAudioHealthStatus, ResolvedAutoDevice, RoutingPolicy,
+    RuntimeGraph, StreamerBindingProfile, StreamerDevicesConfig,
 };
 use wavelinux_pw::{
     a2dp_codec_rank_with_preferences, channel_bus_route_ids_from_routes,
-    channel_has_active_effects, channel_mix_route_expected_for_active_routes,
-    channel_mix_route_revision, channel_mix_route_uses_hardware_direct_monitoring,
-    channel_mix_source_name, channel_uses_adaptive_latency_bridge,
+    channel_has_active_effects, channel_mix_latency_msec,
+    channel_mix_route_expected_for_active_routes, channel_mix_route_revision,
+    channel_mix_route_uses_hardware_direct_monitoring, channel_mix_source_name,
+    channel_uses_adaptive_latency_bridge, channel_uses_persistent_audio_core,
     effect_chain_adaptive_bridge_input_name, effect_chain_filter_output_name,
     effect_chain_input_name, effect_chain_node_name, effect_chain_source_name,
     effect_route_revision, input_route_revision, meter_sampling_enabled,
     meter_targets_for_config_with_devices, mix_monitor_route_revision_for_sink,
-    plan_bluetooth_a2dp_profiles, plan_ensure_graph, plan_ensure_graph_for_active_routes,
-    plan_ensure_passthrough_mic_source, plan_kill_stale_processes, plan_move_app_stream,
-    plan_move_app_stream_to_default, plan_move_capture_stream_to_source,
-    plan_route_channel_to_effect, plan_route_channel_to_mix, plan_route_effect_to_adaptive_bridge,
-    plan_set_channel_bus_mute, plan_set_channel_bus_source_output_mute,
-    plan_set_channel_bus_source_output_volume, plan_set_channel_bus_volume, plan_set_default_sink,
-    plan_set_default_source, plan_set_managed_sink_mute, plan_set_managed_sink_volume,
+    mix_uses_persistent_audio_core, plan_bluetooth_a2dp_profiles, plan_ensure_graph,
+    plan_ensure_graph_for_active_routes, plan_ensure_passthrough_mic_source,
+    plan_kill_stale_processes, plan_move_app_stream, plan_move_app_stream_to_default,
+    plan_move_capture_stream_to_source, plan_move_native_app_stream,
+    plan_move_native_capture_stream, plan_route_channel_to_effect, plan_route_channel_to_mix,
+    plan_route_effect_to_adaptive_bridge, plan_set_channel_bus_mute,
+    plan_set_channel_bus_source_output_mute, plan_set_channel_bus_source_output_volume,
+    plan_set_channel_bus_volume, plan_set_default_sink, plan_set_default_source,
+    plan_set_managed_sink_mute, plan_set_managed_sink_volume,
     plan_set_mix_mute as plan_pw_set_mix_mute, plan_set_mix_volume as plan_pw_set_mix_volume,
-    plan_set_route_sink_input_mute, plan_set_route_sink_input_volume,
-    plan_set_route_source_output_mute, plan_set_route_source_output_volume, plan_set_source_mute,
-    plan_set_source_volume, plan_set_stream_mute, plan_set_stream_volume, plan_unload_modules,
-    probe_effect_availability, render_filter_chain, BluetoothAudioCard, ChannelBusRouteIds,
-    CommandDomain, CommandOutput, CommandSpec, ManagedModule, MeterTarget, PlannedGraph, PwClient,
-    PwError, SinkInputRoute, SnapshotCommandTiming, SourceOutputRoute, StaleProcess,
-    CHANNEL_CONFIG_REVISION, EFFECT_ADAPTIVE_BRIDGE_ROUTE_REVISION, EFFECT_CONFIG_REVISION,
+    plan_set_native_stream_volume, plan_set_route_sink_input_mute,
+    plan_set_route_sink_input_volume, plan_set_route_source_output_mute,
+    plan_set_route_source_output_volume, plan_set_stream_mute, plan_set_stream_volume,
+    plan_unload_modules, probe_effect_availability, render_filter_chain, AudioStateSnapshot,
+    BluetoothAudioCard, ChannelBusRouteIds, CommandDomain, CommandOutput, CommandSpec,
+    ManagedModule, MeterTarget, PipeWireRegistryCache, PlannedGraph, PwClient, PwError,
+    RegistryEventKind, SinkInputRoute, SinkLevelState, SnapshotCommandTiming, SourceOutputRoute,
+    StaleProcess, StreamRouteBackend, CHANNEL_CONFIG_REVISION,
+    EFFECT_ADAPTIVE_BRIDGE_ROUTE_REVISION, EFFECT_CONFIG_REVISION,
 };
 
+mod configuration;
+mod devices;
+mod effects;
 mod hardware_profiles;
+mod health;
+mod levels;
+mod meters;
+mod reconciliation;
+mod registry_actor;
+mod routing;
 
 use hardware_profiles::{
     apply_profile_policy_to_devices, apply_profile_policy_to_graph, apply_profiles_to_devices,
@@ -65,30 +83,51 @@ use hardware_profiles::{
     load_hardware_profile_catalog, remote_profile_sync_needed, sync_remote_profiles_for_devices,
     HardwareProfileCatalog,
 };
+#[cfg(test)]
+use health::{cpu_pressure_between, parse_proc_stat_cpu};
+use health::{pipewire_health_deltas, CpuPressureSampler, PipeWireAudioHealthTracker};
+use registry_actor::{run_native_registry_connection, NativeRegistryHooks};
 
 const DEBUG_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const DEBUG_LOG_ROTATED_FILES: usize = 4;
 const LOG_VERSION_FILE: &str = "log-version";
 const ENGINE_LOG_FILE: &str = "wavelinux-engine.log";
 const LEGACY_APP_LOG_FILE: &str = "wavelinux.log";
+const WAVELINUX5_MIGRATION_MARKER: &str = ".migration-from-wavelinux5.pending";
 const EFFECT_CHAIN_LOG_SUFFIX: &str = ".log";
+const AUDIO_CORE_PROCESS_KEY: &str = "__wavelinux6_audio_core__";
+const AUDIO_CORE_MANIFEST_FILE: &str = "wavelinux6-audio-core.json";
+const AUDIO_CORE_LOG_FILE: &str = "wavelinux6-audio-core.log";
+const ADAPTIVE_QUANTUM_FLOORS_FILE: &str = "adaptive-quantum-floors.json";
+const ADAPTIVE_QUANTUM_FLOORS_VERSION: u32 = 1;
 const HOST_DIAGNOSTICS_TTL: Duration = Duration::from_secs(30);
+const ACCELERATOR_STATUS_TTL: Duration = Duration::from_secs(30);
 const EFFECT_AVAILABILITY_TTL: Duration = Duration::from_secs(30);
 const HARDWARE_PROFILE_TTL: Duration = Duration::from_secs(15);
 const REMOTE_PROFILE_SYNC_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const METER_RESTART_BACKOFF: Duration = Duration::from_secs(5);
 const METER_IDLE_STOP_AFTER: Duration = Duration::from_millis(750);
-const METER_NOISE_FLOOR: f32 = 0.008;
+// Match the visible meter floor. The previous -42 dBFS gate hid ordinary
+// microphone levels even though the capture stream contained valid audio.
+const METER_NOISE_FLOOR: f32 = 0.002;
 const METER_STALE_AFTER: Duration = Duration::from_millis(120);
 const METER_STALE_RELEASE_PER_SECOND: f32 = 0.08;
 const METER_DISPLAY_FLOOR_DB: f32 = -54.0;
 const METER_DISPLAY_CEILING_DB: f32 = 0.0;
 const METER_DISPLAY_EXPONENT: f32 = 1.15;
-const METER_STREAM_LATENCY: &str = "1024/48000";
-const EFFECT_GRAPH_SYNC_DEBOUNCE: Duration = Duration::from_millis(3000);
+const METER_STREAM_LATENCY: &str = "2400/48000";
+const METER_MAINLOOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const EFFECT_GRAPH_SYNC_DEBOUNCE: Duration = Duration::from_millis(75);
+const EFFECT_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const EFFECT_CORE_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const EFFECT_CORE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const EFFECT_CORE_RETRY_MIN: Duration = Duration::from_millis(20);
+const EFFECT_CORE_RETRY_MAX: Duration = Duration::from_millis(160);
 const EFFECT_NODE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const EFFECT_NODE_CLEAR_TIMEOUT: Duration = Duration::from_secs(2);
-const EFFECT_NODE_READY_STABLE_SAMPLES: usize = 2;
+// One visible sample followed by the settled recheck below gives us two
+// observations without adding a redundant third 100 ms startup delay.
+const EFFECT_NODE_READY_STABLE_SAMPLES: usize = 1;
 const EFFECT_NODE_READY_SETTLE: Duration = Duration::from_millis(100);
 const EFFECT_ROUTE_READY_SETTLE: Duration = Duration::from_millis(300);
 const EFFECT_ROUTE_LINK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -97,6 +136,16 @@ const EFFECT_CHAIN_FAILURE_LOGS: usize = 8;
 const GRAPH_REPAIR_DEBOUNCE: Duration = Duration::from_millis(650);
 const ROUTE_HEALTH_REPAIR_BACKOFF: Duration = Duration::from_secs(10);
 const UI_STATE_REFRESH_MAX_AGE: Duration = Duration::from_millis(4_000);
+// Hotplug and stream routing are event-driven. This audit only recovers from a
+// lost subscription event, so keep it infrequent enough that a slow host
+// `pactl list` cannot create regular foreground contention under I/O load.
+const DEFAULT_EVENT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(120);
+const ADAPTIVE_LATENCY_TICK_INTERVAL: Duration = Duration::from_secs(1);
+// Pulse clients commonly emit new/change/remove bursts while negotiating a
+// stream. Waiting for one short burst to settle avoids routing handles that no
+// longer exist while keeping stable app routing below the 100 ms target.
+const PLAYBACK_EVENT_SETTLE: Duration = Duration::from_millis(15);
+const DEVICE_EVENT_SETTLE: Duration = Duration::from_millis(75);
 const SLOW_REFRESH_LOG_THRESHOLD: Duration = Duration::from_millis(300);
 const SEVERE_REFRESH_LOG_THRESHOLD: Duration = Duration::from_millis(1_500);
 const ROUTINE_SLOW_REFRESH_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -137,9 +186,6 @@ const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
     "XDG_DATA_DIRS",
 ];
 const FX_LOG_WARNING_WINDOW: Duration = Duration::from_secs(10 * 60);
-const PIPEWIRE_HEALTH_LOG_SINCE: &str = "10 minutes ago";
-const DSP_LIVE_HELPER_FALLBACK_REASON: &str =
-    "WaveLinux5 accelerated native DSP helper graph is still experimental; using helper-supervised PipeWire filter-chain rollback unless WAVELINUX_AUDIO_RUNTIME=dsp_cpu is set";
 const DSP_HELPER_ENV: &str = "WAVELINUX_DSP_HELPER";
 const EFFECT_CHAIN_STOP_GRACE: Duration = Duration::from_secs(2);
 const AUDIO_COMMAND_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
@@ -184,6 +230,7 @@ impl From<serde_json::Error> for EngineError {
 pub struct EnginePaths {
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
+    pub runtime_dir: PathBuf,
     pub autostart_dir: PathBuf,
 }
 
@@ -197,9 +244,12 @@ impl EnginePaths {
         let dirs = ProjectDirs::from("io.github", "DuskyProjects", &app_name)
             .ok_or(EngineError::ConfigPathUnavailable)?;
         let base_dirs = BaseDirs::new().ok_or(EngineError::ConfigPathUnavailable)?;
+        let runtime_dir = runtime_base_dir().join(graph_prefix());
+        create_private_runtime_dir(&runtime_dir)?;
         Ok(Self {
             config_dir: dirs.config_dir().to_path_buf(),
             data_dir: dirs.data_dir().to_path_buf(),
+            runtime_dir,
             autostart_dir: base_dirs.config_dir().join("autostart"),
         })
     }
@@ -208,6 +258,7 @@ impl EnginePaths {
         Self {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
+            runtime_dir: root.join("runtime"),
             autostart_dir: root.join("autostart"),
         }
     }
@@ -218,6 +269,26 @@ impl EnginePaths {
 
     fn effect_chains_dir(&self) -> PathBuf {
         self.data_dir.join("effects")
+    }
+
+    fn adaptive_quantum_floors_file(&self) -> PathBuf {
+        self.data_dir.join(ADAPTIVE_QUANTUM_FLOORS_FILE)
+    }
+
+    fn control_sockets_dir(&self) -> PathBuf {
+        wavelinux_dsp::control_directory(&self.runtime_dir)
+    }
+
+    fn channel_control_socket(&self, channel_id: &str) -> PathBuf {
+        wavelinux_dsp::channel_control_socket(&self.runtime_dir, &graph_prefix(), channel_id)
+    }
+
+    fn mix_control_socket(&self) -> PathBuf {
+        wavelinux_dsp::mix_control_socket(&self.runtime_dir)
+    }
+
+    fn meter_stream_socket(&self) -> PathBuf {
+        wavelinux_dsp::meter_stream_socket(&self.runtime_dir)
     }
 
     fn autostart_file(&self) -> PathBuf {
@@ -243,6 +314,30 @@ impl EnginePaths {
             .join("v1")
             .join("local")
     }
+
+    fn wavelinux5_migration_marker(&self) -> PathBuf {
+        self.config_dir.join(WAVELINUX5_MIGRATION_MARKER)
+    }
+}
+
+fn runtime_base_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            #[cfg(unix)]
+            let user = unsafe { libc::geteuid() }.to_string();
+            #[cfg(not(unix))]
+            let user = "user".to_string();
+            std::env::temp_dir().join(format!("wavelinux-{user}"))
+        })
+}
+
+fn create_private_runtime_dir(path: &Path) -> Result<(), EngineError> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -257,8 +352,74 @@ impl Default for EngineOptions {
         Self {
             dry_run: std::env::var("WAVELINUX_DRY_RUN").is_ok(),
             auto_repair_on_start: std::env::var("WAVELINUX_NO_AUTO_REPAIR").is_err(),
-            poll_interval: Duration::from_millis(2_000),
+            poll_interval: DEFAULT_EVENT_WATCHDOG_INTERVAL,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EngineRevisions {
+    pub state: u64,
+    pub config: u64,
+    pub graph: u64,
+}
+
+#[derive(Debug)]
+struct EngineChangeSignal {
+    state: AtomicU64,
+    config: AtomicU64,
+    graph: AtomicU64,
+    wait_lock: Mutex<()>,
+    changed: Condvar,
+}
+
+impl Default for EngineChangeSignal {
+    fn default() -> Self {
+        Self {
+            state: AtomicU64::new(1),
+            config: AtomicU64::new(1),
+            graph: AtomicU64::new(1),
+            wait_lock: Mutex::new(()),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+impl EngineChangeSignal {
+    fn revisions(&self) -> EngineRevisions {
+        EngineRevisions {
+            state: self.state.load(Ordering::Acquire),
+            config: self.config.load(Ordering::Acquire),
+            graph: self.graph.load(Ordering::Acquire),
+        }
+    }
+
+    fn notify_config(&self) {
+        self.config.fetch_add(1, Ordering::AcqRel);
+        self.notify_state();
+    }
+
+    fn notify_graph(&self) {
+        self.graph.fetch_add(1, Ordering::AcqRel);
+        self.notify_state();
+    }
+
+    fn notify_state(&self) {
+        self.state.fetch_add(1, Ordering::AcqRel);
+        self.changed.notify_all();
+    }
+
+    fn wait_after(&self, revision: u64, timeout: Duration) -> EngineRevisions {
+        if self.state.load(Ordering::Acquire) != revision {
+            return self.revisions();
+        }
+        let Ok(guard) = self.wait_lock.lock() else {
+            return self.revisions();
+        };
+        if self.state.load(Ordering::Acquire) == revision {
+            let _ = self.changed.wait_timeout(guard, timeout);
+        }
+        self.revisions()
     }
 }
 
@@ -407,6 +568,14 @@ impl RuntimeCache {
                 },
                 last_refresh_unix: 0,
                 adaptive_latency: AdaptiveLatencyStatus::default(),
+                audio_core: Vec::new(),
+                effects: Vec::new(),
+                refresh: Default::default(),
+                pipewire_audio_health: Default::default(),
+                meter_transport: Default::default(),
+                pipewire_registry: Default::default(),
+                peripheral_plugins: Vec::new(),
+                accelerator_providers: Vec::new(),
             },
         }
     }
@@ -508,23 +677,50 @@ fn slow_refresh_log_decision(
 #[derive(Debug)]
 struct MeterSupervisor {
     dry_run: bool,
-    handles: BTreeMap<String, MeterProcess>,
+    process: Option<MeterProcess>,
+    native_backend: bool,
+    native_meters: Vec<LevelMeter>,
     targets: BTreeMap<String, MeterTarget>,
-    last_attempts: BTreeMap<String, Instant>,
+    target_revision: Option<MeterTargetRevision>,
+    last_attempt_at: Option<Instant>,
     last_requested_at: Option<Instant>,
+    last_activity_logged_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MeterTargetRevision {
+    config: u64,
+    graph: u64,
+    audio_graph_running: bool,
+}
+
+impl MeterTargetRevision {
+    fn new(revisions: EngineRevisions, audio_graph_running: bool) -> Self {
+        Self {
+            config: revisions.config,
+            graph: revisions.graph,
+            audio_graph_running,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct MeterSupervisorUpdate {
     meters: Vec<LevelMeter>,
+    native_backend: bool,
     started: usize,
     stopped: usize,
     failed: Vec<String>,
+    sampled_sources: usize,
+    active_targets: usize,
+    max_level: f32,
+    log_activity: bool,
 }
 
 #[derive(Debug)]
 struct MeterProcess {
-    sample: Arc<Mutex<MeterSample>>,
+    source_names: BTreeSet<String>,
+    samples: BTreeMap<String, Arc<AtomicMeterSample>>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -533,18 +729,187 @@ struct MeterProcess {
 struct MeterSample {
     peak_left: f32,
     peak_right: f32,
-    frames: u64,
     updated_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NativeCoreMeterReading {
+    id: String,
+    peak_left: f32,
+    peak_right: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NativeCoreMetersResponse {
+    #[serde(default)]
+    channels: Vec<NativeCoreMeterReading>,
+    #[serde(default)]
+    mixes: Vec<NativeCoreMeterReading>,
+}
+
+#[derive(Debug)]
+struct MeterTransportTracker {
+    protocol_version: AtomicU32,
+    connected: AtomicBool,
+    slot_count: AtomicUsize,
+    last_sequence: AtomicU64,
+    frames_received: AtomicU64,
+    connections: AtomicU64,
+    disconnects: AtomicU64,
+    fallback_polls: AtomicU64,
+    errors: AtomicU64,
+    last_error: Mutex<Option<String>>,
+}
+
+impl Default for MeterTransportTracker {
+    fn default() -> Self {
+        Self {
+            protocol_version: AtomicU32::new(0),
+            connected: AtomicBool::new(false),
+            slot_count: AtomicUsize::new(0),
+            last_sequence: AtomicU64::new(0),
+            frames_received: AtomicU64::new(0),
+            connections: AtomicU64::new(0),
+            disconnects: AtomicU64::new(0),
+            fallback_polls: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            last_error: Mutex::new(None),
+        }
+    }
+}
+
+impl MeterTransportTracker {
+    fn connected(&self, slots: usize) {
+        self.protocol_version.store(
+            u32::from(wavelinux_dsp::METER_STREAM_PROTOCOL_VERSION),
+            Ordering::Relaxed,
+        );
+        self.slot_count.store(slots, Ordering::Relaxed);
+        self.connected.store(true, Ordering::Release);
+        self.connections.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut error) = self.last_error.lock() {
+            *error = None;
+        }
+    }
+
+    fn frame_received(&self, sequence: u64) {
+        self.last_sequence.store(sequence, Ordering::Relaxed);
+        self.frames_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn disconnected(&self, error: Option<String>) {
+        if self.connected.swap(false, Ordering::AcqRel) {
+            self.disconnects.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(error) = error {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut current) = self.last_error.lock() {
+                *current = Some(error);
+            }
+        }
+    }
+
+    fn fallback_polled(&self) {
+        self.fallback_polls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> MeterTransportStatus {
+        MeterTransportStatus {
+            protocol_version: self.protocol_version.load(Ordering::Relaxed) as u16,
+            connected: self.connected.load(Ordering::Acquire),
+            slot_count: self.slot_count.load(Ordering::Relaxed),
+            last_sequence: self.last_sequence.load(Ordering::Relaxed),
+            frames_received: self.frames_received.load(Ordering::Relaxed),
+            connections: self.connections.load(Ordering::Relaxed),
+            disconnects: self.disconnects.load(Ordering::Relaxed),
+            fallback_polls: self.fallback_polls.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            last_error: self.last_error.lock().ok().and_then(|error| error.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CoreMeterTarget {
+    node_id: String,
+    slot_index: usize,
+    gain: f32,
+}
+
+#[derive(Debug)]
+pub struct CoreMeterStream {
+    stream: UnixStream,
+    header: wavelinux_dsp::MeterStreamHeader,
+    frame_bytes: Vec<u8>,
+    target_revision: Option<MeterTargetRevision>,
+    targets: Vec<CoreMeterTarget>,
+    last_sequence: u64,
+}
+
+#[derive(Debug)]
+struct AtomicMeterSample {
+    peak_left: AtomicU32,
+    peak_right: AtomicU32,
+    frames: AtomicU64,
+    updated_micros: AtomicU64,
+    clock_started_at: Instant,
+}
+
+impl Default for AtomicMeterSample {
+    fn default() -> Self {
+        Self {
+            peak_left: AtomicU32::new(0.0_f32.to_bits()),
+            peak_right: AtomicU32::new(0.0_f32.to_bits()),
+            frames: AtomicU64::new(0),
+            updated_micros: AtomicU64::new(0),
+            clock_started_at: Instant::now(),
+        }
+    }
+}
+
+impl AtomicMeterSample {
+    fn publish(&self, peak_left: f32, peak_right: f32, frames: u64) {
+        self.peak_left.store(peak_left.to_bits(), Ordering::Relaxed);
+        self.peak_right
+            .store(peak_right.to_bits(), Ordering::Relaxed);
+        self.frames.fetch_add(frames, Ordering::Relaxed);
+        let updated_micros = duration_micros(self.clock_started_at.elapsed()).saturating_add(1);
+        self.updated_micros.store(updated_micros, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> MeterSample {
+        let updated_micros = self.updated_micros.load(Ordering::Acquire);
+        let updated_at = (updated_micros > 0).then(|| {
+            let elapsed_micros = duration_micros(self.clock_started_at.elapsed());
+            let age = elapsed_micros.saturating_sub(updated_micros.saturating_sub(1));
+            Instant::now()
+                .checked_sub(Duration::from_micros(age))
+                .unwrap_or_else(Instant::now)
+        });
+        MeterSample {
+            peak_left: f32::from_bits(self.peak_left.load(Ordering::Relaxed)),
+            peak_right: f32::from_bits(self.peak_right.load(Ordering::Relaxed)),
+            updated_at,
+        }
+    }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
 }
 
 impl MeterSupervisor {
     fn new(dry_run: bool) -> Self {
         Self {
             dry_run,
-            handles: BTreeMap::new(),
+            process: None,
+            native_backend: false,
+            native_meters: Vec::new(),
             targets: BTreeMap::new(),
-            last_attempts: BTreeMap::new(),
+            target_revision: None,
+            last_attempt_at: None,
             last_requested_at: None,
+            last_activity_logged_at: None,
         }
     }
 
@@ -552,70 +917,164 @@ impl MeterSupervisor {
         &mut self,
         targets: Vec<MeterTarget>,
         mark_requested: bool,
+        target_revision: MeterTargetRevision,
     ) -> MeterSupervisorUpdate {
         let mut update = MeterSupervisorUpdate::default();
         if mark_requested {
             self.last_requested_at = Some(Instant::now());
         }
         if self.dry_run || !meter_sampling_enabled() {
-            update.stopped += self.handles.len();
+            update.stopped += self.active_source_count();
             self.stop_all();
+            self.target_revision = Some(target_revision);
             return update;
+        }
+
+        if self.native_backend {
+            update.stopped += self.active_source_count();
+            self.native_backend = false;
+            self.native_meters.clear();
         }
 
         let targets = targets
             .into_iter()
             .map(|target| (target.node_id.clone(), target))
             .collect::<BTreeMap<_, _>>();
-        self.targets = targets.clone();
         let source_names = targets
             .values()
             .map(|target| target.source_name.clone())
             .collect::<BTreeSet<_>>();
+        self.targets = targets;
+        self.target_revision = Some(target_revision);
         let now = Instant::now();
-        let mut stopped = Vec::new();
-        for (source_name, handle) in &mut self.handles {
-            let exited = handle.has_exited();
-            if !source_names.contains(source_name) || exited {
-                stopped.push((source_name.clone(), exited));
-            }
-        }
-        update.stopped += stopped.len();
-        for (source_name, exited) in stopped {
-            self.handles.remove(&source_name);
-            if exited {
-                self.last_attempts.insert(source_name, now);
-            } else {
-                self.last_attempts.remove(&source_name);
-            }
+        let (source_set_changed, process_exited) = self
+            .process
+            .as_mut()
+            .map(|process| (process.source_names != source_names, process.has_exited()))
+            .unwrap_or((false, false));
+        if source_set_changed || process_exited {
+            update.stopped += self.active_source_count();
+            self.process.take();
+            self.last_attempt_at = process_exited.then_some(now);
         }
 
-        self.last_attempts
-            .retain(|source_name, _| source_names.contains(source_name));
-        for source_name in source_names {
-            if self.handles.contains_key(&source_name) {
-                continue;
-            }
-            if self
-                .last_attempts
-                .get(&source_name)
-                .is_some_and(|attempt| now.duration_since(*attempt) < METER_RESTART_BACKOFF)
-            {
-                continue;
-            }
-            self.last_attempts.insert(source_name.clone(), now);
-            match MeterProcess::spawn(&source_name) {
-                Ok(handle) => {
-                    self.last_attempts.remove(&source_name);
-                    self.handles.insert(source_name, handle);
-                    update.started += 1;
+        if source_names.is_empty() {
+            self.last_attempt_at = None;
+        } else if self.process.is_none()
+            && self
+                .last_attempt_at
+                .is_none_or(|attempt| now.duration_since(attempt) >= METER_RESTART_BACKOFF)
+        {
+            self.last_attempt_at = Some(now);
+            match MeterProcess::spawn(&source_names) {
+                Ok(process) => {
+                    update.started += process.source_names.len();
+                    self.process = Some(process);
+                    self.last_attempt_at = None;
                 }
-                Err(err) => update.failed.push(format!("{source_name}: {err}")),
+                Err(err) => update.failed.push(err.to_string()),
             }
         }
 
-        update.meters = self.snapshot();
+        self.populate_snapshot_update(&mut update, now);
         update
+    }
+
+    fn reconcile_native(
+        &mut self,
+        targets: Vec<MeterTarget>,
+        meters: Vec<LevelMeter>,
+        mark_requested: bool,
+        target_revision: MeterTargetRevision,
+    ) -> MeterSupervisorUpdate {
+        let mut update = MeterSupervisorUpdate::default();
+        if mark_requested {
+            self.last_requested_at = Some(Instant::now());
+        }
+        if self.dry_run {
+            update.stopped += self.active_source_count();
+            self.stop_all();
+            self.target_revision = Some(target_revision);
+            return update;
+        }
+        if let Some(process) = self.process.take() {
+            update.stopped += process.source_names.len();
+        }
+        if !self.native_backend {
+            update.started = meters.len();
+        }
+        self.native_backend = true;
+        self.native_meters = meters;
+        self.targets = targets
+            .into_iter()
+            .map(|target| (target.node_id.clone(), target))
+            .collect();
+        self.target_revision = Some(target_revision);
+        self.last_attempt_at = None;
+        self.populate_snapshot_update(&mut update, Instant::now());
+        update
+    }
+
+    fn snapshot_for_revision(
+        &mut self,
+        target_revision: MeterTargetRevision,
+        mark_requested: bool,
+    ) -> Option<MeterSupervisorUpdate> {
+        if self.target_revision != Some(target_revision) {
+            return None;
+        }
+        let now = Instant::now();
+        let process_exited =
+            !self.native_backend && self.process.as_mut().is_some_and(MeterProcess::has_exited);
+        if process_exited {
+            return None;
+        }
+        if !self.native_backend
+            && self.process.is_none()
+            && !self.targets.is_empty()
+            && self
+                .last_attempt_at
+                .is_none_or(|attempt| now.duration_since(attempt) >= METER_RESTART_BACKOFF)
+        {
+            return None;
+        }
+        if mark_requested {
+            self.last_requested_at = Some(now);
+        }
+        let mut update = MeterSupervisorUpdate::default();
+        self.populate_snapshot_update(&mut update, now);
+        Some(update)
+    }
+
+    fn populate_snapshot_update(&mut self, update: &mut MeterSupervisorUpdate, now: Instant) {
+        update.meters = self.snapshot();
+        update.native_backend = self.native_backend;
+        update.sampled_sources = if self.native_backend {
+            self.native_meters.len()
+        } else {
+            self.process
+                .as_ref()
+                .map(MeterProcess::sampled_source_count)
+                .unwrap_or_default()
+        };
+        update.active_targets = update
+            .meters
+            .iter()
+            .filter(|meter| meter.peak_left > 0.0 || meter.peak_right > 0.0)
+            .count();
+        update.max_level = update
+            .meters
+            .iter()
+            .flat_map(|meter| [meter.peak_left, meter.peak_right])
+            .fold(0.0_f32, f32::max);
+        if update.active_targets > 0
+            && self
+                .last_activity_logged_at
+                .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(30))
+        {
+            self.last_activity_logged_at = Some(now);
+            update.log_activity = true;
+        }
     }
 
     fn snapshot_or_stop_idle(&mut self) -> MeterSupervisorUpdate {
@@ -626,7 +1085,12 @@ impl MeterSupervisor {
                 ..MeterSupervisorUpdate::default()
             };
         }
-        self.reconcile(Vec::new(), false)
+        let stopped = self.active_source_count();
+        self.stop_all();
+        MeterSupervisorUpdate {
+            stopped,
+            ..MeterSupervisorUpdate::default()
+        }
     }
 
     fn requested_recently(&self) -> bool {
@@ -639,44 +1103,74 @@ impl MeterSupervisor {
     }
 
     fn snapshot(&self) -> Vec<LevelMeter> {
+        if self.native_backend {
+            return self.native_meters.clone();
+        }
+        let Some(process) = self.process.as_ref() else {
+            return Vec::new();
+        };
         self.targets
             .values()
-            .filter_map(|target| {
-                self.handles
-                    .get(&target.source_name)
-                    .map(|handle| handle.level_meter(target))
-            })
+            .filter_map(|target| process.level_meter(target))
             .collect()
     }
 
+    fn active_source_count(&self) -> usize {
+        if self.native_backend {
+            return self.native_meters.len();
+        }
+        self.process
+            .as_ref()
+            .map(|process| process.source_names.len())
+            .unwrap_or_default()
+    }
+
     fn stop_all(&mut self) {
-        self.handles.clear();
+        self.process.take();
+        self.native_backend = false;
+        self.native_meters.clear();
         self.targets.clear();
-        self.last_attempts.clear();
+        self.target_revision = None;
+        self.last_attempt_at = None;
         self.last_requested_at = None;
+        self.last_activity_logged_at = None;
     }
 }
 
 impl MeterProcess {
-    fn spawn(source_name: &str) -> Result<Self, std::io::Error> {
-        let endpoint = MeterEndpoint::from_source_name(source_name);
-        let endpoint_context = endpoint.describe();
-        let sample = Arc::new(Mutex::new(MeterSample::default()));
+    fn spawn(source_names: &BTreeSet<String>) -> Result<Self, std::io::Error> {
+        let samples = source_names
+            .iter()
+            .map(|source_name| (source_name.clone(), Arc::new(AtomicMeterSample::default())))
+            .collect::<BTreeMap<_, _>>();
+        let endpoints = samples
+            .iter()
+            .map(|(source_name, sample)| {
+                (
+                    MeterEndpoint::from_source_name(source_name),
+                    Arc::clone(sample),
+                )
+            })
+            .collect::<Vec<_>>();
+        let endpoint_context = endpoints
+            .iter()
+            .map(|(endpoint, _)| endpoint.describe())
+            .collect::<Vec<_>>()
+            .join("; ");
         let stop = Arc::new(AtomicBool::new(false));
-        let reader_sample = Arc::clone(&sample);
         let reader_stop = Arc::clone(&stop);
-        let thread_name = format!("{}-meter-{}", graph_prefix(), safe_file_id(source_name));
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker = thread::Builder::new()
-            .name(thread_name)
+            .name(format!("{}-meters", graph_prefix()))
             .spawn(move || {
-                run_pipewire_meter_stream(endpoint, reader_sample, reader_stop, ready_tx);
+                run_pipewire_meter_group(endpoints, reader_stop, ready_tx);
             })
             .map_err(std::io::Error::other)?;
 
         match ready_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(Ok(())) => Ok(Self {
-                sample,
+                source_names: source_names.clone(),
+                samples,
                 stop,
                 worker: Some(worker),
             }),
@@ -702,11 +1196,18 @@ impl MeterProcess {
             .is_some_and(thread::JoinHandle::is_finished)
     }
 
-    fn level_meter(&self, target: &MeterTarget) -> LevelMeter {
-        let sample = self.sample.lock().map(|sample| *sample).unwrap_or_default();
+    fn sampled_source_count(&self) -> usize {
+        self.samples
+            .values()
+            .filter(|sample| sample.frames.load(Ordering::Relaxed) > 0)
+            .count()
+    }
+
+    fn level_meter(&self, target: &MeterTarget) -> Option<LevelMeter> {
+        let sample = self.samples.get(&target.source_name)?.snapshot();
         let now = Instant::now();
         let gain = if target.muted { 0.0 } else { target.gain }.clamp(0.0, 1.5);
-        LevelMeter {
+        Some(LevelMeter {
             node_id: target.node_id.clone(),
             peak_left: meter_output_level(
                 stale_adjusted_meter_peak(sample.peak_left, sample.updated_at, now),
@@ -716,7 +1217,7 @@ impl MeterProcess {
                 stale_adjusted_meter_peak(sample.peak_right, sample.updated_at, now),
                 gain,
             ),
-        }
+        })
     }
 }
 
@@ -729,25 +1230,22 @@ impl Drop for MeterProcess {
     }
 }
 
-fn run_pipewire_meter_stream(
-    endpoint: MeterEndpoint,
-    sample: Arc<Mutex<MeterSample>>,
+fn run_pipewire_meter_group(
+    endpoints: Vec<(MeterEndpoint, Arc<AtomicMeterSample>)>,
     stop: Arc<AtomicBool>,
     ready: mpsc::Sender<Result<(), String>>,
 ) {
-    if let Err(err) = run_pipewire_meter_stream_inner(endpoint, sample, stop, ready.clone()) {
+    if let Err(err) = run_pipewire_meter_group_inner(endpoints, stop, ready.clone()) {
         let _ = ready.send(Err(err));
     }
 }
 
-fn run_pipewire_meter_stream_inner(
-    endpoint: MeterEndpoint,
-    sample: Arc<Mutex<MeterSample>>,
+fn run_pipewire_meter_group_inner(
+    endpoints: Vec<(MeterEndpoint, Arc<AtomicMeterSample>)>,
     stop: Arc<AtomicBool>,
     ready: mpsc::Sender<Result<(), String>>,
 ) -> Result<(), String> {
     pw::init();
-    let endpoint_context = endpoint.describe();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|err| format!("PipeWire meter mainloop creation failed: {err}"))?;
@@ -756,10 +1254,67 @@ fn run_pipewire_meter_stream_inner(
     let core = context
         .connect_rc(None)
         .map_err(|err| format!("PipeWire meter core connection failed: {err}"))?;
+    let mut streams = Vec::with_capacity(endpoints.len());
+    let mut listeners = Vec::with_capacity(endpoints.len());
+    for (endpoint, sample) in endpoints {
+        let endpoint_context = endpoint.describe();
+        let mut props = meter_stream_properties(&endpoint);
+        if endpoint.dont_remix {
+            props.insert(*pw::keys::STREAM_DONT_REMIX, "true");
+        }
+        if endpoint.dont_reconnect {
+            props.insert(*pw::keys::NODE_DONT_RECONNECT, "true");
+        }
+        if endpoint.capture_sink_monitor {
+            props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
+        }
+
+        let stream = pw::stream::StreamBox::new(&core, &format!("{}-meter", graph_prefix()), props)
+            .map_err(|err| format!("PipeWire meter stream creation failed: {err}"))?;
+        let listener = stream
+            .add_local_listener_with_user_data(PipeWireMeterData {
+                format: Default::default(),
+                sample,
+            })
+            .param_changed(|_, user_data, id, param| {
+                parse_meter_audio_format(id, param, &mut user_data.format);
+            })
+            .process(|stream, user_data| {
+                process_pipewire_meter_buffer(stream, user_data);
+            })
+            .register()
+            .map_err(|err| err.to_string())?;
+        let format = meter_audio_format_pod()?;
+        let mut params = [spa::pod::Pod::from_bytes(&format)
+            .ok_or_else(|| "PipeWire meter format pod was invalid".to_string())?];
+        let mut flags = pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS;
+        if endpoint.dont_reconnect {
+            flags |= pw::stream::StreamFlags::DONT_RECONNECT;
+        }
+        stream
+            .connect(spa::utils::Direction::Input, None, flags, &mut params)
+            .map_err(|err| {
+                format!("PipeWire meter stream connect failed: {err}; {endpoint_context}")
+            })?;
+        listeners.push(listener);
+        streams.push(stream);
+    }
+    let _ = ready.send(Ok(()));
+
+    while !stop.load(Ordering::SeqCst) {
+        mainloop.loop_().iterate(METER_MAINLOOP_POLL_INTERVAL);
+    }
+
+    drop(listeners);
+    drop(streams);
+
+    Ok(())
+}
+
+fn meter_stream_properties(endpoint: &MeterEndpoint) -> pw::properties::PropertiesBox {
     let mut props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
-        *pw::keys::MEDIA_ROLE => "DSP",
         *pw::keys::MEDIA_NAME => format!("{} VU Meter", app_display_name()),
         *pw::keys::NODE_NAME => format!("{}-meter-{}", graph_prefix(), safe_file_id(&endpoint.source_name)),
         *pw::keys::NODE_DESCRIPTION => format!("{} meter for {}", app_display_name(), endpoint.source_name),
@@ -767,12 +1322,6 @@ fn run_pipewire_meter_stream_inner(
         *pw::keys::NODE_PASSIVE => "true",
         *pw::keys::TARGET_OBJECT => endpoint.target_object.clone(),
     };
-    if endpoint.dont_remix {
-        props.insert(*pw::keys::STREAM_DONT_REMIX, "true");
-    }
-    if endpoint.dont_reconnect {
-        props.insert(*pw::keys::NODE_DONT_RECONNECT, "true");
-    }
     props.insert("application.name", app_display_name());
     // Meters are display-only clients. A larger quantum avoids forcing the
     // microphone graph into extra low-latency wakeups while the UI is open.
@@ -780,65 +1329,69 @@ fn run_pipewire_meter_stream_inner(
     props.insert("node.dont-move", "true");
     props.insert("state.restore-props", "false");
     props.insert("state.restore-target", "false");
+    props.insert(
+        "module-stream-restore.id",
+        meter_stream_restore_id(endpoint),
+    );
     props.insert(graph_prop("managed"), "1");
     props.insert(graph_prop("role"), "meter");
-    if endpoint.capture_sink_monitor {
-        props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
-    }
+    props
+}
 
-    let stream = pw::stream::StreamBox::new(&core, &format!("{}-meter", graph_prefix()), props)
-        .map_err(|err| format!("PipeWire meter stream creation failed: {err}"))?;
-    let data = PipeWireMeterData {
-        format: Default::default(),
-        sample,
+fn meter_stream_restore_id(endpoint: &MeterEndpoint) -> String {
+    format!(
+        "{}-meter-{}",
+        graph_prefix(),
+        safe_file_id(&endpoint.source_name)
+    )
+}
+
+fn parse_meter_audio_format(
+    id: u32,
+    param: Option<&spa::pod::Pod>,
+    format: &mut spa::param::audio::AudioInfoRaw,
+) {
+    let Some(param) = param else {
+        return;
     };
-    let _listener = stream
-        .add_local_listener_with_user_data(data)
-        .param_changed(|_, user_data, id, param| {
-            let Some(param) = param else {
-                return;
-            };
-            if id != spa::param::ParamType::Format.as_raw() {
-                return;
-            }
-            let Ok((media_type, media_subtype)) = spa::param::format_utils::parse_format(param)
-            else {
-                return;
-            };
-            if media_type != spa::param::format::MediaType::Audio
-                || media_subtype != spa::param::format::MediaSubtype::Raw
-            {
-                return;
-            }
-            let _ = user_data.format.parse(param);
-        })
-        .process(|stream, user_data| {
-            let Some(mut buffer) = stream.dequeue_buffer() else {
-                return;
-            };
-            let datas = buffer.datas_mut();
-            if datas.is_empty() {
-                return;
-            }
-            let data = &mut datas[0];
-            let chunk = data.chunk();
-            let offset = chunk.offset() as usize;
-            let size = chunk.size() as usize;
-            let channels = user_data.format.channels().max(1) as usize;
-            let Some(bytes) = data.data() else {
-                return;
-            };
-            let Some(end) = offset.checked_add(size) else {
-                return;
-            };
-            if end > bytes.len() {
-                return;
-            }
-            consume_meter_interleaved_f32le(&bytes[offset..end], channels, &user_data.sample);
-        })
-        .register()
-        .map_err(|err| err.to_string())?;
+    if id != spa::param::ParamType::Format.as_raw() {
+        return;
+    }
+    let Ok((media_type, media_subtype)) = spa::param::format_utils::parse_format(param) else {
+        return;
+    };
+    if media_type == spa::param::format::MediaType::Audio
+        && media_subtype == spa::param::format::MediaSubtype::Raw
+    {
+        let _ = format.parse(param);
+    }
+}
 
+fn process_pipewire_meter_buffer(stream: &pw::stream::Stream, user_data: &mut PipeWireMeterData) {
+    let Some(mut buffer) = stream.dequeue_buffer() else {
+        return;
+    };
+    let datas = buffer.datas_mut();
+    if datas.is_empty() {
+        return;
+    }
+    let data = &mut datas[0];
+    let chunk = data.chunk();
+    let offset = chunk.offset() as usize;
+    let size = chunk.size() as usize;
+    let channels = user_data.format.channels().max(1) as usize;
+    let Some(bytes) = data.data() else {
+        return;
+    };
+    let Some(end) = offset.checked_add(size) else {
+        return;
+    };
+    if end <= bytes.len() {
+        consume_meter_interleaved_f32le(&bytes[offset..end], channels, &user_data.sample);
+    }
+}
+
+fn meter_audio_format_pod() -> Result<Vec<u8>, String> {
     let mut audio_info = spa::param::audio::AudioInfoRaw::new();
     audio_info.set_format(spa::param::audio::AudioFormat::F32LE);
     audio_info.set_rate(48_000);
@@ -848,43 +1401,18 @@ fn run_pipewire_meter_stream_inner(
         id: spa::param::ParamType::EnumFormat.as_raw(),
         properties: audio_info.into(),
     };
-    let values = spa::pod::serialize::PodSerializer::serialize(
+    Ok(spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
         &spa::pod::Value::Object(obj),
     )
     .map_err(|err| err.to_string())?
     .0
-    .into_inner();
-    let mut params = [spa::pod::Pod::from_bytes(&values)
-        .ok_or_else(|| "PipeWire meter format pod was invalid".to_string())?];
-
-    let mut stream_flags =
-        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS;
-    if endpoint.dont_reconnect {
-        stream_flags |= pw::stream::StreamFlags::DONT_RECONNECT;
-    }
-    stream
-        .connect(
-            spa::utils::Direction::Input,
-            None,
-            stream_flags,
-            &mut params,
-        )
-        .map_err(|err| {
-            format!("PipeWire meter stream connect failed: {err}; {endpoint_context}")
-        })?;
-    let _ = ready.send(Ok(()));
-
-    while !stop.load(Ordering::SeqCst) {
-        mainloop.loop_().iterate(Duration::from_millis(5));
-    }
-
-    Ok(())
+    .into_inner())
 }
 
 struct PipeWireMeterData {
     format: spa::param::audio::AudioInfoRaw,
-    sample: Arc<Mutex<MeterSample>>,
+    sample: Arc<AtomicMeterSample>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -930,7 +1458,7 @@ impl MeterEndpoint {
 }
 
 #[cfg(test)]
-fn consume_meter_bytes(bytes: &[u8], pending: &mut Vec<u8>, sample: &Arc<Mutex<MeterSample>>) {
+fn consume_meter_bytes(bytes: &[u8], pending: &mut Vec<u8>, sample: &Arc<AtomicMeterSample>) {
     pending.extend_from_slice(bytes);
     let frame_bytes = (pending.len() / 8) * 8;
     if frame_bytes == 0 {
@@ -941,11 +1469,7 @@ fn consume_meter_bytes(bytes: &[u8], pending: &mut Vec<u8>, sample: &Arc<Mutex<M
     pending.drain(..frame_bytes);
 }
 
-fn consume_meter_interleaved_f32le(
-    bytes: &[u8],
-    channels: usize,
-    sample: &Arc<Mutex<MeterSample>>,
-) {
+fn consume_meter_interleaved_f32le(bytes: &[u8], channels: usize, sample: &Arc<AtomicMeterSample>) {
     if channels == 0 {
         return;
     }
@@ -993,12 +1517,60 @@ fn consume_meter_interleaved_f32le(
         0.0
     };
 
-    if let Ok(mut sample) = sample.lock() {
-        sample.peak_left = gate_meter_peak(incoming_left);
-        sample.peak_right = gate_meter_peak(incoming_right);
-        sample.frames = sample.frames.saturating_add(frames);
-        sample.updated_at = Some(Instant::now());
-    }
+    sample.publish(
+        gate_meter_peak(incoming_left),
+        gate_meter_peak(incoming_right),
+        frames,
+    );
+}
+
+fn channel_id_from_bus_meter_id(node_id: &str) -> Option<&str> {
+    node_id
+        .strip_prefix("channel:")?
+        .split_once(":mix:")
+        .map(|(channel_id, _)| channel_id)
+        .filter(|channel_id| !channel_id.is_empty())
+}
+
+fn level_meters_from_native_response(
+    targets: &[MeterTarget],
+    response: NativeCoreMetersResponse,
+) -> Vec<LevelMeter> {
+    let channels = response
+        .channels
+        .into_iter()
+        .map(|meter| (meter.id.clone(), meter))
+        .collect::<BTreeMap<_, _>>();
+    let mixes = response
+        .mixes
+        .into_iter()
+        .map(|meter| (meter.id.clone(), meter))
+        .collect::<BTreeMap<_, _>>();
+
+    targets
+        .iter()
+        .filter_map(|target| {
+            let bus_channel_id = channel_id_from_bus_meter_id(&target.node_id);
+            let (reading, gain) = if let Some(channel_id) = bus_channel_id {
+                (
+                    channels.get(channel_id)?,
+                    if target.muted { 0.0 } else { target.gain },
+                )
+            } else if let Some(reading) = channels.get(&target.node_id) {
+                (reading, if target.muted { 0.0 } else { target.gain })
+            } else {
+                // Native mix meters already include bus, master-volume, and
+                // mute state. Applying the target gain here would square the
+                // configured mix volume.
+                (mixes.get(&target.node_id)?, 1.0)
+            };
+            Some(LevelMeter {
+                node_id: target.node_id.clone(),
+                peak_left: meter_output_level(reading.peak_left, gain),
+                peak_right: meter_output_level(reading.peak_right, gain),
+            })
+        })
+        .collect()
 }
 
 fn meter_output_level(peak: f32, gain: f32) -> f32 {
@@ -1090,6 +1662,44 @@ fn plan_channel_bus_mute_commands(
     commands
 }
 
+fn graph_sink_level_commands(
+    config: &MixerConfig,
+    sink_levels: &BTreeMap<String, SinkLevelState>,
+) -> Vec<CommandSpec> {
+    let mut commands = Vec::new();
+    for mix in config
+        .mixes
+        .iter()
+        .filter(|mix| !mix_uses_persistent_audio_core(mix))
+    {
+        let desired_percent = (mix.volume.clamp(0.0, 1.0) * 100.0).round() as u8;
+        let current = sink_levels.get(&mix.virtual_sink_name);
+        if current.and_then(|level| level.volume_percent) != Some(desired_percent) {
+            commands.push(plan_pw_set_mix_volume(mix, mix.volume));
+        }
+        if current.map(|level| level.muted) != Some(mix.muted) {
+            commands.push(plan_pw_set_mix_mute(mix, mix.muted));
+        }
+    }
+
+    for channel in &config.channels {
+        let current = sink_levels.get(&channel.virtual_sink_name);
+        if current.and_then(|level| level.volume_percent) != Some(100) {
+            commands.push(plan_set_managed_sink_volume(
+                &channel.virtual_sink_name,
+                1.0,
+            ));
+        }
+        if current.map(|level| level.muted) != Some(false) {
+            commands.push(plan_set_managed_sink_mute(
+                &channel.virtual_sink_name,
+                false,
+            ));
+        }
+    }
+    commands
+}
+
 fn managed_route_level_commands(
     config: &MixerConfig,
     source_outputs: &[SourceOutputRoute],
@@ -1150,6 +1760,112 @@ fn managed_route_level_commands(
 struct EffectChainProcess {
     program: String,
     child: Child,
+    config_revision: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AudioSubscriptionEvent {
+    PlaybackStream,
+    CaptureStream,
+    Device,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AudioCoreDiagnosticsResponse {
+    #[serde(default)]
+    protocol_version: u16,
+    #[serde(default)]
+    route_id: String,
+    #[serde(default = "default_sample_rate_hz")]
+    sample_rate_hz: u32,
+    #[serde(default)]
+    target_latency_msec: u16,
+    #[serde(default)]
+    current_buffer_frames: u64,
+    #[serde(default)]
+    captured_frames: u64,
+    #[serde(default)]
+    rendered_frames: u64,
+    #[serde(default)]
+    dropped_frames: u64,
+    #[serde(default)]
+    underrun_frames: u64,
+    #[serde(default)]
+    capture_callbacks: u64,
+    #[serde(default)]
+    worker_running: bool,
+    #[serde(default)]
+    worker_blocks: u64,
+    #[serde(default)]
+    worker_queue_frames: u64,
+    #[serde(default)]
+    worker_queue_capacity_frames: u64,
+    #[serde(default)]
+    worker_overrun_frames: u64,
+    #[serde(default)]
+    accelerator_provider: Option<String>,
+    #[serde(default)]
+    accelerator_active_states: u32,
+    #[serde(default)]
+    accelerator_provider_pids: Vec<u32>,
+    #[serde(default)]
+    accelerator_provider_blocks: u64,
+    #[serde(default)]
+    accelerator_fallback_blocks: u64,
+    #[serde(default)]
+    accelerator_deadline_misses: u64,
+    #[serde(default)]
+    accelerator_invalid_results: u64,
+    #[serde(default)]
+    accelerator_stale_results: u64,
+    #[serde(default)]
+    accelerator_disabled_states: u32,
+    #[serde(default)]
+    accelerator_startup_failures: Vec<String>,
+    #[serde(default)]
+    accelerator_last_failure: Option<String>,
+    #[serde(default)]
+    last_process_micros: u64,
+    #[serde(default)]
+    max_process_micros: u64,
+    #[serde(default)]
+    chain_swaps: u64,
+    #[serde(default)]
+    non_finite_blocks: u64,
+    #[serde(default)]
+    non_finite_samples: u64,
+    #[serde(default)]
+    non_finite_effect_mask: u64,
+    #[serde(default)]
+    chain_recoveries: u64,
+    #[serde(default)]
+    chain_swap_replacements: u64,
+    #[serde(default)]
+    retired_chain_overflows: u64,
+    #[serde(default)]
+    submitted_generation: u64,
+    #[serde(default)]
+    acknowledged_generation: u64,
+    #[serde(default)]
+    submitted_route_generation: u64,
+    #[serde(default)]
+    applied_route_generation: u64,
+    #[serde(default)]
+    input_target_node_name: Option<String>,
+    #[serde(default)]
+    output_target_node_names: Vec<String>,
+    #[serde(default)]
+    route_target_error: Option<String>,
+    #[serde(default = "default_rate_correction")]
+    rate_correction: f64,
+}
+
+fn default_sample_rate_hz() -> u32 {
+    wavelinux_model::SAMPLE_RATE_HZ
+}
+
+fn default_rate_correction() -> f64 {
+    1.0
 }
 
 #[derive(Debug)]
@@ -1160,31 +1876,225 @@ pub struct WaveLinuxEngine {
     pw: PwClient,
     startup_defaults: DefaultDevices,
     config: RwLock<MixerConfig>,
+    persisted_config_revision: Mutex<Option<String>>,
     runtime: RwLock<RuntimeCache>,
+    change_signal: EngineChangeSignal,
     meter_supervisor: Mutex<MeterSupervisor>,
+    meter_transport: MeterTransportTracker,
     effect_chain_processes: Mutex<BTreeMap<String, EffectChainProcess>>,
+    effect_chain_revisions: Mutex<BTreeMap<String, String>>,
     audio_event_subscription: Mutex<Option<Child>>,
+    pipewire_registry: PipeWireRegistryCache,
+    peripheral_plugins: Mutex<BTreeMap<String, PeripheralPluginStatus>>,
+    pipewire_health_subscription: Mutex<Option<Child>>,
+    pipewire_profiler_subscription: Mutex<Option<Child>>,
+    pipewire_audio_health: PipeWireAudioHealthTracker,
     runtime_refresh: Mutex<()>,
     host_diagnostics: Mutex<TimedCache<Vec<Diagnostic>>>,
     effect_availability: Mutex<TimedCache<Vec<EffectAvailability>>>,
     hardware_profiles: Arc<Mutex<TimedCache<HardwareProfileCatalog>>>,
+    accelerator_status: Mutex<TimedCache<Vec<AcceleratorProviderStatus>>>,
     remote_profile_sync: Arc<Mutex<RemoteProfileSyncState>>,
     slow_refresh_log: Mutex<SlowRefreshLogState>,
     audio_commands: Mutex<()>,
     effect_sync_active: AtomicBool,
     capture_move_failures: Mutex<BTreeMap<String, CaptureMoveFailure>>,
     app_stream_move_failures: Mutex<BTreeMap<String, Instant>>,
-    deferred_effect_sync: Mutex<DeferredEffectSync>,
+    effect_updates: Mutex<BTreeMap<String, Arc<EffectUpdateSlot>>>,
+    effect_config_writes: Mutex<()>,
     deferred_graph_repair: Mutex<DeferredGraphRepair>,
     route_health_repair: Mutex<RouteHealthRepairState>,
     adaptive_latency: Mutex<AdaptiveLatencyController>,
+    adaptive_quantum: Mutex<AdaptiveQuantumController>,
+    adaptive_pipewire_health_counters: Mutex<PipeWireAudioHealthStatus>,
+    cpu_pressure_sampler: Mutex<CpuPressureSampler>,
+    audio_core_underrun_counters: Mutex<BTreeMap<String, u64>>,
+    adaptive_core_discontinuity_counters: Mutex<BTreeMap<String, u64>>,
+    startup_repair_pending: AtomicBool,
+    startup_initialization_in_progress: AtomicBool,
     stop: AtomicBool,
 }
 
-#[derive(Debug, Default)]
-struct DeferredEffectSync {
+#[derive(Debug, Clone)]
+struct PendingEffectUpdate {
     generation: u64,
-    channel_ids: BTreeSet<String>,
+    channel: Channel,
+}
+
+#[derive(Debug)]
+struct EffectApplyAcknowledgement {
+    generation: u64,
+    config_revision: String,
+    chain_swaps: u64,
+}
+
+#[derive(Debug)]
+struct EffectUpdateState {
+    status: EffectRuntimeStatus,
+    desired: PendingEffectUpdate,
+    in_flight_generation: Option<u64>,
+    worker_running: bool,
+    coalesced_requests: u64,
+    recovery_not_before: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct EffectEnqueueDecision {
+    generation: u64,
+    previous_acknowledged: u64,
+    coalesced: bool,
+    start_worker: bool,
+    control_socket: String,
+}
+
+#[derive(Debug)]
+struct EffectAttemptCompletion {
+    superseded: bool,
+    final_state: EffectRuntimeState,
+    final_error: Option<String>,
+}
+
+impl EffectUpdateState {
+    fn enqueue(&mut self, channel: Channel) -> Result<EffectEnqueueDecision, String> {
+        let generation = self
+            .desired
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "effect generation counter is exhausted".to_string())?;
+        let coalesced = self.worker_running;
+        if coalesced {
+            self.coalesced_requests = self.coalesced_requests.saturating_add(1);
+        }
+        self.desired = PendingEffectUpdate {
+            generation,
+            channel: channel.clone(),
+        };
+        self.status.selected_effect_count = channel.effects.len();
+        self.status.desired_enabled = channel_effects_desired_enabled(&channel);
+        self.status.desired_generation = generation;
+        self.status.coalesced_requests = self.coalesced_requests;
+        self.status.pending = true;
+        self.status.last_error = None;
+        self.recovery_not_before = None;
+        self.status.resolve_state();
+        let decision = EffectEnqueueDecision {
+            generation,
+            previous_acknowledged: self.status.applied_generation,
+            coalesced,
+            start_worker: !self.worker_running,
+            control_socket: self.status.control_socket.clone(),
+        };
+        self.worker_running = true;
+        Ok(decision)
+    }
+
+    fn begin_latest(&mut self) -> PendingEffectUpdate {
+        let desired = self.desired.clone();
+        self.in_flight_generation = Some(desired.generation);
+        self.status.in_flight_generation = Some(desired.generation);
+        desired
+    }
+
+    fn finish_attempt(
+        &mut self,
+        attempted_generation: u64,
+        result: &Result<EffectApplyAcknowledgement, String>,
+    ) -> EffectAttemptCompletion {
+        self.in_flight_generation = None;
+        self.status.in_flight_generation = None;
+        if self.desired.generation != attempted_generation {
+            return EffectAttemptCompletion {
+                superseded: true,
+                final_state: self.status.state,
+                final_error: None,
+            };
+        }
+        match result {
+            Ok(ack) => {
+                self.status.applied_generation = ack.generation;
+                self.status.core_healthy = true;
+                self.status.pending = false;
+                self.status.last_error = None;
+                self.recovery_not_before = None;
+            }
+            Err(error) => {
+                self.status.core_healthy = false;
+                self.status.pending = false;
+                self.status.last_error = Some(error.clone());
+                self.recovery_not_before = Some(Instant::now() + EFFECT_RECOVERY_RETRY_INTERVAL);
+            }
+        }
+        self.status.resolve_state();
+        self.worker_running = false;
+        EffectAttemptCompletion {
+            superseded: false,
+            final_state: self.status.state,
+            final_error: self.status.last_error.clone(),
+        }
+    }
+
+    fn reserve_recovery_worker(&mut self, now: Instant) -> bool {
+        if self.worker_running
+            || !self.status.core_healthy
+            || !self.status.pending
+            || self.status.applied_generation == self.desired.generation
+            || self
+                .recovery_not_before
+                .is_some_and(|not_before| now < not_before)
+        {
+            return false;
+        }
+
+        self.worker_running = true;
+        self.status.pending = true;
+        self.status.resolve_state();
+        true
+    }
+
+    fn record_worker_spawn_failure(&mut self, error: String) {
+        self.worker_running = false;
+        self.in_flight_generation = None;
+        self.status.in_flight_generation = None;
+        self.status.pending = false;
+        self.status.core_healthy = false;
+        self.status.last_error = Some(error);
+        self.recovery_not_before = Some(Instant::now() + EFFECT_RECOVERY_RETRY_INTERVAL);
+        self.status.resolve_state();
+    }
+}
+
+#[derive(Debug)]
+struct EffectUpdateSlot {
+    state: Mutex<EffectUpdateState>,
+}
+
+impl EffectUpdateSlot {
+    fn new(channel: Channel, control_socket: &Path) -> Self {
+        let desired_enabled = channel_effects_desired_enabled(&channel);
+        let mut status = EffectRuntimeStatus {
+            channel_id: channel.id.clone(),
+            selected_effect_count: channel.effects.len(),
+            desired_enabled,
+            desired_generation: 1,
+            pending: desired_enabled,
+            control_socket: control_socket.to_string_lossy().into_owned(),
+            ..EffectRuntimeStatus::default()
+        };
+        status.resolve_state();
+        Self {
+            state: Mutex::new(EffectUpdateState {
+                desired: PendingEffectUpdate {
+                    generation: 1,
+                    channel,
+                },
+                status,
+                in_flight_generation: None,
+                worker_running: false,
+                coalesced_requests: 0,
+                recovery_not_before: None,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1232,6 +2142,83 @@ struct AdaptiveLatencyController {
     last_reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdaptiveQuantumFloorCache {
+    version: u32,
+    floors: BTreeMap<String, u32>,
+}
+
+impl Default for AdaptiveQuantumFloorCache {
+    fn default() -> Self {
+        Self {
+            version: ADAPTIVE_QUANTUM_FLOORS_VERSION,
+            floors: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AdaptiveQuantumController {
+    output_signature: String,
+    applied_quantum_frames: u32,
+    last_decrease: Option<(Instant, u32)>,
+    learned_floors: BTreeMap<String, u32>,
+}
+
+impl AdaptiveQuantumController {
+    fn with_learned_floors(learned_floors: BTreeMap<String, u32>) -> Self {
+        Self {
+            learned_floors,
+            ..Self::default()
+        }
+    }
+
+    fn update(
+        &mut self,
+        desired_quantum_frames: u32,
+        underrun_delta: u64,
+        output_signature: &str,
+        now: Instant,
+    ) -> (u32, u32, bool) {
+        if self.output_signature != output_signature {
+            self.output_signature = output_signature.to_string();
+            self.applied_quantum_frames = 0;
+            self.last_decrease = None;
+        }
+
+        let mut learned_new_floor = false;
+        if underrun_delta > 0 {
+            if let Some((decreased_at, previous_quantum)) = self.last_decrease {
+                if now.duration_since(decreased_at) <= Duration::from_secs(3)
+                    && self.output_signature != "<no-monitor-output>"
+                {
+                    let floor = self
+                        .learned_floors
+                        .entry(self.output_signature.clone())
+                        .or_default();
+                    if previous_quantum > *floor {
+                        *floor = previous_quantum;
+                        learned_new_floor = true;
+                    }
+                    self.last_decrease = None;
+                }
+            }
+        }
+
+        let floor = self
+            .learned_floors
+            .get(&self.output_signature)
+            .copied()
+            .unwrap_or(0);
+        let applied = desired_quantum_frames.max(floor);
+        if applied < self.applied_quantum_frames {
+            self.last_decrease = Some((now, self.applied_quantum_frames));
+        }
+        self.applied_quantum_frames = applied;
+        (applied, floor, learned_new_floor)
+    }
+}
+
 impl Default for AdaptiveLatencyController {
     fn default() -> Self {
         Self {
@@ -1251,6 +2238,7 @@ impl AdaptiveLatencyController {
         signal: AdaptiveLatencySignal,
         cpu_pressure: f32,
         pipewire_warning_delta: u64,
+        underrun_delta: u64,
         now: Instant,
     ) -> AdaptiveLatencyStatus {
         let levels = normalized_adaptive_levels(settings);
@@ -1268,6 +2256,8 @@ impl AdaptiveLatencyController {
                 underrun_delta: 0,
                 pipewire_warning_delta: 0,
                 cpu_pressure: 0.0,
+                pipewire_quantum_frames: 0,
+                pipewire_quantum_floor_frames: 0,
             };
         }
 
@@ -1342,9 +2332,13 @@ impl AdaptiveLatencyController {
             max_msec: settings.max_msec,
             buffer_fill_msec: None,
             last_reason: self.last_reason.clone(),
-            underrun_delta: u64::from(matches!(signal, AdaptiveLatencySignal::AudioTrouble)),
+            underrun_delta,
             pipewire_warning_delta,
             cpu_pressure,
+            pipewire_quantum_frames: wavelinux_dsp::adaptive_pipewire_quantum_frames(
+                levels[self.active_level],
+            ),
+            pipewire_quantum_floor_frames: 0,
         }
     }
 }
@@ -1370,12 +2364,23 @@ impl WaveLinuxEngine {
         app_version: &str,
     ) -> Result<Arc<Self>, EngineError> {
         fs::create_dir_all(&paths.config_dir)?;
+        fs::create_dir_all(&paths.data_dir)?;
         fs::create_dir_all(paths.local_hardware_profiles_dir())?;
+        create_private_runtime_dir(&paths.runtime_dir)?;
+        create_private_runtime_dir(&paths.control_sockets_dir())?;
         let loaded_config = load_config(&paths)?;
         let config = loaded_config.clone().normalized()?;
         if config != loaded_config {
             write_json(&paths.config_file(), &config)?;
         }
+        let (adaptive_quantum, adaptive_quantum_load_error) =
+            match load_adaptive_quantum_floors(&paths.adaptive_quantum_floors_file()) {
+                Ok(floors) => (AdaptiveQuantumController::with_learned_floors(floors), None),
+                Err(error) => (
+                    AdaptiveQuantumController::default(),
+                    Some(error.to_string()),
+                ),
+            };
         let pw = PwClient::new(options.dry_run);
         let startup_defaults = DefaultDevices::capture(&pw);
         let engine = Arc::new(Self {
@@ -1384,27 +2389,52 @@ impl WaveLinuxEngine {
             startup_defaults,
             runtime: RwLock::new(RuntimeCache::new(options.dry_run)),
             config: RwLock::new(config),
+            persisted_config_revision: Mutex::new(None),
+            change_signal: EngineChangeSignal::default(),
             meter_supervisor: Mutex::new(MeterSupervisor::new(options.dry_run)),
+            meter_transport: MeterTransportTracker::default(),
             effect_chain_processes: Mutex::new(BTreeMap::new()),
+            effect_chain_revisions: Mutex::new(BTreeMap::new()),
             audio_event_subscription: Mutex::new(None),
+            pipewire_registry: PipeWireRegistryCache::default(),
+            peripheral_plugins: Mutex::new(BTreeMap::new()),
+            pipewire_health_subscription: Mutex::new(None),
+            pipewire_profiler_subscription: Mutex::new(None),
+            pipewire_audio_health: PipeWireAudioHealthTracker::default(),
             runtime_refresh: Mutex::new(()),
             host_diagnostics: Mutex::new(TimedCache::default()),
             effect_availability: Mutex::new(TimedCache::default()),
             hardware_profiles: Arc::new(Mutex::new(TimedCache::default())),
+            accelerator_status: Mutex::new(TimedCache::default()),
             remote_profile_sync: Arc::new(Mutex::new(RemoteProfileSyncState::default())),
             slow_refresh_log: Mutex::new(SlowRefreshLogState::default()),
             audio_commands: Mutex::new(()),
             effect_sync_active: AtomicBool::new(false),
             capture_move_failures: Mutex::new(BTreeMap::new()),
             app_stream_move_failures: Mutex::new(BTreeMap::new()),
-            deferred_effect_sync: Mutex::new(DeferredEffectSync::default()),
+            effect_updates: Mutex::new(BTreeMap::new()),
+            effect_config_writes: Mutex::new(()),
             deferred_graph_repair: Mutex::new(DeferredGraphRepair::default()),
             route_health_repair: Mutex::new(RouteHealthRepairState::default()),
             adaptive_latency: Mutex::new(AdaptiveLatencyController::default()),
+            adaptive_quantum: Mutex::new(adaptive_quantum),
+            adaptive_pipewire_health_counters: Mutex::new(PipeWireAudioHealthStatus::default()),
+            cpu_pressure_sampler: Mutex::new(CpuPressureSampler::default()),
+            audio_core_underrun_counters: Mutex::new(BTreeMap::new()),
+            adaptive_core_discontinuity_counters: Mutex::new(BTreeMap::new()),
+            startup_repair_pending: AtomicBool::new(false),
+            startup_initialization_in_progress: AtomicBool::new(false),
             paths,
             options,
             stop: AtomicBool::new(false),
         });
+        if let Some(error) = adaptive_quantum_load_error {
+            engine.log_engine_event(
+                "latency.quantum_cache",
+                format!("ignored invalid learned-floor cache: {error}"),
+            );
+        }
+        engine.initialize_effect_update_slots()?;
         engine.persist_config()?;
         engine.rebuild_effect_chain_configs()?;
         if let Ok(config) = engine.read_config() {
@@ -1420,7 +2450,9 @@ impl WaveLinuxEngine {
                     config.settings.lock_default_output,
                     engine.startup_defaults.sink.as_deref().unwrap_or("<none>"),
                     engine.startup_defaults.source.as_deref().unwrap_or("<none>"),
-                    if meter_sampling_enabled() {
+                    if graph_prefix() == "wavelinux6" {
+                        "native-core"
+                    } else if meter_sampling_enabled() {
                         "pipewire-stream"
                     } else {
                         "disabled"
@@ -1448,19 +2480,29 @@ impl WaveLinuxEngine {
         if !startup_cleanup.is_empty() {
             engine.log_command_executions("startup.cleanup", &startup_cleanup);
         }
-        let startup_source_levels = engine.reset_startup_hardware_microphone_levels()?;
-        if !startup_source_levels.is_empty() {
-            engine.log_command_executions("startup.source-levels", &startup_source_levels);
-        }
         if engine.options.auto_repair_on_start && restore_on_launch {
+            engine
+                .startup_initialization_in_progress
+                .store(true, Ordering::Release);
+            if let Ok(mut runtime) = engine.runtime.write() {
+                runtime.status.audio_graph_running = startup_graph_reusable;
+                runtime.status.message = if startup_graph_reusable {
+                    "Connecting to existing audio graph".into()
+                } else {
+                    "Starting audio engine".into()
+                };
+            }
             if startup_graph_reusable {
                 engine.log_engine_event(
                     "repair.startup",
-                    "existing audio graph matched current profiles and routes; skipped startup repair",
+                    "existing audio graph matched current profiles and routes; scheduling a background refresh",
                 );
-                let _ = engine.refresh_runtime();
             } else {
-                let _ = engine.repair_audio_graph();
+                engine.startup_repair_pending.store(true, Ordering::Release);
+                engine.log_engine_event(
+                    "repair.startup",
+                    "scheduled initial audio graph repair on the background worker",
+                );
             }
         }
         #[cfg(not(test))]
@@ -1472,7 +2514,7 @@ impl WaveLinuxEngine {
         self.log_engine_event(
             "engine.identity",
             format!(
-                "app={} version={} graph_prefix={} graph_property_prefix={} appimage={} current_exe={} config_dir={} data_dir={} latest_installed_appimage={}",
+                "app={} version={} graph_prefix={} graph_property_prefix={} appimage={} current_exe={} config_dir={} data_dir={} runtime_dir={} latest_installed_appimage={}",
                 app_display_name(),
                 self.app_version,
                 graph_prefix(),
@@ -1484,6 +2526,7 @@ impl WaveLinuxEngine {
                     .unwrap_or_else(|| "<unknown>".into()),
                 self.paths.config_dir.display(),
                 self.paths.data_dir.display(),
+                self.paths.runtime_dir.display(),
                 latest_installed_appimage_summary(&self.paths.data_dir)
                     .unwrap_or_else(|| "<none>".into()),
             ),
@@ -1513,9 +2556,10 @@ impl WaveLinuxEngine {
             code: "runtime.identity.paths".into(),
             severity: DiagnosticSeverity::Info,
             message: format!(
-                "AppImage={appimage_display}; config={}; data={}",
+                "AppImage={appimage_display}; config={}; data={}; runtime={}",
                 self.paths.config_dir.display(),
-                self.paths.data_dir.display()
+                self.paths.data_dir.display(),
+                self.paths.runtime_dir.display()
             ),
             action: None,
         });
@@ -1531,7 +2575,7 @@ impl WaveLinuxEngine {
                             self.app_version
                         ),
                         action: Some(
-                            "Reinstall WaveLinux5 so the launcher and AppImage point at the same build"
+                            "Reinstall WaveLinux 6 so the launcher and AppImage point at the same build"
                                 .into(),
                         ),
                     });
@@ -1546,7 +2590,7 @@ impl WaveLinuxEngine {
                     code: "runtime.identity.installed_appimage_stale".into(),
                     severity: DiagnosticSeverity::Warning,
                     message: format!(
-                        "Installed WaveLinux5 AppImage is {latest_version} at {}, while app reports {}",
+                        "Installed WaveLinux 6 AppImage is {latest_version} at {}, while app reports {}",
                         latest_path.display(),
                         self.app_version
                     ),
@@ -1561,47 +2605,249 @@ impl WaveLinuxEngine {
     pub fn spawn_background(self: &Arc<Self>) -> thread::JoinHandle<()> {
         let engine = Arc::clone(self);
         thread::spawn(move || {
-            let (audio_event_tx, audio_event_rx) = mpsc::sync_channel(1);
+            let (audio_event_tx, audio_event_rx) = mpsc::sync_channel(16);
             let audio_event_reader = engine.start_audio_event_subscription(audio_event_tx);
-            let _ = engine.refresh_runtime();
+            if audio_event_reader.is_some()
+                && engine
+                    .pipewire_registry
+                    .wait_initialized(Duration::from_secs(1))
+            {
+                let status = engine.pipewire_registry.status();
+                engine.log_engine_event(
+                    "pipewire.registry",
+                    format!(
+                        "ready generation={} objects={} nodes={} devices={} ports={} links={} metadata={}",
+                        status.generation,
+                        status.object_count,
+                        status.node_count,
+                        status.device_count,
+                        status.port_count,
+                        status.link_count,
+                        status.metadata_count,
+                    ),
+                );
+            }
+            let pipewire_health_reader = engine.start_pipewire_health_subscription();
+            let pipewire_profiler_reader = engine.start_pipewire_profiler_subscription();
+            let repair_pending = engine.startup_repair_pending.swap(false, Ordering::AcqRel);
+            let startup_result = if repair_pending && !engine.stop.load(Ordering::SeqCst) {
+                engine.repair_audio_graph().map(|_| ())
+            } else {
+                engine.refresh_runtime()
+            };
+            engine
+                .startup_initialization_in_progress
+                .store(false, Ordering::Release);
+            engine.change_signal.notify_state();
+            if let Err(err) = startup_result {
+                engine.log_engine_event(
+                    "repair.startup",
+                    format!("initial audio graph startup failed: {err}"),
+                );
+            }
+            let adaptive_worker = if engine.options.dry_run {
+                None
+            } else {
+                let adaptive_engine = Arc::clone(&engine);
+                thread::Builder::new()
+                    .name("wavelinux-adaptive-latency".into())
+                    .spawn(move || {
+                        let mut previous_error = None;
+                        while !adaptive_engine.stop.load(Ordering::SeqCst) {
+                            let started = Instant::now();
+                            match adaptive_engine.refresh_adaptive_latency_live() {
+                                Ok(()) => previous_error = None,
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    if previous_error.as_deref() != Some(message.as_str()) {
+                                        adaptive_engine.log_engine_event(
+                                            "latency.adaptive",
+                                            format!("control tick failed: {message}"),
+                                        );
+                                        previous_error = Some(message);
+                                    }
+                                }
+                            }
+                            adaptive_engine.recover_effect_updates_if_ready();
+                            let remaining =
+                                ADAPTIVE_LATENCY_TICK_INTERVAL.saturating_sub(started.elapsed());
+                            if !remaining.is_zero() {
+                                thread::sleep(remaining);
+                            }
+                        }
+                    })
+                    .ok()
+            };
             while !engine.stop.load(Ordering::SeqCst) {
-                match audio_event_rx.recv_timeout(engine.options.poll_interval) {
-                    Ok(()) => {
-                        // Let the new Pulse stream finish publishing its properties before
-                        // taking the graph snapshot, while coalescing the event burst.
-                        thread::sleep(Duration::from_millis(25));
-                        while audio_event_rx.try_recv().is_ok() {}
+                let event = match audio_event_rx.recv_timeout(engine.options.poll_interval) {
+                    Ok(event) => {
+                        let settle = match event {
+                            AudioSubscriptionEvent::PlaybackStream
+                            | AudioSubscriptionEvent::CaptureStream => PLAYBACK_EVENT_SETTLE,
+                            AudioSubscriptionEvent::Device => DEVICE_EVENT_SETTLE,
+                        };
+                        thread::sleep(settle);
+                        coalesce_audio_subscription_events(event, &audio_event_rx)
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    // This is a low-frequency safety audit, not the old two-second
+                    // refresh loop. Normal operation is driven by graph events.
+                    Err(mpsc::RecvTimeoutError::Timeout) => AudioSubscriptionEvent::Device,
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         thread::sleep(engine.options.poll_interval);
+                        AudioSubscriptionEvent::Device
                     }
-                }
+                };
                 if !engine.stop.load(Ordering::SeqCst) {
-                    let _ = engine.refresh_runtime();
+                    let result = match event {
+                        AudioSubscriptionEvent::PlaybackStream => engine.refresh_playback_streams(),
+                        AudioSubscriptionEvent::CaptureStream => engine.refresh_runtime(),
+                        AudioSubscriptionEvent::Device => engine.refresh_runtime(),
+                    };
+                    if let Err(err) = result {
+                        engine.log_engine_event(
+                            "runtime.events",
+                            format!("event={event:?} refresh_failed={err}"),
+                        );
+                    }
                 }
             }
             engine.stop_audio_event_subscription();
+            engine.stop_pipewire_health_subscription();
+            engine.stop_pipewire_profiler_subscription();
             if let Some(reader) = audio_event_reader {
                 let _ = reader.join();
+            }
+            if let Some(reader) = pipewire_health_reader {
+                let _ = reader.join();
+            }
+            if let Some(reader) = pipewire_profiler_reader {
+                let _ = reader.join();
+            }
+            if let Some(worker) = adaptive_worker {
+                let _ = worker.join();
             }
         })
     }
 
     pub fn stop_background(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.change_signal.notify_state();
         self.stop_audio_event_subscription();
+        self.stop_pipewire_health_subscription();
+        self.stop_pipewire_profiler_subscription();
         self.stop_meter_supervisor();
+    }
+
+    pub fn revisions(&self) -> EngineRevisions {
+        self.change_signal.revisions()
+    }
+
+    pub fn wait_for_change(&self, revision: u64, timeout: Duration) -> EngineRevisions {
+        self.change_signal.wait_after(revision, timeout)
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
     }
 
     fn start_audio_event_subscription(
         self: &Arc<Self>,
-        events: mpsc::SyncSender<()>,
+        events: mpsc::SyncSender<AudioSubscriptionEvent>,
     ) -> Option<thread::JoinHandle<()>> {
         if self.options.dry_run {
             return None;
         }
+        let engine = Arc::clone(self);
+        thread::Builder::new()
+            .name("wavelinux-pipewire-registry".into())
+            .spawn(move || {
+                let mut reconnecting = false;
+                let mut connected_once = false;
+                while !engine.stop.load(Ordering::SeqCst) {
+                    engine.pipewire_registry.mark_connected(reconnecting);
+                    let batch_engine = Arc::clone(&engine);
+                    let batch_events = events.clone();
+                    let reconnect_bootstrap = reconnecting;
+                    let hooks = NativeRegistryHooks {
+                        cache: engine.pipewire_registry.clone(),
+                        stopping: {
+                            let engine = Arc::clone(&engine);
+                            Arc::new(move || engine.stop.load(Ordering::SeqCst))
+                        },
+                        on_batch: Arc::new(move |batch| {
+                            if batch.changed_objects == 0 && !batch.initial {
+                                return;
+                            }
+                            if batch.initial {
+                                batch_engine.change_signal.notify_state();
+                                if reconnect_bootstrap {
+                                    let _ = batch_events.try_send(AudioSubscriptionEvent::Device);
+                                }
+                            }
+                            for event in batch.events {
+                                let event = match event {
+                                    RegistryEventKind::PlaybackStream => {
+                                        AudioSubscriptionEvent::PlaybackStream
+                                    }
+                                    RegistryEventKind::CaptureStream => {
+                                        AudioSubscriptionEvent::CaptureStream
+                                    }
+                                    RegistryEventKind::Device => AudioSubscriptionEvent::Device,
+                                };
+                                let _ = batch_events.try_send(event);
+                            }
+                        }),
+                    };
+                    if !connected_once {
+                        engine.log_engine_event(
+                            "pipewire.registry",
+                            "subscribing to native in-process PipeWire registry actor",
+                        );
+                    }
+                    let result = run_native_registry_connection(hooks);
+                    let initialized = engine.pipewire_registry.status().initialized;
+                    connected_once |= initialized;
+                    if engine.stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let detail = result
+                        .err()
+                        .unwrap_or_else(|| "native PipeWire registry loop ended".into());
+                    engine.pipewire_registry.mark_disconnected(&detail);
+                    if !connected_once {
+                        engine.pipewire_registry.mark_unavailable(format!(
+                            "native PipeWire registry unavailable: {detail}"
+                        ));
+                        engine.log_engine_event(
+                            "pipewire.registry",
+                            format!(
+                                "native registry unavailable ({detail}); using Pulse event compatibility"
+                            ),
+                        );
+                        if let Some(reader) =
+                            engine.start_pulse_audio_event_subscription(events.clone())
+                        {
+                            let _ = reader.join();
+                        }
+                        break;
+                    }
+                    engine.log_engine_event(
+                        "pipewire.registry",
+                        format!("{detail}; reconnecting native registry"),
+                    );
+                    thread::sleep(Duration::from_millis(500));
+                    if !engine.stop.load(Ordering::SeqCst) {
+                        reconnecting = true;
+                    }
+                }
+            })
+            .ok()
+    }
 
+    fn start_pulse_audio_event_subscription(
+        self: &Arc<Self>,
+        events: mpsc::SyncSender<AudioSubscriptionEvent>,
+    ) -> Option<thread::JoinHandle<()>> {
         let mut child = match host_command("pactl")
             .arg("subscribe")
             .stdout(Stdio::piped())
@@ -1650,8 +2896,8 @@ impl WaveLinuxEngine {
                     let Ok(line) = line else {
                         break;
                     };
-                    if audio_subscription_event_relevant(&line) {
-                        let _ = events.try_send(());
+                    if let Some(event) = parse_audio_subscription_event(&line) {
+                        let _ = events.try_send(event);
                     }
                 }
             })
@@ -1668,6 +2914,160 @@ impl WaveLinuxEngine {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    fn start_pipewire_health_subscription(self: &Arc<Self>) -> Option<thread::JoinHandle<()>> {
+        if self.options.dry_run {
+            return None;
+        }
+
+        let mut child = match host_command("journalctl")
+            .args([
+                "--user",
+                "--follow",
+                "--lines=0",
+                "--output=cat",
+                "-u",
+                "pipewire.service",
+                "-u",
+                "pipewire-pulse.service",
+                "-u",
+                "wireplumber.service",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                self.log_engine_event(
+                    "pipewire.health",
+                    format!("live journal monitor unavailable: {err}"),
+                );
+                return None;
+            }
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        };
+        if let Ok(mut subscription) = self.pipewire_health_subscription.lock() {
+            *subscription = Some(child);
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        self.pipewire_audio_health.set_monitor_available(true);
+        self.log_engine_event(
+            "pipewire.health",
+            "subscribed to live PipeWire and WirePlumber warning events",
+        );
+        let engine = Arc::clone(self);
+        thread::Builder::new()
+            .name("wavelinux-audio-health".into())
+            .spawn(move || {
+                let owned_prefix = graph_prefix();
+                for line in BufReader::new(stdout).lines() {
+                    if engine.stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(line) = line else {
+                        break;
+                    };
+                    if engine
+                        .pipewire_audio_health
+                        .observe_line(&line, &owned_prefix)
+                    {
+                        engine.change_signal.notify_state();
+                    }
+                }
+                engine.pipewire_audio_health.set_monitor_available(false);
+            })
+            .ok()
+    }
+
+    fn stop_pipewire_health_subscription(&self) {
+        let child = self
+            .pipewire_health_subscription
+            .lock()
+            .ok()
+            .and_then(|mut subscription| subscription.take());
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.pipewire_audio_health.set_monitor_available(false);
+    }
+
+    fn start_pipewire_profiler_subscription(self: &Arc<Self>) -> Option<thread::JoinHandle<()>> {
+        if self.options.dry_run {
+            return None;
+        }
+
+        let (child, stdout) = match spawn_pipewire_profiler_monitor() {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                self.log_engine_event(
+                    "pipewire.profiler",
+                    format!("direct profiler unavailable: {error}"),
+                );
+                return None;
+            }
+        };
+        if let Ok(mut subscription) = self.pipewire_profiler_subscription.lock() {
+            *subscription = Some(child);
+        } else {
+            return None;
+        }
+        self.pipewire_audio_health.reset_profiler_baseline();
+        self.pipewire_audio_health.set_profiler_available(true);
+        self.log_engine_event(
+            "pipewire.profiler",
+            "subscribed to direct PipeWire profiler counters",
+        );
+
+        let engine = Arc::clone(self);
+        thread::Builder::new()
+            .name("wavelinux-pipewire-profiler".into())
+            .spawn(move || {
+                let owned_prefix = graph_prefix();
+                for line in BufReader::new(stdout).lines() {
+                    if engine.stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(line) = line else {
+                        break;
+                    };
+                    if engine
+                        .pipewire_audio_health
+                        .observe_profiler_line(&line, &owned_prefix)
+                    {
+                        engine.log_engine_event(
+                            "pipewire.profiler",
+                            format!("new direct audio error: {}", line.trim()),
+                        );
+                        engine.change_signal.notify_state();
+                    }
+                }
+                engine.pipewire_audio_health.set_profiler_available(false);
+            })
+            .ok()
+    }
+
+    fn stop_pipewire_profiler_subscription(&self) {
+        let child = self
+            .pipewire_profiler_subscription
+            .lock()
+            .ok()
+            .and_then(|mut subscription| subscription.take());
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.pipewire_audio_health.set_profiler_available(false);
     }
 
     pub fn prewarm_hardware_profiles(&self) -> Result<HardwareProfilePrewarmReport, EngineError> {
@@ -1700,7 +3100,12 @@ impl WaveLinuxEngine {
     }
 
     pub fn get_state(&self) -> Result<AppStateSnapshot, EngineError> {
-        let _ = self.refresh_runtime_if_stale(UI_STATE_REFRESH_MAX_AGE);
+        if !self
+            .startup_initialization_in_progress
+            .load(Ordering::Acquire)
+        {
+            let _ = self.refresh_runtime_if_stale(UI_STATE_REFRESH_MAX_AGE);
+        }
         self.cached_state()
     }
 
@@ -1709,43 +3114,261 @@ impl WaveLinuxEngine {
         self.cached_state()
     }
 
-    pub fn observe_meters(&self) -> Result<Vec<LevelMeter>, EngineError> {
-        let (graph, audio_graph_running) = {
-            let runtime = self.read_runtime()?;
-            (
-                runtime.graph.clone(),
-                runtime.status.audio_graph_running && !self.stop.load(Ordering::SeqCst),
-            )
-        };
+    /// Return the current immutable UI snapshot without initiating host queries.
+    pub fn cached_state_snapshot(&self) -> Result<AppStateSnapshot, EngineError> {
+        self.cached_state()
+    }
+
+    fn initialize_effect_update_slots(&self) -> Result<(), EngineError> {
         let config = self.read_config()?.clone();
-        let config = effective_config_with_runtime_auto_devices(&config, &graph);
-        let config = config_with_unavailable_effects_bypassed(&config, &graph);
-        let config = self.config_with_unhealthy_effects_bypassed(&config);
-        let meters = self.refresh_meter_supervisor(&config, &graph, audio_graph_running, true)?;
-        let mut runtime = self.write_runtime()?;
-        if runtime.status.audio_graph_running {
-            runtime.graph.meters = meters.clone();
-        } else if !runtime.graph.meters.is_empty() {
-            runtime.graph.meters.clear();
+        let mut slots = self
+            .effect_updates
+            .lock()
+            .map_err(|_| EngineError::LockPoisoned)?;
+        slots.clear();
+        for channel in config.channels {
+            let socket = self.paths.channel_control_socket(&channel.id);
+            slots.insert(
+                channel.id.clone(),
+                Arc::new(EffectUpdateSlot::new(channel, &socket)),
+            );
         }
-        Ok(meters)
+        Ok(())
+    }
+
+    fn effect_update_slot(&self, channel: &Channel) -> Result<Arc<EffectUpdateSlot>, EngineError> {
+        let mut slots = self
+            .effect_updates
+            .lock()
+            .map_err(|_| EngineError::LockPoisoned)?;
+        Ok(Arc::clone(slots.entry(channel.id.clone()).or_insert_with(
+            || {
+                Arc::new(EffectUpdateSlot::new(
+                    channel.clone(),
+                    &self.paths.channel_control_socket(&channel.id),
+                ))
+            },
+        )))
+    }
+
+    fn desired_effect_generation(&self, channel_id: &str) -> u64 {
+        self.effect_updates
+            .lock()
+            .ok()
+            .and_then(|slots| slots.get(channel_id).cloned())
+            .and_then(|slot| slot.state.lock().ok().map(|state| state.desired.generation))
+            .unwrap_or(1)
+    }
+
+    fn effect_runtime_statuses(&self, config: &MixerConfig) -> Vec<EffectRuntimeStatus> {
+        let slots = self.effect_updates.lock().ok();
+        let mut statuses = config
+            .channels
+            .iter()
+            .map(|channel| {
+                slots
+                    .as_ref()
+                    .and_then(|slots| slots.get(&channel.id))
+                    .and_then(|slot| slot.state.lock().ok().map(|state| state.status.clone()))
+                    .unwrap_or_else(|| {
+                        let desired_enabled = channel_effects_desired_enabled(channel);
+                        let mut status = EffectRuntimeStatus {
+                            channel_id: channel.id.clone(),
+                            selected_effect_count: channel.effects.len(),
+                            desired_enabled,
+                            desired_generation: 1,
+                            pending: desired_enabled,
+                            control_socket: self
+                                .paths
+                                .channel_control_socket(&channel.id)
+                                .to_string_lossy()
+                                .into_owned(),
+                            ..EffectRuntimeStatus::default()
+                        };
+                        status.resolve_state();
+                        status
+                    })
+            })
+            .collect::<Vec<_>>();
+        statuses.sort_by(|left, right| left.channel_id.cmp(&right.channel_id));
+        statuses
     }
 
     fn cached_state(&self) -> Result<AppStateSnapshot, EngineError> {
         let config = self.read_config()?.clone();
         let runtime = self.read_runtime()?;
+        let mut engine_status = runtime.status.clone();
+        engine_status.effects = self.effect_runtime_statuses(&config);
+        engine_status.meter_transport = self.meter_transport.snapshot();
+        engine_status.pipewire_registry = self.pipewire_registry.status();
+        engine_status.peripheral_plugins = self
+            .peripheral_plugins
+            .lock()
+            .map(|plugins| plugins.values().cloned().collect())
+            .unwrap_or_default();
+        engine_status.accelerator_providers =
+            self.accelerator_provider_statuses(&engine_status.audio_core)?;
         Ok(AppStateSnapshot {
             config,
             graph: runtime.graph.clone(),
             diagnostics: runtime.diagnostics.clone(),
-            engine: runtime.status.clone(),
+            engine: engine_status,
             catalog: EffectCatalog::default(),
         })
+    }
+
+    pub fn set_peripheral_plugin_status(&self, status: PeripheralPluginStatus) {
+        if let Ok(mut plugins) = self.peripheral_plugins.lock() {
+            plugins.insert(status.kind.clone(), status);
+        }
+    }
+
+    fn accelerator_provider_statuses(
+        &self,
+        audio_core: &[AudioCoreChannelStatus],
+    ) -> Result<Vec<AcceleratorProviderStatus>, EngineError> {
+        let mut cache = self
+            .accelerator_status
+            .lock()
+            .map_err(|_| EngineError::LockPoisoned)?;
+        if cache_expired(cache.checked_at, ACCELERATOR_STATUS_TTL) {
+            cache.value = [
+                wavelinux_accelerator::AcceleratorProvider::Cuda,
+                wavelinux_accelerator::AcceleratorProvider::OpenVino,
+                wavelinux_accelerator::AcceleratorProvider::MiGraphX,
+            ]
+            .into_iter()
+            .map(|provider| {
+                let probe = wavelinux_accelerator::probe_provider_pack(provider);
+                let qualification = probe.qualification.as_ref();
+                AcceleratorProviderStatus {
+                    provider: provider.as_str().into(),
+                    protocol_version: wavelinux_accelerator::ACCELERATOR_PROTOCOL_VERSION,
+                    installed: probe.installed,
+                    valid: probe.valid,
+                    qualified: probe.qualified,
+                    active: false,
+                    pack_version: probe.pack_version,
+                    model_sha256: probe.model_sha256,
+                    hardware_fingerprint: probe.hardware_fingerprint,
+                    tested_unix: qualification
+                        .map(|record| record.tested_unix)
+                        .filter(|timestamp| *timestamp > 0),
+                    blocks: qualification.map(|record| record.blocks),
+                    numerical_max_abs_error: qualification
+                        .map(|record| record.numerical_max_abs_error),
+                    deadline_misses: qualification.map(|record| record.deadline_misses),
+                    discontinuities: qualification.map(|record| record.discontinuities),
+                    added_latency_msec: qualification.map(|record| record.added_latency_msec),
+                    cpu_reduction_percent: qualification.map(|record| record.cpu_reduction_percent),
+                    fallback_validated: qualification
+                        .is_some_and(|record| record.fallback_validated),
+                    live_workload_validated: qualification
+                        .is_some_and(|record| record.live_workload_validated),
+                    detail: probe.detail,
+                }
+            })
+            .collect();
+            cache.checked_at = Some(Instant::now());
+        }
+        let mut statuses = cache.value.clone();
+        for status in &mut statuses {
+            let matching = audio_core.iter().filter(|core| {
+                core.accelerator_provider.as_deref() == Some(status.provider.as_str())
+            });
+            let (active_states, provider_blocks, fallback_blocks) =
+                matching.fold((0_u32, 0_u64, 0_u64), |totals, core| {
+                    (
+                        totals.0.saturating_add(core.accelerator_active_states),
+                        totals.1.saturating_add(core.accelerator_provider_blocks),
+                        totals.2.saturating_add(core.accelerator_fallback_blocks),
+                    )
+                });
+            status.active = active_states > 0;
+            if status.active || fallback_blocks > 0 {
+                status.detail = format!(
+                    "{}; live states={active_states}, provider blocks={provider_blocks}, CPU fallbacks={fallback_blocks}",
+                    status.detail
+                );
+            }
+        }
+        Ok(statuses)
     }
 
     pub fn refresh_runtime(&self) -> Result<(), EngineError> {
         let _runtime_refresh = self.lock_runtime_refresh()?;
         self.refresh_runtime_unlocked()
+    }
+
+    fn refresh_playback_streams(&self) -> Result<(), EngineError> {
+        let _runtime_refresh = self.lock_runtime_refresh()?;
+        let started = Instant::now();
+        let config = self.read_config()?.clone();
+        let (mut graph, audio_graph_running) = {
+            let runtime = self.read_runtime()?;
+            (runtime.graph.clone(), runtime.status.audio_graph_running)
+        };
+
+        graph.app_streams = if let Some((snapshot, _)) = self
+            .pipewire_registry
+            .audio_state_snapshot(Some(&config), Vec::new())
+        {
+            snapshot.graph.app_streams
+        } else {
+            self.pw.list_app_streams(Some(&config), &graph.outputs)?
+        };
+        let mut routed_count = 0_usize;
+        if audio_graph_running && !self.stop.load(Ordering::SeqCst) {
+            let routable = fast_routable_streams_for_graph(&config, &graph);
+            let routed_stream_ids = self.route_configured_streams(&config, &routable)?;
+            routed_count = routed_stream_ids.len();
+            if !routed_stream_ids.is_empty() {
+                for stream in &mut graph.app_streams {
+                    if routed_stream_ids.contains(&stream.id) {
+                        stream.routed_channel_id =
+                            route_stream_to_configured_channel(&config, stream)
+                                .map(|channel| channel.id.clone());
+                    }
+                }
+            }
+            let _ = self.apply_configured_stream_volumes(&config, &graph.app_streams)?;
+        }
+        self.remember_observed_apps(&graph.app_streams)?;
+
+        let stream_count = graph.app_streams.len();
+        let changed = {
+            let mut runtime = self.write_runtime()?;
+            if runtime.graph.app_streams == graph.app_streams {
+                false
+            } else {
+                runtime.graph.app_streams = graph.app_streams;
+                true
+            }
+        };
+        if changed {
+            self.change_signal.notify_graph();
+        }
+        if routed_count > 0 {
+            let command_elapsed_ms = started.elapsed().as_millis();
+            self.log_engine_event(
+                "route.streams.fast",
+                format!(
+                    "moved={routed_count} command_elapsed_ms={command_elapsed_ms} estimated_event_to_route_ms={}",
+                    command_elapsed_ms.saturating_add(PLAYBACK_EVENT_SETTLE.as_millis()),
+                ),
+            );
+        }
+        if started.elapsed() >= Duration::from_millis(100) {
+            self.log_engine_event(
+                "runtime.refresh.fast",
+                format!(
+                    "elapsed_ms={} streams={} changed={changed}",
+                    started.elapsed().as_millis(),
+                    stream_count
+                ),
+            );
+        }
+        Ok(())
     }
 
     fn refresh_runtime_if_stale(&self, max_age: Duration) -> Result<(), EngineError> {
@@ -1776,14 +3399,21 @@ impl WaveLinuxEngine {
         let mut phase_started = Instant::now();
         let mut refresh_phases = Vec::new();
         let config = self.read_config()?.clone();
-        let (mut graph, mut snapshot_command_timings) =
-            self.snapshot_for_config_timed(Some(&config))?;
+        let (audio_state, mut snapshot_command_timings) =
+            self.audio_state_snapshot_for_config_timed(Some(&config))?;
+        let mut repair_seed_state = Some(audio_state.clone());
+        let mut graph = audio_state.graph;
+        let mut route_snapshot = audio_state.routes;
+        let mut active_sink = audio_state.active_playback_sink;
         record_refresh_phase(&mut refresh_phases, &mut phase_started, "snapshot");
         let mut audio_graph_running = graph_has_wavelinux_nodes(&graph);
+        let mut fast_routed_streams = false;
         if audio_graph_running && !self.stop.load(Ordering::SeqCst) {
             let fast_streams = fast_routable_streams_for_graph(&config, &graph);
             let routed_stream_ids = self.route_configured_streams(&config, &fast_streams)?;
+            fast_routed_streams = !routed_stream_ids.is_empty();
             if !routed_stream_ids.is_empty() {
+                repair_seed_state = None;
                 for stream in &mut graph.app_streams {
                     if routed_stream_ids.contains(&stream.id) {
                         stream.routed_channel_id =
@@ -1802,11 +3432,15 @@ impl WaveLinuxEngine {
             }
         }
         record_refresh_phase(&mut refresh_phases, &mut phase_started, "app_routes_fast");
-        let mut bluetooth_cards = self.bluetooth_audio_cards().unwrap_or_default();
-        let mut default_source = self.pw.default_source().ok().flatten();
-        let mut default_sink = self.pw.default_sink().ok().flatten();
-        let mut active_sink = self.pw.active_playback_sink().ok().flatten();
-        let mut route_snapshot = self.pw.route_snapshot().unwrap_or_default();
+        let mut bluetooth_cards = self
+            .bluetooth_audio_cards_for_devices(
+                audio_state.bluetooth_cards,
+                &graph.inputs,
+                &graph.outputs,
+            )
+            .unwrap_or_default();
+        let mut default_source = audio_state.default_source;
+        let mut default_sink = audio_state.default_sink;
         let mut managed_modules = route_snapshot.managed_modules;
         let mut source_outputs = route_snapshot.source_output_routes;
         let mut sink_inputs = route_snapshot.sink_input_routes;
@@ -1838,17 +3472,24 @@ impl WaveLinuxEngine {
                 .any(|output| !output.skipped && output.error.is_none())
             {
                 thread::sleep(Duration::from_millis(250));
-                let (next_graph, timings) = self.snapshot_for_config_timed(Some(&config))?;
-                graph = next_graph;
+                let (next_state, timings) =
+                    self.audio_state_snapshot_for_config_timed(Some(&config))?;
+                repair_seed_state = Some(next_state.clone());
+                let next_bluetooth_cards = next_state.bluetooth_cards;
+                default_source = next_state.default_source;
+                default_sink = next_state.default_sink;
+                active_sink = next_state.active_playback_sink;
+                source_outputs = next_state.routes.source_output_routes;
+                sink_inputs = next_state.routes.sink_input_routes;
+                graph = next_state.graph;
                 snapshot_command_timings.extend(timings);
-                bluetooth_cards = self.bluetooth_audio_cards().unwrap_or_default();
-                default_source = self.pw.default_source().ok().flatten();
-                default_sink = self.pw.default_sink().ok().flatten();
-                active_sink = self.pw.active_playback_sink().ok().flatten();
-                route_snapshot = self.pw.route_snapshot().unwrap_or_default();
-                managed_modules = route_snapshot.managed_modules;
-                source_outputs = route_snapshot.source_output_routes;
-                sink_inputs = route_snapshot.sink_input_routes;
+                bluetooth_cards = self
+                    .bluetooth_audio_cards_for_devices(
+                        next_bluetooth_cards,
+                        &graph.inputs,
+                        &graph.outputs,
+                    )
+                    .unwrap_or_default();
                 desired_audio_config = effective_config_with_profiled_devices(
                     &config,
                     &graph.inputs,
@@ -1877,6 +3518,7 @@ impl WaveLinuxEngine {
                 active_sink: active_sink.as_deref(),
                 managed_modules: &managed_modules,
                 source_outputs: &source_outputs,
+                sink_inputs: &sink_inputs,
             },
         );
         let effect_sync_active = self.effect_sync_active.load(Ordering::SeqCst);
@@ -1914,7 +3556,7 @@ impl WaveLinuxEngine {
         let realtime_fallback_channel_ids =
             self.realtime_fallback_sync_channel_ids_for_runtime_prefix(&config, &graph_prefix());
         let realtime_fallback_repair_needed = !realtime_fallback_channel_ids.is_empty();
-        let default_device_lock_repair_needed = default_device_lock_repair_needed(
+        let default_device_lock_repair_needed = self.confirmed_default_device_lock_repair_needed(
             &audio_config,
             default_source.as_deref(),
             default_sink.as_deref(),
@@ -1949,6 +3591,24 @@ impl WaveLinuxEngine {
                 &active_app_channel_ids,
                 &active_mix_ids,
                 &route_health,
+            );
+        let persistent_core_target_repair_needed = graph_prefix() == "wavelinux6"
+            && self.audio_core_process_is_tracked()
+            && !active_effect_route_repair_needed
+            && !realtime_fallback_repair_needed
+            && !bluetooth_monitor_route_refresh_needed
+            && !route_health_repair_needed
+            && persistent_core_target_routes_need_sync(
+                &audio_config,
+                &source_outputs,
+                &sink_inputs,
+            )
+            && app_routing_graph_ready_without_persistent_targets(
+                &audio_config,
+                &graph,
+                &managed_modules,
+                &source_outputs,
+                &sink_inputs,
             );
         let mut route_mutations_deferred = false;
         let mut route_mutation_requested = false;
@@ -1986,6 +3646,8 @@ impl WaveLinuxEngine {
                 && !route_health_repair_needed
             {
                 "realtime FX fallback triggered; rebuilding affected effect chains"
+            } else if persistent_core_target_repair_needed {
+                "hardware target changed; retargeting the persistent audio core live"
             } else if incremental_mix_route_repair_needed {
                 "active application mix changed; synchronizing live routes"
             } else if route_health_repair_needed {
@@ -2045,7 +3707,16 @@ impl WaveLinuxEngine {
                             &graph_prefix(),
                         );
                     }
-                    if incremental_mix_route_repair_needed {
+                    if persistent_core_target_repair_needed {
+                        self.rebuild_effect_chain_configs_from_config(
+                            &audio_config,
+                            &graph_prefix(),
+                        )?;
+                        outputs.extend(self.sync_persistent_audio_core_targets()?);
+                        if default_device_lock_repair_needed {
+                            outputs.extend(self.apply_default_device_locks(&audio_config)?);
+                        }
+                    } else if incremental_mix_route_repair_needed {
                         outputs.extend(self.sync_active_mix_routes_unlocked(
                             &audio_config,
                             IncrementalMixRouteView {
@@ -2062,11 +3733,18 @@ impl WaveLinuxEngine {
                         || active_route_repair_needed
                         || route_health_repair_needed
                     {
-                        outputs.extend(self.repair_audio_graph_unlocked()?.outputs);
+                        outputs.extend(
+                            self.repair_audio_graph_unlocked_from_snapshot(
+                                repair_seed_state.take(),
+                            )?
+                            .outputs,
+                        );
                     } else if !default_lock_only_repair
                         && (auto_device_route_repair_needed || default_device_lock_repair_needed)
                     {
-                        outputs.extend(self.repair_auto_device_routes_unlocked()?);
+                        outputs.extend(
+                            self.repair_auto_device_routes_unlocked(repair_seed_state.take())?,
+                        );
                     }
                     self.log_command_executions("hotplug.device", &outputs);
                     if default_lock_only_repair {
@@ -2074,15 +3752,22 @@ impl WaveLinuxEngine {
                         default_sink = self.pw.default_sink().ok().flatten();
                         active_sink = self.pw.active_playback_sink().ok().flatten();
                     } else {
-                        let (next_graph, timings) =
-                            self.snapshot_for_config_timed(Some(&config))?;
-                        graph = next_graph;
+                        let (next_state, timings) =
+                            self.audio_state_snapshot_for_config_timed(Some(&config))?;
+                        let next_bluetooth_cards = next_state.bluetooth_cards;
+                        default_source = next_state.default_source;
+                        default_sink = next_state.default_sink;
+                        active_sink = next_state.active_playback_sink;
+                        route_snapshot = next_state.routes;
+                        graph = next_state.graph;
                         snapshot_command_timings.extend(timings);
-                        bluetooth_cards = self.bluetooth_audio_cards().unwrap_or_default();
-                        default_source = self.pw.default_source().ok().flatten();
-                        default_sink = self.pw.default_sink().ok().flatten();
-                        active_sink = self.pw.active_playback_sink().ok().flatten();
-                        route_snapshot = self.pw.route_snapshot().unwrap_or_default();
+                        bluetooth_cards = self
+                            .bluetooth_audio_cards_for_devices(
+                                next_bluetooth_cards,
+                                &graph.inputs,
+                                &graph.outputs,
+                            )
+                            .unwrap_or_default();
                         managed_modules = route_snapshot.managed_modules;
                         source_outputs = route_snapshot.source_output_routes;
                         sink_inputs = route_snapshot.sink_input_routes;
@@ -2136,9 +3821,6 @@ impl WaveLinuxEngine {
             };
             let updated_volumes =
                 self.apply_configured_stream_volumes(&config, &graph.app_streams)?;
-            route_snapshot = self.pw.route_snapshot().unwrap_or_default();
-            source_outputs = route_snapshot.source_output_routes;
-            sink_inputs = route_snapshot.sink_input_routes;
             let moved_capture_streams = if graph_ready_for_apps {
                 self.move_capture_streams_to_locked_default_input(
                     &audio_config,
@@ -2149,9 +3831,19 @@ impl WaveLinuxEngine {
             } else {
                 false
             };
-            if rescued_streams || routed_streams || updated_volumes || moved_capture_streams {
-                let (next_graph, timings) = self.snapshot_for_config_timed(Some(&config))?;
-                graph = next_graph;
+            if runtime_route_resnapshot_needed(
+                fast_routed_streams,
+                rescued_streams,
+                routed_streams,
+                updated_volumes,
+                moved_capture_streams,
+            ) {
+                let (next_state, timings) =
+                    self.audio_state_snapshot_for_config_timed(Some(&config))?;
+                graph = next_state.graph;
+                active_sink = next_state.active_playback_sink;
+                source_outputs = next_state.routes.source_output_routes;
+                sink_inputs = next_state.routes.sink_input_routes;
                 snapshot_command_timings.extend(timings);
                 audio_graph_running = graph_has_wavelinux_nodes(&graph);
             }
@@ -2164,7 +3856,7 @@ impl WaveLinuxEngine {
         };
         record_refresh_phase(&mut refresh_phases, &mut phase_started, "meters");
         self.remember_observed_apps(&graph.app_streams)?;
-        let auto_devices = resolved_auto_devices_for_config(
+        let mut auto_devices = resolved_auto_devices_for_config(
             &config,
             &graph.inputs,
             &graph.outputs,
@@ -2173,15 +3865,31 @@ impl WaveLinuxEngine {
             default_sink.as_deref(),
             active_sink.as_deref(),
         );
+        let audio_core_status = self.collect_audio_core_status(&audio_config);
+        let mut adaptive_audio_core_status = audio_core_status.clone();
+        apply_audio_core_discontinuity_deltas(
+            &mut adaptive_audio_core_status,
+            &self.adaptive_core_discontinuity_counters,
+        );
         let mut diagnostics = self.host_diagnostics()?;
-        diagnostics.extend(self.effect_chain_diagnostics(&audio_config, &graph));
-        let adaptive_latency_status =
-            self.adaptive_latency_status(&config.settings.adaptive_latency, &diagnostics)?;
+        diagnostics.extend(self.effect_chain_diagnostics_with_core(
+            &audio_config,
+            &graph,
+            &audio_core_status,
+        ));
+        let adaptive_latency_status = self.adaptive_latency_status(
+            &config.settings.adaptive_latency,
+            &adaptive_audio_core_status,
+        )?;
         self.send_adaptive_latency_targets(&config, &adaptive_latency_status);
         let healthy = diagnostics
             .iter()
             .all(|item| item.severity != DiagnosticSeverity::Error);
         let mut runtime = self.write_runtime()?;
+        stabilize_auto_device_reasons(&runtime.graph.auto_devices, &mut auto_devices);
+        let graph_changed = runtime.graph != graph;
+        let diagnostics_changed = runtime.diagnostics != diagnostics;
+        let previous_status = runtime.status.clone();
         self.log_auto_device_changes(&runtime.graph.auto_devices, &auto_devices);
         graph.auto_devices = auto_devices;
         runtime.graph = graph;
@@ -2194,6 +3902,9 @@ impl WaveLinuxEngine {
         runtime.status.audio_graph_running = audio_graph_running;
         runtime.status.last_refresh_unix = OffsetDateTime::now_utc().unix_timestamp();
         runtime.status.adaptive_latency = adaptive_latency_status;
+        runtime.status.audio_core = audio_core_status;
+        runtime.status.pipewire_audio_health = self.pipewire_audio_health.snapshot();
+        runtime.status.pipewire_registry = self.pipewire_registry.status();
         runtime.refreshed_at = Some(Instant::now());
         runtime.status.message = if healthy {
             if self.options.dry_run {
@@ -2211,6 +3922,36 @@ impl WaveLinuxEngine {
         let snapshot_failed = snapshot_command_timings
             .iter()
             .any(|timing| !timing.succeeded);
+        {
+            let refresh = &mut runtime.status.refresh;
+            let elapsed_msec = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+            refresh.total_refreshes = refresh.total_refreshes.saturating_add(1);
+            refresh.last_total_msec = elapsed_msec;
+            refresh.peak_total_msec = refresh.peak_total_msec.max(elapsed_msec);
+            refresh.last_phase_msec = refresh_phases
+                .iter()
+                .map(|(phase, elapsed_ms)| {
+                    (
+                        (*phase).to_string(),
+                        (*elapsed_ms).min(u128::from(u64::MAX)) as u64,
+                    )
+                })
+                .collect();
+            refresh.snapshot_commands =
+                snapshot_command_timings.len().min(u32::MAX as usize) as u32;
+            refresh.snapshot_failures = snapshot_command_timings
+                .iter()
+                .filter(|timing| !timing.succeeded)
+                .count()
+                .min(u32::MAX as usize) as u32;
+            if route_mutation_requested {
+                refresh.route_mutations = refresh.route_mutations.saturating_add(1);
+            }
+            if route_mutations_deferred {
+                refresh.deferred_route_mutations =
+                    refresh.deferred_route_mutations.saturating_add(1);
+            }
+        }
         let slow_refresh_decision = {
             let mut state = self
                 .slow_refresh_log
@@ -2246,6 +3987,13 @@ impl WaveLinuxEngine {
                     snapshot_commands,
                 ),
             );
+        }
+        let status_changed = runtime.status != previous_status;
+        drop(runtime);
+        if graph_changed {
+            self.change_signal.notify_graph();
+        } else if diagnostics_changed || status_changed {
+            self.change_signal.notify_state();
         }
         Ok(())
     }
@@ -2346,498 +4094,6 @@ impl WaveLinuxEngine {
                 ),
             );
         }
-    }
-
-    pub fn repair_audio_graph(&self) -> Result<RepairReport, EngineError> {
-        self.log_engine_event("repair.start", "requested audio graph repair");
-        let report = {
-            let _audio_commands = self.lock_audio_commands()?;
-            self.repair_audio_graph_unlocked()?
-        };
-        let _ = self.refresh_runtime();
-        Ok(report)
-    }
-
-    fn sync_active_mix_routes_unlocked(
-        &self,
-        config: &MixerConfig,
-        view: IncrementalMixRouteView<'_>,
-        active_app_channel_ids: &BTreeSet<String>,
-        active_mix_ids: &BTreeSet<String>,
-        route_health: &[RouteHealthIssue],
-    ) -> Result<Vec<CommandExecution>, EngineError> {
-        let started = Instant::now();
-        let mut seen = BTreeSet::new();
-        let unhealthy_module_ids = route_health
-            .iter()
-            .filter(|issue| issue.reason != RouteHealthReason::LevelMismatch)
-            .filter_map(|issue| issue.module_id.clone())
-            .collect::<BTreeSet<_>>();
-        let stale_modules = view
-            .managed_modules
-            .iter()
-            .filter(|module| {
-                managed_module_is_incremental_mix_route(module)
-                    && (module_is_stale_for_active_routes(
-                        module,
-                        config,
-                        active_app_channel_ids,
-                        active_mix_ids,
-                    ) || unhealthy_module_ids.contains(&module.module_id)
-                        || module_dedupe_key_for_config(module, config)
-                            .is_some_and(|key| !seen.insert(key)))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut outputs = self
-            .pw
-            .execute_all(plan_unload_modules(&stale_modules))
-            .into_iter()
-            .map(command_execution)
-            .collect::<Vec<_>>();
-        let plan =
-            plan_ensure_graph_for_active_routes(config, active_app_channel_ids, active_mix_ids);
-        let mut skipped = Vec::new();
-        let commands = plan
-            .commands
-            .into_iter()
-            .filter(command_is_incremental_mix_route)
-            .filter_map(|command| {
-                if !route_command_endpoints_available(&command, view.graph) {
-                    skipped.push(skipped_command_with_stderr(
-                        command,
-                        "live route endpoint is not visible yet; retrying on the next audio event",
-                    ));
-                    return None;
-                }
-                (!repair_command_is_satisfied(
-                    &command,
-                    view.graph,
-                    view.source_outputs,
-                    view.sink_inputs,
-                    view.managed_modules,
-                ))
-                .then_some(command)
-            })
-            .collect::<Vec<_>>();
-        let load_count = commands.len();
-        outputs.extend(skipped);
-        outputs.extend(
-            self.pw
-                .execute_all(commands)
-                .into_iter()
-                .map(command_execution),
-        );
-        if route_health
-            .iter()
-            .any(|issue| issue.reason == RouteHealthReason::LevelMismatch)
-            || active_mix_routes_have_custom_levels(config, active_app_channel_ids, active_mix_ids)
-        {
-            outputs.extend(self.apply_managed_route_levels(config)?);
-        }
-        self.log_engine_event(
-            "repair.active-routes",
-            format!(
-                "active_channels={} active_mixes={} loaded={} outputs={} failed={} elapsed_ms={}",
-                active_app_channel_ids.len(),
-                active_mix_ids.len(),
-                load_count,
-                outputs.len(),
-                outputs
-                    .iter()
-                    .filter(|output| output.error.is_some())
-                    .count(),
-                started.elapsed().as_millis(),
-            ),
-        );
-        Ok(outputs)
-    }
-
-    fn repair_audio_graph_unlocked(&self) -> Result<RepairReport, EngineError> {
-        let started = Instant::now();
-        let mut outputs = self.ensure_bluetooth_a2dp_profiles(true)?;
-        self.log_command_executions("repair.bluetooth", &outputs);
-        if outputs
-            .iter()
-            .any(|output| !output.skipped && output.error.is_none())
-        {
-            thread::sleep(Duration::from_millis(250));
-        }
-        let config = self.effective_config_for_audio_graph(&self.read_config()?.clone());
-        let pre_cleanup_graph = self
-            .pw
-            .snapshot_for_config_with_effect_availability(None, Vec::new());
-        let active_app_channel_ids = active_app_channel_ids_for_graph(&config, &pre_cleanup_graph);
-        let pre_cleanup_route_snapshot = self.pw.route_snapshot().unwrap_or_default();
-        let active_mix_ids = active_mix_ids_for_routes(
-            &config,
-            &pre_cleanup_graph,
-            &pre_cleanup_route_snapshot.source_output_routes,
-            &pre_cleanup_route_snapshot.sink_input_routes,
-        );
-        let monitor_preroute_outputs =
-            self.preload_monitor_output_routes_for_config(&config, &active_mix_ids)?;
-        let preserve_stale_monitor_routes = monitor_preroute_outputs.iter().any(|output| {
-            output.error.is_some() || output.stderr.contains("preserving existing monitor route")
-        });
-        self.log_command_executions("repair.preroute", &monitor_preroute_outputs);
-        outputs.extend(monitor_preroute_outputs);
-        let cleanup_outputs = self.cleanup_stale_modules_for_config(
-            &config,
-            &active_app_channel_ids,
-            &active_mix_ids,
-            preserve_stale_monitor_routes,
-        )?;
-        self.log_command_executions("repair.cleanup", &cleanup_outputs);
-        outputs.extend(cleanup_outputs);
-        self.rebuild_effect_chain_configs()?;
-
-        let mut planned =
-            plan_ensure_graph_for_active_routes(&config, &active_app_channel_ids, &active_mix_ids);
-        let planned_count = planned.commands.len();
-        let existing_graph = self
-            .pw
-            .snapshot_for_config_with_effect_availability(None, Vec::new());
-        let managed_modules = self.pw.managed_modules().unwrap_or_default();
-        let source_outputs = self.pw.source_output_routes().unwrap_or_default();
-        let sink_inputs = self.pw.sink_input_routes().unwrap_or_default();
-        let active_effect_channel_ids = config
-            .channels
-            .iter()
-            .filter(|channel| channel_has_active_effects(channel))
-            .map(|channel| channel.id.clone())
-            .collect::<BTreeSet<_>>();
-        planned.commands.retain(|command| {
-            if command_routes_active_effect_channel(command, &active_effect_channel_ids) {
-                return true;
-            }
-            !repair_command_is_satisfied(
-                command,
-                &existing_graph,
-                &source_outputs,
-                &sink_inputs,
-                &managed_modules,
-            )
-        });
-
-        let (graph_commands, mut route_commands) = split_repair_commands(&planned.commands);
-        self.log_engine_event(
-            "repair.plan",
-            format!(
-                "planned={} retained={} graph_commands={} route_commands={} managed_modules={} source_outputs={} sink_inputs={} inputs={} outputs={}",
-                planned_count,
-                planned.commands.len(),
-                graph_commands.len(),
-                route_commands.len(),
-                managed_modules.len(),
-                source_outputs.len(),
-                sink_inputs.len(),
-                existing_graph.inputs.len(),
-                existing_graph.outputs.len(),
-            ),
-        );
-        outputs.extend(
-            self.pw
-                .execute_all(graph_commands)
-                .into_iter()
-                .map(command_execution),
-        );
-
-        outputs.extend(self.start_effect_chain_processes(&config)?);
-        let mut route_config = config.clone();
-        let active_effect_channels = config
-            .channels
-            .iter()
-            .filter(|channel| channel_has_active_effects(channel))
-            .collect::<Vec<_>>();
-        if !active_effect_channels.is_empty() {
-            for channel in &active_effect_channels {
-                let _ = self.wait_for_effect_nodes_ready_for_routing(channel);
-            }
-            let post_effect_graph = self
-                .pw
-                .snapshot_for_config_with_effect_availability(None, Vec::new());
-            let mut missing_effect_channels = Vec::new();
-            for channel in &mut route_config.channels {
-                if !channel_has_active_effects(channel) {
-                    continue;
-                }
-                if effect_chain_endpoint_readiness_for_graph(&post_effect_graph, channel).ready() {
-                    continue;
-                }
-                missing_effect_channels.push(channel.name.clone());
-                for effect in &mut channel.effects {
-                    effect.bypassed = true;
-                }
-            }
-            if !missing_effect_channels.is_empty() {
-                self.log_engine_event(
-                    "repair.effects",
-                    format!(
-                        "missing FX sources for {}; routing affected channels from raw monitors",
-                        missing_effect_channels.join(", ")
-                    ),
-                );
-                let fallback_plan = plan_ensure_graph_for_active_routes(
-                    &route_config,
-                    &active_app_channel_ids,
-                    &active_mix_ids,
-                );
-                let (_, fallback_route_commands) = split_repair_commands(&fallback_plan.commands);
-                let managed_modules = self.pw.managed_modules().unwrap_or_default();
-                let source_outputs = self.pw.source_output_routes().unwrap_or_default();
-                let sink_inputs = self.pw.sink_input_routes().unwrap_or_default();
-                route_commands = fallback_route_commands
-                    .into_iter()
-                    .filter(|command| {
-                        !repair_command_is_satisfied(
-                            command,
-                            &post_effect_graph,
-                            &source_outputs,
-                            &sink_inputs,
-                            &managed_modules,
-                        )
-                    })
-                    .collect();
-            }
-            outputs.extend(self.cleanup_modules(|module| {
-                matches!(
-                    module.role.as_deref(),
-                    Some("channel_to_mix") | Some("channel_to_effect")
-                ) && module
-                    .channel_id
-                    .as_deref()
-                    .is_some_and(|channel_id| active_effect_channel_ids.contains(channel_id))
-            })?);
-        }
-
-        outputs.extend(
-            self.pw
-                .execute_all(route_commands)
-                .into_iter()
-                .map(command_execution),
-        );
-        outputs.extend(self.apply_graph_levels(&route_config)?);
-        let linked_effect_channel_ids = route_config
-            .channels
-            .iter()
-            .filter(|channel| channel_has_active_effects(channel))
-            .map(|channel| channel.id.clone())
-            .collect::<BTreeSet<_>>();
-        let route_issues =
-            self.wait_for_effect_routes_linked(&route_config, &linked_effect_channel_ids);
-        if !route_issues.is_empty() {
-            self.log_engine_event(
-                "repair.effects",
-                format!(
-                    "FX loopbacks still unhealthy after repair: {}",
-                    route_health_summary(&route_issues)
-                ),
-            );
-        }
-        outputs.extend(self.apply_default_device_locks(&route_config)?);
-        let source_outputs = self.pw.source_output_routes().unwrap_or_default();
-        outputs.extend(self.execute_capture_stream_moves_unlocked(&route_config, &source_outputs)?);
-        self.log_command_executions("repair.outputs", &outputs);
-        self.log_engine_event(
-            "repair.end",
-            format!(
-                "outputs={} failed={} skipped={} elapsed_ms={}",
-                outputs.len(),
-                outputs
-                    .iter()
-                    .filter(|output| output.error.is_some())
-                    .count(),
-                outputs.iter().filter(|output| output.skipped).count(),
-                started.elapsed().as_millis(),
-            ),
-        );
-        Ok(RepairReport {
-            dry_run: self.options.dry_run,
-            planned,
-            outputs,
-        })
-    }
-
-    fn repair_auto_device_routes_unlocked(&self) -> Result<Vec<CommandExecution>, EngineError> {
-        let started = Instant::now();
-        let config = self.effective_config_for_audio_graph(&self.read_config()?.clone());
-        let initial_graph = self
-            .pw
-            .snapshot_for_config_with_effect_availability(None, Vec::new());
-        let initial_routes = self.pw.route_snapshot().unwrap_or_default();
-        let active_app_channel_ids = active_app_channel_ids_for_graph(&config, &initial_graph);
-        let active_mix_ids = active_mix_ids_for_routes(
-            &config,
-            &initial_graph,
-            &initial_routes.source_output_routes,
-            &initial_routes.sink_input_routes,
-        );
-        let monitor_preroute_outputs =
-            self.preload_monitor_output_routes_for_config(&config, &active_mix_ids)?;
-        let preserve_stale_monitor_routes = monitor_preroute_outputs.iter().any(|output| {
-            output.error.is_some() || output.stderr.contains("preserving existing monitor route")
-        });
-        let mut outputs = monitor_preroute_outputs;
-        outputs.extend(self.cleanup_stale_auto_device_modules_for_config(
-            &config,
-            &active_mix_ids,
-            preserve_stale_monitor_routes,
-        )?);
-
-        let mut planned =
-            plan_ensure_graph_for_active_routes(&config, &active_app_channel_ids, &active_mix_ids);
-        let planned_count = planned.commands.len();
-        let existing_graph = self
-            .pw
-            .snapshot_for_config_with_effect_availability(None, Vec::new());
-        let managed_modules = self.pw.managed_modules().unwrap_or_default();
-        let source_outputs = self.pw.source_output_routes().unwrap_or_default();
-        let sink_inputs = self.pw.sink_input_routes().unwrap_or_default();
-        planned.commands.retain(|command| {
-            command_is_auto_device_route(command)
-                && !repair_command_is_satisfied(
-                    command,
-                    &existing_graph,
-                    &source_outputs,
-                    &sink_inputs,
-                    &managed_modules,
-                )
-        });
-        self.log_engine_event(
-            "repair.auto-device",
-            format!(
-                "planned={} retained={} managed_modules={} source_outputs={} sink_inputs={} inputs={} outputs={}",
-                planned_count,
-                planned.commands.len(),
-                managed_modules.len(),
-                source_outputs.len(),
-                sink_inputs.len(),
-                existing_graph.inputs.len(),
-                existing_graph.outputs.len(),
-            ),
-        );
-        outputs.extend(
-            self.pw
-                .execute_all(planned.commands)
-                .into_iter()
-                .map(command_execution),
-        );
-        outputs.extend(self.apply_default_device_locks(&config)?);
-        let source_outputs = self.pw.source_output_routes().unwrap_or_default();
-        outputs.extend(self.execute_capture_stream_moves_unlocked(&config, &source_outputs)?);
-        self.log_engine_event(
-            "repair.auto-device",
-            format!(
-                "outputs={} failed={} skipped={} elapsed_ms={}",
-                outputs.len(),
-                outputs
-                    .iter()
-                    .filter(|output| output.error.is_some())
-                    .count(),
-                outputs.iter().filter(|output| output.skipped).count(),
-                started.elapsed().as_millis(),
-            ),
-        );
-        Ok(outputs)
-    }
-
-    fn repair_bluetooth_monitor_routes_unlocked(
-        &self,
-        config: &MixerConfig,
-    ) -> Result<Vec<CommandExecution>, EngineError> {
-        let plan = plan_ensure_graph(config);
-        let monitor_commands = plan
-            .commands
-            .into_iter()
-            .filter(command_is_mix_monitor_route)
-            .filter(command_targets_bluetooth_sink)
-            .collect::<Vec<_>>();
-        if monitor_commands.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let desired_routes = monitor_commands
-            .iter()
-            .filter_map(|command| {
-                let properties = command_arg_value(&command.args, "source_output_properties=")?;
-                let mix_id = graph_property_value_from_arg(properties, "mix_id")?;
-                let sink = command_arg_value(&command.args, "sink=")?;
-                Some((mix_id.to_owned(), sink.to_owned()))
-            })
-            .collect::<Vec<_>>();
-
-        let mut outputs = self.cleanup_modules(|module| {
-            module.role.as_deref() == Some("mix_monitor")
-                && desired_routes.iter().any(|(mix_id, sink)| {
-                    module.mix_id.as_deref() == Some(mix_id.as_str())
-                        && module
-                            .sink_name
-                            .as_deref()
-                            .is_some_and(|actual| audio_endpoint_names_match(actual, sink))
-                })
-        })?;
-
-        if !outputs.is_empty() {
-            thread::sleep(CLEANUP_MODULE_SETTLE);
-        }
-
-        let mut graph = self
-            .pw
-            .snapshot_for_config_with_effect_availability(None, Vec::new());
-        if monitor_commands
-            .iter()
-            .any(|command| !monitor_route_endpoints_available(command, &graph))
-        {
-            for _ in 0..6 {
-                thread::sleep(Duration::from_millis(200));
-                graph = self
-                    .pw
-                    .snapshot_for_config_with_effect_availability(None, Vec::new());
-                if monitor_commands
-                    .iter()
-                    .all(|command| monitor_route_endpoints_available(command, &graph))
-                {
-                    break;
-                }
-            }
-        }
-
-        if monitor_commands
-            .iter()
-            .any(|command| monitor_route_endpoints_available(command, &graph))
-        {
-            self.log_engine_event(
-                "hotplug.output",
-                "Bluetooth monitor route reset; waiting for A2DP transport before reconnecting",
-            );
-            thread::sleep(BLUETOOTH_MONITOR_ROUTE_SETTLE);
-            graph = self
-                .pw
-                .snapshot_for_config_with_effect_availability(None, Vec::new());
-        }
-
-        let commands = monitor_commands
-            .into_iter()
-            .filter_map(|command| {
-                if monitor_route_endpoints_available(&command, &graph) {
-                    Some(command)
-                } else {
-                    outputs.push(skipped_command_with_stderr(
-                        command,
-                        "Bluetooth monitor output is not visible; keeping route disconnected",
-                    ));
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        outputs.extend(
-            self.pw
-                .execute_all(commands)
-                .into_iter()
-                .map(command_execution),
-        );
-        Ok(outputs)
     }
 
     pub fn run_diagnostics(&self) -> Result<SoundCheckReport, EngineError> {
@@ -2953,660 +4209,6 @@ impl WaveLinuxEngine {
         })
     }
 
-    pub fn create_mix(self: &Arc<Self>, name: String) -> Result<Mix, EngineError> {
-        let mix = self.update_config(|config| config.create_mix(name))??;
-        let _ = self.repair_audio_graph_if_running();
-        Ok(mix)
-    }
-
-    pub fn rename_mix(self: &Arc<Self>, mix_id: String, name: String) -> Result<Mix, EngineError> {
-        let mix = self.update_config(|config| config.rename_mix(mix_id, name))??;
-        let _ = self.repair_audio_graph_if_running();
-        Ok(mix)
-    }
-
-    pub fn move_mix(&self, mix_id: String, direction: i32) -> Result<Mix, EngineError> {
-        self.update_config(|config| config.move_mix(mix_id, direction))?
-    }
-
-    pub fn delete_mix(self: &Arc<Self>, mix_id: String) -> Result<Mix, EngineError> {
-        let removed = self.update_config(|config| config.delete_mix(mix_id))??;
-        let _ = self.repair_audio_graph_if_running();
-        Ok(removed)
-    }
-
-    pub fn set_mix_volume(&self, mix_id: String, volume: f32) -> Result<Mix, EngineError> {
-        let mix = self.update_config(|config| config.set_mix_volume(mix_id, volume))??;
-        let graph_running = self.audio_graph_running_cached();
-        self.log_engine_event(
-            "level.mix",
-            format!(
-                "mix={} volume={:.3} graph_running={}",
-                mix.id, mix.volume, graph_running
-            ),
-        );
-        if graph_running {
-            let _audio_commands = self.lock_audio_commands()?;
-            let output =
-                command_execution(self.pw.execute(plan_pw_set_mix_volume(&mix, mix.volume)));
-            self.log_command_executions("level.mix", &[output]);
-            self.refresh_meter_targets_after_level_change();
-        }
-        Ok(mix)
-    }
-
-    pub fn set_mix_mute(&self, mix_id: String, muted: bool) -> Result<Mix, EngineError> {
-        let mix = self.update_config(|config| config.set_mix_mute(mix_id, muted))??;
-        let graph_running = self.audio_graph_running_cached();
-        self.log_engine_event(
-            "level.mix",
-            format!(
-                "mix={} muted={} graph_running={}",
-                mix.id, mix.muted, graph_running
-            ),
-        );
-        if graph_running {
-            let _audio_commands = self.lock_audio_commands()?;
-            let output = command_execution(self.pw.execute(plan_pw_set_mix_mute(&mix, mix.muted)));
-            self.log_command_executions("level.mix", &[output]);
-            self.refresh_meter_targets_after_level_change();
-        }
-        Ok(mix)
-    }
-
-    pub fn set_mix_icon(&self, mix_id: String, icon: Option<String>) -> Result<Mix, EngineError> {
-        self.update_config(|config| config.set_mix_icon(mix_id, icon))?
-    }
-
-    pub fn set_channel_icon(
-        &self,
-        channel_id: String,
-        icon: Option<String>,
-    ) -> Result<Channel, EngineError> {
-        self.update_config(|config| config.set_channel_icon(channel_id, icon))?
-    }
-
-    pub fn set_mix_monitor_output(
-        self: &Arc<Self>,
-        mix_id: String,
-        output: Option<String>,
-    ) -> Result<Mix, EngineError> {
-        let mix = self.update_config(|config| {
-            let mix = config.set_mix_monitor_output(mix_id, output)?;
-            if mix.id == "monitor" {
-                config.settings.monitor_follows_default_output = false;
-            }
-            Ok(mix)
-        })??;
-        let _ = self.repair_audio_graph_if_running();
-        Ok(mix)
-    }
-
-    pub fn set_mix_outputs(
-        self: &Arc<Self>,
-        mix_id: String,
-        outputs: Vec<String>,
-    ) -> Result<Mix, EngineError> {
-        let mix = self.update_config(|config| config.set_mix_outputs(mix_id, outputs))??;
-        let _ = self.repair_audio_graph_if_running();
-        Ok(mix)
-    }
-
-    pub fn create_channel(
-        self: &Arc<Self>,
-        name: String,
-        kind: ChannelKind,
-    ) -> Result<Channel, EngineError> {
-        let channel = self.update_config(|config| config.create_channel(name, kind))??;
-        let _ = self.repair_audio_graph_if_running();
-        Ok(channel)
-    }
-
-    pub fn rename_channel(
-        self: &Arc<Self>,
-        channel_id: String,
-        name: String,
-    ) -> Result<Channel, EngineError> {
-        let channel = self.update_config(|config| config.rename_channel(channel_id, name))??;
-        let _ = self.rebuild_effect_chain_configs();
-        let _ = self.repair_audio_graph_if_running();
-        Ok(channel)
-    }
-
-    pub fn move_channel(&self, channel_id: String, direction: i32) -> Result<Channel, EngineError> {
-        self.update_config(|config| config.move_channel(channel_id, direction))?
-    }
-
-    pub fn delete_channel(self: &Arc<Self>, channel_id: String) -> Result<Channel, EngineError> {
-        let removed = self.update_config(|config| config.delete_channel(channel_id))??;
-        let _ = self.rebuild_effect_chain_configs();
-        let _ = self.repair_audio_graph_if_running();
-        Ok(removed)
-    }
-
-    pub fn set_channel_linked(
-        &self,
-        channel_id: String,
-        linked: bool,
-    ) -> Result<Channel, EngineError> {
-        self.update_config(|config| config.set_channel_linked(channel_id, linked))?
-    }
-
-    pub fn set_channel_input(
-        self: &Arc<Self>,
-        channel_id: String,
-        source_device: Option<String>,
-    ) -> Result<Channel, EngineError> {
-        let source_device = self.sanitize_hardware_input_for_bluetooth_a2dp(source_device);
-        let channel =
-            self.update_config(|config| config.set_channel_input(channel_id, source_device))??;
-        let _ = self.repair_audio_graph_if_running();
-        Ok(channel)
-    }
-
-    pub fn set_hardware_input_device(
-        self: &Arc<Self>,
-        channel_id: String,
-        source_device: Option<String>,
-    ) -> Result<Channel, EngineError> {
-        self.set_channel_input(channel_id, source_device)
-    }
-
-    pub fn set_channel_input_mode(
-        self: &Arc<Self>,
-        channel_id: String,
-        input_mode: ChannelInputMode,
-    ) -> Result<Channel, EngineError> {
-        let channel =
-            self.update_config(|config| config.set_channel_input_mode(channel_id, input_mode))??;
-        let _ = self.repair_audio_graph_if_running();
-        Ok(channel)
-    }
-
-    pub fn restore_device(self: &Arc<Self>, kind: String) -> Result<MixerConfig, EngineError> {
-        let normalized_kind = kind.trim().to_ascii_lowercase();
-        let config = self.update_config(|config| {
-            match normalized_kind.as_str() {
-                "input" | "source" => {
-                    let source = config.device_policy.restorable_input.clone();
-                    if let Some(source) = source {
-                        if let Some(channel) = config
-                            .channels
-                            .iter_mut()
-                            .find(|channel| channel.kind.uses_hardware_slot())
-                        {
-                            channel.source_device = Some(source.clone());
-                            config.device_policy.preferred_input = Some(source);
-                        }
-                    }
-                    config.device_policy.restorable_input = None;
-                    config.device_policy.active_input_fallback = false;
-                }
-                "output" | "sink" => {
-                    let output = config.device_policy.restorable_output.clone();
-                    if let Some(output) = output {
-                        let mix_index = config
-                            .mixes
-                            .iter()
-                            .position(|mix| mix.id == "monitor")
-                            .or_else(|| (!config.mixes.is_empty()).then_some(0));
-                        if let Some(mix_index) = mix_index {
-                            let mix = &mut config.mixes[mix_index];
-                            mix.set_outputs(vec![output.clone()]);
-                            config.device_policy.preferred_output = Some(output);
-                        }
-                    }
-                    config.device_policy.restorable_output = None;
-                    config.device_policy.active_output_fallback = false;
-                }
-                _ => return Err(ModelError::InvalidName),
-            }
-            Ok(config.clone())
-        })??;
-        let _ = self.repair_audio_graph_if_running();
-        Ok(config)
-    }
-
-    pub fn set_settings(
-        self: &Arc<Self>,
-        settings: MixerSettings,
-    ) -> Result<MixerSettings, EngineError> {
-        self.apply_start_at_login(settings.start_at_login)?;
-        let (settings, audio_graph_needs_repair) = self.update_config(|config| {
-            let previous = config.settings.clone();
-            let settings = config.set_settings(settings);
-            Ok((
-                settings.clone(),
-                settings_affect_audio_graph(&previous, &settings),
-            ))
-        })??;
-        if audio_graph_needs_repair {
-            let _ = self.repair_audio_graph_if_running();
-        }
-        Ok(settings)
-    }
-
-    pub fn list_hardware_profiles(&self) -> Result<HardwareProfileUiState, EngineError> {
-        let catalog = self.hardware_profiles()?;
-        let config = self.read_config()?.clone();
-        Ok(hardware_profile_ui_state(&catalog, &config.device_policy))
-    }
-
-    pub fn streamer_devices_config(&self) -> Result<StreamerDevicesConfig, EngineError> {
-        Ok(self.read_config()?.streamer_devices.clone())
-    }
-
-    pub fn ensure_streamer_binding_profiles(
-        &self,
-        profiles: Vec<StreamerBindingProfile>,
-    ) -> Result<StreamerDevicesConfig, EngineError> {
-        self.update_config(|config| Ok(config.ensure_streamer_binding_profiles(profiles)))?
-    }
-
-    pub fn set_streamer_device_enabled(
-        &self,
-        device_id: String,
-        enabled: bool,
-    ) -> Result<StreamerDevicesConfig, EngineError> {
-        self.update_config(|config| config.set_streamer_device_enabled(device_id, enabled))?
-    }
-
-    pub fn set_streamer_binding_profile(
-        &self,
-        profile: StreamerBindingProfile,
-    ) -> Result<StreamerBindingProfile, EngineError> {
-        self.update_config(|config| config.set_streamer_binding_profile(profile))?
-    }
-
-    pub fn set_device_hardware_profile(
-        &self,
-        device_id: String,
-        profile_id: Option<String>,
-    ) -> Result<HardwareProfileUiState, EngineError> {
-        let device_id = device_id.trim().to_string();
-        if device_id.is_empty() {
-            return Err(ModelError::InvalidName.into());
-        }
-        let profile_id = profile_id
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        if let Some(profile_id) = profile_id.as_deref() {
-            let config = self.read_config()?.clone();
-            let catalog = self.hardware_profiles()?;
-            if profile_id != config.device_policy.fallback_hardware_profile.id
-                && !catalog
-                    .profiles
-                    .iter()
-                    .any(|entry| entry.profile.id == profile_id)
-            {
-                return Err(ModelError::InvalidConfig(format!(
-                    "unknown hardware profile: {profile_id}"
-                ))
-                .into());
-            }
-        }
-
-        self.update_config(|config| {
-            if let Some(profile_id) = profile_id.clone() {
-                config
-                    .device_policy
-                    .hardware_profile_assignments
-                    .insert(device_id.clone(), profile_id);
-            } else {
-                config
-                    .device_policy
-                    .hardware_profile_assignments
-                    .remove(&device_id);
-            }
-            Ok(())
-        })??;
-        self.log_engine_event(
-            "hardware.profile.assignment",
-            format!(
-                "device={} profile={}",
-                device_id,
-                profile_id.as_deref().unwrap_or("auto")
-            ),
-        );
-        let _ = self.refresh_runtime();
-        self.list_hardware_profiles()
-    }
-
-    pub fn set_fallback_hardware_profile(
-        &self,
-        fallback_profile: FallbackHardwareProfile,
-    ) -> Result<HardwareProfileUiState, EngineError> {
-        let fallback_profile = fallback_profile.normalized();
-        let fallback_id = fallback_profile.id.clone();
-        self.update_config(|config| {
-            let old_id = config.device_policy.fallback_hardware_profile.id.clone();
-            config.device_policy.fallback_hardware_profile = fallback_profile.clone();
-            if old_id != fallback_id {
-                for assigned_profile_id in config
-                    .device_policy
-                    .hardware_profile_assignments
-                    .values_mut()
-                {
-                    if *assigned_profile_id == old_id {
-                        *assigned_profile_id = fallback_id.clone();
-                    }
-                }
-            }
-            Ok(())
-        })??;
-        self.log_engine_event(
-            "hardware.profile.fallback",
-            format!("profile={} name={}", fallback_id, fallback_profile.name),
-        );
-        let _ = self.refresh_runtime();
-        self.list_hardware_profiles()
-    }
-
-    pub fn set_hardware_profile_policy(
-        &self,
-        profile_id: String,
-        name: Option<String>,
-        latency_policy: LatencyPolicy,
-        routing_policy: RoutingPolicy,
-    ) -> Result<HardwareProfileUiState, EngineError> {
-        let profile_id = clean_profile_id(profile_id)?;
-        let name = name.and_then(clean_optional_profile_name);
-        let config = self.read_config()?.clone();
-        if profile_id == config.device_policy.fallback_hardware_profile.id {
-            let mut fallback_profile = config.device_policy.fallback_hardware_profile.clone();
-            if let Some(name) = name {
-                fallback_profile.name = name;
-            }
-            fallback_profile.latency_policy = normalized_profile_latency(latency_policy);
-            fallback_profile.routing_policy = normalized_profile_routing(routing_policy);
-            return self.set_fallback_hardware_profile(fallback_profile);
-        }
-
-        let catalog = self.hardware_profiles()?;
-        let mut profile = hardware_profile_by_id(&catalog, &profile_id)
-            .cloned()
-            .ok_or_else(|| {
-                ModelError::InvalidConfig(format!("unknown hardware profile: {profile_id}"))
-            })?;
-        if let Some(name) = name {
-            profile.name = name;
-        }
-        profile.latency_policy = normalized_profile_latency(latency_policy);
-        profile.routing_policy = normalized_profile_routing(routing_policy);
-        profile.revision = profile.revision.saturating_add(1).max(1);
-        let path = self.write_local_hardware_profile_override(&profile)?;
-        self.reload_hardware_profiles_cache()?;
-        self.log_engine_event(
-            "hardware.profile.override",
-            format!("profile={} path={}", profile.id, path.display()),
-        );
-        let _ = self.refresh_runtime();
-        self.list_hardware_profiles()
-    }
-
-    pub fn set_channel_volume(
-        &self,
-        channel_id: String,
-        mix_id: String,
-        volume: f32,
-    ) -> Result<wavelinux_model::MixBus, EngineError> {
-        let (bus, channel) = self.update_config(|config| {
-            let bus = config.set_channel_volume(channel_id.clone(), mix_id.clone(), volume)?;
-            let channel = config
-                .channels
-                .iter()
-                .find(|channel| channel.id == channel_id)
-                .cloned()
-                .ok_or_else(|| ModelError::ChannelNotFound(channel_id.clone()))?;
-            Ok((bus, channel))
-        })??;
-
-        let graph_running = self.audio_graph_running_cached();
-        self.log_engine_event(
-            "level.channel",
-            format!(
-                "channel={} mix={} volume={:.3} linked={} graph_running={}",
-                channel.id, mix_id, bus.volume, channel.linked, graph_running
-            ),
-        );
-        if !graph_running {
-            return Ok(bus);
-        }
-
-        let _audio_commands = self.lock_audio_commands()?;
-        let mut outputs = Vec::new();
-        if channel.linked {
-            for (linked_mix_id, linked_bus) in &channel.mix_buses {
-                if !linked_bus.enabled {
-                    continue;
-                }
-                outputs.extend(self.execute_channel_bus_volume_unlocked(
-                    &channel.id,
-                    linked_mix_id,
-                    linked_bus.volume,
-                ));
-            }
-        } else if bus.enabled {
-            outputs.extend(self.execute_channel_bus_volume_unlocked(
-                &channel.id,
-                &mix_id,
-                bus.volume,
-            ));
-        }
-        self.log_command_executions("level.channel", &outputs);
-        self.refresh_meter_targets_after_level_change();
-        Ok(bus)
-    }
-
-    pub fn set_channel_mute(
-        &self,
-        channel_id: String,
-        mix_id: String,
-        muted: bool,
-    ) -> Result<wavelinux_model::MixBus, EngineError> {
-        let bus = self.update_config(|config| {
-            config.set_channel_mute(channel_id.clone(), mix_id.clone(), muted)
-        })??;
-        let graph_running = self.audio_graph_running_cached();
-        self.log_engine_event(
-            "level.channel",
-            format!(
-                "channel={} mix={} muted={} graph_running={}",
-                channel_id, mix_id, bus.muted, graph_running
-            ),
-        );
-        if !graph_running {
-            return Ok(bus);
-        }
-
-        let _audio_commands = self.lock_audio_commands()?;
-        let outputs = if bus.enabled {
-            self.execute_channel_bus_mute_unlocked(&channel_id, &mix_id, bus.muted)
-        } else {
-            Vec::new()
-        };
-        self.log_command_executions("level.channel", &outputs);
-        self.refresh_meter_targets_after_level_change();
-        Ok(bus)
-    }
-
-    pub fn set_channel_bus_enabled(
-        self: &Arc<Self>,
-        channel_id: String,
-        mix_id: String,
-        enabled: bool,
-    ) -> Result<wavelinux_model::MixBus, EngineError> {
-        let bus = self.update_config(|config| {
-            config.set_channel_bus_enabled(channel_id.clone(), mix_id.clone(), enabled)
-        })??;
-        let _ = self.repair_audio_graph_if_running();
-        Ok(bus)
-    }
-
-    pub fn assign_app_to_channel(
-        &self,
-        channel_id: String,
-        matcher: AppMatcher,
-    ) -> Result<AppRoute, EngineError> {
-        self.update_config(|config| config.assign_app_to_channel(channel_id, matcher))?
-    }
-
-    pub fn remove_app_route(&self, matcher: AppMatcher) -> Result<Option<AppRoute>, EngineError> {
-        self.update_config(|config| Ok(config.remove_app_route(matcher)))?
-    }
-
-    pub fn set_app_volume_preset(
-        &self,
-        matcher: AppMatcher,
-        volume: f32,
-    ) -> Result<AppVolumePreset, EngineError> {
-        self.update_config(|config| config.set_app_volume_preset(matcher, volume))?
-    }
-
-    pub fn remove_app_volume_preset(
-        &self,
-        matcher: AppMatcher,
-    ) -> Result<Option<AppVolumePreset>, EngineError> {
-        self.update_config(|config| Ok(config.remove_app_volume_preset(matcher)))?
-    }
-
-    pub fn forget_app(&self, matcher: AppMatcher) -> Result<Option<KnownApp>, EngineError> {
-        self.update_config(|config| Ok(config.forget_app(matcher)))?
-    }
-
-    pub fn restore_app(&self, matcher: AppMatcher) -> Result<Option<KnownApp>, EngineError> {
-        self.update_config(|config| Ok(config.restore_app(matcher)))?
-    }
-
-    pub fn pin_app_identity(
-        &self,
-        matcher: AppMatcher,
-        label: String,
-    ) -> Result<KnownApp, EngineError> {
-        self.update_config(|config| config.pin_app_identity(matcher, label))?
-    }
-
-    pub fn merge_app_identity(
-        &self,
-        source: AppMatcher,
-        target: AppMatcher,
-    ) -> Result<KnownApp, EngineError> {
-        self.update_config(|config| config.merge_app_identity(source, target))?
-    }
-
-    pub fn reset_app_identity(&self, matcher: AppMatcher) -> Result<Option<KnownApp>, EngineError> {
-        self.update_config(|config| Ok(config.reset_app_identity(matcher)))?
-    }
-
-    pub fn move_app_stream(
-        &self,
-        stream_id: String,
-        channel_id: String,
-    ) -> Result<CommandExecution, EngineError> {
-        let saved_config = self.read_config()?.clone();
-        let route_config = self.effective_config_for_audio_graph(&saved_config);
-        let channel = route_config
-            .channels
-            .iter()
-            .find(|channel| channel.id == channel_id)
-            .cloned()
-            .ok_or_else(|| ModelError::ChannelNotFound(channel_id.clone()))?;
-        let command = plan_move_app_stream(&stream_id, &channel);
-        if !self.audio_graph_running_cached() {
-            return Ok(skipped_command(command));
-        }
-
-        let _audio_commands = self.lock_audio_commands()?;
-        let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
-        let output = ignore_stale_stream_command(output, &stream_id);
-        if output.error.is_none() && !output.skipped {
-            let level_outputs = self.apply_managed_route_levels(&route_config)?;
-            self.log_command_executions("route.levels", &level_outputs);
-        }
-        Ok(output)
-    }
-
-    pub fn move_app_stream_to_default(
-        &self,
-        stream_id: String,
-    ) -> Result<CommandExecution, EngineError> {
-        let command = plan_move_app_stream_to_default(&stream_id);
-        if !self.audio_graph_running_cached() {
-            return Ok(skipped_command(command));
-        }
-
-        let _audio_commands = self.lock_audio_commands()?;
-        let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
-        Ok(ignore_stale_stream_command(output, &stream_id))
-    }
-
-    pub fn set_app_stream_volume(
-        &self,
-        stream_id: String,
-        volume: f32,
-    ) -> Result<CommandExecution, EngineError> {
-        let command = plan_set_stream_volume(&stream_id, volume);
-        if !self.audio_graph_running_cached() {
-            return Ok(skipped_command(command));
-        }
-
-        let _audio_commands = self.lock_audio_commands()?;
-        let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
-        Ok(ignore_stale_stream_command(output, &stream_id))
-    }
-
-    pub fn set_app_stream_mute(
-        &self,
-        stream_id: String,
-        muted: bool,
-    ) -> Result<CommandExecution, EngineError> {
-        let command = plan_set_stream_mute(&stream_id, muted);
-        if !self.audio_graph_running_cached() {
-            return Ok(skipped_command(command));
-        }
-
-        let _audio_commands = self.lock_audio_commands()?;
-        let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
-        Ok(ignore_stale_stream_command(output, &stream_id))
-    }
-
-    pub fn set_effect_chain(
-        self: &Arc<Self>,
-        channel_id: String,
-        effects: Vec<EffectInstance>,
-    ) -> Result<Channel, EngineError> {
-        let channel =
-            self.update_config(|config| config.set_effect_chain(channel_id, effects))??;
-        self.schedule_effect_graph_sync(channel.id.clone());
-        Ok(channel)
-    }
-
-    pub fn set_effect_param(
-        self: &Arc<Self>,
-        channel_id: String,
-        instance_id: String,
-        param_id: String,
-        value: f32,
-    ) -> Result<Channel, EngineError> {
-        let channel = self.update_config(|config| {
-            config.set_effect_param(channel_id, instance_id, param_id, value)
-        })??;
-        self.schedule_effect_graph_sync(channel.id.clone());
-        Ok(channel)
-    }
-
-    pub fn bypass_effect(
-        self: &Arc<Self>,
-        channel_id: String,
-        instance_id: String,
-        bypassed: bool,
-    ) -> Result<Channel, EngineError> {
-        let channel =
-            self.update_config(|config| config.bypass_effect(channel_id, instance_id, bypassed))??;
-        self.schedule_effect_graph_sync(channel.id.clone());
-        Ok(channel)
-    }
-
     pub fn cleanup_audio_graph(&self) -> Result<Vec<CommandExecution>, EngineError> {
         self.log_engine_event("cleanup.full", "requested full graph cleanup");
         self.stop_meter_supervisor();
@@ -3703,6 +4305,7 @@ impl WaveLinuxEngine {
                 active_sink: active_sink.as_deref(),
                 managed_modules: &managed_modules,
                 source_outputs: &source_outputs,
+                sink_inputs: &sink_inputs,
             },
         ) {
             return Ok(false);
@@ -3794,44 +4397,6 @@ impl WaveLinuxEngine {
         Ok(outputs)
     }
 
-    fn reset_startup_hardware_microphone_levels(
-        &self,
-    ) -> Result<Vec<CommandExecution>, EngineError> {
-        let inputs = match self.pw.list_inputs() {
-            Ok(inputs) => inputs,
-            Err(err) => {
-                self.log_engine_event(
-                    "startup.source-levels",
-                    format!(
-                        "skipped microphone level reset because inputs could not be read: {err}"
-                    ),
-                );
-                return Ok(Vec::new());
-            }
-        };
-        let bluetooth_cards = self.bluetooth_audio_cards().unwrap_or_default();
-        let commands = startup_microphone_level_reset_commands(&inputs, &bluetooth_cards);
-        if commands.is_empty() {
-            self.log_engine_event("startup.source-levels", "no hardware microphones to reset");
-            return Ok(Vec::new());
-        }
-
-        let _audio_commands = self.lock_audio_commands()?;
-        Ok(commands
-            .into_iter()
-            .map(|command| {
-                let stream_id = command_stream_id(&command).map(str::to_string);
-                let result = self.pw.execute(command.clone());
-                let output = command_execution_with_spec(command, result);
-                if let Some(stream_id) = stream_id {
-                    ignore_stale_stream_command(output, &stream_id)
-                } else {
-                    output
-                }
-            })
-            .collect())
-    }
-
     fn route_configured_streams(
         &self,
         config: &MixerConfig,
@@ -3855,32 +4420,35 @@ impl WaveLinuxEngine {
             return Ok(BTreeSet::new());
         }
 
-        self.log_engine_event(
-            "route.streams",
-            format!(
-                "routing {} configured app stream(s): {}",
-                routes.len(),
-                routes
-                    .iter()
-                    .map(|(stream, channel)| format!("{}->{}", stream.id, channel.id))
-                    .collect::<Vec<_>>()
-                    .join(","),
-            ),
-        );
         let _audio_commands = self.lock_audio_commands()?;
         let mut routed_stream_ids = BTreeSet::new();
         for (stream, channel) in routes {
-            let command = plan_move_app_stream(&stream.id, &channel);
+            let native_node_id = match self
+                .pipewire_registry
+                .playback_route_backend(&stream.id, &channel.virtual_sink_name)
+            {
+                Some(StreamRouteBackend::Native(route)) => Some((
+                    route.stream_node_id,
+                    route.target_object_serial,
+                    route.target_node_name,
+                )),
+                Some(StreamRouteBackend::Unavailable(detail)) => {
+                    self.log_engine_event(
+                        "route.streams",
+                        format!("stream={} deferred={detail}", stream.id),
+                    );
+                    continue;
+                }
+                Some(StreamRouteBackend::PulseCompatibility) | None => None,
+            };
+            let command = if let Some((node_id, serial, target)) = native_node_id.as_ref() {
+                plan_move_native_app_stream(*node_id, serial, target)
+            } else {
+                plan_move_app_stream(&stream.id, &channel)
+            };
             let output = command_execution_with_spec(command.clone(), self.pw.execute(command));
             let output = ignore_stale_stream_command(output, &stream.id);
             if output.skipped && output.stderr.contains("disappeared") {
-                self.log_engine_event(
-                    "route.streams",
-                    format!(
-                        "stream {} disappeared before configured routing; ignoring stale state",
-                        stream.id
-                    ),
-                );
                 continue;
             }
 
@@ -3889,13 +4457,26 @@ impl WaveLinuxEngine {
             self.log_command_executions("route.streams", std::slice::from_ref(&output));
             if move_succeeded {
                 routed_stream_ids.insert(stream.id.clone());
-                let target_volume = configured_volume_for_stream(config, &stream).unwrap_or(1.0);
-                let volume_command = plan_set_stream_volume(&stream.id, target_volume);
-                let volume_output = command_execution_with_spec(
-                    volume_command.clone(),
-                    self.pw.execute(volume_command),
-                );
-                self.log_command_executions("route.streams", std::slice::from_ref(&volume_output));
+                if let Some(target_volume) = configured_volume_update_for_stream(config, &stream) {
+                    let volume_command = native_node_id
+                        .as_ref()
+                        .map(|(node_id, _, _)| {
+                            plan_set_native_stream_volume(*node_id, target_volume)
+                        })
+                        .unwrap_or_else(|| plan_set_stream_volume(&stream.id, target_volume));
+                    let volume_output = command_execution_with_spec(
+                        volume_command.clone(),
+                        self.pw.execute(volume_command),
+                    );
+                    let volume_output = ignore_stale_stream_command(volume_output, &stream.id);
+                    if volume_output.skipped && volume_output.stderr.contains("disappeared") {
+                        continue;
+                    }
+                    self.log_command_executions(
+                        "route.streams",
+                        std::slice::from_ref(&volume_output),
+                    );
+                }
             }
         }
         Ok(routed_stream_ids)
@@ -3916,9 +4497,12 @@ impl WaveLinuxEngine {
             bluetooth_cards,
         )?;
         for output in &outputs {
+            if output.skipped && output.stderr.contains("disappeared") {
+                continue;
+            }
             self.log_command_executions("default.input", std::slice::from_ref(output));
         }
-        Ok(!outputs.is_empty())
+        Ok(outputs.iter().any(|output| !output.skipped))
     }
 
     fn execute_capture_stream_moves_unlocked(
@@ -3983,15 +4567,38 @@ impl WaveLinuxEngine {
                 commands.len()
             ),
         );
-        let outputs = commands
+        let results = commands
             .into_iter()
-            .map(|command| {
+            .filter_map(|pulse_command| {
+                let source_output_id = pulse_command.args.get(1)?.clone();
+                let target_source = pulse_command.args.get(2)?.clone();
+                let signature = capture_move_signature_for_command(&pulse_command, source_outputs);
+                let command = match self
+                    .pipewire_registry
+                    .capture_route_backend(&source_output_id, &target_source)
+                {
+                    Some(StreamRouteBackend::Native(route)) => plan_move_native_capture_stream(
+                        route.stream_node_id,
+                        &route.target_object_serial,
+                        &route.target_node_name,
+                    ),
+                    Some(StreamRouteBackend::Unavailable(detail)) => {
+                        self.log_engine_event(
+                            "default.input",
+                            format!("stream={source_output_id} deferred={detail}"),
+                        );
+                        return None;
+                    }
+                    Some(StreamRouteBackend::PulseCompatibility) | None => pulse_command,
+                };
                 let result = self.pw.execute(command.clone());
-                command_execution_with_spec(command, result)
+                let output = command_execution_with_spec(command, result);
+                let output = ignore_stale_stream_command(output, &source_output_id);
+                Some((source_output_id, signature, output))
             })
             .collect::<Vec<_>>();
-        self.remember_failed_capture_moves(&outputs, source_outputs)?;
-        Ok(outputs)
+        self.remember_failed_capture_moves(&results)?;
+        Ok(results.into_iter().map(|(_, _, output)| output).collect())
     }
 
     fn capture_move_recently_failed(&self, source_output_id: &str, signature: &str) -> bool {
@@ -4020,23 +4627,18 @@ impl WaveLinuxEngine {
 
     fn remember_failed_capture_moves(
         &self,
-        outputs: &[CommandExecution],
-        source_outputs: &[SourceOutputRoute],
+        results: &[(String, String, CommandExecution)],
     ) -> Result<(), EngineError> {
         let mut failures = self
             .capture_move_failures
             .lock()
             .map_err(|_| EngineError::LockPoisoned)?;
         let now = Instant::now();
-        for output in outputs {
-            let Some(source_output_id) = output.command.args.get(1) else {
-                continue;
-            };
+        for (source_output_id, signature, output) in results {
             if output.error.is_some() {
-                let signature = capture_move_signature_for_command(&output.command, source_outputs);
                 let attempts = failures
                     .get(source_output_id)
-                    .filter(|failure| failure.signature == signature)
+                    .filter(|failure| failure.signature == *signature)
                     .map(|failure| failure.attempts.saturating_add(1))
                     .unwrap_or(1);
                 failures.insert(
@@ -4044,7 +4646,7 @@ impl WaveLinuxEngine {
                     CaptureMoveFailure {
                         failed_at: now,
                         attempts,
-                        signature,
+                        signature: signature.clone(),
                     },
                 );
             } else {
@@ -4142,8 +4744,8 @@ impl WaveLinuxEngine {
         let updates = streams
             .iter()
             .filter_map(|stream| {
-                let volume = configured_volume_for_stream(config, stream)?;
-                ((stream.volume - volume).abs() > 0.01).then(|| (stream.id.clone(), volume))
+                configured_volume_update_for_stream(config, stream)
+                    .map(|volume| (stream.id.clone(), volume))
             })
             .collect::<Vec<_>>();
 
@@ -4221,40 +4823,34 @@ impl WaveLinuxEngine {
         &self,
         config: &MixerConfig,
     ) -> Result<Vec<CommandExecution>, EngineError> {
-        let mut outputs = Vec::new();
-        for mix in &config.mixes {
-            outputs.push(command_execution(
-                self.pw.execute(plan_pw_set_mix_volume(mix, mix.volume)),
-            ));
-            outputs.push(command_execution(
-                self.pw.execute(plan_pw_set_mix_mute(mix, mix.muted)),
-            ));
+        let (state, _) = self
+            .pw
+            .audio_state_snapshot_with_effect_availability_timed(None, Vec::new());
+        let mut commands = graph_sink_level_commands(config, &state.sink_levels);
+        commands.extend(managed_route_level_commands(
+            config,
+            &state.routes.source_output_routes,
+            &state.routes.sink_input_routes,
+        ));
+        if !commands.is_empty() {
+            self.log_engine_event(
+                "route.levels",
+                format!("repairing {} graph level(s)", commands.len()),
+            );
         }
-
-        for channel in &config.channels {
-            outputs.push(command_execution(self.pw.execute(
-                plan_set_managed_sink_volume(&channel.virtual_sink_name, 1.0),
-            )));
-            outputs.push(command_execution(self.pw.execute(
-                plan_set_managed_sink_mute(&channel.virtual_sink_name, false),
-            )));
-            for (mix_id, bus) in &channel.mix_buses {
-                if !bus.enabled {
-                    continue;
-                }
-                outputs.extend(self.execute_channel_bus_volume_unlocked(
-                    &channel.id,
-                    mix_id,
-                    bus.volume,
-                ));
-                outputs.extend(self.execute_channel_bus_mute_unlocked(
-                    &channel.id,
-                    mix_id,
-                    bus.muted,
-                ));
-            }
+        let mut outputs = commands
+            .into_iter()
+            .map(|command| {
+                let result = self.pw.execute(command.clone());
+                command_execution_with_stale_stream_skip(command, result)
+            })
+            .collect::<Vec<_>>();
+        // Keep this call for non-snapshot callers whose route handles can change
+        // while levels are being restored. It becomes a no-op once the first
+        // snapshot-derived commands have converged.
+        if outputs.iter().any(|output| output.error.is_some()) {
+            outputs.extend(self.apply_managed_route_levels(config)?);
         }
-        outputs.extend(self.apply_managed_route_levels(config)?);
         Ok(outputs)
     }
 
@@ -4302,6 +4898,26 @@ impl WaveLinuxEngine {
             .into_iter()
             .map(command_execution)
             .collect())
+    }
+
+    fn confirmed_default_device_lock_repair_needed(
+        &self,
+        config: &MixerConfig,
+        observed_source: Option<&str>,
+        observed_sink: Option<&str>,
+    ) -> bool {
+        if !default_device_lock_repair_needed(config, observed_source, observed_sink) {
+            return false;
+        }
+        let input_repair = default_input_lock_repair_needed(config, observed_source)
+            && self.pw.default_source().map_or(true, |current| {
+                default_input_lock_repair_needed(config, current.as_deref())
+            });
+        let output_repair = default_output_lock_repair_needed(config, observed_sink)
+            && self.pw.default_sink().map_or(true, |current| {
+                default_output_lock_repair_needed(config, current.as_deref())
+            });
+        input_repair || output_repair
     }
 
     fn restore_startup_default_devices(
@@ -4373,18 +4989,26 @@ impl WaveLinuxEngine {
         force_all_a2dp: bool,
     ) -> Result<Vec<CommandExecution>, EngineError> {
         let bluetooth_cards = self.bluetooth_audio_cards()?;
+        self.ensure_bluetooth_a2dp_profiles_for_cards(&bluetooth_cards, force_all_a2dp)
+    }
+
+    fn ensure_bluetooth_a2dp_profiles_for_cards(
+        &self,
+        bluetooth_cards: &[BluetoothAudioCard],
+        force_all_a2dp: bool,
+    ) -> Result<Vec<CommandExecution>, EngineError> {
         let commands = {
             let mut runtime = self
                 .runtime
                 .write()
                 .map_err(|_| EngineError::LockPoisoned)?;
-            prune_initialized_bluetooth_cards(&mut runtime, &bluetooth_cards);
+            prune_initialized_bluetooth_cards(&mut runtime, bluetooth_cards);
             let commands = plan_bluetooth_a2dp_profiles(
-                &bluetooth_cards,
+                bluetooth_cards,
                 &runtime.initialized_bluetooth_cards,
                 force_all_a2dp,
             );
-            for card in &bluetooth_cards {
+            for card in bluetooth_cards {
                 if let Some(pref) = &card.preferred_a2dp_profile {
                     runtime
                         .initialized_bluetooth_cards
@@ -4421,13 +5045,21 @@ impl WaveLinuxEngine {
     }
 
     fn bluetooth_audio_cards(&self) -> Result<Vec<BluetoothAudioCard>, EngineError> {
-        let mut cards = self.pw.bluetooth_audio_cards()?;
-        if let Ok(catalog) = self.hardware_profiles() {
-            let inputs = self.pw.list_inputs().unwrap_or_default();
-            let outputs = self.pw.list_outputs().unwrap_or_default();
+        let cards = self.pw.bluetooth_audio_cards()?;
+        let inputs = self.pw.list_inputs().unwrap_or_default();
+        let outputs = self.pw.list_outputs().unwrap_or_default();
+        self.bluetooth_audio_cards_for_devices(cards, &inputs, &outputs)
+    }
 
-            let mut profiled_inputs = inputs.clone();
-            let mut profiled_outputs = outputs.clone();
+    fn bluetooth_audio_cards_for_devices(
+        &self,
+        mut cards: Vec<BluetoothAudioCard>,
+        inputs: &[DeviceInfo],
+        outputs: &[DeviceInfo],
+    ) -> Result<Vec<BluetoothAudioCard>, EngineError> {
+        if let Ok(catalog) = self.hardware_profiles() {
+            let mut profiled_inputs = inputs.to_vec();
+            let mut profiled_outputs = outputs.to_vec();
             if let Ok(config) = self.read_config() {
                 apply_profile_policy_to_devices(
                     &mut profiled_inputs,
@@ -4532,51 +5164,111 @@ impl WaveLinuxEngine {
             &self.read_config()?.clone(),
             runtime_prefix,
         );
+        self.rebuild_effect_chain_configs_from_config(&config, runtime_prefix)
+    }
+
+    fn rebuild_effect_chain_configs_from_config(
+        &self,
+        config: &MixerConfig,
+        runtime_prefix: &str,
+    ) -> Result<Vec<PathBuf>, EngineError> {
+        let _writes = self
+            .effect_config_writes
+            .lock()
+            .map_err(|_| EngineError::LockPoisoned)?;
         let dir = self.paths.effect_chains_dir();
+        let control_dir = self.paths.control_sockets_dir();
         fs::create_dir_all(&dir)?;
+        create_private_runtime_dir(&control_dir)?;
 
         let catalog = EffectCatalog::default();
         let mut written = Vec::new();
         let mut desired = BTreeSet::new();
-        for channel in config
-            .channels
-            .iter()
-            .filter(|channel| channel.effects.iter().any(|effect| !effect.bypassed))
-        {
+        let mut desired_sockets = BTreeSet::new();
+        let mut manifest_channels = Vec::new();
+        for channel in config.channels.iter().filter(|channel| {
+            channel_uses_persistent_audio_core(channel)
+                || channel.effects.iter().any(|effect| !effect.bypassed)
+        }) {
+            let filter_channel = channel_with_effect_enable_applied(channel);
             let file_name = effect_chain_file_name(&channel.id, "conf");
             desired.insert(file_name.clone());
             let path = dir.join(&file_name);
             let tmp_path = dir.join(format!(".{}.{}.tmp", file_name, Uuid::new_v4().simple()));
-            fs::write(&tmp_path, render_filter_chain(channel, &catalog))?;
+            fs::write(&tmp_path, render_filter_chain(&filter_channel, &catalog))?;
             fs::rename(&tmp_path, &path)?;
             written.push(path);
 
             let file_name = effect_chain_file_name(&channel.id, "json");
             desired.insert(file_name.clone());
             let path = dir.join(&file_name);
-            let tmp_path = dir.join(format!(".{}.{}.tmp", file_name, Uuid::new_v4().simple()));
             let mut dsp_config = dsp_channel_config(channel);
+            dsp_config.generation = self.desired_effect_generation(&channel.id);
             dsp_config.adaptive_latency =
                 dsp_adaptive_latency_config(&config.settings.adaptive_latency);
-            dsp_config.control_socket_path = Some(
-                dir.join(effect_chain_file_name(&channel.id, "sock"))
-                    .to_string_lossy()
-                    .to_string(),
-            );
-            fs::write(&tmp_path, serde_json::to_string_pretty(&dsp_config)?)?;
-            fs::rename(&tmp_path, &path)?;
+            let socket_path = self.paths.channel_control_socket(&channel.id);
+            let socket_name = socket_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("wavelinux6-chain-channel.sock")
+                .to_string();
+            desired_sockets.insert(socket_name.clone());
+            dsp_config.control_socket_path = Some(socket_path.to_string_lossy().into_owned());
+            if runtime_prefix == "wavelinux6" {
+                manifest_channels.push(dsp_config.clone());
+            }
+            write_json(&path, &dsp_config)?;
             written.push(path);
 
             if channel_uses_adaptive_latency_bridge(channel) {
                 let file_name = effect_chain_file_name(&channel.id, "bridge.json");
                 desired.insert(file_name.clone());
                 let path = dir.join(&file_name);
-                let tmp_path = dir.join(format!(".{}.{}.tmp", file_name, Uuid::new_v4().simple()));
-                let bridge_config = dsp_adaptive_bridge_config(channel, &config, &dir);
-                fs::write(&tmp_path, serde_json::to_string_pretty(&bridge_config)?)?;
-                fs::rename(&tmp_path, &path)?;
+                let bridge_config =
+                    dsp_adaptive_bridge_config(channel, config, &self.paths.runtime_dir);
+                write_json(&path, &bridge_config)?;
                 written.push(path);
             }
+        }
+
+        if runtime_prefix == "wavelinux6" {
+            manifest_channels.sort_by(|left, right| left.channel_id.cmp(&right.channel_id));
+            let learned_quantum_floors = self
+                .adaptive_quantum
+                .lock()
+                .map_err(|_| EngineError::LockPoisoned)?
+                .learned_floors
+                .clone();
+            let mut manifest_mixes = config
+                .mixes
+                .iter()
+                .map(|mix| {
+                    let mut dsp_mix = dsp_mix_config(mix, config);
+                    dsp_mix.pipewire_quantum_frames =
+                        learned_quantum_floor_for_mix(mix, &learned_quantum_floors);
+                    dsp_mix
+                })
+                .collect::<Vec<_>>();
+            manifest_mixes.sort_by(|left, right| left.mix_id.cmp(&right.mix_id));
+            let manifest_content = serde_json::to_string(&(&manifest_channels, &manifest_mixes))?;
+            desired_sockets.insert(wavelinux_dsp::MIX_CONTROL_SOCKET_FILE.into());
+            let manifest = wavelinux_dsp::DspCoreManifest::new(
+                content_revision(&manifest_content),
+                manifest_channels,
+            )
+            .with_runtime_root(self.paths.runtime_dir.to_string_lossy().into_owned())
+            .with_mixes(
+                manifest_mixes,
+                Some(
+                    self.paths
+                        .mix_control_socket()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            );
+            let manifest_path = dir.join(AUDIO_CORE_MANIFEST_FILE);
+            write_json(&manifest_path, &manifest)?;
+            written.push(manifest_path);
         }
 
         for entry in fs::read_dir(&dir)? {
@@ -4594,6 +5286,19 @@ impl WaveLinuxEngine {
                 fs::remove_file(path)?;
             }
         }
+        for entry in fs::read_dir(&control_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.starts_with(&format!("{}-chain-", graph_prefix()))
+                && name.ends_with(".sock")
+                && !desired_sockets.contains(name)
+            {
+                fs::remove_file(path)?;
+            }
+        }
         Ok(written)
     }
 
@@ -4601,18 +5306,116 @@ impl WaveLinuxEngine {
         &self,
         config: &MixerConfig,
     ) -> Result<Vec<CommandExecution>, EngineError> {
+        if graph_prefix() == "wavelinux6" {
+            let mut outputs = vec![self.start_persistent_audio_core_process()];
+            if outputs.iter().all(|output| output.error.is_none()) {
+                outputs.extend(self.sync_persistent_audio_core_targets()?);
+                outputs.extend(
+                    config
+                        .channels
+                        .iter()
+                        .filter(|channel| channel_uses_persistent_audio_core(channel))
+                        .map(|channel| self.start_effect_chain_process(channel)),
+                );
+            }
+            return Ok(outputs);
+        }
         let mut outputs = Vec::new();
-        for channel in config
-            .channels
-            .iter()
-            .filter(|channel| channel.effects.iter().any(|effect| !effect.bypassed))
-        {
+        for channel in config.channels.iter().filter(|channel| {
+            channel_uses_persistent_audio_core(channel)
+                || channel.effects.iter().any(|effect| !effect.bypassed)
+        }) {
             outputs.push(self.start_effect_chain_process(channel));
         }
         Ok(outputs)
     }
 
+    fn sync_persistent_audio_core_targets(&self) -> Result<Vec<CommandExecution>, EngineError> {
+        let manifest_path = self
+            .paths
+            .effect_chains_dir()
+            .join(AUDIO_CORE_MANIFEST_FILE);
+        let mut manifest: wavelinux_dsp::DspCoreManifest = read_json(&manifest_path)?;
+        manifest
+            .resolve_control_socket_paths()
+            .map_err(EngineError::Io)?;
+        manifest.validate().map_err(EngineError::Io)?;
+        let mut outputs = Vec::with_capacity(manifest.channels.len() + manifest.mixes.len());
+        for channel in &manifest.channels {
+            if !channel.input_target_capable && channel.input_target_node_name.is_none() {
+                continue;
+            }
+            let target = channel.input_target_node_name.as_deref();
+            let args = match target {
+                Some(target) => vec![
+                    "set_input_target".to_string(),
+                    channel.channel_id.clone(),
+                    target.to_string(),
+                ],
+                None => vec!["clear_input_target".to_string(), channel.channel_id.clone()],
+            };
+            let command = CommandSpec::new(
+                CommandDomain::Effects,
+                dsp_helper_program(),
+                args,
+                format!(
+                    "retarget '{}' without restarting audio",
+                    channel.channel_name
+                ),
+            );
+            if self.options.dry_run {
+                outputs.push(skipped_command(command));
+                continue;
+            }
+            let result = send_audio_core_input_target(
+                &self.paths.channel_control_socket(&channel.channel_id),
+                &channel.channel_id,
+                target,
+            )
+            .map(|response| CommandOutput {
+                command: command.clone(),
+                stdout: response.to_string(),
+                stderr: "persistent input target update applied".into(),
+                skipped: true,
+            })
+            .map_err(PwError::Io);
+            outputs.push(command_execution_with_spec(command, result));
+        }
+        for mix in &manifest.mixes {
+            let command = CommandSpec::new(
+                CommandDomain::Effects,
+                dsp_helper_program(),
+                std::iter::once("set_output_targets".to_string())
+                    .chain(std::iter::once(mix.mix_id.clone()))
+                    .chain(mix.output_target_node_names.iter().cloned())
+                    .collect::<Vec<_>>(),
+                format!("retarget '{}' without restarting audio", mix.mix_name),
+            );
+            if self.options.dry_run {
+                outputs.push(skipped_command(command));
+                continue;
+            }
+            let result = send_audio_core_output_targets(
+                &self.paths.mix_control_socket(),
+                &mix.mix_id,
+                &mix.output_target_node_names,
+            )
+            .map(|response| CommandOutput {
+                command: command.clone(),
+                stdout: response.to_string(),
+                stderr: "persistent output target update applied".into(),
+                skipped: true,
+            })
+            .map_err(PwError::Io);
+            outputs.push(command_execution_with_spec(command, result));
+        }
+        Ok(outputs)
+    }
+
     fn start_effect_chain_process(&self, channel: &Channel) -> CommandExecution {
+        if channel_uses_persistent_audio_core(channel) {
+            return self.update_persistent_audio_core_channel(channel);
+        }
         let path = self
             .paths
             .effect_chains_dir()
@@ -4621,7 +5424,7 @@ impl WaveLinuxEngine {
             channel,
             &path,
             wavelinux_dsp::AudioRuntimeMode::from_env(),
-            graph_prefix() == "wavelinux5",
+            graph_prefix() == "wavelinux6",
         );
         let command = CommandSpec::new(
             CommandDomain::Effects,
@@ -4630,6 +5433,13 @@ impl WaveLinuxEngine {
             format!("start '{}' effect chain", channel.name),
         );
         let log_path = self.effect_chain_log_path(channel);
+        let json_path = path.with_extension("json");
+        let config_revision =
+            audio_core_channel_revision_from_path(&json_path).unwrap_or_else(|_| {
+                content_revision(&fs::read_to_string(&json_path).unwrap_or_default())
+            });
+        let native_core = program.ends_with("wavelinux6-audio-core")
+            && args.iter().any(|arg| arg == "--run-native");
 
         let result = if self.options.dry_run {
             Ok(CommandOutput {
@@ -4641,12 +5451,40 @@ impl WaveLinuxEngine {
         } else if self.effect_chain_process_is_tracked(&channel.id)
             && self.effect_chain_nodes_visible(channel)
         {
-            Ok(CommandOutput {
-                command: command.clone(),
-                stdout: String::new(),
-                stderr: "effect helper is already running".into(),
-                skipped: true,
-            })
+            let current_revision = self.tracked_effect_chain_config_revision(&channel.id);
+            if native_core && current_revision.as_deref() != Some(config_revision.as_str()) {
+                let socket_path = self.paths.channel_control_socket(&channel.id);
+                match send_effect_chain_swap(
+                    &socket_path,
+                    &channel.id,
+                    &json_path,
+                    &config_revision,
+                    self.desired_effect_generation(&channel.id),
+                ) {
+                    Ok(response) => {
+                        self.remember_effect_chain_config_revision(
+                            &channel.id,
+                            config_revision.clone(),
+                        );
+                        Ok(CommandOutput {
+                            command: command.clone(),
+                            stdout: response.to_string(),
+                            stderr: "native chain swap queued without restarting audio".into(),
+                            skipped: true,
+                        })
+                    }
+                    Err(err) => Err(PwError::Io(format!(
+                        "native chain update was rejected; existing audio remains active: {err}"
+                    ))),
+                }
+            } else {
+                Ok(CommandOutput {
+                    command: command.clone(),
+                    stdout: String::new(),
+                    stderr: "effect helper is already running at the requested revision".into(),
+                    skipped: true,
+                })
+            }
         } else {
             if self.effect_chain_process_is_tracked(&channel.id) {
                 self.stop_tracked_effect_chain_process(&channel.id);
@@ -4682,6 +5520,7 @@ impl WaveLinuxEngine {
                                 EffectChainProcess {
                                     program: program.clone(),
                                     child: child_process,
+                                    config_revision: config_revision.clone(),
                                 },
                             ) {
                                 let previous_pid = previous.child.id();
@@ -4695,6 +5534,10 @@ impl WaveLinuxEngine {
                                     format!("replaced tracked {} pid={previous_pid}", channel.id),
                                 );
                             }
+                            self.remember_effect_chain_config_revision(
+                                &channel.id,
+                                config_revision.clone(),
+                            );
                             Ok(CommandOutput {
                                 command: command.clone(),
                                 stdout: String::new(),
@@ -4716,7 +5559,312 @@ impl WaveLinuxEngine {
         command_execution(result)
     }
 
+    fn start_persistent_audio_core_process(&self) -> CommandExecution {
+        let manifest_path = self
+            .paths
+            .effect_chains_dir()
+            .join(AUDIO_CORE_MANIFEST_FILE);
+        let program = dsp_helper_program();
+        let args = vec![
+            "--run-core".to_string(),
+            "--manifest".to_string(),
+            manifest_path.to_string_lossy().to_string(),
+        ];
+        let command = CommandSpec::new(
+            CommandDomain::Effects,
+            program.clone(),
+            args.clone(),
+            "start persistent WaveLinux 6 audio core",
+        );
+        if self.options.dry_run {
+            return skipped_command(command);
+        }
+
+        self.reap_effect_chain_processes();
+        let topology_revision = audio_core_topology_revision(&manifest_path).unwrap_or_default();
+        let running_revision = self
+            .effect_chain_processes
+            .lock()
+            .ok()
+            .and_then(|processes| {
+                processes
+                    .get(AUDIO_CORE_PROCESS_KEY)
+                    .map(|process| process.config_revision.clone())
+            });
+        if running_revision.as_deref() == Some(topology_revision.as_str()) {
+            match self.wait_for_persistent_audio_core_ready(&manifest_path) {
+                Ok(ready) => {
+                    return CommandExecution {
+                    command,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "persistent audio core is already running; readiness acknowledged for {ready} endpoints"
+                    ),
+                    skipped: true,
+                    error: None,
+                    };
+                }
+                Err(error) => {
+                    self.log_engine_event(
+                        "effects.ready",
+                        format!("tracked audio core failed readiness; restarting: {error}"),
+                    );
+                    self.mark_all_effect_cores_unavailable(&error);
+                    self.stop_tracked_effect_chain_process(AUDIO_CORE_PROCESS_KEY);
+                }
+            }
+        } else if running_revision.is_some() {
+            self.stop_tracked_effect_chain_process(AUDIO_CORE_PROCESS_KEY);
+        }
+
+        let log_path = self.paths.config_dir.join(AUDIO_CORE_LOG_FILE);
+        let result = (|| -> Result<CommandOutput, PwError> {
+            let stdout = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&log_path)
+                .map_err(|err| PwError::Io(err.to_string()))?;
+            let stderr = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(|err| PwError::Io(err.to_string()))?;
+            let mut child = host_command(&program);
+            child
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr));
+            #[cfg(unix)]
+            child.process_group(0);
+            let child_process = child.spawn().map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    PwError::CommandNotFound(program.clone())
+                } else {
+                    PwError::Io(err.to_string())
+                }
+            })?;
+            let pid = child_process.id();
+            self.effect_chain_processes
+                .lock()
+                .map_err(|_| PwError::Io("effect process lock poisoned".into()))?
+                .insert(
+                    AUDIO_CORE_PROCESS_KEY.into(),
+                    EffectChainProcess {
+                        program: program.clone(),
+                        child: child_process,
+                        config_revision: topology_revision,
+                    },
+                );
+            let ready = self
+                .wait_for_persistent_audio_core_ready(&manifest_path)
+                .map_err(PwError::Io)?;
+            self.refresh_persistent_effect_revisions();
+            Ok(CommandOutput {
+                command: command.clone(),
+                stdout: String::new(),
+                stderr: format!(
+                    "{} pid={pid} readiness_endpoints={ready}",
+                    log_path.display()
+                ),
+                skipped: false,
+            })
+        })();
+        if let Err(error) = &result {
+            let error = format!("audio core startup failed: {error}");
+            self.mark_all_effect_cores_unavailable(&error);
+            self.stop_tracked_effect_chain_process(AUDIO_CORE_PROCESS_KEY);
+        }
+        command_execution(result)
+    }
+
+    fn wait_for_persistent_audio_core_ready(&self, manifest_path: &Path) -> Result<usize, String> {
+        let mut manifest: wavelinux_dsp::DspCoreManifest = read_json(manifest_path)
+            .map_err(|err| format!("failed to read audio-core readiness manifest: {err}"))?;
+        manifest.resolve_control_socket_paths()?;
+        manifest.validate()?;
+        let mut ready = 0_usize;
+        for channel in &manifest.channels {
+            let socket_path = self.paths.channel_control_socket(&channel.channel_id);
+            let response = wait_for_audio_core_ready(
+                &socket_path,
+                &channel.channel_id,
+                EFFECT_CORE_READY_TIMEOUT,
+            )?;
+            self.observe_effect_core_ready(channel, &response);
+            self.log_engine_event(
+                "effects.ready",
+                format!(
+                    "channel_id={} desired_generation={} acknowledged_generation={} protocol={} resolved_control_socket={}",
+                    channel.channel_id,
+                    channel.generation,
+                    response.acknowledged_generation,
+                    response.protocol_version,
+                    socket_path.display(),
+                ),
+            );
+            ready = ready.saturating_add(1);
+        }
+        if !manifest.mixes.is_empty() {
+            let socket_path = self.paths.mix_control_socket();
+            for mix in &manifest.mixes {
+                let response = wait_for_audio_core_ready(
+                    &socket_path,
+                    &mix.mix_id,
+                    EFFECT_CORE_READY_TIMEOUT,
+                )?;
+                self.log_engine_event(
+                    "effects.ready",
+                    format!(
+                        "mix_id={} protocol={} resolved_control_socket={}",
+                        mix.mix_id,
+                        response.protocol_version,
+                        socket_path.display(),
+                    ),
+                );
+                ready = ready.saturating_add(1);
+            }
+        }
+        self.change_signal.notify_state();
+        Ok(ready)
+    }
+
+    fn observe_effect_core_ready(
+        &self,
+        config: &wavelinux_dsp::DspChannelConfig,
+        response: &AudioCoreDiagnosticsResponse,
+    ) {
+        self.observe_effect_core_diagnostics(&config.channel_id, Ok(response));
+    }
+
+    fn mark_all_effect_cores_unavailable(&self, error: &str) {
+        let slots = self
+            .effect_updates
+            .lock()
+            .map(|slots| slots.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for slot in slots {
+            if let Ok(mut state) = slot.state.lock() {
+                state.status.core_healthy = false;
+                state.status.pending = false;
+                state.status.last_error = Some(error.to_string());
+                state.status.resolve_state();
+            }
+        }
+        self.change_signal.notify_state();
+    }
+
+    fn observe_effect_core_diagnostics(
+        &self,
+        channel_id: &str,
+        observation: Result<&AudioCoreDiagnosticsResponse, &str>,
+    ) {
+        let slot = self
+            .effect_updates
+            .lock()
+            .ok()
+            .and_then(|slots| slots.get(channel_id).cloned());
+        let Some(slot) = slot else {
+            return;
+        };
+        let Ok(mut state) = slot.state.lock() else {
+            return;
+        };
+        let previous = state.status.clone();
+        match observation {
+            Ok(response) => {
+                state.status.core_healthy = true;
+                if response.acknowledged_generation == state.status.desired_generation {
+                    state.status.applied_generation = response.acknowledged_generation;
+                    state.status.pending = false;
+                    state.status.last_error = None;
+                    state.recovery_not_before = None;
+                } else {
+                    state.status.pending = true;
+                    state.status.last_error = Some(format!(
+                        "audio core acknowledged generation {}, latest desired generation is {}",
+                        response.acknowledged_generation, state.status.desired_generation
+                    ));
+                }
+            }
+            Err(error) => {
+                state.status.core_healthy = false;
+                state.status.pending = false;
+                state.status.last_error = Some(error.to_string());
+            }
+        }
+        state.status.resolve_state();
+        if state.status != previous {
+            self.change_signal.notify_state();
+        }
+    }
+
+    fn update_persistent_audio_core_channel(&self, channel: &Channel) -> CommandExecution {
+        if !self.audio_core_process_is_tracked() {
+            return self.start_persistent_audio_core_process();
+        }
+        let json_path = self
+            .paths
+            .effect_chains_dir()
+            .join(effect_chain_file_name(&channel.id, "json"));
+        let socket_path = self.paths.channel_control_socket(&channel.id);
+        let config_revision =
+            audio_core_channel_revision_from_path(&json_path).unwrap_or_else(|_| {
+                content_revision(&fs::read_to_string(&json_path).unwrap_or_default())
+            });
+        let command = CommandSpec::new(
+            CommandDomain::Effects,
+            dsp_helper_program(),
+            ["swap_chain", channel.id.as_str()],
+            format!("update '{}' in persistent audio core", channel.name),
+        );
+        if self
+            .tracked_effect_chain_config_revision(&channel.id)
+            .as_deref()
+            == Some(config_revision.as_str())
+        {
+            return CommandExecution {
+                command,
+                stdout: String::new(),
+                stderr: "persistent audio core already has this channel revision".into(),
+                skipped: true,
+                error: None,
+            };
+        }
+        match send_effect_chain_swap(
+            &socket_path,
+            &channel.id,
+            &json_path,
+            &config_revision,
+            self.desired_effect_generation(&channel.id),
+        ) {
+            Ok(response) => {
+                self.remember_effect_chain_config_revision(&channel.id, config_revision);
+                CommandExecution {
+                    command,
+                    stdout: response.to_string(),
+                    stderr: "native chain swap queued without restarting audio".into(),
+                    skipped: true,
+                    error: None,
+                }
+            }
+            Err(err) => CommandExecution {
+                command,
+                stdout: String::new(),
+                stderr: String::new(),
+                skipped: true,
+                error: Some(format!(
+                    "native chain update was rejected; existing audio remains active: {err}"
+                )),
+            },
+        }
+    }
+
     fn effect_chain_log_path(&self, channel: &Channel) -> PathBuf {
+        if channel_uses_persistent_audio_core(channel) {
+            return self.paths.config_dir.join(AUDIO_CORE_LOG_FILE);
+        }
         self.paths
             .config_dir
             .join(effect_chain_file_name(&channel.id, "log"))
@@ -4740,7 +5888,7 @@ impl WaveLinuxEngine {
         channel_ids: &BTreeSet<String>,
         runtime_prefix: &str,
     ) -> Vec<(String, PathBuf)> {
-        if runtime_prefix != "wavelinux5" {
+        if runtime_prefix != "wavelinux6" {
             return Vec::new();
         }
 
@@ -4768,7 +5916,7 @@ impl WaveLinuxEngine {
         channel_ids: &BTreeSet<String>,
         runtime_prefix: &str,
     ) {
-        if runtime_prefix != "wavelinux5" {
+        if runtime_prefix != "wavelinux6" {
             return;
         }
 
@@ -4909,19 +6057,186 @@ impl WaveLinuxEngine {
 
     fn recent_effect_chain_failure_summary(&self, channel: &Channel) -> Option<String> {
         let current_log_path = self.effect_chain_log_path(channel);
+        let channel_filter =
+            channel_uses_persistent_audio_core(channel).then_some(channel.id.as_str());
         [
             Some(current_log_path),
             self.active_effect_chain_failure_log_path(channel),
         ]
         .into_iter()
         .flatten()
-        .find_map(|path| effect_chain_log_failure_summary(&path))
+        .find_map(|path| effect_chain_log_failure_summary(&path, channel_filter))
+    }
+
+    fn collect_audio_core_status(&self, config: &MixerConfig) -> Vec<AudioCoreChannelStatus> {
+        let mut queried = self.query_audio_core_status(config);
+        apply_audio_core_discontinuity_deltas(&mut queried, &self.audio_core_underrun_counters);
+        queried
+    }
+
+    fn collect_adaptive_audio_core_status(
+        &self,
+        config: &MixerConfig,
+    ) -> Vec<AudioCoreChannelStatus> {
+        let mut queried = self.query_audio_core_status(config);
+        apply_audio_core_discontinuity_deltas(
+            &mut queried,
+            &self.adaptive_core_discontinuity_counters,
+        );
+        queried
+    }
+
+    fn query_audio_core_status(&self, config: &MixerConfig) -> Vec<AudioCoreChannelStatus> {
+        let mut queried = config
+            .channels
+            .iter()
+            .filter(|channel| channel_uses_persistent_audio_core(channel))
+            .map(|channel| {
+                let socket_path = self.paths.channel_control_socket(&channel.id);
+                match query_audio_core_diagnostics(&socket_path, &channel.id) {
+                    Ok(response) => {
+                        self.observe_effect_core_diagnostics(&channel.id, Ok(&response));
+                        AudioCoreChannelStatus {
+                            channel_id: channel.id.clone(),
+                            online: true,
+                            sample_rate_hz: response.sample_rate_hz,
+                            target_latency_msec: response.target_latency_msec,
+                            current_buffer_frames: response.current_buffer_frames,
+                            buffer_fill_msec: response.current_buffer_frames as f32 * 1000.0
+                                / response.sample_rate_hz.max(1) as f32,
+                            captured_frames: response.captured_frames,
+                            rendered_frames: response.rendered_frames,
+                            dropped_frames: response.dropped_frames,
+                            underrun_frames: response.underrun_frames,
+                            underrun_delta: 0,
+                            capture_callbacks: response.capture_callbacks,
+                            worker_running: response.worker_running,
+                            worker_blocks: response.worker_blocks,
+                            worker_queue_frames: response.worker_queue_frames,
+                            worker_queue_capacity_frames: response.worker_queue_capacity_frames,
+                            worker_overrun_frames: response.worker_overrun_frames,
+                            accelerator_provider: response.accelerator_provider,
+                            accelerator_active_states: response.accelerator_active_states,
+                            accelerator_provider_pids: response.accelerator_provider_pids,
+                            accelerator_provider_blocks: response.accelerator_provider_blocks,
+                            accelerator_fallback_blocks: response.accelerator_fallback_blocks,
+                            accelerator_deadline_misses: response.accelerator_deadline_misses,
+                            accelerator_invalid_results: response.accelerator_invalid_results,
+                            accelerator_stale_results: response.accelerator_stale_results,
+                            accelerator_disabled_states: response.accelerator_disabled_states,
+                            accelerator_startup_failures: response.accelerator_startup_failures,
+                            accelerator_last_failure: response.accelerator_last_failure,
+                            last_process_micros: response.last_process_micros,
+                            max_process_micros: response.max_process_micros,
+                            chain_swaps: response.chain_swaps,
+                            non_finite_blocks: response.non_finite_blocks,
+                            non_finite_samples: response.non_finite_samples,
+                            non_finite_effect_mask: response.non_finite_effect_mask,
+                            chain_recoveries: response.chain_recoveries,
+                            chain_swap_replacements: response.chain_swap_replacements,
+                            retired_chain_overflows: response.retired_chain_overflows,
+                            submitted_generation: response.submitted_generation,
+                            acknowledged_generation: response.acknowledged_generation,
+                            submitted_route_generation: response.submitted_route_generation,
+                            applied_route_generation: response.applied_route_generation,
+                            input_target_node_name: response.input_target_node_name,
+                            output_target_node_names: response.output_target_node_names,
+                            route_target_error: response.route_target_error,
+                            rate_correction: response.rate_correction,
+                            error: None,
+                        }
+                    }
+                    Err(error) => {
+                        self.observe_effect_core_diagnostics(&channel.id, Err(&error));
+                        AudioCoreChannelStatus {
+                            channel_id: channel.id.clone(),
+                            error: Some(error),
+                            ..AudioCoreChannelStatus::default()
+                        }
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        if config.mixes.iter().any(mix_uses_persistent_audio_core) {
+            let socket_path = self.paths.mix_control_socket();
+            queried.extend(config.mixes.iter().map(|mix| {
+                let status_id = format!("mix:{}", mix.id);
+                match query_audio_core_diagnostics(&socket_path, &mix.id) {
+                    Ok(response) => AudioCoreChannelStatus {
+                        channel_id: status_id,
+                        online: true,
+                        sample_rate_hz: response.sample_rate_hz,
+                        target_latency_msec: response.target_latency_msec,
+                        current_buffer_frames: response.current_buffer_frames,
+                        buffer_fill_msec: response.current_buffer_frames as f32 * 1000.0
+                            / response.sample_rate_hz.max(1) as f32,
+                        captured_frames: response.captured_frames,
+                        rendered_frames: response.rendered_frames,
+                        dropped_frames: response.dropped_frames,
+                        underrun_frames: response.underrun_frames,
+                        underrun_delta: 0,
+                        capture_callbacks: response.capture_callbacks,
+                        worker_running: response.worker_running,
+                        worker_blocks: response.worker_blocks,
+                        worker_queue_frames: response.worker_queue_frames,
+                        worker_queue_capacity_frames: response.worker_queue_capacity_frames,
+                        worker_overrun_frames: response.worker_overrun_frames,
+                        accelerator_provider: response.accelerator_provider,
+                        accelerator_active_states: response.accelerator_active_states,
+                        accelerator_provider_pids: response.accelerator_provider_pids,
+                        accelerator_provider_blocks: response.accelerator_provider_blocks,
+                        accelerator_fallback_blocks: response.accelerator_fallback_blocks,
+                        accelerator_deadline_misses: response.accelerator_deadline_misses,
+                        accelerator_invalid_results: response.accelerator_invalid_results,
+                        accelerator_stale_results: response.accelerator_stale_results,
+                        accelerator_disabled_states: response.accelerator_disabled_states,
+                        accelerator_startup_failures: response.accelerator_startup_failures,
+                        accelerator_last_failure: response.accelerator_last_failure,
+                        last_process_micros: response.last_process_micros,
+                        max_process_micros: response.max_process_micros,
+                        chain_swaps: response.chain_swaps,
+                        non_finite_blocks: response.non_finite_blocks,
+                        non_finite_samples: response.non_finite_samples,
+                        non_finite_effect_mask: response.non_finite_effect_mask,
+                        chain_recoveries: response.chain_recoveries,
+                        chain_swap_replacements: response.chain_swap_replacements,
+                        retired_chain_overflows: response.retired_chain_overflows,
+                        submitted_generation: response.submitted_generation,
+                        acknowledged_generation: response.acknowledged_generation,
+                        submitted_route_generation: response.submitted_route_generation,
+                        applied_route_generation: response.applied_route_generation,
+                        input_target_node_name: response.input_target_node_name,
+                        output_target_node_names: response.output_target_node_names,
+                        route_target_error: response.route_target_error,
+                        rate_correction: response.rate_correction,
+                        error: None,
+                    },
+                    Err(error) => AudioCoreChannelStatus {
+                        channel_id: status_id,
+                        error: Some(error),
+                        ..AudioCoreChannelStatus::default()
+                    },
+                }
+            }));
+        }
+        queried.sort_by(|left, right| left.channel_id.cmp(&right.channel_id));
+        queried
     }
 
     fn effect_chain_diagnostics(
         &self,
         config: &MixerConfig,
         graph: &RuntimeGraph,
+    ) -> Vec<Diagnostic> {
+        let audio_core = self.collect_audio_core_status(config);
+        self.effect_chain_diagnostics_with_core(config, graph, &audio_core)
+    }
+
+    fn effect_chain_diagnostics_with_core(
+        &self,
+        config: &MixerConfig,
+        graph: &RuntimeGraph,
+        audio_core: &[AudioCoreChannelStatus],
     ) -> Vec<Diagnostic> {
         let availability = graph
             .effect_availability
@@ -4930,6 +6245,7 @@ impl WaveLinuxEngine {
             .collect::<BTreeMap<_, _>>();
         let catalog = EffectCatalog::default();
         let mut diagnostics = Vec::new();
+        diagnostics.extend(audio_core_integrity_diagnostics(audio_core));
 
         for channel in config
             .channels
@@ -4984,19 +6300,36 @@ impl WaveLinuxEngine {
                 },
             });
 
-            let realtime_underrun_log = self.effect_chain_log_mentions_realtime_underrun(channel);
+            let live_core_status = audio_core
+                .iter()
+                .find(|status| status.channel_id == channel.id && status.online);
+            let realtime_underrun_log = live_core_status.map_or_else(
+                || self.effect_chain_log_mentions_realtime_underrun(channel),
+                |status| status.underrun_delta > 0,
+            );
             let preserved_failure_log = self.active_effect_chain_failure_log_path(channel);
             if realtime_underrun_log || preserved_failure_log.is_some() {
                 let current_log_path = self.effect_chain_log_path(channel);
                 let log_path = preserved_failure_log.as_ref().unwrap_or(&current_log_path);
-                let failure_summary = self
-                    .recent_effect_chain_failure_summary(channel)
-                    .map(|summary| format!(": {summary}"))
+                let failure_summary = live_core_status
+                    .map(|status| {
+                        format!(
+                            ": underrun_delta={} dropped_frames={} process_us={} buffer_ms={:.1}",
+                            status.underrun_delta,
+                            status.dropped_frames,
+                            status.last_process_micros,
+                            status.buffer_fill_msec
+                        )
+                    })
+                    .or_else(|| {
+                        self.recent_effect_chain_failure_summary(channel)
+                            .map(|summary| format!(": {summary}"))
+                    })
                     .unwrap_or_default();
                 let conf_path = self.active_effect_chain_failure_artifact_path(channel, "conf");
                 let json_path = self.active_effect_chain_failure_artifact_path(channel, "json");
                 let mut action = format!(
-                    "WaveLinux5 bypassed heavy FX to keep audio alive; inspect {} before reenabling the affected effect",
+                    "WaveLinux 6 bypassed heavy FX to keep audio alive; inspect {} before reenabling the affected effect",
                     log_path.display()
                 );
                 if let Some(conf_path) = conf_path {
@@ -5057,13 +6390,19 @@ impl WaveLinuxEngine {
     }
 
     fn effect_chain_log_mentions_realtime_underrun(&self, channel: &Channel) -> bool {
+        let channel_filter =
+            channel_uses_persistent_audio_core(channel).then_some(channel.id.as_str());
         effect_chain_log_mentions_recent(
             &self.effect_chain_log_path(channel),
             &["underrun detected", "processing too slow"],
+            channel_filter,
         )
         .is_some()
-            || effect_chain_log_recent_native_underrun(&self.effect_chain_log_path(channel))
-                .is_some()
+            || effect_chain_log_recent_native_underrun(
+                &self.effect_chain_log_path(channel),
+                channel_filter,
+            )
+            .is_some()
     }
 
     fn effect_chain_has_active_realtime_failure(&self, channel: &Channel) -> bool {
@@ -5076,13 +6415,20 @@ impl WaveLinuxEngine {
     }
 
     fn effect_chain_recent_log_mentions(&self, channel: &Channel, markers: &[&str]) -> bool {
-        if effect_chain_log_mentions_recent(&self.effect_chain_log_path(channel), markers).is_some()
+        let channel_filter =
+            channel_uses_persistent_audio_core(channel).then_some(channel.id.as_str());
+        if effect_chain_log_mentions_recent(
+            &self.effect_chain_log_path(channel),
+            markers,
+            channel_filter,
+        )
+        .is_some()
         {
             return true;
         }
         self.active_effect_chain_failure_log_path(channel)
             .as_deref()
-            .is_some_and(|path| effect_chain_log_mentions(path, markers))
+            .is_some_and(|path| effect_chain_log_mentions(path, markers, channel_filter))
     }
 
     fn config_with_unhealthy_effects_bypassed(&self, config: &MixerConfig) -> MixerConfig {
@@ -5094,9 +6440,9 @@ impl WaveLinuxEngine {
         config: &MixerConfig,
         runtime_prefix: &str,
     ) -> MixerConfig {
-        if runtime_prefix != "wavelinux5" {
-            // Stable WaveLinux keeps the existing behavior: runtime FX warnings
-            // remain diagnostic-only so user-selected processing is preserved.
+        if runtime_prefix != "wavelinux6" {
+            // Legacy runtimes keep warnings diagnostic-only so their behavior is
+            // not changed while WaveLinux 6 is being migrated.
             return config.clone();
         }
 
@@ -5115,7 +6461,7 @@ impl WaveLinuxEngine {
         config: &MixerConfig,
         runtime_prefix: &str,
     ) -> BTreeSet<String> {
-        if runtime_prefix != "wavelinux5" {
+        if runtime_prefix != "wavelinux6" {
             return BTreeSet::new();
         }
 
@@ -5137,18 +6483,25 @@ impl WaveLinuxEngine {
         &self,
         mut should_unload: impl FnMut(&ManagedModule) -> bool,
     ) -> Result<Vec<CommandExecution>, EngineError> {
-        let modules = self
-            .pw
-            .managed_modules()?
-            .into_iter()
+        let modules = self.pw.managed_modules()?;
+        Ok(self.cleanup_modules_from_snapshot(&modules, |module| should_unload(module)))
+    }
+
+    fn cleanup_modules_from_snapshot(
+        &self,
+        modules: &[ManagedModule],
+        mut should_unload: impl FnMut(&ManagedModule) -> bool,
+    ) -> Vec<CommandExecution> {
+        let modules = modules
+            .iter()
             .filter(|module| should_unload(module))
+            .cloned()
             .collect::<Vec<_>>();
-        Ok(self
-            .pw
+        self.pw
             .execute_all(plan_unload_modules(&modules))
             .into_iter()
             .map(command_execution)
-            .collect())
+            .collect()
     }
 
     fn cleanup_all_modules_until_clear(&self) -> Result<Vec<CommandExecution>, EngineError> {
@@ -5228,6 +6581,14 @@ impl WaveLinuxEngine {
         mix_id: &str,
         volume: f32,
     ) -> Vec<CommandExecution> {
+        if graph_prefix() == "wavelinux6" {
+            return vec![self.execute_native_mix_control_unlocked(
+                "set_mix_bus",
+                mix_id,
+                Some(channel_id),
+                serde_json::json!({ "volume": volume }),
+            )];
+        }
         let route_ids = self.channel_bus_route_ids_unlocked(channel_id, mix_id);
 
         plan_channel_bus_volume_commands(
@@ -5249,6 +6610,14 @@ impl WaveLinuxEngine {
         mix_id: &str,
         muted: bool,
     ) -> Vec<CommandExecution> {
+        if graph_prefix() == "wavelinux6" {
+            return vec![self.execute_native_mix_control_unlocked(
+                "set_mix_bus",
+                mix_id,
+                Some(channel_id),
+                serde_json::json!({ "muted": muted }),
+            )];
+        }
         let route_ids = self.channel_bus_route_ids_unlocked(channel_id, mix_id);
 
         plan_channel_bus_mute_commands(
@@ -5262,6 +6631,48 @@ impl WaveLinuxEngine {
             command_execution_with_stale_stream_skip(command, result)
         })
         .collect()
+    }
+
+    fn execute_native_mix_control_unlocked(
+        &self,
+        control_command: &str,
+        mix_id: &str,
+        channel_id: Option<&str>,
+        fields: serde_json::Value,
+    ) -> CommandExecution {
+        let command = CommandSpec::new(
+            CommandDomain::Level,
+            dsp_helper_program(),
+            [control_command, mix_id],
+            match channel_id {
+                Some(channel_id) => {
+                    format!("update native mix {mix_id} bus {channel_id}")
+                }
+                None => format!("update native mix {mix_id}"),
+            },
+        );
+        let mut payload = serde_json::json!({
+            "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+            "command": control_command,
+            "request_id": Uuid::new_v4().to_string(),
+            "mix_id": mix_id,
+        });
+        if let Some(channel_id) = channel_id {
+            payload["channel_id"] = serde_json::Value::String(channel_id.to_string());
+        }
+        if let (Some(payload), Some(fields)) = (payload.as_object_mut(), fields.as_object()) {
+            payload.extend(fields.clone());
+        }
+        let socket_path = self.paths.mix_control_socket();
+        let result = send_core_control_request(&socket_path, &payload)
+            .map(|response| CommandOutput {
+                command: command.clone(),
+                stdout: response.to_string(),
+                stderr: String::new(),
+                skipped: false,
+            })
+            .map_err(PwError::Io);
+        command_execution(result)
     }
 
     fn reap_effect_chain_processes(&self) {
@@ -5310,6 +6721,18 @@ impl WaveLinuxEngine {
 
     fn active_effect_chain_config_markers(&self) -> BTreeSet<String> {
         self.reap_effect_chain_processes();
+        if self.audio_core_process_is_tracked() {
+            return self
+                .effect_chain_revisions
+                .lock()
+                .map(|revisions| {
+                    revisions
+                        .keys()
+                        .map(|channel_id| effect_chain_file_name(channel_id, "conf"))
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
         self.effect_chain_processes
             .lock()
             .map(|processes| {
@@ -5322,10 +6745,56 @@ impl WaveLinuxEngine {
     }
 
     fn effect_chain_process_is_tracked(&self, channel_id: &str) -> bool {
+        if graph_prefix() == "wavelinux6" && channel_id != AUDIO_CORE_PROCESS_KEY {
+            return self.audio_core_process_is_tracked();
+        }
         self.reap_effect_chain_processes();
         self.effect_chain_processes
             .lock()
             .map(|processes| processes.contains_key(channel_id))
+            .unwrap_or(false)
+    }
+
+    fn tracked_effect_chain_config_revision(&self, channel_id: &str) -> Option<String> {
+        self.effect_chain_revisions
+            .lock()
+            .ok()
+            .and_then(|revisions| revisions.get(channel_id).cloned())
+    }
+
+    fn remember_effect_chain_config_revision(&self, channel_id: &str, revision: String) {
+        if let Ok(mut revisions) = self.effect_chain_revisions.lock() {
+            revisions.insert(channel_id.to_string(), revision);
+        }
+    }
+
+    fn refresh_persistent_effect_revisions(&self) {
+        let Ok(config) = self.read_config() else {
+            return;
+        };
+        let revisions = config
+            .channels
+            .iter()
+            .filter_map(|channel| {
+                let path = self
+                    .paths
+                    .effect_chains_dir()
+                    .join(effect_chain_file_name(&channel.id, "json"));
+                audio_core_channel_revision_from_path(&path)
+                    .ok()
+                    .map(|revision| (channel.id.clone(), revision))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if let Ok(mut current) = self.effect_chain_revisions.lock() {
+            *current = revisions;
+        }
+    }
+
+    fn audio_core_process_is_tracked(&self) -> bool {
+        self.reap_effect_chain_processes();
+        self.effect_chain_processes
+            .lock()
+            .map(|processes| processes.contains_key(AUDIO_CORE_PROCESS_KEY))
             .unwrap_or(false)
     }
 
@@ -5345,6 +6814,11 @@ impl WaveLinuxEngine {
         let Some(mut process) = child else {
             return;
         };
+        if channel_id == AUDIO_CORE_PROCESS_KEY {
+            if let Ok(mut revisions) = self.effect_chain_revisions.lock() {
+                revisions.clear();
+            }
+        }
 
         let pid = process.child.id();
         match terminate_effect_chain_child(
@@ -5417,9 +6891,27 @@ impl WaveLinuxEngine {
         active_mix_ids: &BTreeSet<String>,
         preserve_stale_monitor_routes: bool,
     ) -> Result<Vec<CommandExecution>, EngineError> {
+        let modules = self.pw.managed_modules()?;
+        self.cleanup_stale_modules_for_config_from_snapshot(
+            config,
+            active_app_channel_ids,
+            active_mix_ids,
+            preserve_stale_monitor_routes,
+            &modules,
+        )
+    }
+
+    fn cleanup_stale_modules_for_config_from_snapshot(
+        &self,
+        config: &MixerConfig,
+        active_app_channel_ids: &BTreeSet<String>,
+        active_mix_ids: &BTreeSet<String>,
+        preserve_stale_monitor_routes: bool,
+        modules: &[ManagedModule],
+    ) -> Result<Vec<CommandExecution>, EngineError> {
         let mut outputs = self.cleanup_stale_processes()?;
         let mut seen = BTreeSet::new();
-        outputs.extend(self.cleanup_modules(|module| {
+        outputs.extend(self.cleanup_modules_from_snapshot(modules, |module| {
             if preserve_stale_monitor_routes && module.role.as_deref() == Some("mix_monitor") {
                 return false;
             }
@@ -5433,18 +6925,19 @@ impl WaveLinuxEngine {
             }
 
             module_dedupe_key_for_config(module, config).is_some_and(|key| !seen.insert(key))
-        })?);
+        }));
         Ok(outputs)
     }
 
-    fn cleanup_stale_auto_device_modules_for_config(
+    fn cleanup_stale_auto_device_modules_for_config_from_snapshot(
         &self,
         config: &MixerConfig,
         active_mix_ids: &BTreeSet<String>,
         preserve_stale_monitor_routes: bool,
-    ) -> Result<Vec<CommandExecution>, EngineError> {
+        modules: &[ManagedModule],
+    ) -> Vec<CommandExecution> {
         let mut seen = BTreeSet::new();
-        self.cleanup_modules(|module| {
+        self.cleanup_modules_from_snapshot(modules, |module| {
             if !module_is_auto_device_route(module) {
                 return false;
             }
@@ -5471,11 +6964,10 @@ impl WaveLinuxEngine {
         &self,
         config: &MixerConfig,
         active_mix_ids: &BTreeSet<String>,
+        initial_state: &AudioStateSnapshot,
     ) -> Result<Vec<CommandExecution>, EngineError> {
         let plan = plan_ensure_graph_for_active_routes(config, &BTreeSet::new(), active_mix_ids);
-        let mut existing_graph = self
-            .pw
-            .snapshot_for_config_with_effect_availability(None, Vec::new());
+        let mut existing_state = initial_state.clone();
         let monitor_commands = plan
             .commands
             .into_iter()
@@ -5483,33 +6975,39 @@ impl WaveLinuxEngine {
             .collect::<Vec<_>>();
         if monitor_commands.iter().any(|command| {
             command_targets_bluetooth_sink(command)
-                && !monitor_route_endpoints_available(command, &existing_graph)
+                && !monitor_route_endpoints_available(command, &existing_state.graph)
         }) {
             for _ in 0..6 {
                 thread::sleep(Duration::from_millis(200));
-                existing_graph = self
+                existing_state.graph = self
                     .pw
                     .snapshot_for_config_with_effect_availability(None, Vec::new());
                 if monitor_commands.iter().all(|command| {
                     !command_targets_bluetooth_sink(command)
-                        || monitor_route_endpoints_available(command, &existing_graph)
+                        || monitor_route_endpoints_available(command, &existing_state.graph)
                 }) {
                     break;
                 }
             }
+            if monitor_commands.iter().all(|command| {
+                !command_targets_bluetooth_sink(command)
+                    || monitor_route_endpoints_available(command, &existing_state.graph)
+            }) {
+                existing_state = self
+                    .pw
+                    .audio_state_snapshot_with_effect_availability_timed(None, Vec::new())
+                    .0;
+            }
         }
-        let mut managed_modules = self.pw.managed_modules().unwrap_or_default();
-        let mut source_outputs = self.pw.source_output_routes().unwrap_or_default();
-        let mut sink_inputs = self.pw.sink_input_routes().unwrap_or_default();
         if monitor_commands.iter().any(|command| {
             command_targets_bluetooth_sink(command)
-                && monitor_route_endpoints_available(command, &existing_graph)
+                && monitor_route_endpoints_available(command, &existing_state.graph)
                 && !repair_command_is_satisfied(
                     command,
-                    &existing_graph,
-                    &source_outputs,
-                    &sink_inputs,
-                    &managed_modules,
+                    &existing_state.graph,
+                    &existing_state.routes.source_output_routes,
+                    &existing_state.routes.sink_input_routes,
+                    &existing_state.routes.managed_modules,
                 )
         }) {
             self.log_engine_event(
@@ -5517,18 +7015,16 @@ impl WaveLinuxEngine {
                 "Bluetooth monitor output is visible; waiting for A2DP transport to settle",
             );
             thread::sleep(BLUETOOTH_MONITOR_ROUTE_SETTLE);
-            existing_graph = self
+            existing_state = self
                 .pw
-                .snapshot_for_config_with_effect_availability(None, Vec::new());
-            managed_modules = self.pw.managed_modules().unwrap_or_default();
-            source_outputs = self.pw.source_output_routes().unwrap_or_default();
-            sink_inputs = self.pw.sink_input_routes().unwrap_or_default();
+                .audio_state_snapshot_with_effect_availability_timed(None, Vec::new())
+                .0;
         }
         let mut skipped = Vec::new();
         let commands = monitor_commands
             .into_iter()
             .filter_map(|command| {
-                if !monitor_route_endpoints_available(&command, &existing_graph) {
+                if !monitor_route_endpoints_available(&command, &existing_state.graph) {
                     skipped.push(skipped_command_with_stderr(
                         command,
                         "monitor output is not visible yet; preserving existing monitor route",
@@ -5537,10 +7033,10 @@ impl WaveLinuxEngine {
                 }
                 (!repair_command_is_satisfied(
                     &command,
-                    &existing_graph,
-                    &source_outputs,
-                    &sink_inputs,
-                    &managed_modules,
+                    &existing_state.graph,
+                    &existing_state.routes.source_output_routes,
+                    &existing_state.routes.sink_input_routes,
+                    &existing_state.routes.managed_modules,
                 ))
                 .then_some(command)
             })
@@ -5583,7 +7079,20 @@ impl WaveLinuxEngine {
 
     fn persist_config(&self) -> Result<(), EngineError> {
         let config = self.read_config()?.clone();
-        write_json(&self.paths.config_file(), &config)
+        let serialized = serde_json::to_string(&config)?;
+        let revision = content_revision(&serialized);
+        let mut persisted = self
+            .persisted_config_revision
+            .lock()
+            .map_err(|_| EngineError::LockPoisoned)?;
+        if persisted.as_deref() == Some(revision.as_str()) && self.paths.config_file().is_file() {
+            return Ok(());
+        }
+        write_json(&self.paths.config_file(), &config)?;
+        *persisted = Some(revision);
+        drop(persisted);
+        self.change_signal.notify_config();
+        Ok(())
     }
 
     fn persist_followed_monitor_output_selection(
@@ -5726,10 +7235,23 @@ impl WaveLinuxEngine {
         &self,
         config: Option<&MixerConfig>,
     ) -> Result<(RuntimeGraph, Vec<SnapshotCommandTiming>), EngineError> {
-        let (mut graph, timings) = self.pw.snapshot_for_config_with_effect_availability_timed(
-            config,
-            self.effect_availability()?,
-        );
+        let effect_availability = self.effect_availability()?;
+        let (mut graph, timings) = if let Some((snapshot, generation)) = self
+            .pipewire_registry
+            .audio_state_snapshot(config, effect_availability.clone())
+        {
+            (
+                snapshot.graph,
+                vec![SnapshotCommandTiming {
+                    label: format!("pipewire registry generation {generation}"),
+                    elapsed_ms: 0,
+                    succeeded: true,
+                }],
+            )
+        } else {
+            self.pw
+                .snapshot_for_config_with_effect_availability_timed(config, effect_availability)
+        };
         let profile_policy = match config {
             Some(config) => config.device_policy.clone(),
             None => self.read_config()?.device_policy.clone(),
@@ -5747,6 +7269,45 @@ impl WaveLinuxEngine {
         Ok((graph, timings))
     }
 
+    fn audio_state_snapshot_for_config_timed(
+        &self,
+        config: Option<&MixerConfig>,
+    ) -> Result<(AudioStateSnapshot, Vec<SnapshotCommandTiming>), EngineError> {
+        let effect_availability = self.effect_availability()?;
+        let (mut snapshot, timings) = if let Some((snapshot, generation)) = self
+            .pipewire_registry
+            .audio_state_snapshot(config, effect_availability.clone())
+        {
+            (
+                snapshot,
+                vec![SnapshotCommandTiming {
+                    label: format!("pipewire registry generation {generation}"),
+                    elapsed_ms: 0,
+                    succeeded: true,
+                }],
+            )
+        } else {
+            self.pw
+                .audio_state_snapshot_with_effect_availability_timed(config, effect_availability)
+        };
+        let profile_policy = match config {
+            Some(config) => config.device_policy.clone(),
+            None => self.read_config()?.device_policy.clone(),
+        };
+        let devices = snapshot
+            .graph
+            .inputs
+            .iter()
+            .chain(snapshot.graph.outputs.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        self.ensure_remote_profiles_for_devices(&devices, &profile_policy)?;
+        if let Ok(catalog) = self.hardware_profiles() {
+            apply_profile_policy_to_graph(&mut snapshot.graph, &catalog, &profile_policy);
+        }
+        Ok((snapshot, timings))
+    }
+
     fn host_diagnostics(&self) -> Result<Vec<Diagnostic>, EngineError> {
         let mut cache = self
             .host_diagnostics
@@ -5755,7 +7316,9 @@ impl WaveLinuxEngine {
         if cache_expired(cache.checked_at, HOST_DIAGNOSTICS_TTL) {
             let mut diagnostics = self.pw.diagnostics();
             diagnostics.extend(self.runtime_identity_diagnostics());
-            diagnostics.extend(pipewire_audio_health_diagnostics());
+            diagnostics.extend(pipewire_audio_health_diagnostics(
+                &self.pipewire_audio_health.snapshot(),
+            ));
             diagnostics.extend(dsp_runtime_diagnostics());
             cache.value = diagnostics;
             cache.checked_at = Some(Instant::now());
@@ -5766,21 +7329,87 @@ impl WaveLinuxEngine {
     fn adaptive_latency_status(
         &self,
         settings: &wavelinux_model::AdaptiveLatencySettings,
-        diagnostics: &[Diagnostic],
+        audio_core: &[AudioCoreChannelStatus],
     ) -> Result<AdaptiveLatencyStatus, EngineError> {
-        let (signal, cpu_pressure, pipewire_warning_delta) =
-            adaptive_latency_signal(settings, diagnostics);
+        let pipewire_health = self.pipewire_audio_health.snapshot();
+        let (pipewire_warning_delta, owned_pipewire_warning_delta) = {
+            let mut previous = self
+                .adaptive_pipewire_health_counters
+                .lock()
+                .map_err(|_| EngineError::LockPoisoned)?;
+            let (warning_delta, owned_delta) = pipewire_health_deltas(&previous, &pipewire_health);
+            *previous = pipewire_health;
+            (warning_delta, owned_delta)
+        };
+        let cpu_pressure = self
+            .cpu_pressure_sampler
+            .lock()
+            .map_err(|_| EngineError::LockPoisoned)?
+            .sample()
+            .unwrap_or(0.0);
+        let (signal, cpu_pressure, pipewire_warning_delta, underrun_delta) =
+            adaptive_latency_signal(
+                settings,
+                audio_core,
+                cpu_pressure,
+                pipewire_warning_delta,
+                owned_pipewire_warning_delta,
+            );
         let mut controller = self
             .adaptive_latency
             .lock()
             .map_err(|_| EngineError::LockPoisoned)?;
-        Ok(controller.update(
+        let now = Instant::now();
+        let mut status = controller.update(
             settings,
             signal,
             cpu_pressure,
             pipewire_warning_delta,
-            Instant::now(),
-        ))
+            underrun_delta,
+            now,
+        );
+        drop(controller);
+        let output_signature = adaptive_monitor_output_signature(audio_core);
+        let (quantum_frames, quantum_floor_frames, learned_floor_cache) = {
+            let mut controller = self
+                .adaptive_quantum
+                .lock()
+                .map_err(|_| EngineError::LockPoisoned)?;
+            let (quantum_frames, quantum_floor_frames, learned_new_floor) = controller.update(
+                status.pipewire_quantum_frames,
+                status.underrun_delta,
+                &output_signature,
+                now,
+            );
+            let cache = learned_new_floor.then(|| AdaptiveQuantumFloorCache {
+                version: ADAPTIVE_QUANTUM_FLOORS_VERSION,
+                floors: controller.learned_floors.clone(),
+            });
+            (quantum_frames, quantum_floor_frames, cache)
+        };
+        if let Some(cache) = learned_floor_cache {
+            match write_json(&self.paths.adaptive_quantum_floors_file(), &cache) {
+                Ok(()) => self.log_engine_event(
+                    "latency.quantum_cache",
+                    format!(
+                        "learned output_signature={} floor_frames={}",
+                        output_signature, quantum_floor_frames
+                    ),
+                ),
+                Err(error) => self.log_engine_event(
+                    "latency.quantum_cache",
+                    format!("could not persist learned floor: {error}"),
+                ),
+            }
+        }
+        status.pipewire_quantum_frames = quantum_frames;
+        status.pipewire_quantum_floor_frames = quantum_floor_frames;
+        status.buffer_fill_msec = audio_core
+            .iter()
+            .filter(|channel| channel.online)
+            .map(|channel| channel.buffer_fill_msec)
+            .max_by(f32::total_cmp);
+        Ok(status)
     }
 
     fn send_adaptive_latency_targets(&self, config: &MixerConfig, status: &AdaptiveLatencyStatus) {
@@ -5790,19 +7419,76 @@ impl WaveLinuxEngine {
         for channel in config
             .channels
             .iter()
-            .filter(|channel| channel.effects.iter().any(|effect| !effect.bypassed))
+            .filter(|channel| channel_uses_persistent_audio_core(channel))
         {
-            let socket_path = self
-                .paths
-                .effect_chains_dir()
-                .join(effect_chain_file_name(&channel.id, "sock"));
+            let socket_path = self.paths.channel_control_socket(&channel.id);
             send_adaptive_latency_target(
                 &socket_path,
                 &channel.id,
                 status.target_msec,
+                status.pipewire_quantum_frames,
                 &status.last_reason,
             );
         }
+        if config.mixes.iter().any(mix_uses_persistent_audio_core) {
+            let socket_path = self.paths.mix_control_socket();
+            for mix in &config.mixes {
+                send_adaptive_latency_target(
+                    &socket_path,
+                    &mix.id,
+                    status.target_msec,
+                    status.pipewire_quantum_frames,
+                    &status.last_reason,
+                );
+            }
+        }
+    }
+
+    fn refresh_adaptive_latency_live(&self) -> Result<(), EngineError> {
+        let config = self.read_config()?.clone();
+        let audio_core = self.collect_adaptive_audio_core_status(&config);
+        let status =
+            self.adaptive_latency_status(&config.settings.adaptive_latency, &audio_core)?;
+        self.send_adaptive_latency_targets(&config, &status);
+
+        let (target_changed, trouble_detected) = {
+            let mut runtime = self.write_runtime()?;
+            let target_changed = runtime.status.adaptive_latency.target_msec != status.target_msec
+                || runtime.status.adaptive_latency.last_reason != status.last_reason
+                || runtime.status.adaptive_latency.pipewire_quantum_frames
+                    != status.pipewire_quantum_frames
+                || runtime
+                    .status
+                    .adaptive_latency
+                    .pipewire_quantum_floor_frames
+                    != status.pipewire_quantum_floor_frames;
+            let trouble_detected = status.underrun_delta > 0;
+            runtime.status.adaptive_latency = status.clone();
+            runtime.status.audio_core = audio_core;
+            runtime.status.pipewire_audio_health = self.pipewire_audio_health.snapshot();
+            (target_changed, trouble_detected)
+        };
+        if target_changed || trouble_detected {
+            self.log_engine_event(
+                "latency.adaptive",
+                format!(
+                    "target_ms={} level={} quantum_frames={} quantum_floor_frames={} reason={} discontinuity_frames={} cpu_pressure={:.3} buffer_ms={}",
+                    status.target_msec,
+                    status.active_level,
+                    status.pipewire_quantum_frames,
+                    status.pipewire_quantum_floor_frames,
+                    status.last_reason,
+                    status.underrun_delta,
+                    status.cpu_pressure,
+                    status
+                        .buffer_fill_msec
+                        .map(|value| format!("{value:.1}"))
+                        .unwrap_or_else(|| "n/a".into()),
+                ),
+            );
+            self.change_signal.notify_state();
+        }
+        Ok(())
     }
 
     fn effect_availability(&self) -> Result<Vec<EffectAvailability>, EngineError> {
@@ -5954,28 +7640,64 @@ impl WaveLinuxEngine {
         audio_graph_running: bool,
         mark_requested: bool,
     ) -> Result<Vec<LevelMeter>, EngineError> {
+        let target_revision = MeterTargetRevision::new(self.revisions(), audio_graph_running);
         let targets = if audio_graph_running {
             meter_targets_for_config_with_devices(config, &graph.inputs)
         } else {
             Vec::new()
         };
+        let requested = mark_requested
+            || self
+                .meter_supervisor
+                .lock()
+                .map_err(|_| EngineError::LockPoisoned)?
+                .requested_recently();
+        let native_meters = (graph_prefix() == "wavelinux6" && audio_graph_running && requested)
+            .then(|| self.native_core_level_meters(&targets));
         let update = {
             let mut supervisor = self
                 .meter_supervisor
                 .lock()
                 .map_err(|_| EngineError::LockPoisoned)?;
-            if mark_requested || supervisor.requested_recently() {
-                supervisor.reconcile(targets, mark_requested)
+            if let Some(Ok(meters)) = native_meters {
+                supervisor.reconcile_native(targets, meters, mark_requested, target_revision)
+            } else if requested {
+                supervisor.reconcile(targets, mark_requested, target_revision)
             } else {
                 supervisor.snapshot_or_stop_idle()
             }
         };
 
+        self.log_meter_supervisor_update(&update);
+        Ok(update.meters)
+    }
+
+    fn native_core_level_meters(&self, targets: &[MeterTarget]) -> Result<Vec<LevelMeter>, String> {
+        let socket_path = self.paths.mix_control_socket();
+        let response = send_core_control_request(
+            &socket_path,
+            &serde_json::json!({
+                "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+                "command": "get_meters",
+                "request_id": Uuid::new_v4().to_string(),
+            }),
+        )?;
+        let response: NativeCoreMetersResponse = serde_json::from_value(response)
+            .map_err(|err| format!("invalid meter response: {err}"))?;
+        Ok(level_meters_from_native_response(targets, response))
+    }
+
+    fn log_meter_supervisor_update(&self, update: &MeterSupervisorUpdate) {
         if update.started > 0 || update.stopped > 0 || !update.failed.is_empty() {
             self.log_engine_event(
                 "meters.supervisor",
                 format!(
-                    "started={} stopped={} failed={} active={}",
+                    "backend={} started={} stopped={} failed={} active={}",
+                    if update.native_backend {
+                        "native-core"
+                    } else {
+                        "pipewire-fallback"
+                    },
                     update.started,
                     update.stopped,
                     update.failed.len(),
@@ -5987,7 +7709,22 @@ impl WaveLinuxEngine {
             }
         }
 
-        Ok(update.meters)
+        if update.log_activity {
+            self.log_engine_event(
+                "meters.activity",
+                format!(
+                    "backend={} sampled_targets={} active_targets={} max_level={:.3}",
+                    if update.native_backend {
+                        "native-core"
+                    } else {
+                        "pipewire-fallback"
+                    },
+                    update.sampled_sources,
+                    update.active_targets,
+                    update.max_level,
+                ),
+            );
+        }
     }
 
     fn refresh_cached_meters(&self) -> Result<(), EngineError> {
@@ -6020,59 +7757,9 @@ impl WaveLinuxEngine {
         Ok(update.meters)
     }
 
-    fn refresh_meter_targets_after_level_change(&self) {
-        let result = (|| -> Result<(), EngineError> {
-            let config = self.read_config()?.clone();
-            let (graph, audio_graph_running) = {
-                let runtime = self.read_runtime()?;
-                (
-                    runtime.graph.clone(),
-                    runtime.status.audio_graph_running && !self.stop.load(Ordering::SeqCst),
-                )
-            };
-            let meters =
-                self.refresh_meter_supervisor(&config, &graph, audio_graph_running, false)?;
-            let mut runtime = self.write_runtime()?;
-            if runtime.status.audio_graph_running {
-                runtime.graph.meters = meters;
-            }
-            Ok(())
-        })();
-        if let Err(err) = result {
-            self.log_engine_event(
-                "meters.supervisor",
-                format!("level-change meter target refresh failed: {err}"),
-            );
-        }
-    }
-
-    fn refresh_meter_targets_from_live_graph(&self, area: &str) {
-        let result = (|| -> Result<(), EngineError> {
-            let config = self.effective_config_for_audio_graph(&self.read_config()?.clone());
-            let graph = self
-                .pw
-                .snapshot_for_config_with_effect_availability(None, Vec::new());
-            let audio_graph_running =
-                graph_has_wavelinux_nodes(&graph) && !self.stop.load(Ordering::SeqCst);
-            let meters =
-                self.refresh_meter_supervisor(&config, &graph, audio_graph_running, false)?;
-            let mut runtime = self.write_runtime()?;
-            if runtime.status.audio_graph_running {
-                runtime.graph.meters = meters;
-            }
-            Ok(())
-        })();
-        if let Err(err) = result {
-            self.log_engine_event(
-                area,
-                format!("meter target refresh after effect sync failed: {err}"),
-            );
-        }
-    }
-
     fn stop_meter_supervisor(&self) {
         if let Ok(mut supervisor) = self.meter_supervisor.lock() {
-            let stopped = supervisor.handles.len();
+            let stopped = supervisor.active_source_count();
             supervisor.stop_all();
             if stopped > 0 {
                 self.log_engine_event("meters.supervisor", format!("stopped={stopped}"));
@@ -6210,6 +7897,12 @@ impl WaveLinuxEngine {
             .collect::<Vec<_>>();
         if channels.is_empty() {
             return Ok(Vec::new());
+        }
+        if channels
+            .iter()
+            .all(|channel| channel_uses_persistent_audio_core(channel))
+        {
+            return self.sync_persistent_audio_core_channels_unlocked(&config, &channels);
         }
 
         let mut outputs = self.cleanup_modules(|module| {
@@ -6363,6 +8056,114 @@ impl WaveLinuxEngine {
         Ok(outputs)
     }
 
+    fn sync_persistent_audio_core_channels_unlocked(
+        &self,
+        config: &MixerConfig,
+        channels: &[&Channel],
+    ) -> Result<Vec<CommandExecution>, EngineError> {
+        let mut outputs = Vec::new();
+        let mut routes_need_sync = false;
+        for channel in channels {
+            let nodes_were_visible = self.effect_chain_nodes_visible(channel);
+            routes_need_sync |= !nodes_were_visible;
+            let start_output = self.start_effect_chain_process(channel);
+            let start_failed = start_output.error.is_some();
+            outputs.push(start_output);
+            if start_failed {
+                continue;
+            }
+            if !nodes_were_visible && !self.wait_for_effect_nodes_ready_for_routing(channel) {
+                self.log_engine_event(
+                    "effects.sync",
+                    format!(
+                        "{} persistent audio-core endpoints did not become ready; existing routes were preserved",
+                        channel.name
+                    ),
+                );
+                continue;
+            }
+        }
+
+        // A native chain swap does not alter endpoints or routing. Keeping the
+        // existing graph untouched avoids redundant Pulse commands and link
+        // activation while the core crossfades to the prepared chain.
+        if !routes_need_sync {
+            return Ok(outputs);
+        }
+
+        let graph = self
+            .pw
+            .snapshot_for_config_with_effect_availability(None, Vec::new());
+        let managed_modules = self.pw.managed_modules().unwrap_or_default();
+        let source_outputs = self.pw.source_output_routes().unwrap_or_default();
+        let sink_inputs = self.pw.sink_input_routes().unwrap_or_default();
+        let mut route_commands = Vec::new();
+        for channel in channels {
+            route_commands.extend(plan_route_channel_to_effect(channel, &config.settings));
+            for mix in config.mixes.iter().filter(|mix| {
+                channel
+                    .mix_buses
+                    .get(&mix.id)
+                    .is_some_and(|bus| bus.enabled)
+            }) {
+                route_commands.extend(plan_route_channel_to_mix(channel, mix, &config.settings));
+            }
+        }
+        route_commands.retain(|command| {
+            !repair_command_is_satisfied(
+                command,
+                &graph,
+                &source_outputs,
+                &sink_inputs,
+                &managed_modules,
+            )
+        });
+        outputs.extend(
+            self.pw
+                .execute_all(route_commands)
+                .into_iter()
+                .map(command_execution),
+        );
+
+        for channel in channels {
+            for mix in config.mixes.iter().filter(|mix| {
+                channel
+                    .mix_buses
+                    .get(&mix.id)
+                    .is_some_and(|bus| bus.enabled)
+            }) {
+                if let Some(bus) = channel.mix_buses.get(&mix.id) {
+                    outputs.extend(self.execute_channel_bus_volume_unlocked(
+                        &channel.id,
+                        &mix.id,
+                        bus.volume,
+                    ));
+                    outputs.extend(self.execute_channel_bus_mute_unlocked(
+                        &channel.id,
+                        &mix.id,
+                        bus.muted,
+                    ));
+                }
+            }
+        }
+
+        let channel_ids = channels
+            .iter()
+            .map(|channel| channel.id.clone())
+            .collect::<BTreeSet<_>>();
+        let route_issues = self.wait_for_effect_routes_linked(config, &channel_ids);
+        if !route_issues.is_empty() {
+            self.log_engine_event(
+                "effects.sync",
+                format!(
+                    "persistent audio-core routes are not fully linked yet: {}",
+                    route_health_summary(&route_issues)
+                ),
+            );
+        }
+        Ok(outputs)
+    }
+
     fn mark_effect_sync_active(&self) -> EffectSyncActiveGuard<'_> {
         self.effect_sync_active.store(true, Ordering::SeqCst);
         EffectSyncActiveGuard {
@@ -6402,6 +8203,56 @@ impl WaveLinuxEngine {
         self.effect_chain_endpoint_readiness(channel).ready()
     }
 
+    fn wait_for_persistent_core_nodes_ready_for_routing(
+        &self,
+        channels: &[&Channel],
+        mixes: &[Mix],
+    ) -> bool {
+        if self.options.dry_run || channels.is_empty() {
+            return true;
+        }
+
+        let started = Instant::now();
+        let mut ready_samples = 0;
+        while started.elapsed() < EFFECT_NODE_WAIT_TIMEOUT {
+            let inputs = self.pw.list_inputs().unwrap_or_default();
+            let outputs = self.pw.list_outputs().unwrap_or_default();
+            let all_ready = channels.iter().all(|channel| {
+                effect_chain_endpoint_readiness_for_devices(&inputs, &outputs, channel).ready()
+            }) && mixes.iter().all(|mix| {
+                inputs
+                    .iter()
+                    .any(|input| input.name == mix.virtual_source_name)
+            });
+            if all_ready {
+                ready_samples += 1;
+                if ready_samples >= EFFECT_NODE_READY_STABLE_SAMPLES {
+                    // The native core publishes every channel from one process.
+                    // One shared settle period is enough before loading routes.
+                    thread::sleep(EFFECT_NODE_READY_SETTLE);
+                    let settled_inputs = self.pw.list_inputs().unwrap_or_default();
+                    let settled_outputs = self.pw.list_outputs().unwrap_or_default();
+                    return channels.iter().all(|channel| {
+                        effect_chain_endpoint_readiness_for_devices(
+                            &settled_inputs,
+                            &settled_outputs,
+                            channel,
+                        )
+                        .ready()
+                    }) && mixes.iter().all(|mix| {
+                        settled_inputs
+                            .iter()
+                            .any(|input| input.name == mix.virtual_source_name)
+                    });
+                }
+            } else {
+                ready_samples = 0;
+            }
+            thread::sleep(EFFECT_NODE_READY_SETTLE);
+        }
+        false
+    }
+
     fn wait_for_effect_routes_linked(
         &self,
         config: &MixerConfig,
@@ -6414,18 +8265,16 @@ impl WaveLinuxEngine {
         let started = Instant::now();
         let mut issues = Vec::new();
         while started.elapsed() < EFFECT_ROUTE_LINK_WAIT_TIMEOUT {
-            let graph = self
+            let state = self
                 .pw
-                .snapshot_for_config_with_effect_availability(None, Vec::new());
-            let managed_modules = self.pw.managed_modules().unwrap_or_default();
-            let source_outputs = self.pw.source_output_routes().unwrap_or_default();
-            let sink_inputs = self.pw.sink_input_routes().unwrap_or_default();
+                .audio_state_snapshot_with_effect_availability_timed(None, Vec::new())
+                .0;
             issues = effect_route_health_issues_for_channels(
                 config,
-                &graph,
-                &managed_modules,
-                &source_outputs,
-                &sink_inputs,
+                &state.graph,
+                &state.routes.managed_modules,
+                &state.routes.source_output_routes,
+                &state.routes.sink_input_routes,
                 channel_ids,
             );
             if issues.is_empty() {
@@ -6474,85 +8323,344 @@ impl WaveLinuxEngine {
     }
 
     fn schedule_effect_graph_sync(self: &Arc<Self>, channel_id: String) {
-        self.schedule_effect_graph_sync_many(BTreeSet::from([channel_id]));
-    }
-
-    fn schedule_effect_graph_sync_many(self: &Arc<Self>, channel_ids: BTreeSet<String>) {
-        if channel_ids.is_empty() {
-            return;
-        }
-        let generation = match self.deferred_effect_sync.lock() {
-            Ok(mut sync) => {
-                sync.generation = sync.generation.saturating_add(1);
-                sync.channel_ids.extend(channel_ids);
-                sync.generation
-            }
-            Err(_) => {
-                self.log_engine_event("effects.sync", "failed to schedule effect graph sync");
+        let channel = match self.read_config().ok().and_then(|config| {
+            config
+                .channels
+                .iter()
+                .find(|item| item.id == channel_id)
+                .cloned()
+        }) {
+            Some(channel) => channel,
+            None => {
+                self.log_engine_event(
+                    "effects.sync",
+                    format!("channel_id={channel_id} request_failed=channel_not_found"),
+                );
                 return;
             }
         };
-        let engine = Arc::clone(self);
-        let _ = thread::Builder::new()
-            .name("wavelinux-effects-sync".into())
-            .spawn(move || {
-                thread::sleep(EFFECT_GRAPH_SYNC_DEBOUNCE);
-                if engine.stop.load(Ordering::SeqCst) {
+        let slot = match self.effect_update_slot(&channel) {
+            Ok(slot) => slot,
+            Err(err) => {
+                self.log_engine_event(
+                    "effects.sync",
+                    format!("channel_id={channel_id} request_failed={err}"),
+                );
+                return;
+            }
+        };
+        let decision = {
+            let Ok(mut state) = slot.state.lock() else {
+                self.log_engine_event(
+                    "effects.sync",
+                    format!("channel_id={channel_id} request_failed=state_lock_poisoned"),
+                );
+                return;
+            };
+            match state.enqueue(channel.clone()) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    state.status.pending = false;
+                    state.status.last_error = Some(error.clone());
+                    state.status.resolve_state();
+                    self.log_engine_event(
+                        "effects.sync",
+                        format!("channel_id={channel_id} request_failed={error}"),
+                    );
+                    self.change_signal.notify_state();
                     return;
                 }
-                let channel_ids = match engine.deferred_effect_sync.lock() {
-                    Ok(mut sync) => {
-                        if sync.generation != generation {
-                            return;
-                        }
-                        mem::take(&mut sync.channel_ids)
-                    }
-                    Err(_) => return,
-                };
-                if channel_ids.is_empty() {
-                    return;
-                }
-                if let Err(err) = engine.rebuild_effect_chain_configs() {
-                    engine.log_engine_event(
-                        "effects.sync",
-                        format!("failed to write effect chain configs: {err}"),
-                    );
-                    return;
-                }
-                if engine.audio_graph_running_cached() {
-                    engine.log_engine_event(
-                        "effects.sync",
-                        format!(
-                            "effect chain changed; syncing affected channels: {}",
-                            channel_ids.iter().cloned().collect::<Vec<_>>().join(", ")
-                        ),
-                    );
-                    match engine.try_sync_effect_channels(&channel_ids) {
-                        Ok(Some(outputs)) => {
-                            engine.log_command_executions("effects.sync", &outputs);
-                            engine.refresh_meter_targets_from_live_graph("effects.sync");
-                        }
-                        Ok(None) => {
-                            // Preserve the accumulated channel set. The next
-                            // debounce pass will retry after the active graph
-                            // mutation has had time to finish.
-                            engine.log_engine_event(
-                                "effects.sync",
-                                "effect route sync requeued; graph mutation is still running",
-                            );
-                            engine.schedule_effect_graph_sync_many(channel_ids);
-                        }
-                        Err(err) => {
-                            engine.log_engine_event("effects.sync", format!("sync failed: {err}"));
-                        }
-                    }
-                } else {
-                    engine.log_engine_event(
-                        "effects.sync",
-                        "effect chain changed while audio graph was stopped; repair skipped",
-                    );
-                }
+            }
+        };
+        self.change_signal.notify_state();
+        self.log_engine_event(
+            "effects.sync",
+            format!(
+                "channel_id={} desired_generation={} previous_acknowledged_generation={} selected_effect_count={} desired_enabled={} resolved_control_socket={} request_{} final_effect_status=red",
+                channel.id,
+                decision.generation,
+                decision.previous_acknowledged,
+                channel.effects.len(),
+                channel_effects_desired_enabled(&channel),
+                decision.control_socket,
+                if decision.coalesced { "coalesced" } else { "queued" },
+            ),
+        );
+        if !decision.start_worker {
+            return;
+        }
+        self.spawn_effect_update_worker(slot, &channel.id, decision.generation);
+    }
+
+    fn recover_effect_updates_if_ready(self: &Arc<Self>) {
+        if self.stop.load(Ordering::SeqCst) || !self.audio_graph_running_cached() {
+            return;
+        }
+        let slots = self
+            .effect_updates
+            .lock()
+            .map(|slots| {
+                slots
+                    .iter()
+                    .map(|(channel_id, slot)| (channel_id.clone(), Arc::clone(slot)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for (channel_id, slot) in slots {
+            let recovery = slot.state.lock().ok().and_then(|mut state| {
+                state.reserve_recovery_worker(Instant::now()).then(|| {
+                    (
+                        state.desired.generation,
+                        state.status.applied_generation,
+                        state.status.selected_effect_count,
+                        state.status.desired_enabled,
+                        state.status.control_socket.clone(),
+                    )
+                })
             });
+            let Some((generation, previous_acknowledged, selected_count, enabled, socket)) =
+                recovery
+            else {
+                continue;
+            };
+
+            self.log_engine_event(
+                "effects.sync",
+                format!(
+                    "channel_id={channel_id} desired_generation={generation} previous_acknowledged_generation={previous_acknowledged} selected_effect_count={selected_count} desired_enabled={enabled} resolved_control_socket={socket} request_recovery=true final_effect_status=red",
+                ),
+            );
+            self.change_signal.notify_state();
+            self.spawn_effect_update_worker(slot, &channel_id, generation);
+        }
+    }
+
+    fn spawn_effect_update_worker(
+        self: &Arc<Self>,
+        slot: Arc<EffectUpdateSlot>,
+        channel_id: &str,
+        generation: u64,
+    ) {
+        let engine = Arc::clone(self);
+        let worker_slot = Arc::clone(&slot);
+        let thread_name = format!("wavelinux-fx-{}", safe_file_id(channel_id));
+        if let Err(err) = thread::Builder::new().name(thread_name).spawn(move || {
+            engine.run_effect_update_worker(worker_slot);
+        }) {
+            if let Ok(mut state) = slot.state.lock() {
+                state.record_worker_spawn_failure(format!("failed to start effect worker: {err}"));
+            }
+            self.change_signal.notify_state();
+            self.log_engine_event(
+                "effects.sync",
+                format!(
+                    "channel_id={channel_id} desired_generation={generation} request_failed=worker_spawn error={err}",
+                ),
+            );
+        }
+    }
+
+    fn run_effect_update_worker(self: &Arc<Self>, slot: Arc<EffectUpdateSlot>) {
+        thread::sleep(EFFECT_GRAPH_SYNC_DEBOUNCE);
+        loop {
+            if self.stop.load(Ordering::SeqCst) {
+                if let Ok(mut state) = slot.state.lock() {
+                    state.worker_running = false;
+                    state.in_flight_generation = None;
+                    state.status.in_flight_generation = None;
+                    state.status.pending = false;
+                    state.status.last_error = Some("WaveLinux is stopping".into());
+                    state.status.resolve_state();
+                }
+                self.change_signal.notify_state();
+                return;
+            }
+
+            let desired = {
+                let Ok(mut state) = slot.state.lock() else {
+                    return;
+                };
+                state.begin_latest()
+            };
+            let socket = self.paths.channel_control_socket(&desired.channel.id);
+            self.log_engine_event(
+                "effects.sync",
+                format!(
+                    "channel_id={} desired_generation={} selected_effect_count={} desired_enabled={} resolved_control_socket={} request_started",
+                    desired.channel.id,
+                    desired.generation,
+                    desired.channel.effects.len(),
+                    channel_effects_desired_enabled(&desired.channel),
+                    socket.display(),
+                ),
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.apply_effect_update(&desired)
+            }))
+            .unwrap_or_else(|panic| {
+                Err(format!("effect worker panicked: {}", panic_payload(panic)))
+            });
+
+            let completion = {
+                let Ok(mut state) = slot.state.lock() else {
+                    return;
+                };
+                state.finish_attempt(desired.generation, &result)
+            };
+            self.change_signal.notify_state();
+
+            if completion.superseded {
+                self.log_engine_event(
+                    "effects.sync",
+                    format!(
+                        "channel_id={} desired_generation={} request_superseded=true",
+                        desired.channel.id, desired.generation
+                    ),
+                );
+                thread::sleep(EFFECT_GRAPH_SYNC_DEBOUNCE);
+                continue;
+            }
+
+            match result {
+                Ok(ack) => self.log_engine_event(
+                    "effects.sync",
+                    format!(
+                        "channel_id={} desired_generation={} request_acknowledged={} config_revision={} chain_swaps={} final_effect_status={}",
+                        desired.channel.id,
+                        desired.generation,
+                        ack.generation,
+                        ack.config_revision,
+                        ack.chain_swaps,
+                        effect_runtime_state_name(completion.final_state),
+                    ),
+                ),
+                Err(error) => self.log_engine_event(
+                    "effects.sync",
+                    format!(
+                        "channel_id={} desired_generation={} request_failed={} final_effect_status={} error={}",
+                        desired.channel.id,
+                        desired.generation,
+                        true,
+                        effect_runtime_state_name(completion.final_state),
+                        completion.final_error.unwrap_or(error),
+                    ),
+                ),
+            }
+            return;
+        }
+    }
+
+    fn apply_effect_update(
+        &self,
+        desired: &PendingEffectUpdate,
+    ) -> Result<EffectApplyAcknowledgement, String> {
+        if !channel_uses_persistent_audio_core(&desired.channel) {
+            self.rebuild_effect_chain_configs()
+                .map_err(|err| err.to_string())?;
+            if self.audio_graph_running_cached() {
+                let channel_ids = BTreeSet::from([desired.channel.id.clone()]);
+                match self
+                    .try_sync_effect_channels(&channel_ids)
+                    .map_err(|err| err.to_string())?
+                {
+                    Some(outputs) => self.log_command_executions("effects.sync", &outputs),
+                    None => return Err("legacy effect graph mutation is busy".into()),
+                }
+            }
+            return Ok(EffectApplyAcknowledgement {
+                generation: desired.generation,
+                config_revision: "legacy-filter-chain".into(),
+                chain_swaps: 0,
+            });
+        }
+
+        let (config_path, config_revision) =
+            self.write_effect_runtime_config(&desired.channel, desired.generation)?;
+        if !self.audio_graph_running_cached() {
+            return Err("audio graph is stopped; selected effects remain saved".into());
+        }
+        let socket_path = self.paths.channel_control_socket(&desired.channel.id);
+        let ready = wait_for_audio_core_ready(
+            &socket_path,
+            &desired.channel.id,
+            EFFECT_CORE_READY_TIMEOUT,
+        )?;
+        if ready.acknowledged_generation == desired.generation {
+            return Ok(EffectApplyAcknowledgement {
+                generation: desired.generation,
+                config_revision,
+                chain_swaps: ready.chain_swaps,
+            });
+        }
+        if ready.submitted_generation < desired.generation {
+            let response = send_effect_chain_swap(
+                &socket_path,
+                &desired.channel.id,
+                &config_path,
+                &config_revision,
+                desired.generation,
+            )?;
+            let queued_generation = response
+                .get("graph_revision")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| "audio core did not return a queued generation".to_string())?;
+            if queued_generation != desired.generation {
+                return Err(format!(
+                    "audio core queued generation {queued_generation}, expected {}",
+                    desired.generation
+                ));
+            }
+        }
+        let acknowledged = wait_for_effect_generation_ack(
+            &socket_path,
+            &desired.channel.id,
+            desired.generation,
+            EFFECT_CORE_ACK_TIMEOUT,
+        )?;
+        Ok(EffectApplyAcknowledgement {
+            generation: acknowledged.acknowledged_generation,
+            config_revision,
+            chain_swaps: acknowledged.chain_swaps,
+        })
+    }
+
+    fn write_effect_runtime_config(
+        &self,
+        channel: &Channel,
+        generation: u64,
+    ) -> Result<(PathBuf, String), String> {
+        let settings = self
+            .read_config()
+            .map_err(|err| err.to_string())?
+            .settings
+            .adaptive_latency
+            .clone();
+        let _writes = self
+            .effect_config_writes
+            .lock()
+            .map_err(|_| "effect config write lock poisoned".to_string())?;
+        let path = self
+            .paths
+            .effect_chains_dir()
+            .join(effect_chain_file_name(&channel.id, "json"));
+        let existing = read_json::<wavelinux_dsp::DspChannelConfig>(&path).ok();
+        let mut dsp_config = dsp_channel_config(channel);
+        if dsp_config.input_target_node_name.is_none() {
+            dsp_config.input_target_node_name =
+                existing.and_then(|config| config.input_target_node_name);
+        }
+        dsp_config.generation = generation;
+        dsp_config.adaptive_latency = dsp_adaptive_latency_config(&settings);
+        dsp_config.control_socket_path = Some(
+            self.paths
+                .channel_control_socket(&channel.id)
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let revision = audio_core_channel_processing_revision(&dsp_config);
+        write_json(&path, &dsp_config).map_err(|err| err.to_string())?;
+        Ok((path, revision))
     }
 
     fn audio_graph_running_cached(&self) -> bool {
@@ -6788,7 +8896,7 @@ fn latest_installed_appimage(data_dir: &Path) -> Option<(String, PathBuf)> {
 
 fn appimage_version_from_path(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
-    name.strip_prefix("WaveLinux5_")?
+    name.strip_prefix("WaveLinux6_")?
         .strip_suffix("_amd64.AppImage")
         .map(ToOwned::to_owned)
 }
@@ -7089,43 +9197,6 @@ fn input_device_can_auto_select(
 
 fn input_device_can_be_opened(input: &DeviceInfo) -> bool {
     input.is_available || input_has_safe_availability_override(input)
-}
-
-fn startup_microphone_level_reset_commands(
-    inputs: &[DeviceInfo],
-    bluetooth_cards: &[BluetoothAudioCard],
-) -> Vec<CommandSpec> {
-    inputs
-        .iter()
-        .filter(|input| {
-            input_device_can_be_opened(input)
-                && !input.is_virtual
-                && is_restorable_device(&input.id)
-                && !looks_like_monitor_source(input)
-                && input.bus != Some(wavelinux_model::DeviceBus::Bluetooth)
-                && !input.id.trim().starts_with("bluez_input.")
-                && !bluetooth_input_would_force_hfp(&input.id, bluetooth_cards)
-        })
-        .flat_map(|input| {
-            [
-                plan_set_source_volume(&input.id, safe_startup_input_volume(input)),
-                plan_set_source_mute(&input.id, false),
-            ]
-        })
-        .collect()
-}
-
-fn safe_startup_input_volume(input: &DeviceInfo) -> f32 {
-    let text = format!("{} {}", input.id, input.description).to_lowercase();
-    if input.bus == Some(wavelinux_model::DeviceBus::Pci)
-        || text.contains("digital microphone")
-        || text.contains("built-in")
-        || text.contains("internal")
-    {
-        0.46
-    } else {
-        1.0
-    }
 }
 
 fn best_monitor_output_choice(outputs: &[DeviceInfo]) -> Option<AutoDeviceChoice> {
@@ -7781,6 +9852,7 @@ struct ProfiledDeviceRepairView<'a> {
     active_sink: Option<&'a str>,
     managed_modules: &'a [ManagedModule],
     source_outputs: &'a [SourceOutputRoute],
+    sink_inputs: &'a [SinkInputRoute],
 }
 
 fn auto_device_route_repair_needed_for_profiled_devices(
@@ -7812,6 +9884,7 @@ fn auto_device_route_repair_needed_for_profiled_devices(
         auto_output.as_deref(),
         view.managed_modules,
         view.source_outputs,
+        view.sink_inputs,
     )
 }
 
@@ -8103,9 +10176,46 @@ fn auto_device_route_repair_needed(
     auto_output: Option<&str>,
     managed_modules: &[ManagedModule],
     source_outputs: &[SourceOutputRoute],
+    sink_inputs: &[SinkInputRoute],
 ) -> bool {
     auto_input_repair_needed(config, auto_input, managed_modules, source_outputs)
-        || auto_output_repair_needed(config, auto_output, managed_modules, source_outputs)
+        || auto_output_repair_needed(
+            config,
+            auto_output,
+            managed_modules,
+            source_outputs,
+            sink_inputs,
+        )
+}
+
+fn native_input_target_route_ready(
+    channel: &Channel,
+    expected_source: &str,
+    source_outputs: &[SourceOutputRoute],
+) -> bool {
+    source_outputs.iter().any(|route| {
+        route.role.as_deref() == Some("input_target")
+            && route.channel_id.as_deref() == Some(channel.id.as_str())
+            && [route.source_name.as_deref(), route.target_object.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|source| audio_endpoint_names_match(source, expected_source))
+    })
+}
+
+fn native_mix_output_target_route_ready(
+    mix: &Mix,
+    expected_sink: &str,
+    sink_inputs: &[SinkInputRoute],
+) -> bool {
+    sink_inputs.iter().any(|route| {
+        route.role.as_deref() == Some("mix_output_target")
+            && route.mix_id.as_deref() == Some(mix.id.as_str())
+            && [route.sink_name.as_deref(), route.target_object.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|sink| audio_endpoint_names_match(sink, expected_sink))
+    })
 }
 
 fn default_device_lock_repair_needed(
@@ -8136,6 +10246,9 @@ fn auto_input_repair_needed(
             if expected_source != auto_input {
                 return false;
             }
+            if channel_uses_persistent_audio_core(channel) {
+                return !native_input_target_route_ready(channel, expected_source, source_outputs);
+            }
             !managed_modules.iter().any(|module| {
                 module.role.as_deref() == Some("input_to_channel")
                     && module.channel_id.as_deref() == Some(channel.id.as_str())
@@ -8160,6 +10273,7 @@ fn auto_output_repair_needed(
     auto_output: Option<&str>,
     managed_modules: &[ManagedModule],
     source_outputs: &[SourceOutputRoute],
+    sink_inputs: &[SinkInputRoute],
 ) -> bool {
     if !config.settings.monitor_follows_default_output
         && !config.device_policy.active_output_fallback
@@ -8172,7 +10286,10 @@ fn auto_output_repair_needed(
     let Some(monitor_mix) = config.mixes.iter().find(|mix| mix.id == "monitor") else {
         return false;
     };
-    let expected_source = format!("{}.monitor", monitor_mix.virtual_sink_name);
+    if mix_uses_persistent_audio_core(monitor_mix) {
+        return !native_mix_output_target_route_ready(monitor_mix, auto_output, sink_inputs);
+    }
+    let expected_source = mix_render_source_name(monitor_mix);
     let monitor_routes = managed_modules
         .iter()
         .filter(|module| {
@@ -8268,6 +10385,7 @@ fn capture_stream_move_commands_for_bluetooth_protection(
         .iter()
         .filter(|route| {
             !route.id.trim().is_empty()
+                && !route.dont_move
                 && !source_output_is_wavelinux_owned(route)
                 && route
                     .source_name
@@ -8283,7 +10401,7 @@ fn capture_stream_should_move_to_locked_default_input(
     route: &SourceOutputRoute,
     expected_source: &str,
 ) -> bool {
-    if route.id.trim().is_empty() || source_output_is_wavelinux_owned(route) {
+    if route.id.trim().is_empty() || route.dont_move || source_output_is_wavelinux_owned(route) {
         return false;
     }
     let Some(source_name) = route.source_name.as_deref() else {
@@ -8322,6 +10440,14 @@ fn user_selectable_wavelinux_capture_sources(
         ]
     });
     mix_sources.chain(channel_sources)
+}
+
+fn mix_render_source_name(mix: &Mix) -> String {
+    if mix_uses_persistent_audio_core(mix) {
+        mix.virtual_source_name.clone()
+    } else {
+        format!("{}.monitor", mix.virtual_sink_name)
+    }
 }
 
 fn capture_move_signature_for_command(
@@ -8397,6 +10523,13 @@ fn command_execution(result: Result<CommandOutput, PwError>) -> CommandExecution
     }
 }
 
+fn command_executions_may_have_mutated_graph(outputs: &[CommandExecution]) -> bool {
+    // A failed command can still have applied part of its operation before the
+    // client observed the error. Only dry-run/skipped commands are guaranteed
+    // to leave the captured host snapshot current.
+    outputs.iter().any(|output| !output.skipped)
+}
+
 fn command_execution_with_spec(
     command: CommandSpec,
     result: Result<CommandOutput, PwError>,
@@ -8462,7 +10595,9 @@ fn command_stream_id(command: &CommandSpec) -> Option<&str> {
             "set-sink-input-volume"
             | "set-sink-input-mute"
             | "set-source-output-volume"
-            | "set-source-output-mute",
+            | "set-source-output-mute"
+            | "move-sink-input"
+            | "move-source-output",
         ) => command.args.get(1).map(String::as_str),
         _ => None,
     }
@@ -8626,6 +10761,41 @@ fn app_routing_graph_ready(
     source_outputs: &[SourceOutputRoute],
     sink_inputs: &[SinkInputRoute],
 ) -> bool {
+    app_routing_graph_ready_with_target_check(
+        config,
+        graph,
+        managed_modules,
+        source_outputs,
+        sink_inputs,
+        true,
+    )
+}
+
+fn app_routing_graph_ready_without_persistent_targets(
+    config: &MixerConfig,
+    graph: &RuntimeGraph,
+    managed_modules: &[ManagedModule],
+    source_outputs: &[SourceOutputRoute],
+    sink_inputs: &[SinkInputRoute],
+) -> bool {
+    app_routing_graph_ready_with_target_check(
+        config,
+        graph,
+        managed_modules,
+        source_outputs,
+        sink_inputs,
+        false,
+    )
+}
+
+fn app_routing_graph_ready_with_target_check(
+    config: &MixerConfig,
+    graph: &RuntimeGraph,
+    managed_modules: &[ManagedModule],
+    source_outputs: &[SourceOutputRoute],
+    sink_inputs: &[SinkInputRoute],
+    check_persistent_targets: bool,
+) -> bool {
     let active_app_channel_ids = active_app_channel_ids_for_graph(config, graph);
     let active_mix_ids = active_mix_ids_for_routes(config, graph, source_outputs, sink_inputs);
     let output_names = graph
@@ -8640,9 +10810,9 @@ fn app_routing_graph_ready(
         .collect::<BTreeSet<_>>();
 
     for mix in &config.mixes {
-        if !output_names.contains(mix.virtual_sink_name.as_str())
-            || !input_names.contains(mix.virtual_source_name.as_str())
-        {
+        let sink_missing = !mix_uses_persistent_audio_core(mix)
+            && !output_names.contains(mix.virtual_sink_name.as_str());
+        if sink_missing || !input_names.contains(mix.virtual_source_name.as_str()) {
             return false;
         }
     }
@@ -8652,23 +10822,45 @@ fn app_routing_graph_ready(
         .iter()
         .filter(|mix| active_mix_ids.contains(&mix.id))
     {
-        let monitor_source = format!("{}.monitor", mix.virtual_sink_name);
+        let monitor_source = mix_render_source_name(mix);
         for output in mix.outputs() {
-            if !managed_modules.iter().any(|module| {
-                module.role.as_deref() == Some("mix_monitor")
-                    && module.mix_id.as_deref() == Some(mix.id.as_str())
-                    && module.source_name.as_deref() == Some(monitor_source.as_str())
-                    && module
-                        .sink_name
-                        .as_deref()
-                        .is_some_and(|sink| audio_endpoint_names_match(sink, &output))
-                    && module.route_revision.as_deref()
-                        == Some(
-                            mix_monitor_route_revision_for_sink(&config.settings, mix, &output)
-                                .as_str(),
-                        )
-            }) {
+            let route_ready = if mix_uses_persistent_audio_core(mix) {
+                if !check_persistent_targets {
+                    continue;
+                }
+                native_mix_output_target_route_ready(mix, &output, sink_inputs)
+            } else {
+                managed_modules.iter().any(|module| {
+                    module.role.as_deref() == Some("mix_monitor")
+                        && module.mix_id.as_deref() == Some(mix.id.as_str())
+                        && module.source_name.as_deref() == Some(monitor_source.as_str())
+                        && module
+                            .sink_name
+                            .as_deref()
+                            .is_some_and(|sink| audio_endpoint_names_match(sink, &output))
+                        && module.route_revision.as_deref()
+                            == Some(
+                                mix_monitor_route_revision_for_sink(&config.settings, mix, &output)
+                                    .as_str(),
+                            )
+                })
+            };
+            if !route_ready {
                 return false;
+            }
+        }
+    }
+
+    if check_persistent_targets {
+        for channel in config
+            .channels
+            .iter()
+            .filter(|channel| channel_uses_persistent_audio_core(channel))
+        {
+            if let Some(source) = channel.source_device.as_deref() {
+                if !native_input_target_route_ready(channel, source, source_outputs) {
+                    return false;
+                }
             }
         }
     }
@@ -8684,6 +10876,66 @@ fn app_routing_graph_ready(
             &active_mix_ids,
         )
     })
+}
+
+fn persistent_core_target_routes_need_sync(
+    config: &MixerConfig,
+    source_outputs: &[SourceOutputRoute],
+    sink_inputs: &[SinkInputRoute],
+) -> bool {
+    let input_changed = config
+        .channels
+        .iter()
+        .filter(|channel| channel_uses_persistent_audio_core(channel))
+        .any(|channel| {
+            let actual = source_outputs
+                .iter()
+                .filter(|route| {
+                    route.role.as_deref() == Some("input_target")
+                        && route.channel_id.as_deref() == Some(channel.id.as_str())
+                })
+                .collect::<Vec<_>>();
+            match channel.source_device.as_deref() {
+                Some(source) => {
+                    !native_input_target_route_ready(channel, source, source_outputs)
+                        || actual.iter().any(|route| {
+                            ![route.source_name.as_deref(), route.target_object.as_deref()]
+                                .into_iter()
+                                .flatten()
+                                .any(|actual| audio_endpoint_names_match(actual, source))
+                        })
+                }
+                None => !actual.is_empty(),
+            }
+        });
+    let output_changed = config
+        .mixes
+        .iter()
+        .filter(|mix| mix_uses_persistent_audio_core(mix))
+        .any(|mix| {
+            let expected = mix.outputs();
+            let actual = sink_inputs
+                .iter()
+                .filter(|route| {
+                    route.role.as_deref() == Some("mix_output_target")
+                        && route.mix_id.as_deref() == Some(mix.id.as_str())
+                })
+                .collect::<Vec<_>>();
+            expected
+                .iter()
+                .any(|output| !native_mix_output_target_route_ready(mix, output, sink_inputs))
+                || actual.iter().any(|route| {
+                    ![route.sink_name.as_deref(), route.target_object.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|actual| {
+                            expected
+                                .iter()
+                                .any(|output| audio_endpoint_names_match(actual, output))
+                        })
+                })
+        });
+    input_changed || output_changed
 }
 
 struct IncrementalMixRouteView<'a> {
@@ -8812,16 +11064,18 @@ fn channel_route_ready(
         let effect_processed_name = effect_chain_filter_output_name(channel);
         let adaptive_bridge_input_name = effect_chain_adaptive_bridge_input_name(channel);
         if effect_readiness.ready() {
-            let effect_route_ready = managed_modules.iter().any(|module| {
-                module.role.as_deref() == Some("channel_to_effect")
-                    && module.channel_id.as_deref() == Some(channel.id.as_str())
-                    && module.source_name.as_deref() == Some(raw_source_name.as_str())
-                    && module.sink_name.as_deref() == Some(effect_input_name.as_str())
-                    && module.route_revision.as_deref()
-                        == Some(effect_route_revision(&config.settings, channel).as_str())
-            });
-            if !effect_route_ready {
-                return false;
+            if !channel_uses_persistent_audio_core(channel) {
+                let effect_route_ready = managed_modules.iter().any(|module| {
+                    module.role.as_deref() == Some("channel_to_effect")
+                        && module.channel_id.as_deref() == Some(channel.id.as_str())
+                        && module.source_name.as_deref() == Some(raw_source_name.as_str())
+                        && module.sink_name.as_deref() == Some(effect_input_name.as_str())
+                        && module.route_revision.as_deref()
+                            == Some(effect_route_revision(&config.settings, channel).as_str())
+                });
+                if !effect_route_ready {
+                    return false;
+                }
             }
             if channel_uses_adaptive_latency_bridge(channel) {
                 let bridge_route_ready = managed_modules.iter().any(|module| {
@@ -8840,6 +11094,24 @@ fn channel_route_ready(
         } else {
             return false;
         }
+    }
+    if channel_uses_persistent_audio_core(channel) {
+        // WaveLinux 6 buses are summed inside the persistent core. Their
+        // readiness is represented by the stable mix source endpoint rather
+        // than one Pulse module per channel/mix pair.
+        return config
+            .mixes
+            .iter()
+            .filter(|mix| {
+                channel_mix_route_expected_for_active_routes(
+                    channel,
+                    mix,
+                    &config.settings,
+                    active_app_channel_ids,
+                    active_mix_ids,
+                )
+            })
+            .all(mix_uses_persistent_audio_core);
     }
     config
         .mixes
@@ -8912,6 +11184,16 @@ fn active_mix_ids_for_routes(
     source_outputs: &[SourceOutputRoute],
     _sink_inputs: &[SinkInputRoute],
 ) -> BTreeSet<String> {
+    // WaveLinux 6 mixes are persistent bridge endpoints. Keeping their output
+    // routes alive avoids graph mutation when a recorder starts or an app
+    // resumes after being idle.
+    if config
+        .channels
+        .iter()
+        .any(channel_uses_persistent_audio_core)
+    {
+        return all_mix_ids(config);
+    }
     let active_app_channel_ids = active_app_channel_ids_for_graph(config, graph);
     config
         .mixes
@@ -9011,7 +11293,10 @@ fn source_output_uses_source(
 
 fn source_output_is_wavelinux_internal(output: &SourceOutputRoute, source_name: &str) -> bool {
     if output.managed.as_deref() == Some("1")
-        || output.application_name.as_deref() == Some("WaveLinux5")
+        || matches!(
+            output.application_name.as_deref(),
+            Some("WaveLinux6" | "WaveLinux 6" | "WaveLinux5")
+        )
     {
         return true;
     }
@@ -9037,13 +11322,20 @@ fn is_restorable_device(device: &str) -> bool {
     !device.to_ascii_lowercase().contains("wavelinux")
 }
 
-fn effect_chain_log_mentions_recent(path: &Path, markers: &[&str]) -> Option<String> {
+fn effect_chain_log_mentions_recent(
+    path: &Path,
+    markers: &[&str],
+    channel_id: Option<&str>,
+) -> Option<String> {
     let log = fs::read_to_string(path).ok()?;
     let now_nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
     let window_nanos = FX_LOG_WARNING_WINDOW.as_nanos() as i128;
     let mut found_untimestamped_marker = false;
 
     for line in log.lines().rev() {
+        if !effect_chain_log_line_matches_channel(line, channel_id) {
+            continue;
+        }
         let lower = line.to_ascii_lowercase();
         if !markers.iter().any(|marker| lower.contains(marker)) {
             continue;
@@ -9072,7 +11364,10 @@ fn effect_chain_log_mentions_recent(path: &Path, markers: &[&str]) -> Option<Str
     }
 }
 
-fn effect_chain_log_recent_native_underrun(path: &Path) -> Option<String> {
+fn effect_chain_log_recent_native_underrun(
+    path: &Path,
+    channel_id: Option<&str>,
+) -> Option<String> {
     let log = fs::read_to_string(path).ok()?;
     let now_nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
     let window_nanos = FX_LOG_WARNING_WINDOW.as_nanos() as i128;
@@ -9084,6 +11379,9 @@ fn effect_chain_log_recent_native_underrun(path: &Path) -> Option<String> {
     let mut newest: Option<(u64, String)> = None;
 
     for line in log.lines().rev() {
+        if !effect_chain_log_line_matches_channel(line, channel_id) {
+            continue;
+        }
         let Some(underrun_frames) = effect_chain_native_underrun_frames(line) else {
             continue;
         };
@@ -9105,19 +11403,25 @@ fn effect_chain_log_recent_native_underrun(path: &Path) -> Option<String> {
     newest.and_then(|(underrun_frames, summary)| (underrun_frames > 0).then_some(summary))
 }
 
-fn effect_chain_log_mentions(path: &Path, markers: &[&str]) -> bool {
+fn effect_chain_log_mentions(path: &Path, markers: &[&str], channel_id: Option<&str>) -> bool {
     let Ok(log) = fs::read_to_string(path) else {
         return false;
     };
     log.lines().any(|line| {
+        if !effect_chain_log_line_matches_channel(line, channel_id) {
+            return false;
+        }
         let lower = line.to_ascii_lowercase();
         markers.iter().any(|marker| lower.contains(marker))
     })
 }
 
-fn effect_chain_log_failure_summary(path: &Path) -> Option<String> {
+fn effect_chain_log_failure_summary(path: &Path, channel_id: Option<&str>) -> Option<String> {
     let log = fs::read_to_string(path).ok()?;
     log.lines().rev().find_map(|line| {
+        if !effect_chain_log_line_matches_channel(line, channel_id) {
+            return None;
+        }
         let lower = line.to_ascii_lowercase();
         if !lower.contains("underrun detected")
             && !lower.contains("processing too slow")
@@ -9127,6 +11431,17 @@ fn effect_chain_log_failure_summary(path: &Path) -> Option<String> {
         }
         Some(effect_chain_log_line_summary(line))
     })
+}
+
+fn effect_chain_log_line_matches_channel(line: &str, channel_id: Option<&str>) -> bool {
+    let Some(channel_id) = channel_id else {
+        return true;
+    };
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix("channel_id="))
+        .is_some_and(|value| {
+            value.trim_matches(|character| character == ',' || character == '"') == channel_id
+        })
 }
 
 fn effect_chain_log_line_summary(line: &str) -> String {
@@ -9198,6 +11513,38 @@ fn bypass_realtime_fallback_effects(channel: &mut Channel) -> bool {
     changed
 }
 
+fn channel_effects_desired_enabled(channel: &Channel) -> bool {
+    channel.effects_enabled && channel.effects.iter().any(|effect| !effect.bypassed)
+}
+
+fn channel_with_effect_enable_applied(channel: &Channel) -> Channel {
+    let mut effective = channel.clone();
+    if !effective.effects_enabled {
+        for effect in &mut effective.effects {
+            effect.bypassed = true;
+        }
+    }
+    effective
+}
+
+fn effect_runtime_state_name(state: EffectRuntimeState) -> &'static str {
+    match state {
+        EffectRuntimeState::Grey => "grey",
+        EffectRuntimeState::Red => "red",
+        EffectRuntimeState::Green => "green",
+    }
+}
+
+fn panic_payload(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).into()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".into()
+    }
+}
+
 fn safe_file_id(value: &str) -> String {
     let mut safe = String::new();
     for ch in value.chars() {
@@ -9262,6 +11609,7 @@ fn settings_affect_audio_graph(previous: &MixerSettings, next: &MixerSettings) -
 
 fn module_is_stale_for_config(module: &ManagedModule, config: &MixerConfig) -> bool {
     match module.role.as_deref() {
+        Some("mix") if config.mixes.iter().all(mix_uses_persistent_audio_core) => true,
         Some("mix") => module.mix_id.as_deref().is_none_or(|mix_id| {
             config
                 .mixes
@@ -9274,6 +11622,7 @@ fn module_is_stale_for_config(module: &ManagedModule, config: &MixerConfig) -> b
                         .is_some_and(|node_name| node_name != mix.virtual_sink_name)
                 })
         }),
+        Some("mix_source") if config.mixes.iter().all(mix_uses_persistent_audio_core) => true,
         Some("mix_source") => module.mix_id.as_deref().is_none_or(|mix_id| {
             config
                 .mixes
@@ -9312,7 +11661,7 @@ fn module_is_stale_for_config(module: &ManagedModule, config: &MixerConfig) -> b
                     }
                     route_endpoint_mismatch(
                         module,
-                        Some(&format!("{}.monitor", mix.virtual_sink_name)),
+                        Some(&mix_render_source_name(mix)),
                         Some(output),
                     )
                 })
@@ -9352,7 +11701,9 @@ fn module_is_stale_for_config(module: &ManagedModule, config: &MixerConfig) -> b
                 .iter()
                 .find(|channel| channel.id == channel_id)
                 .is_none_or(|channel| {
-                    if !channel_has_active_effects(channel) {
+                    if channel_uses_persistent_audio_core(channel)
+                        || !channel_has_active_effects(channel)
+                    {
                         return true;
                     }
                     if module.route_revision.as_deref()
@@ -9389,6 +11740,14 @@ fn module_is_stale_for_config(module: &ManagedModule, config: &MixerConfig) -> b
                 Some(&effect_chain_filter_output_name(channel)),
                 Some(&effect_chain_adaptive_bridge_input_name(channel)),
             )
+        }
+        Some("channel_to_mix")
+            if config
+                .channels
+                .iter()
+                .all(channel_uses_persistent_audio_core) =>
+        {
+            true
         }
         Some("channel_to_mix") => {
             let Some(channel_id) = module.channel_id.as_deref() else {
@@ -9874,6 +12233,17 @@ fn auto_device_slot_matches(left: &ResolvedAutoDevice, right: &ResolvedAutoDevic
     left.kind == right.kind && left.channel_id == right.channel_id && left.mix_id == right.mix_id
 }
 
+fn stabilize_auto_device_reasons(previous: &[ResolvedAutoDevice], next: &mut [ResolvedAutoDevice]) {
+    for device in next {
+        let Some(prior) = previous.iter().find(|prior| {
+            auto_device_slot_matches(prior, device) && prior.device_id == device.device_id
+        }) else {
+            continue;
+        };
+        device.reason = prior.reason;
+    }
+}
+
 fn auto_device_reason_label(reason: &AutoDeviceReason) -> &'static str {
     match reason {
         AutoDeviceReason::Priority => "priority",
@@ -10118,7 +12488,7 @@ fn load_config(paths: &EnginePaths) -> Result<MixerConfig, EngineError> {
             }
         }
     } else {
-        Ok(import_stable_config_for_wavelinux5(&path).unwrap_or_default())
+        Ok(import_wavelinux5_config_for_wavelinux6(paths)?.unwrap_or_default())
     }
 }
 
@@ -10132,7 +12502,13 @@ fn effect_chain_file_name(channel_id: &str, suffix: &str) -> String {
 }
 
 fn dsp_channel_config(channel: &Channel) -> wavelinux_dsp::DspChannelConfig {
-    wavelinux_dsp::DspChannelConfig::new(
+    let mut effects = channel.effects.clone();
+    if !channel.effects_enabled {
+        for effect in &mut effects {
+            effect.bypassed = true;
+        }
+    }
+    let mut config = wavelinux_dsp::DspChannelConfig::new(
         channel.id.clone(),
         channel.name.clone(),
         graph_prefix(),
@@ -10140,14 +12516,34 @@ fn dsp_channel_config(channel: &Channel) -> wavelinux_dsp::DspChannelConfig {
         app_display_name(),
         effect_chain_input_name(channel),
         effect_chain_source_name(channel),
-        channel.effects.clone(),
-    )
+        effects,
+    );
+    config.input_target_node_name = channel.source_device.clone();
+    if channel.kind.uses_hardware_slot() {
+        config.input_target_capable = true;
+    }
+    config.input_mode = match channel.input_mode {
+        ChannelInputMode::Stereo => wavelinux_dsp::DspInputMode::Stereo,
+        ChannelInputMode::MonoLeft => wavelinux_dsp::DspInputMode::MonoLeft,
+        ChannelInputMode::MonoRight => wavelinux_dsp::DspInputMode::MonoRight,
+        ChannelInputMode::SumMono => wavelinux_dsp::DspInputMode::SumMono,
+        ChannelInputMode::SwapLr => wavelinux_dsp::DspInputMode::SwapLr,
+    };
+    config.input_channels = if matches!(
+        channel.input_mode,
+        ChannelInputMode::Stereo | ChannelInputMode::SwapLr
+    ) {
+        2
+    } else {
+        1
+    };
+    config
 }
 
 fn dsp_adaptive_bridge_config(
     channel: &Channel,
     config: &MixerConfig,
-    effect_dir: &Path,
+    runtime_root: &Path,
 ) -> wavelinux_dsp::DspChannelConfig {
     let mut bridge = wavelinux_dsp::DspChannelConfig::new(
         channel.id.clone(),
@@ -10163,10 +12559,9 @@ fn dsp_adaptive_bridge_config(
     bridge.output_role = Some("effect_output".into());
     bridge.adaptive_latency = dsp_adaptive_latency_config(&config.settings.adaptive_latency);
     bridge.control_socket_path = Some(
-        effect_dir
-            .join(effect_chain_file_name(&channel.id, "sock"))
+        wavelinux_dsp::channel_control_socket(runtime_root, &graph_prefix(), &channel.id)
             .to_string_lossy()
-            .to_string(),
+            .into_owned(),
     );
     bridge
 }
@@ -10179,6 +12574,78 @@ fn dsp_adaptive_latency_config(
         min_msec: settings.min_msec,
         max_msec: settings.max_msec,
         levels_msec: settings.levels_msec.clone(),
+    }
+}
+
+fn dsp_mix_config(mix: &Mix, config: &MixerConfig) -> wavelinux_dsp::DspMixConfig {
+    let latency_msec = config
+        .channels
+        .iter()
+        .filter(|channel| {
+            channel
+                .mix_buses
+                .get(&mix.id)
+                .is_some_and(|bus| bus.enabled)
+        })
+        .map(|channel| channel_mix_latency_msec(channel, mix, &config.settings))
+        .max()
+        .unwrap_or(config.settings.adaptive_latency.min_msec)
+        .clamp(5, 500);
+    let latency_frames = ((u64::from(config.audio.sample_rate_hz) * u64::from(latency_msec)) / 1000)
+        .max(1)
+        .min(u64::from(u32::MAX)) as u32;
+    wavelinux_dsp::DspMixConfig {
+        mix_id: mix.id.clone(),
+        mix_name: mix.name.clone(),
+        graph_prefix: graph_prefix(),
+        property_prefix: graph_property_prefix(),
+        app_name: app_display_name(),
+        output_node_name: mix.virtual_source_name.clone(),
+        output_target_node_names: mix.outputs(),
+        sample_rate_hz: config.audio.sample_rate_hz,
+        latency_frames,
+        pipewire_quantum_frames: 0,
+        adaptive_latency: dsp_adaptive_latency_config(&config.settings.adaptive_latency),
+        volume: mix.volume,
+        muted: mix.muted,
+        buses: config
+            .channels
+            .iter()
+            .filter_map(|channel| {
+                channel
+                    .mix_buses
+                    .get(&mix.id)
+                    .map(|bus| wavelinux_dsp::DspMixBusConfig {
+                        channel_id: channel.id.clone(),
+                        volume: bus.volume,
+                        muted: bus.muted,
+                        enabled: bus.enabled,
+                    })
+            })
+            .collect(),
+    }
+}
+
+fn apply_audio_core_discontinuity_deltas(
+    statuses: &mut [AudioCoreChannelStatus],
+    counters: &Mutex<BTreeMap<String, u64>>,
+) {
+    let Ok(mut previous) = counters.lock() else {
+        return;
+    };
+    let active_ids = statuses
+        .iter()
+        .map(|status| status.channel_id.clone())
+        .collect::<BTreeSet<_>>();
+    previous.retain(|channel_id, _| active_ids.contains(channel_id));
+    for status in statuses {
+        if !status.online {
+            continue;
+        }
+        let discontinuity_frames = status.underrun_frames.saturating_add(status.dropped_frames);
+        status.underrun_delta = previous
+            .insert(status.channel_id.clone(), discontinuity_frames)
+            .map_or(0, |prior| discontinuity_frames.saturating_sub(prior));
     }
 }
 
@@ -10205,11 +12672,29 @@ fn normalized_adaptive_levels(settings: &wavelinux_model::AdaptiveLatencySetting
     levels
 }
 
+fn learned_quantum_floor_for_mix(mix: &Mix, floors: &BTreeMap<String, u32>) -> u32 {
+    if mix.id != "monitor" {
+        return 0;
+    }
+    floors.get(&mix.outputs().join("|")).copied().unwrap_or(0)
+}
+
+fn adaptive_monitor_output_signature(audio_core: &[AudioCoreChannelStatus]) -> String {
+    audio_core
+        .iter()
+        .find(|status| status.channel_id == "mix:monitor")
+        .map(|status| status.output_target_node_names.join("|"))
+        .filter(|signature| !signature.is_empty())
+        .unwrap_or_else(|| "<no-monitor-output>".into())
+}
+
 fn adaptive_latency_signal(
     settings: &wavelinux_model::AdaptiveLatencySettings,
-    diagnostics: &[Diagnostic],
-) -> (AdaptiveLatencySignal, f32, u64) {
-    let cpu_pressure = system_cpu_pressure().unwrap_or(0.0);
+    audio_core: &[AudioCoreChannelStatus],
+    cpu_pressure: f32,
+    pipewire_warning_delta: u64,
+    owned_pipewire_warning_delta: u64,
+) -> (AdaptiveLatencySignal, f32, u64, u64) {
     let audio_triggers_enabled = matches!(
         settings.trigger_mode,
         wavelinux_model::AdaptiveLatencyTriggerMode::AudioOnly
@@ -10220,49 +12705,33 @@ fn adaptive_latency_signal(
         wavelinux_model::AdaptiveLatencyTriggerMode::CpuOnly
             | wavelinux_model::AdaptiveLatencyTriggerMode::Hybrid
     );
-    let pipewire_warning_delta = if audio_triggers_enabled {
-        diagnostics
+    let pipewire_warning_delta = u64::from(audio_triggers_enabled) * pipewire_warning_delta;
+    let owned_pipewire_warning_delta =
+        u64::from(audio_triggers_enabled) * owned_pipewire_warning_delta;
+    let core_discontinuity_delta = if audio_triggers_enabled {
+        audio_core
             .iter()
-            .filter(|diagnostic| diagnostic.code.contains("pipewire.audio_health"))
-            .count() as u64
+            .filter(|status| status.online)
+            .map(|status| status.underrun_delta)
+            .sum()
     } else {
         0
     };
-    let effect_underrun_delta = if audio_triggers_enabled {
-        diagnostics
-            .iter()
-            .filter(|diagnostic| {
-                diagnostic.code.contains("effects.underrun")
-                    || diagnostic.message.to_ascii_lowercase().contains("underrun")
-            })
-            .count() as u64
-    } else {
-        0
-    };
-    if effect_underrun_delta > 0 {
+    let underrun_delta = core_discontinuity_delta;
+    if underrun_delta > 0 {
         return (
             AdaptiveLatencySignal::AudioTrouble,
             cpu_pressure,
             pipewire_warning_delta,
+            underrun_delta,
         );
     }
-    let owned_pipewire_warning_delta = if audio_triggers_enabled {
-        diagnostics
-            .iter()
-            .filter(|diagnostic| {
-                diagnostic
-                    .code
-                    .contains("pipewire.audio_health.wavelinux_owned")
-            })
-            .count() as u64
-    } else {
-        0
-    };
     if owned_pipewire_warning_delta > 0 {
         return (
             AdaptiveLatencySignal::PipeWireTrouble,
             cpu_pressure,
             pipewire_warning_delta,
+            underrun_delta,
         );
     }
     if cpu_triggers_enabled && cpu_pressure >= 0.88 {
@@ -10270,24 +12739,15 @@ fn adaptive_latency_signal(
             AdaptiveLatencySignal::CpuPressure,
             cpu_pressure,
             pipewire_warning_delta,
+            underrun_delta,
         );
     }
     (
         AdaptiveLatencySignal::Clean,
         cpu_pressure,
         pipewire_warning_delta,
+        underrun_delta,
     )
-}
-
-fn system_cpu_pressure() -> Option<f32> {
-    let load = fs::read_to_string("/proc/loadavg")
-        .ok()?
-        .split_whitespace()
-        .next()?
-        .parse::<f32>()
-        .ok()?;
-    let cpus = std::thread::available_parallelism().ok()?.get().max(1) as f32;
-    Some((load / cpus).clamp(0.0, 1.0))
 }
 
 #[cfg(unix)]
@@ -10295,24 +12755,18 @@ fn send_adaptive_latency_target(
     socket_path: &Path,
     route_id: &str,
     target_msec: u16,
+    pipewire_quantum_frames: u32,
     reason: &str,
 ) {
-    if !socket_path.exists() {
-        return;
-    }
-    let Ok(mut stream) = UnixStream::connect(socket_path) else {
-        return;
-    };
     let payload = serde_json::json!({
+        "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
         "command": "set_target_latency",
         "route_id": route_id,
         "target_msec": target_msec,
+        "pipewire_quantum_frames": pipewire_quantum_frames,
         "reason": reason,
     });
-    let _ = stream.write_all(payload.to_string().as_bytes());
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
+    let _ = send_core_control_request(socket_path, &payload);
 }
 
 #[cfg(not(unix))]
@@ -10320,8 +12774,461 @@ fn send_adaptive_latency_target(
     _socket_path: &Path,
     _route_id: &str,
     _target_msec: u16,
+    _pipewire_quantum_frames: u32,
     _reason: &str,
 ) {
+}
+
+#[cfg(unix)]
+fn send_audio_core_input_target(
+    socket_path: &Path,
+    route_id: &str,
+    target_node_name: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let before = query_audio_core_diagnostics(socket_path, route_id)?;
+    let requested_generation = next_route_generation(&before)?;
+    let request_id = Uuid::new_v4().to_string();
+    let command = if target_node_name.is_some() {
+        "set_input_target"
+    } else {
+        "clear_input_target"
+    };
+    let payload = serde_json::json!({
+        "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+        "command": command,
+        "request_id": request_id,
+        "route_id": route_id,
+        "target_node_name": target_node_name,
+        "route_generation": requested_generation,
+    });
+    let queued = send_core_control_request(socket_path, &payload)?;
+    validate_control_request_id(&queued, &request_id)?;
+    let queued_generation = queued_route_generation(&queued)?;
+    let applied = wait_for_route_generation_ack(
+        socket_path,
+        route_id,
+        queued_generation,
+        EFFECT_CORE_ACK_TIMEOUT,
+    )?;
+    if applied.input_target_node_name.as_deref() != target_node_name {
+        return Err(format!(
+            "input target generation {queued_generation} applied {}, expected {}",
+            applied
+                .input_target_node_name
+                .as_deref()
+                .unwrap_or("<none>"),
+            target_node_name.unwrap_or("<none>"),
+        ));
+    }
+    Ok(serde_json::json!({
+        "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+        "ok": true,
+        "request_id": request_id,
+        "route_id": route_id,
+        "route_generation": queued_generation,
+        "applied_route_generation": applied.applied_route_generation,
+        "target_node_name": applied.input_target_node_name,
+        "operation": if target_node_name.is_some() {
+            "input_target_applied"
+        } else {
+            "input_target_cleared"
+        },
+    }))
+}
+
+#[cfg(not(unix))]
+fn send_audio_core_input_target(
+    _socket_path: &Path,
+    _route_id: &str,
+    _target_node_name: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    Err("WaveLinux audio-core routing requires Unix sockets".into())
+}
+
+#[cfg(unix)]
+fn send_audio_core_output_targets(
+    socket_path: &Path,
+    mix_id: &str,
+    target_node_names: &[String],
+) -> Result<serde_json::Value, String> {
+    let before = query_audio_core_diagnostics(socket_path, mix_id)?;
+    let requested_generation = next_route_generation(&before)?;
+    let request_id = Uuid::new_v4().to_string();
+    let payload = serde_json::json!({
+        "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+        "command": "set_output_targets",
+        "request_id": request_id,
+        "mix_id": mix_id,
+        "target_node_names": target_node_names,
+        "route_generation": requested_generation,
+    });
+    let queued = send_core_control_request(socket_path, &payload)?;
+    validate_control_request_id(&queued, &request_id)?;
+    let queued_generation = queued_route_generation(&queued)?;
+    let applied = wait_for_route_generation_ack(
+        socket_path,
+        mix_id,
+        queued_generation,
+        EFFECT_CORE_ACK_TIMEOUT,
+    )?;
+    if applied.output_target_node_names != target_node_names {
+        return Err(format!(
+            "output target generation {queued_generation} applied {:?}, expected {:?}",
+            applied.output_target_node_names, target_node_names,
+        ));
+    }
+    Ok(serde_json::json!({
+        "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+        "ok": true,
+        "request_id": request_id,
+        "route_id": mix_id,
+        "route_generation": queued_generation,
+        "applied_route_generation": applied.applied_route_generation,
+        "target_node_names": applied.output_target_node_names,
+        "operation": "output_targets_applied",
+    }))
+}
+
+#[cfg(not(unix))]
+fn send_audio_core_output_targets(
+    _socket_path: &Path,
+    _mix_id: &str,
+    _target_node_names: &[String],
+) -> Result<serde_json::Value, String> {
+    Err("WaveLinux audio-core routing requires Unix sockets".into())
+}
+
+#[cfg(unix)]
+fn send_effect_chain_swap(
+    socket_path: &Path,
+    route_id: &str,
+    config_path: &Path,
+    config_revision: &str,
+    desired_generation: u64,
+) -> Result<serde_json::Value, String> {
+    let payload = serde_json::json!({
+        "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+        "command": "swap_chain",
+        "request_id": Uuid::new_v4().to_string(),
+        "route_id": route_id,
+        "config_path": config_path,
+        "config_revision": config_revision,
+        "desired_generation": desired_generation,
+    });
+    send_core_control_request(socket_path, &payload)
+}
+
+#[cfg(not(unix))]
+fn send_effect_chain_swap(
+    _socket_path: &Path,
+    _route_id: &str,
+    _config_path: &Path,
+    _config_revision: &str,
+    _desired_generation: u64,
+) -> Result<serde_json::Value, String> {
+    Err("WaveLinux audio-core control requires Unix sockets".into())
+}
+
+#[cfg(unix)]
+fn query_audio_core_diagnostics(
+    socket_path: &Path,
+    route_id: &str,
+) -> Result<AudioCoreDiagnosticsResponse, String> {
+    let payload = serde_json::json!({
+        "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+        "command": "get_diagnostics",
+        "request_id": Uuid::new_v4().to_string(),
+        "route_id": route_id,
+    });
+    let response = send_core_control_request(socket_path, &payload)?;
+    let diagnostics: AudioCoreDiagnosticsResponse =
+        serde_json::from_value(response).map_err(|err| format!("invalid diagnostics: {err}"))?;
+    if diagnostics.protocol_version != wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION {
+        return Err(format!(
+            "audio core protocol {} does not match expected {}",
+            diagnostics.protocol_version,
+            wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION
+        ));
+    }
+    if diagnostics.route_id != route_id {
+        return Err(format!(
+            "audio core returned route {} for {route_id}",
+            diagnostics.route_id
+        ));
+    }
+    Ok(diagnostics)
+}
+
+#[cfg(unix)]
+fn wait_for_audio_core_ready(
+    socket_path: &Path,
+    route_id: &str,
+    timeout: Duration,
+) -> Result<AudioCoreDiagnosticsResponse, String> {
+    let started = Instant::now();
+    let mut delay = EFFECT_CORE_RETRY_MIN;
+    let mut last_error = format!("control socket is not ready: {}", socket_path.display());
+    while started.elapsed() < timeout {
+        match query_audio_core_diagnostics(socket_path, route_id) {
+            Ok(response) => return Ok(response),
+            Err(error) => last_error = error,
+        }
+        thread::sleep(delay);
+        delay = (delay * 2).min(EFFECT_CORE_RETRY_MAX);
+    }
+    Err(format!(
+        "audio core readiness timed out after {} ms for route_id={} resolved_control_socket={}: {}",
+        timeout.as_millis(),
+        route_id,
+        socket_path.display(),
+        last_error
+    ))
+}
+
+#[cfg(not(unix))]
+fn wait_for_audio_core_ready(
+    _socket_path: &Path,
+    _route_id: &str,
+    _timeout: Duration,
+) -> Result<AudioCoreDiagnosticsResponse, String> {
+    Err("WaveLinux audio-core readiness requires Unix sockets".into())
+}
+
+fn next_route_generation(response: &AudioCoreDiagnosticsResponse) -> Result<u64, String> {
+    response
+        .submitted_route_generation
+        .max(response.applied_route_generation)
+        .checked_add(1)
+        .ok_or_else(|| "audio core route generation exhausted".to_string())
+}
+
+fn validate_control_request_id(
+    response: &serde_json::Value,
+    expected_request_id: &str,
+) -> Result<(), String> {
+    let response_request_id = response
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "audio core response omitted request_id".to_string())?;
+    if response_request_id != expected_request_id {
+        return Err(format!(
+            "audio core returned request_id {response_request_id}, expected {expected_request_id}"
+        ));
+    }
+    Ok(())
+}
+
+fn queued_route_generation(response: &serde_json::Value) -> Result<u64, String> {
+    response
+        .get("route_generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "audio core response omitted route_generation".to_string())
+}
+
+fn wait_for_route_generation_ack(
+    socket_path: &Path,
+    route_id: &str,
+    desired_generation: u64,
+    timeout: Duration,
+) -> Result<AudioCoreDiagnosticsResponse, String> {
+    let started = Instant::now();
+    let mut delay = EFFECT_CORE_RETRY_MIN;
+    let mut last_applied = 0;
+    let mut last_submitted = 0;
+    let mut last_error = None;
+    while started.elapsed() < timeout {
+        match query_audio_core_diagnostics(socket_path, route_id) {
+            Ok(response) => {
+                last_applied = response.applied_route_generation;
+                last_submitted = response.submitted_route_generation;
+                if response.applied_route_generation >= desired_generation {
+                    return Ok(response);
+                }
+                if response.submitted_route_generation >= desired_generation {
+                    if let Some(error) = response.route_target_error.as_deref() {
+                        return Err(format!(
+                            "audio core rejected route generation {desired_generation} for {route_id}: {error}"
+                        ));
+                    }
+                }
+                last_error = None;
+            }
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(delay);
+        delay = (delay * 2).min(EFFECT_CORE_RETRY_MAX);
+    }
+    Err(format!(
+        "audio core route acknowledgement timed out after {} ms for route_id={} desired_generation={} submitted_route_generation={} applied_route_generation={} resolved_control_socket={} last_error={}",
+        timeout.as_millis(),
+        route_id,
+        desired_generation,
+        last_submitted,
+        last_applied,
+        socket_path.display(),
+        last_error.as_deref().unwrap_or("none"),
+    ))
+}
+
+fn wait_for_effect_generation_ack(
+    socket_path: &Path,
+    route_id: &str,
+    desired_generation: u64,
+    timeout: Duration,
+) -> Result<AudioCoreDiagnosticsResponse, String> {
+    let started = Instant::now();
+    let mut delay = EFFECT_CORE_RETRY_MIN;
+    let mut last_acknowledged = 0;
+    let mut last_submitted = 0;
+    let mut last_error = None;
+    while started.elapsed() < timeout {
+        match query_audio_core_diagnostics(socket_path, route_id) {
+            Ok(response) => {
+                last_acknowledged = response.acknowledged_generation;
+                last_submitted = response.submitted_generation;
+                last_error = None;
+                if response.acknowledged_generation == desired_generation {
+                    return Ok(response);
+                }
+                if response.acknowledged_generation > desired_generation {
+                    return Err(format!(
+                        "generation {desired_generation} was superseded by acknowledged generation {}",
+                        response.acknowledged_generation
+                    ));
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(delay);
+        delay = (delay * 2).min(EFFECT_CORE_RETRY_MAX);
+    }
+    Err(format!(
+        "audio core acknowledgement timed out after {} ms for route_id={} desired_generation={} submitted_generation={} acknowledged_generation={} resolved_control_socket={} last_error={}",
+        timeout.as_millis(),
+        route_id,
+        desired_generation,
+        last_submitted,
+        last_acknowledged,
+        socket_path.display(),
+        last_error.as_deref().unwrap_or("none"),
+    ))
+}
+
+#[cfg(not(unix))]
+fn query_audio_core_diagnostics(
+    _socket_path: &Path,
+    _route_id: &str,
+) -> Result<AudioCoreDiagnosticsResponse, String> {
+    Err("WaveLinux audio-core diagnostics require Unix sockets".into())
+}
+
+#[cfg(unix)]
+fn send_core_control_request(
+    socket_path: &Path,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if !socket_path.exists() {
+        return Err(format!(
+            "control socket is missing: {}",
+            socket_path.display()
+        ));
+    }
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|err| format!("could not connect to {}: {err}", socket_path.display()))?;
+    let timeout = Some(Duration::from_secs(1));
+    stream
+        .set_read_timeout(timeout)
+        .map_err(|err| err.to_string())?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|err| err.to_string())?;
+    stream
+        .write_all(payload.to_string().as_bytes())
+        .map_err(|err| err.to_string())?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|err| err.to_string())?;
+    let mut response = String::new();
+    stream
+        .take(1024 * 1024)
+        .read_to_string(&mut response)
+        .map_err(|err| err.to_string())?;
+    let response: serde_json::Value =
+        serde_json::from_str(&response).map_err(|err| format!("invalid core response: {err}"))?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(response
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("audio core rejected the request")
+            .to_string());
+    }
+    Ok(response)
+}
+
+fn content_revision(content: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in content.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn audio_core_channel_processing_revision(config: &wavelinux_dsp::DspChannelConfig) -> String {
+    let mut processing = config.clone();
+    processing.input_target_node_name = None;
+    content_revision(&serde_json::to_string(&processing).unwrap_or_default())
+}
+
+fn audio_core_channel_revision_from_path(path: &Path) -> Result<String, String> {
+    let config: wavelinux_dsp::DspChannelConfig =
+        read_json(path).map_err(|error| error.to_string())?;
+    Ok(audio_core_channel_processing_revision(&config))
+}
+
+fn audio_core_topology_revision(manifest_path: &Path) -> Result<String, String> {
+    let raw = fs::read_to_string(manifest_path).map_err(|err| err.to_string())?;
+    let manifest: wavelinux_dsp::DspCoreManifest =
+        serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+    let mut topology = format!("protocol:{}|", manifest.protocol_version);
+    topology.push_str(
+        &manifest
+            .channels
+            .iter()
+            .map(|channel| {
+                format!(
+                    "{}:{}:{}:{}:{}:{:?}:{}:{:?}:{}:{}",
+                    channel.channel_id,
+                    channel.channel_name,
+                    channel.input_node_name,
+                    channel.output_node_name,
+                    channel.input_channels,
+                    channel.input_mode,
+                    channel.input_target_capable,
+                    channel.input_role,
+                    channel.sample_rate_hz,
+                    channel.property_prefix,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|"),
+    );
+    for mix in &manifest.mixes {
+        topology.push('|');
+        topology.push_str(&format!(
+            "mix:{}:{}:{}:{}:{}",
+            mix.mix_id,
+            mix.mix_name,
+            mix.output_node_name,
+            mix.sample_rate_hz,
+            mix.buses
+                .iter()
+                .map(|bus| bus.channel_id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    Ok(content_revision(&topology))
 }
 
 fn effect_chain_launch_command(
@@ -10384,28 +13291,66 @@ fn dsp_helper_program() -> String {
     std::env::var(DSP_HELPER_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "wavelinux5-dsp-helper".into())
+        .unwrap_or_else(|| "wavelinux6-audio-core".into())
 }
 
-fn import_stable_config_for_wavelinux5(path: &Path) -> Option<MixerConfig> {
-    if std::env::var("WAVELINUX_XDG_APP_NAME").ok().as_deref() != Some("WaveLinux5") {
-        return None;
+fn import_wavelinux5_config_for_wavelinux6(
+    paths: &EnginePaths,
+) -> Result<Option<MixerConfig>, EngineError> {
+    if std::env::var("WAVELINUX_XDG_APP_NAME").ok().as_deref() != Some("WaveLinux6") {
+        return Ok(None);
     }
-    let dirs = ProjectDirs::from("io.github", "DuskyProjects", "WaveLinux")?;
-    let stable_path = dirs.config_dir().join("config.json");
-    if stable_path == path || !stable_path.exists() {
-        return None;
+    let Some(config_dir) = wavelinux5_config_dir() else {
+        return Ok(None);
+    };
+    let source = config_dir.join("config.json");
+    if source == paths.config_file() || !source.is_file() {
+        return Ok(None);
     }
-    let mut config: MixerConfig = read_json(&stable_path).ok()?;
+    let mut config: MixerConfig = read_json(&source)?;
     apply_graph_namespace(&mut config);
-    let _ = write_json(path, &config);
-    Some(config)
+    config = config.normalized()?;
+    write_json(&paths.config_file(), &config)?;
+    fs::write(
+        paths.wavelinux5_migration_marker(),
+        source.to_string_lossy().as_bytes(),
+    )?;
+    Ok(Some(config))
+}
+
+fn wavelinux5_config_dir() -> Option<PathBuf> {
+    ProjectDirs::from("io.github", "DuskyProjects", "WaveLinux5")
+        .map(|dirs| dirs.config_dir().to_path_buf())
 }
 
 fn backup_invalid_config(path: &Path) {
     let timestamp = OffsetDateTime::now_utc().unix_timestamp();
     let backup = path.with_file_name(format!("config.invalid.{timestamp}.json"));
     let _ = fs::rename(path, backup);
+}
+
+fn load_adaptive_quantum_floors(path: &Path) -> Result<BTreeMap<String, u32>, EngineError> {
+    if !path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let cache: AdaptiveQuantumFloorCache = read_json(path)?;
+    if cache.version != ADAPTIVE_QUANTUM_FLOORS_VERSION {
+        return Err(EngineError::Json(format!(
+            "unsupported adaptive quantum cache version {}",
+            cache.version
+        )));
+    }
+    Ok(cache
+        .floors
+        .into_iter()
+        .filter(|(signature, floor)| {
+            !signature.trim().is_empty()
+                && signature != "<no-monitor-output>"
+                && *floor >= 64
+                && *floor <= 8192
+                && floor.is_power_of_two()
+        })
+        .collect())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, EngineError> {
@@ -10418,15 +13363,38 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), EngineError> {
         fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_string_pretty(value)?;
-    fs::write(path, data)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let tmp_path = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let write_result = (|| -> Result<(), EngineError> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        file.write_all(data.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&tmp_path, path)?;
+        if let Some(parent) = path.parent() {
+            if let Ok(directory) = fs::File::open(parent) {
+                let _ = directory.sync_all();
+            }
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_result?;
     Ok(())
 }
 
 fn render_autostart_desktop_entry() -> String {
     let app_name = app_display_name();
     let icon = graph_prefix();
-    let startup_wm_class = if graph_prefix() == "wavelinux5" {
-        "io.github.duskyprojects.WaveLinux5"
+    let startup_wm_class = if graph_prefix() == "wavelinux6" {
+        "io.github.duskyprojects.WaveLinux6"
     } else {
         "io.github.duskyprojects.WaveLinux"
     };
@@ -10508,6 +13476,20 @@ fn fast_routable_streams_for_graph(config: &MixerConfig, graph: &RuntimeGraph) -
         })
         .cloned()
         .collect()
+}
+
+fn runtime_route_resnapshot_needed(
+    fast_routed_streams: bool,
+    rescued_streams: bool,
+    routed_streams: bool,
+    updated_volumes: bool,
+    moved_capture_streams: bool,
+) -> bool {
+    fast_routed_streams
+        || rescued_streams
+        || routed_streams
+        || updated_volumes
+        || moved_capture_streams
 }
 
 fn implicit_channel_id_for_stream(stream: &AppStream) -> Option<&'static str> {
@@ -10652,6 +13634,11 @@ fn configured_volume_for_stream(config: &MixerConfig, stream: &AppStream) -> Opt
         .map(|preset| preset.volume)
 }
 
+fn configured_volume_update_for_stream(config: &MixerConfig, stream: &AppStream) -> Option<f32> {
+    let volume = configured_volume_for_stream(config, stream)?;
+    ((stream.volume - volume).abs() > 0.01).then_some(volume)
+}
+
 fn stream_matchers_for_config(config: &MixerConfig, stream: &AppStream) -> Vec<AppMatcher> {
     let Some(raw) = AppMatcher::from_stream(stream) else {
         return Vec::new();
@@ -10781,10 +13768,11 @@ fn graph_diagnostics(config: &MixerConfig, graph: &RuntimeGraph) -> Vec<Diagnost
     }
 
     for mix in &config.mixes {
-        if !graph
-            .outputs
-            .iter()
-            .any(|output| output.name == mix.virtual_sink_name)
+        if !mix_uses_persistent_audio_core(mix)
+            && !graph
+                .outputs
+                .iter()
+                .any(|output| output.name == mix.virtual_sink_name)
         {
             diagnostics.push(Diagnostic {
                 code: format!("graph.mix_sink.{}", mix.id),
@@ -10821,12 +13809,16 @@ fn graph_diagnostics(config: &MixerConfig, graph: &RuntimeGraph) -> Vec<Diagnost
             .iter()
             .find(|output| output.name == channel.virtual_sink_name);
         if let Some(channel_sink) = channel_sink {
-            if channel_sink
-                .pipewire_properties
-                .get(&graph_prop("channel_config_revision"))
-                .map(String::as_str)
-                != Some(CHANNEL_CONFIG_REVISION)
-            {
+            let current_revision = if channel_uses_persistent_audio_core(channel) {
+                effect_node_has_current_config_revision(channel_sink)
+            } else {
+                channel_sink
+                    .pipewire_properties
+                    .get(&graph_prop("channel_config_revision"))
+                    .map(String::as_str)
+                    == Some(CHANNEL_CONFIG_REVISION)
+            };
+            if !current_revision {
                 diagnostics.push(Diagnostic {
                     code: format!("graph.channel_revision.{}", channel.id),
                     severity: DiagnosticSeverity::Error,
@@ -10935,17 +13927,19 @@ fn route_diagnostics(
             let effect_input_name = effect_chain_input_name(channel);
 
             if effect_chain_endpoint_readiness_for_graph(graph, channel).ready() {
-                if !managed_modules.iter().any(|module| {
-                    managed_module_matches_route(
-                        module,
-                        "channel_to_effect",
-                        Some(&channel.id),
-                        None,
-                        &raw_source_name,
-                        &effect_input_name,
-                        &effect_route_revision(&config.settings, channel),
-                    )
-                }) {
+                if !channel_uses_persistent_audio_core(channel)
+                    && !managed_modules.iter().any(|module| {
+                        managed_module_matches_route(
+                            module,
+                            "channel_to_effect",
+                            Some(&channel.id),
+                            None,
+                            &raw_source_name,
+                            &effect_input_name,
+                            &effect_route_revision(&config.settings, channel),
+                        )
+                    })
+                {
                     diagnostics.push(Diagnostic {
                         code: format!("graph.route_effect.{}", channel.id),
                         severity: DiagnosticSeverity::Warning,
@@ -11106,42 +14100,12 @@ fn latency_diagnostics(config: &MixerConfig) -> Vec<Diagnostic> {
     diagnostics
 }
 
-fn pipewire_audio_health_diagnostics() -> Vec<Diagnostic> {
-    let output = host_command("journalctl")
-        .args([
-            "--user",
-            "-u",
-            "pipewire",
-            "-u",
-            "pipewire-pulse",
-            "-u",
-            "wireplumber",
-            "--since",
-            PIPEWIRE_HEALTH_LOG_SINCE,
-            "--no-pager",
-        ])
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
+fn pipewire_audio_health_diagnostics(health: &PipeWireAudioHealthStatus) -> Vec<Diagnostic> {
+    if health.warning_events == 0 {
         return Vec::new();
     }
 
-    let log = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    let out_of_buffers = log.matches("out of buffers").count();
-    let resyncs = log.matches("resync").count();
-    let link_failures =
-        log.matches("link failed").count() + log.matches("failed to activate").count();
-    let owned_mentions = log
-        .lines()
-        .filter(|line| line.contains(&graph_prefix()))
-        .count();
-    if out_of_buffers == 0 && resyncs == 0 && link_failures == 0 {
-        return Vec::new();
-    }
-
-    let code = if owned_mentions > 0 {
+    let code = if health.owned_events > 0 {
         "pipewire.audio_health.wavelinux_owned_buffer_resync"
     } else {
         "pipewire.audio_health.recent_buffer_resync"
@@ -11151,7 +14115,15 @@ fn pipewire_audio_health_diagnostics() -> Vec<Diagnostic> {
         code: code.into(),
         severity: DiagnosticSeverity::Warning,
         message: format!(
-            "PipeWire recently reported audio graph trouble ({out_of_buffers} out-of-buffer, {resyncs} resync, {link_failures} link activation failure, {owned_mentions} WaveLinux-owned log mention)"
+            "PipeWire reported {} audio warning events this session ({} direct profiler error, {} WaveLinux-owned direct error, {} out-of-buffer, {} resync, {} link activation failure, {} xrun, {} WaveLinux-owned event)",
+            health.warning_events,
+            health.direct_errors,
+            health.owned_direct_errors,
+            health.out_of_buffers,
+            health.resyncs,
+            health.link_failures,
+            health.xruns,
+            health.owned_events,
         ),
         action: Some(
             "Let WaveLinux repair stale routes first; if this continues during normal playback, reconnect the affected Bluetooth device or use a stable hardware profile"
@@ -11160,15 +14132,110 @@ fn pipewire_audio_health_diagnostics() -> Vec<Diagnostic> {
     }]
 }
 
+fn audio_core_integrity_diagnostics(statuses: &[AudioCoreChannelStatus]) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for status in statuses {
+        if !status.online {
+            if let Some(error) = status.error.as_deref() {
+                diagnostics.push(Diagnostic {
+                    code: format!("audio_core.offline.{}", status.channel_id),
+                    severity: DiagnosticSeverity::Warning,
+                    message: format!("Audio core endpoint {} is offline", status.channel_id),
+                    action: Some(format!(
+                        "Repair the audio graph if the endpoint does not recover: {error}"
+                    )),
+                });
+            }
+            continue;
+        }
+
+        if status.non_finite_blocks > 0
+            || status.non_finite_samples > 0
+            || status.chain_recoveries > 0
+        {
+            diagnostics.push(Diagnostic {
+                code: format!("audio_core.non_finite.{}", status.channel_id),
+                severity: DiagnosticSeverity::Warning,
+                message: format!(
+                    "Audio core endpoint {} contained invalid DSP output (blocks={}, samples={}, effect_mask=0x{:x}, recoveries={})",
+                    status.channel_id,
+                    status.non_finite_blocks,
+                    status.non_finite_samples,
+                    status.non_finite_effect_mask,
+                    status.chain_recoveries,
+                ),
+                action: Some(
+                    "The dry signal was preserved automatically. Disable the affected effect and inspect the Audio Core counters if they continue increasing."
+                        .into(),
+                ),
+            });
+        }
+
+        if status.retired_chain_overflows > 0 {
+            diagnostics.push(Diagnostic {
+                code: format!("audio_core.retired_chain_overflow.{}", status.channel_id),
+                severity: DiagnosticSeverity::Warning,
+                message: format!(
+                    "Audio core endpoint {} exhausted its retired-chain queue {} times",
+                    status.channel_id, status.retired_chain_overflows
+                ),
+                action: Some(
+                    "Pause rapid effect topology changes and inspect Audio Core processing latency."
+                        .into(),
+                ),
+            });
+        }
+
+        if !status.accelerator_startup_failures.is_empty()
+            || status.accelerator_fallback_blocks > 0
+            || status.accelerator_disabled_states > 0
+        {
+            diagnostics.push(Diagnostic {
+                code: format!("audio_core.accelerator_fallback.{}", status.channel_id),
+                severity: DiagnosticSeverity::Warning,
+                message: format!(
+                    "Audio core endpoint {} used the exact CPU neural fallback (provider={}, startup_failures={}, fallback_blocks={}, deadline_misses={}, invalid_results={}, disabled_states={})",
+                    status.channel_id,
+                    status.accelerator_provider.as_deref().unwrap_or("unknown"),
+                    status.accelerator_startup_failures.len(),
+                    status.accelerator_fallback_blocks,
+                    status.accelerator_deadline_misses,
+                    status.accelerator_invalid_results,
+                    status.accelerator_disabled_states,
+                ),
+                action: Some(
+                    "Audio continuity was preserved. Requalify the provider pack on this machine or select the CPU provider if fallback counters continue increasing."
+                        .into(),
+                ),
+            });
+        }
+
+        if let Some(error) = status.route_target_error.as_deref() {
+            diagnostics.push(Diagnostic {
+                code: format!("audio_core.route_target.{}", status.channel_id),
+                severity: DiagnosticSeverity::Warning,
+                message: format!(
+                    "Audio core endpoint {} could not apply its latest hardware target",
+                    status.channel_id
+                ),
+                action: Some(format!(
+                    "The previous endpoint remains active when possible. Check device availability: {error}"
+                )),
+            });
+        }
+    }
+    diagnostics
+}
+
 fn dsp_runtime_diagnostics() -> Vec<Diagnostic> {
     let dsp_requested = std::env::var_os(wavelinux_dsp::AUDIO_RUNTIME_ENV).is_some()
         || std::env::var_os(wavelinux_dsp::DSP_PROVIDER_ENV).is_some()
-        || graph_prefix() == "wavelinux5";
+        || graph_prefix() == "wavelinux6";
     if !dsp_requested {
         return Vec::new();
     }
 
-    let status = effective_dsp_runtime_status(wavelinux_dsp::probe_backend_from_env());
+    let status = wavelinux_dsp::probe_backend_from_env();
     let selected_provider = status
         .selected_provider
         .map(|provider| provider.as_str())
@@ -11191,7 +14258,7 @@ fn dsp_runtime_diagnostics() -> Vec<Diagnostic> {
             status.fallback_count
         ),
         action: status.fallback_active.then(|| {
-            "Install the requested CUDA/OpenVINO runtime or set WAVELINUX_DSP_PROVIDER=cpu to make the CPU fallback explicit.".into()
+            "Use WAVELINUX_DSP_PROVIDER=cpu, or install a qualified WaveLinux accelerator provider pack when one is available.".into()
         }),
     });
 
@@ -11201,7 +14268,7 @@ fn dsp_runtime_diagnostics() -> Vec<Diagnostic> {
             severity: DiagnosticSeverity::Warning,
             message: reason.clone(),
             action: Some(
-                "Use WAVELINUX_AUDIO_RUNTIME=pipewire_filter_chain for rollback, or continue with dsp_* modes while the live helper graph is under test."
+                "Use WAVELINUX_AUDIO_RUNTIME=dsp_cpu for the native CPU path or pipewire_filter_chain for compatibility rollback."
                     .into(),
             ),
         });
@@ -11218,27 +14285,13 @@ fn dsp_runtime_diagnostics() -> Vec<Diagnostic> {
                 status.provider_probe_failures.join("; ")
             ),
             action: Some(
-                "Use WAVELINUX_DSP_PROVIDER=cuda|openvino|cpu to pin the test provider.".into(),
+                "Use WAVELINUX_DSP_PROVIDER=cpu unless an accelerator provider pack has passed workload qualification."
+                    .into(),
             ),
         });
     }
 
     diagnostics
-}
-
-fn effective_dsp_runtime_status(
-    status: wavelinux_dsp::DspBackendStatus,
-) -> wavelinux_dsp::DspBackendStatus {
-    if matches!(
-        status.runtime,
-        wavelinux_dsp::AudioRuntimeMode::DspAuto | wavelinux_dsp::AudioRuntimeMode::DspAccelerated
-    ) {
-        return status.with_runtime_fallback(
-            wavelinux_dsp::AudioRuntimeMode::PipewireFilterChain,
-            DSP_LIVE_HELPER_FALLBACK_REASON,
-        );
-    }
-    status
 }
 
 fn host_command(program: &str) -> Command {
@@ -11247,19 +14300,52 @@ fn host_command(program: &str) -> Command {
     command
 }
 
-fn audio_subscription_event_relevant(line: &str) -> bool {
+fn spawn_pipewire_profiler_monitor() -> io::Result<(Child, ChildStdout)> {
+    let mut child = host_command("pw-top")
+        .arg("--batch-mode")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other(
+            "pw-top profiler did not provide standard output",
+        ));
+    };
+    Ok((child, stdout))
+}
+
+fn parse_audio_subscription_event(line: &str) -> Option<AudioSubscriptionEvent> {
     let line = line.trim().to_ascii_lowercase();
-    line.starts_with("event '")
-        && [
-            " on sink-input ",
-            " on source-output ",
-            " on sink ",
-            " on source ",
-            " on card ",
-            " on server ",
-        ]
+    if !line.starts_with("event '") {
+        return None;
+    }
+    if line.contains(" on sink-input ") {
+        return Some(AudioSubscriptionEvent::PlaybackStream);
+    }
+    // Source-output changes describe recording clients, including WaveLinux's
+    // display-only meter streams. They do not change hardware, defaults, or
+    // desired routes and must not trigger an expensive device/profile refresh.
+    if line.contains(" on source-output ") {
+        return None;
+    }
+    [" on sink ", " on source ", " on card ", " on server "]
         .iter()
         .any(|object| line.contains(object))
+        .then_some(AudioSubscriptionEvent::Device)
+}
+
+#[cfg(test)]
+fn audio_subscription_event_relevant(line: &str) -> bool {
+    parse_audio_subscription_event(line).is_some()
+}
+
+fn coalesce_audio_subscription_events(
+    initial: AudioSubscriptionEvent,
+    events: &mpsc::Receiver<AudioSubscriptionEvent>,
+) -> AudioSubscriptionEvent {
+    events.try_iter().fold(initial, std::cmp::max)
 }
 
 fn terminate_effect_chain_child(
@@ -11293,7 +14379,7 @@ fn is_dsp_helper_program(program: &str) -> bool {
     Path::new(program)
         .file_name()
         .and_then(|name| name.to_str())
-        == Some("wavelinux5-dsp-helper")
+        == Some("wavelinux6-audio-core")
 }
 
 #[cfg(unix)]
@@ -11339,6 +14425,8 @@ fn sanitize_host_command_env(command: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
     use tempfile::tempdir;
     use wavelinux_model::{percent_to_unit, AppMatcher, DeviceInfo};
 
@@ -11358,6 +14446,417 @@ mod tests {
         engine
     }
 
+    fn hardware_channel_with_effects() -> Channel {
+        let mut channel = MixerConfig::default()
+            .channels
+            .into_iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        channel.effects = vec![EffectInstance::new("limiter")];
+        channel.effects_enabled = true;
+        channel
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_route_control_waits_for_set_and_clear_acknowledgements() {
+        let root = tempdir().unwrap();
+        let socket_path = root.path().join("audio-core.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let mut generation = 1_u64;
+            let mut target = Some("alsa_input.old".to_string());
+            let mut route_commands = 0_usize;
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut payload = String::new();
+                stream.read_to_string(&mut payload).unwrap();
+                let command: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                let request_id = command.get("request_id").cloned().unwrap_or_default();
+                let response = match command["command"].as_str().unwrap() {
+                    "get_diagnostics" => serde_json::json!({
+                        "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+                        "ok": true,
+                        "request_id": request_id,
+                        "route_id": "hardware_in",
+                        "submitted_route_generation": generation,
+                        "applied_route_generation": generation,
+                        "input_target_node_name": target,
+                    }),
+                    "set_input_target" | "clear_input_target" => {
+                        generation = command["route_generation"].as_u64().unwrap();
+                        target = command
+                            .get("target_node_name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                        route_commands += 1;
+                        serde_json::json!({
+                            "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+                            "ok": true,
+                            "request_id": request_id,
+                            "route_id": "hardware_in",
+                            "route_generation": generation,
+                            "target_node_name": target,
+                        })
+                    }
+                    command => panic!("unexpected command {command}"),
+                };
+                stream.write_all(response.to_string().as_bytes()).unwrap();
+            }
+            assert_eq!(route_commands, 2);
+            assert_eq!(generation, 3);
+            assert!(target.is_none());
+        });
+
+        let applied =
+            send_audio_core_input_target(&socket_path, "hardware_in", Some("alsa_input.usb"))
+                .unwrap();
+        assert_eq!(applied["route_generation"], 2);
+        assert_eq!(applied["operation"], "input_target_applied");
+
+        let cleared = send_audio_core_input_target(&socket_path, "hardware_in", None).unwrap();
+        assert_eq!(cleared["route_generation"], 3);
+        assert_eq!(cleared["operation"], "input_target_cleared");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn repair_snapshot_is_reused_only_after_skipped_preplan_commands() {
+        let command = CommandSpec::new(
+            CommandDomain::Graph,
+            "pactl",
+            ["load-module", "module-loopback"],
+            "test graph mutation",
+        );
+        let skipped = CommandExecution {
+            command: command.clone(),
+            stdout: String::new(),
+            stderr: String::new(),
+            skipped: true,
+            error: None,
+        };
+        let completed = CommandExecution {
+            skipped: false,
+            ..skipped.clone()
+        };
+        let failed = CommandExecution {
+            command,
+            skipped: false,
+            error: Some("server disconnected after accepting command".into()),
+            ..skipped.clone()
+        };
+
+        assert!(!command_executions_may_have_mutated_graph(&[]));
+        assert!(!command_executions_may_have_mutated_graph(&[skipped]));
+        assert!(command_executions_may_have_mutated_graph(&[completed]));
+        assert!(command_executions_may_have_mutated_graph(&[failed]));
+    }
+
+    #[test]
+    fn effect_update_state_coalesces_one_hundred_requests_and_ignores_stale_completion() {
+        let mut state = EffectUpdateSlot::new(
+            hardware_channel_with_effects(),
+            Path::new("/run/user/1000/wavelinux6/control/wavelinux6-chain-hardware_in.sock"),
+        )
+        .state
+        .into_inner()
+        .unwrap();
+
+        let mut first_attempt = None;
+        for index in 0..100 {
+            let mut channel = hardware_channel_with_effects();
+            channel.effects_enabled = index % 2 == 1;
+            channel.effects[0]
+                .params
+                .insert("strength".into(), index as f32);
+            if index % 3 == 0 {
+                channel.effects.push(EffectInstance::new("highpass"));
+            }
+            let decision = state.enqueue(channel).unwrap();
+            if index == 0 {
+                assert!(decision.start_worker);
+                first_attempt = Some(state.begin_latest());
+            } else {
+                assert!(!decision.start_worker);
+                assert_eq!(state.in_flight_generation, Some(2));
+            }
+        }
+
+        assert_eq!(state.desired.generation, 101);
+        assert_eq!(state.coalesced_requests, 99);
+        assert_eq!(state.status.coalesced_requests, 99);
+        assert!(state.desired.channel.effects_enabled);
+        assert_eq!(state.desired.channel.effects[0].params["strength"], 99.0);
+
+        let first_attempt = first_attempt.unwrap();
+        let stale = state.finish_attempt(
+            first_attempt.generation,
+            &Ok(EffectApplyAcknowledgement {
+                generation: first_attempt.generation,
+                config_revision: "stale".into(),
+                chain_swaps: 1,
+            }),
+        );
+        assert!(stale.superseded);
+        assert!(state.worker_running);
+        assert_eq!(state.status.applied_generation, 0);
+        assert_eq!(state.status.state, EffectRuntimeState::Red);
+
+        let latest = state.begin_latest();
+        let completed = state.finish_attempt(
+            latest.generation,
+            &Ok(EffectApplyAcknowledgement {
+                generation: latest.generation,
+                config_revision: "latest".into(),
+                chain_swaps: 2,
+            }),
+        );
+        assert!(!completed.superseded);
+        assert!(!state.worker_running);
+        assert_eq!(state.status.applied_generation, 101);
+        assert_eq!(state.status.desired_generation, 101);
+        assert_eq!(state.status.state, EffectRuntimeState::Green);
+    }
+
+    #[test]
+    fn unavailable_core_finishes_red_without_discarding_selected_effects() {
+        let channel = hardware_channel_with_effects();
+        let mut state = EffectUpdateSlot::new(
+            channel.clone(),
+            Path::new("/run/user/1000/wavelinux6/control/wavelinux6-chain-hardware_in.sock"),
+        )
+        .state
+        .into_inner()
+        .unwrap();
+        state.enqueue(channel).unwrap();
+        let desired = state.begin_latest();
+
+        let completed = state.finish_attempt(
+            desired.generation,
+            &Err("control socket is unavailable".into()),
+        );
+
+        assert!(!completed.superseded);
+        assert_eq!(state.status.state, EffectRuntimeState::Red);
+        assert!(!state.status.core_healthy);
+        assert_eq!(state.desired.channel.effects.len(), 1);
+        assert_eq!(
+            state.status.last_error.as_deref(),
+            Some("control socket is unavailable")
+        );
+
+        assert!(!state.reserve_recovery_worker(Instant::now()));
+        state.status.core_healthy = true;
+        state.status.pending = true;
+        state.status.resolve_state();
+        assert!(state.reserve_recovery_worker(
+            Instant::now() + EFFECT_RECOVERY_RETRY_INTERVAL + Duration::from_millis(1)
+        ));
+        let recovered = state.begin_latest();
+        assert_eq!(recovered.generation, desired.generation);
+        let completed = state.finish_attempt(
+            recovered.generation,
+            &Ok(EffectApplyAcknowledgement {
+                generation: recovered.generation,
+                config_revision: "recovered".into(),
+                chain_swaps: 1,
+            }),
+        );
+        assert!(!completed.superseded);
+        assert_eq!(state.status.state, EffectRuntimeState::Green);
+        assert_eq!(state.status.applied_generation, desired.generation);
+        assert_eq!(state.desired.channel.effects.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_microphone_control_protocol_advances_acknowledged_generation() {
+        use std::os::unix::net::UnixListener;
+
+        let root = tempdir().unwrap();
+        let runtime_root = root.path().join("runtime/wavelinux6");
+        let socket_path =
+            wavelinux_dsp::channel_control_socket(&runtime_root, "wavelinux6", "hardware_in");
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let config_path = root
+            .path()
+            .join("effects/wavelinux6-chain-hardware_in.json");
+        let channel = hardware_channel_with_effects();
+        let mut config = wavelinux_dsp::DspChannelConfig::new(
+            channel.id.clone(),
+            channel.name.clone(),
+            "wavelinux6",
+            "wavelinux6",
+            "WaveLinux 6",
+            "wavelinux6_channel_hardware_in",
+            "wavelinux6-mic",
+            channel.effects.clone(),
+        );
+        config.generation = 2;
+        config.control_socket_path = Some(socket_path.to_string_lossy().into_owned());
+        write_json(&config_path, &config).unwrap();
+        let server_config_path = config_path.clone();
+
+        let server = thread::spawn(move || {
+            let mut submitted = 1_u64;
+            let mut acknowledged = 1_u64;
+            let mut chain_swaps = 0_u64;
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                stream.read_to_string(&mut request).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                let response = match request["command"].as_str().unwrap() {
+                    "get_diagnostics" => serde_json::json!({
+                        "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+                        "ok": true,
+                        "route_id": "hardware_in",
+                        "sample_rate_hz": 48_000,
+                        "chain_swaps": chain_swaps,
+                        "submitted_generation": submitted,
+                        "acknowledged_generation": acknowledged,
+                        "rate_correction": 1.0,
+                    }),
+                    "swap_chain" => {
+                        assert_eq!(
+                            request["config_path"],
+                            server_config_path.to_string_lossy().as_ref()
+                        );
+                        let loaded: wavelinux_dsp::DspChannelConfig =
+                            read_json(&server_config_path).unwrap();
+                        assert_eq!(loaded.output_node_name, "wavelinux6-mic");
+                        submitted = request["desired_generation"].as_u64().unwrap();
+                        acknowledged = submitted;
+                        chain_swaps += 1;
+                        serde_json::json!({
+                            "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+                            "ok": true,
+                            "route_id": "hardware_in",
+                            "graph_revision": submitted,
+                        })
+                    }
+                    command => panic!("unexpected command {command}"),
+                };
+                stream.write_all(response.to_string().as_bytes()).unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
+        });
+
+        let ready =
+            wait_for_audio_core_ready(&socket_path, "hardware_in", Duration::from_millis(250))
+                .unwrap();
+        assert_eq!(ready.acknowledged_generation, 1);
+        let queued = send_effect_chain_swap(
+            &socket_path,
+            "hardware_in",
+            &config_path,
+            "test-revision",
+            2,
+        )
+        .unwrap();
+        assert_eq!(queued["graph_revision"], 2);
+        let applied = wait_for_effect_generation_ack(
+            &socket_path,
+            "hardware_in",
+            2,
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        assert_eq!(applied.acknowledged_generation, 2);
+        assert_eq!(applied.chain_swaps, 1);
+        server.join().unwrap();
+
+        let obsolete_data_socket = root
+            .path()
+            .join("data/effects/wavelinux6-chain-hardware_in.sock");
+        assert!(!obsolete_data_socket.exists());
+        assert!(socket_path.starts_with(&runtime_root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_runtime_reapplies_latest_generation_without_graph_repair() {
+        let engine = test_engine();
+        engine.write_runtime().unwrap().status.audio_graph_running = true;
+        let channel = hardware_channel_with_effects();
+        let slot = engine.effect_update_slot(&channel).unwrap();
+        let generation = {
+            let mut state = slot.state.lock().unwrap();
+            state.enqueue(channel).unwrap();
+            let desired = state.begin_latest();
+            state.finish_attempt(
+                desired.generation,
+                &Err("control socket is unavailable".into()),
+            );
+            state.status.core_healthy = true;
+            state.status.pending = true;
+            state.recovery_not_before = Some(Instant::now() - Duration::from_millis(1));
+            state.status.resolve_state();
+            desired.generation
+        };
+
+        engine.recover_effect_updates_if_ready();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = slot.state.lock().unwrap();
+            if !state.worker_running && state.status.applied_generation == generation {
+                assert_eq!(state.status.state, EffectRuntimeState::Green);
+                assert_eq!(state.desired.generation, generation);
+                break;
+            }
+            assert!(Instant::now() < deadline, "effect recovery did not finish");
+            drop(state);
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let log = fs::read_to_string(engine.paths.log_file()).unwrap();
+        assert!(log.contains("request_recovery=true"));
+        assert!(log.contains(&format!("request_acknowledged={generation}")));
+        assert!(!log.contains("[repair."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn core_readiness_failure_is_bounded_and_names_the_canonical_socket() {
+        let root = tempdir().unwrap();
+        let socket_path = wavelinux_dsp::channel_control_socket(
+            &root.path().join("runtime/wavelinux6"),
+            "wavelinux6",
+            "hardware_in",
+        );
+        let started = Instant::now();
+        let error =
+            wait_for_audio_core_ready(&socket_path, "hardware_in", Duration::from_millis(60))
+                .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.contains("readiness timed out"));
+        assert!(error.contains(socket_path.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_runtime_control_directory_is_private_and_ephemeral() {
+        let engine = test_engine();
+        let control_dir = engine.paths.control_sockets_dir();
+
+        assert!(control_dir.starts_with(&engine.paths.runtime_dir));
+        assert!(!control_dir.starts_with(&engine.paths.data_dir));
+        assert_eq!(
+            fs::metadata(&engine.paths.runtime_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(control_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
     fn wavelinux5_config_with_effects(effects: Vec<EffectInstance>) -> MixerConfig {
         let mut config = MixerConfig::default();
         wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux5");
@@ -11365,17 +14864,9 @@ mod tests {
         config
     }
 
-    fn assert_wavelinux5_stop_script_scope(script: &str) {
-        assert!(script.contains("stop_wavelinux5_processes"));
-        assert!(script.contains("cleanup_wavelinux5_audio_modules"));
-        assert!(script.contains("wavelinux5-dsp-helper"));
-        assert!(script.contains("WaveLinux5_[^ ]*_amd64"));
-        assert!(script.contains(r"\/wavelinux5\/effects\/wavelinux5-chain-"));
-        assert!(script.contains("/wavelinux5|WaveLinux5/"));
+    fn assert_wavelinux6_stop_script_scope(script: &str) {
+        assert!(script.contains("wavelinux6-audio-core"));
         assert!(script.contains("$2 == \"module-loopback\""));
-        assert!(script.contains(
-            "cleanup_wavelinux5_audio_modules\nstop_wavelinux5_processes\ncleanup_wavelinux5_audio_modules"
-        ));
         assert!(!script.contains("(^|[/ ])wavelinux([ ]|$)"));
         assert!(!script.contains("WaveLinux_[^ ]*_amd64"));
         assert!(!script.contains(r"\/wavelinux\/effects\/wavelinux-chain-"));
@@ -11383,42 +14874,52 @@ mod tests {
 
     #[test]
     fn install_script_process_matching_never_targets_stable_wavelinux() {
-        assert_wavelinux5_stop_script_scope(include_str!("../../../scripts/install-local.sh"));
+        let script = include_str!("../../../scripts/install-local.sh");
+        assert!(script.contains("stop_previous_wavelinux_processes"));
+        assert!(script.contains("cleanup_previous_wavelinux_audio_modules"));
+        assert!(script.contains("WaveLinux6_[^ ]*_amd64"));
+        assert!(script.contains(r"\/wavelinux6\/effects\/wavelinux6-chain-"));
+        assert!(!script.contains("wavelinux(5|6)"));
+        assert!(!script.contains("WaveLinux(5|6)"));
+        assert!(!script.contains("wavelinux6-audio-core|wavelinux5-dsp-helper"));
+        assert_wavelinux6_stop_script_scope(script);
     }
 
     #[test]
     fn uninstall_script_process_matching_never_targets_stable_wavelinux() {
-        assert_wavelinux5_stop_script_scope(include_str!("../../../scripts/uninstall-local.sh"));
+        let script = include_str!("../../../scripts/uninstall-local.sh");
+        assert!(script.contains("stop_wavelinux6_processes"));
+        assert!(script.contains("cleanup_wavelinux6_audio_modules"));
+        assert!(script.contains("WaveLinux6_[^ ]*_amd64"));
+        assert!(script.contains(r"\/wavelinux6\/effects\/wavelinux6-chain-"));
+        assert_wavelinux6_stop_script_scope(script);
     }
 
     #[test]
-    fn dsp_runtime_reports_filter_chain_fallback_until_live_helper_graph_exists() {
+    fn dsp_auto_reports_native_cpu_when_accelerator_is_not_qualified() {
         let inputs = wavelinux_dsp::ProviderProbeInputs {
-            cuda_available: true,
-            cuda_detail: "ok".into(),
-            openvino_available: true,
-            openvino_detail: "ok".into(),
+            cuda_available: false,
+            cuda_detail: "provider pack unavailable".into(),
+            openvino_available: false,
+            openvino_detail: "provider pack unavailable".into(),
+            migraphx_available: false,
+            migraphx_detail: "provider pack unavailable".into(),
             portable_cpu_available: true,
             portable_cpu_detail: "simd".into(),
         };
-        let status = wavelinux_dsp::select_provider(
+        let effective = wavelinux_dsp::select_provider(
             wavelinux_dsp::AudioRuntimeMode::DspAuto,
             wavelinux_dsp::DspProviderPreference::Auto,
             &inputs,
         );
 
-        let effective = effective_dsp_runtime_status(status);
-
         assert_eq!(effective.runtime, wavelinux_dsp::AudioRuntimeMode::DspAuto);
         assert_eq!(
             effective.effective_runtime,
-            wavelinux_dsp::AudioRuntimeMode::PipewireFilterChain
+            wavelinux_dsp::AudioRuntimeMode::DspCpu
         );
-        assert!(effective.fallback_active);
-        assert_eq!(
-            effective.runtime_fallback_reason.as_deref(),
-            Some(DSP_LIVE_HELPER_FALLBACK_REASON)
-        );
+        assert!(!effective.fallback_active);
+        assert!(effective.runtime_fallback_reason.is_none());
         assert!(!effective.accelerated);
     }
 
@@ -11429,16 +14930,16 @@ mod tests {
             cuda_detail: "no cuda".into(),
             openvino_available: false,
             openvino_detail: "no openvino".into(),
+            migraphx_available: false,
+            migraphx_detail: "no migraphx".into(),
             portable_cpu_available: true,
             portable_cpu_detail: "simd".into(),
         };
-        let status = wavelinux_dsp::select_provider(
+        let effective = wavelinux_dsp::select_provider(
             wavelinux_dsp::AudioRuntimeMode::DspCpu,
             wavelinux_dsp::DspProviderPreference::Auto,
             &inputs,
         );
-
-        let effective = effective_dsp_runtime_status(status);
 
         assert_eq!(effective.runtime, wavelinux_dsp::AudioRuntimeMode::DspCpu);
         assert_eq!(
@@ -11484,7 +14985,7 @@ mod tests {
             true,
         );
 
-        assert_eq!(program, "wavelinux5-dsp-helper");
+        assert_eq!(program, "wavelinux6-audio-core");
         assert_eq!(
             args,
             vec![
@@ -11514,7 +15015,7 @@ mod tests {
             true,
         );
 
-        assert_eq!(program, "wavelinux5-dsp-helper");
+        assert_eq!(program, "wavelinux6-audio-core");
         assert_eq!(
             args,
             vec![
@@ -11546,7 +15047,7 @@ mod tests {
             true,
         );
 
-        assert_eq!(program, "wavelinux5-dsp-helper");
+        assert_eq!(program, "wavelinux6-audio-core");
         assert_eq!(
             args,
             vec![
@@ -11564,7 +15065,7 @@ mod tests {
             .into_iter()
             .find(|channel| channel.id == "hardware_in")
             .unwrap();
-        channel.effects = vec![EffectInstance::new("rnnoise")];
+        channel.effects = vec![EffectInstance::new("convolver")];
 
         let (program, args) = effect_chain_launch_command(
             &channel,
@@ -11573,7 +15074,7 @@ mod tests {
             true,
         );
 
-        assert_eq!(program, "wavelinux5-dsp-helper");
+        assert_eq!(program, "wavelinux6-audio-core");
         assert_eq!(
             args,
             vec![
@@ -11661,6 +15162,36 @@ mod tests {
         let second_refresh = engine.read_runtime().unwrap().refreshed_at.unwrap();
 
         assert_eq!(first_refresh, second_refresh);
+    }
+
+    #[test]
+    fn startup_graph_repair_is_deferred_to_the_background_worker() {
+        let root = tempdir().unwrap();
+        let paths = EnginePaths::for_tests(root.path());
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        let mut config = MixerConfig::default();
+        config.settings.restore_audio_graph_on_launch = true;
+        write_json(&paths.config_file(), &config).unwrap();
+
+        let engine = WaveLinuxEngine::new(
+            paths,
+            EngineOptions {
+                dry_run: true,
+                auto_repair_on_start: true,
+                poll_interval: Duration::from_millis(50),
+            },
+        )
+        .unwrap();
+
+        assert!(engine.startup_repair_pending.load(Ordering::Acquire));
+        assert!(engine
+            .startup_initialization_in_progress
+            .load(Ordering::Acquire));
+        let started = Instant::now();
+        let state = engine.get_state().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(state.engine.message, "Starting audio engine");
+        assert!(!state.engine.audio_graph_running);
     }
 
     #[test]
@@ -12154,6 +15685,7 @@ mod tests {
             node_name: None,
             media_name: None,
             managed: None,
+            dont_move: false,
         }
     }
 
@@ -12169,6 +15701,41 @@ mod tests {
             sink: None,
             sink_name: module.sink_name.clone(),
             target_object: module.sink_name.clone(),
+        }
+    }
+
+    fn native_input_target_route(channel_id: &str, source_name: &str) -> SourceOutputRoute {
+        SourceOutputRoute {
+            id: format!("native-input-{channel_id}"),
+            module_id: None,
+            role: Some("input_target".into()),
+            channel_id: Some(channel_id.into()),
+            mix_id: None,
+            muted: Some(false),
+            volume_percent: Some(100),
+            source_id: None,
+            source_name: Some(source_name.into()),
+            target_object: Some(source_name.into()),
+            application_name: Some("WaveLinux 6".into()),
+            node_name: Some(format!("wavelinux6-input-target-{channel_id}")),
+            media_name: None,
+            managed: Some("1".into()),
+            dont_move: true,
+        }
+    }
+
+    fn native_mix_output_target_route(mix_id: &str, sink_name: &str) -> SinkInputRoute {
+        SinkInputRoute {
+            id: format!("native-output-{mix_id}"),
+            module_id: None,
+            role: Some("mix_output_target".into()),
+            channel_id: None,
+            mix_id: Some(mix_id.into()),
+            muted: Some(false),
+            volume_percent: Some(100),
+            sink: None,
+            sink_name: Some(sink_name.into()),
+            target_object: Some(sink_name.into()),
         }
     }
 
@@ -12436,6 +16003,110 @@ mod tests {
     }
 
     #[test]
+    fn wavelinux6_graph_is_ready_without_pulse_mix_sinks_or_bus_loopbacks() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+        let mut graph = running_graph_for_config(&config);
+        graph.outputs.retain(|output| {
+            config
+                .mixes
+                .iter()
+                .all(|mix| output.name != mix.virtual_sink_name)
+        });
+        graph.inputs.retain(|input| {
+            config
+                .mixes
+                .iter()
+                .all(|mix| input.name != format!("{}.monitor", mix.virtual_sink_name))
+        });
+        graph.app_streams.push(AppStream {
+            id: "browser-stream".into(),
+            app_id: Some("brave-browser".into()),
+            binary: Some("brave-browser".into()),
+            process_name: Some("brave".into()),
+            window_class: None,
+            display_name: "Brave".into(),
+            media_name: Some("YouTube".into()),
+            routed_channel_id: Some("browser".into()),
+            volume: 1.0,
+            muted: false,
+        });
+
+        assert!(config.mixes.iter().all(|mix| graph
+            .inputs
+            .iter()
+            .any(|input| input.name == mix.virtual_source_name)));
+        assert!(app_routing_graph_ready(&config, &graph, &[], &[], &[]));
+    }
+
+    #[test]
+    fn wavelinux6_graph_requires_matching_native_device_target_streams() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+        config
+            .set_channel_input("hardware_in", Some("alsa_input.usb_cm01".into()))
+            .unwrap();
+        config
+            .set_mix_outputs(
+                "monitor",
+                vec![
+                    "alsa_output.usb_cm01".into(),
+                    "bluez_output.headphones".into(),
+                ],
+            )
+            .unwrap();
+        let mut graph = running_graph_for_config(&config);
+        graph.outputs.retain(|output| {
+            config
+                .mixes
+                .iter()
+                .all(|mix| output.name != mix.virtual_sink_name)
+        });
+        graph.inputs.retain(|input| {
+            config
+                .mixes
+                .iter()
+                .all(|mix| input.name != format!("{}.monitor", mix.virtual_sink_name))
+        });
+        let input_route = native_input_target_route("hardware_in", "alsa_input.usb_cm01");
+        let output_routes = vec![
+            native_mix_output_target_route("monitor", "alsa_output.usb_cm01"),
+            native_mix_output_target_route("monitor", "bluez_output.headphones"),
+        ];
+
+        assert!(app_routing_graph_ready(
+            &config,
+            &graph,
+            &[],
+            std::slice::from_ref(&input_route),
+            &output_routes,
+        ));
+        assert!(!app_routing_graph_ready(
+            &config,
+            &graph,
+            &[],
+            &[],
+            &output_routes,
+        ));
+        assert!(!app_routing_graph_ready(
+            &config,
+            &graph,
+            &[],
+            std::slice::from_ref(&input_route),
+            &output_routes[..1],
+        ));
+
+        let wrong_input = native_input_target_route("hardware_in", "alsa_input.internal_mic");
+        assert!(!app_routing_graph_ready(
+            &config,
+            &graph,
+            &[],
+            std::slice::from_ref(&wrong_input),
+            &output_routes,
+        ));
+    }
+
+    #[test]
     fn app_routing_guard_requires_effect_source_readiness() {
         let mut config = MixerConfig::default();
         config
@@ -12595,6 +16266,7 @@ mod tests {
     #[test]
     fn meter_supervisor_does_not_spawn_in_dry_run() {
         let mut supervisor = MeterSupervisor::new(true);
+        let revision = MeterTargetRevision::new(EngineRevisions::default(), true);
         let update = supervisor.reconcile(
             vec![MeterTarget {
                 node_id: "stream".into(),
@@ -12603,15 +16275,102 @@ mod tests {
                 muted: false,
             }],
             true,
+            revision,
         );
 
         assert!(update.meters.is_empty());
-        assert!(supervisor.handles.is_empty());
+        assert!(supervisor.process.is_none());
+        assert!(supervisor.snapshot_for_revision(revision, true).is_some());
+        assert!(supervisor
+            .snapshot_for_revision(
+                MeterTargetRevision {
+                    graph: revision.graph + 1,
+                    ..revision
+                },
+                true,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn native_meter_supervisor_never_spawns_a_pipewire_reader() {
+        let mut supervisor = MeterSupervisor::new(false);
+        let revision = MeterTargetRevision::new(EngineRevisions::default(), true);
+        let target = MeterTarget {
+            node_id: "music".into(),
+            source_name: "wavelinux6_fx_music_source".into(),
+            gain: 1.0,
+            muted: false,
+        };
+        let meter = LevelMeter {
+            node_id: "music".into(),
+            peak_left: 0.4,
+            peak_right: 0.2,
+        };
+
+        let update = supervisor.reconcile_native(vec![target], vec![meter.clone()], true, revision);
+
+        assert!(supervisor.native_backend);
+        assert!(supervisor.process.is_none());
+        assert_eq!(update.meters, vec![meter]);
+        assert_eq!(supervisor.snapshot(), update.meters);
+    }
+
+    #[test]
+    fn native_meter_response_maps_channels_buses_and_mixes_once() {
+        let targets = vec![
+            MeterTarget {
+                node_id: "music".into(),
+                source_name: "wavelinux6_fx_music_source".into(),
+                gain: 0.5,
+                muted: false,
+            },
+            MeterTarget {
+                node_id: "channel:music:mix:stream".into(),
+                source_name: "wavelinux6_fx_music_source".into(),
+                gain: 0.25,
+                muted: false,
+            },
+            MeterTarget {
+                node_id: "stream".into(),
+                source_name: "wavelinux6_mix_stream_source".into(),
+                gain: 0.2,
+                muted: false,
+            },
+        ];
+        let response = NativeCoreMetersResponse {
+            channels: vec![NativeCoreMeterReading {
+                id: "music".into(),
+                peak_left: 0.4,
+                peak_right: 0.2,
+            }],
+            mixes: vec![NativeCoreMeterReading {
+                id: "stream".into(),
+                peak_left: 0.3,
+                peak_right: 0.1,
+            }],
+        };
+
+        let meters = level_meters_from_native_response(&targets, response);
+        assert_eq!(meters.len(), 3);
+        assert_eq!(meters[0].node_id, "music");
+        assert_eq!(
+            meters[0].peak_left,
+            meter_output_level(0.4, targets[0].gain)
+        );
+        assert_eq!(meters[1].node_id, "channel:music:mix:stream");
+        assert_eq!(
+            meters[1].peak_left,
+            meter_output_level(0.4, targets[1].gain)
+        );
+        assert_eq!(meters[2].node_id, "stream");
+        assert_eq!(meters[2].peak_left, meter_output_level(0.3, 1.0));
+        assert_ne!(meters[2].peak_left, meter_output_level(0.3, 0.2));
     }
 
     #[test]
     fn meter_sample_reader_tracks_real_rms_frames() {
-        let sample = Arc::new(Mutex::new(MeterSample::default()));
+        let sample = Arc::new(AtomicMeterSample::default());
         let mut pending = Vec::new();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0.25_f32.to_le_bytes());
@@ -12620,28 +16379,28 @@ mod tests {
         bytes.extend_from_slice(&0.2_f32.to_le_bytes());
 
         consume_meter_bytes(&bytes[..5], &mut pending, &sample);
-        assert_eq!(sample.lock().unwrap().frames, 0);
+        assert_eq!(sample.frames.load(Ordering::Relaxed), 0);
         consume_meter_bytes(&bytes[5..], &mut pending, &sample);
 
-        let sample = *sample.lock().unwrap();
-        assert_eq!(sample.frames, 2);
-        assert!(sample.updated_at.is_some());
+        assert_eq!(sample.frames.load(Ordering::Relaxed), 2);
+        let snapshot = sample.snapshot();
+        assert!(snapshot.updated_at.is_some());
         let expected_left = ((0.25_f32.powi(2) + 0.1_f32.powi(2)) / 2.0).sqrt();
         let expected_right = ((0.5_f32.powi(2) + 0.2_f32.powi(2)) / 2.0).sqrt();
-        assert!((sample.peak_left - expected_left).abs() < 0.000_001);
-        assert!((sample.peak_right - expected_right).abs() < 0.000_001);
+        assert!((snapshot.peak_left - expected_left).abs() < 0.000_001);
+        assert!((snapshot.peak_right - expected_right).abs() < 0.000_001);
     }
 
     #[test]
     fn meter_sample_tracks_current_rms_without_backend_peak_hold() {
-        let sample = Arc::new(Mutex::new(MeterSample::default()));
+        let sample = Arc::new(AtomicMeterSample::default());
         let mut pending = Vec::new();
         let mut hit = Vec::new();
         hit.extend_from_slice(&0.5_f32.to_le_bytes());
         hit.extend_from_slice(&(-0.75_f32).to_le_bytes());
         consume_meter_bytes(&hit, &mut pending, &sample);
 
-        let hit_sample = *sample.lock().unwrap();
+        let hit_sample = sample.snapshot();
         assert!((hit_sample.peak_left - 0.5).abs() < f32::EPSILON);
         assert!((hit_sample.peak_right - 0.75).abs() < f32::EPSILON);
 
@@ -12649,21 +16408,21 @@ mod tests {
         silence.extend_from_slice(&0.0_f32.to_le_bytes());
         silence.extend_from_slice(&0.0_f32.to_le_bytes());
         consume_meter_bytes(&silence, &mut pending, &sample);
-        let silent_sample = *sample.lock().unwrap();
+        let silent_sample = sample.snapshot();
         assert_eq!(silent_sample.peak_left, 0.0);
         assert_eq!(silent_sample.peak_right, 0.0);
     }
 
     #[test]
     fn meter_sample_ignores_floor_noise() {
-        let sample = Arc::new(Mutex::new(MeterSample::default()));
+        let sample = Arc::new(AtomicMeterSample::default());
         let mut pending = Vec::new();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(METER_NOISE_FLOOR * 0.5).to_le_bytes());
         bytes.extend_from_slice(&(-METER_NOISE_FLOOR * 0.5).to_le_bytes());
         consume_meter_bytes(&bytes, &mut pending, &sample);
 
-        let sample = *sample.lock().unwrap();
+        let sample = sample.snapshot();
         assert_eq!(sample.peak_left, 0.0);
         assert_eq!(sample.peak_right, 0.0);
     }
@@ -12707,6 +16466,18 @@ mod tests {
         assert!(!source_endpoint.capture_sink_monitor);
         assert!(source_endpoint.dont_reconnect);
         assert!(!source_endpoint.dont_remix);
+    }
+
+    #[test]
+    fn meter_restore_ids_are_isolated_by_target_source() {
+        let microphone = MeterEndpoint::from_source_name("wavelinux6-mic");
+        let browser = MeterEndpoint::from_source_name("wavelinux6_fx_browser_source");
+
+        assert_ne!(
+            meter_stream_restore_id(&microphone),
+            meter_stream_restore_id(&browser)
+        );
+        assert!(meter_stream_restore_id(&microphone).contains("wavelinux6-mic"));
     }
 
     #[test]
@@ -12968,6 +16739,67 @@ mod tests {
     }
 
     #[test]
+    fn wavelinux6_marks_replaced_pulse_mix_modules_and_routes_stale() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+        config
+            .set_mix_monitor_output("monitor", Some("alsa_output.test".into()))
+            .unwrap();
+        let monitor = config.mixes.iter().find(|mix| mix.id == "monitor").unwrap();
+
+        let replaced = [
+            ManagedModule {
+                module_id: "legacy-mix".into(),
+                role: Some("mix".into()),
+                channel_id: None,
+                mix_id: Some(monitor.id.clone()),
+                route_revision: None,
+                node_name: Some(monitor.virtual_sink_name.clone()),
+                source_name: None,
+                sink_name: None,
+            },
+            ManagedModule {
+                module_id: "legacy-mix-source".into(),
+                role: Some("mix_source".into()),
+                channel_id: None,
+                mix_id: Some(monitor.id.clone()),
+                route_revision: None,
+                node_name: Some(monitor.virtual_source_name.clone()),
+                source_name: None,
+                sink_name: None,
+            },
+            ManagedModule {
+                module_id: "legacy-channel-route".into(),
+                role: Some("channel_to_mix".into()),
+                channel_id: Some("browser".into()),
+                mix_id: Some(monitor.id.clone()),
+                route_revision: None,
+                node_name: None,
+                source_name: Some("wavelinux6_fx_browser_source".into()),
+                sink_name: Some(monitor.virtual_sink_name.clone()),
+            },
+            ManagedModule {
+                module_id: "legacy-monitor-route".into(),
+                role: Some("mix_monitor".into()),
+                channel_id: None,
+                mix_id: Some(monitor.id.clone()),
+                route_revision: Some(mix_monitor_route_revision_for_sink(
+                    &config.settings,
+                    monitor,
+                    "alsa_output.test",
+                )),
+                node_name: None,
+                source_name: Some(format!("{}.monitor", monitor.virtual_sink_name)),
+                sink_name: Some("alsa_output.test".into()),
+            },
+        ];
+
+        assert!(replaced
+            .iter()
+            .all(|module| module_is_stale_for_config(module, &config)));
+    }
+
+    #[test]
     fn stale_cleanup_keeps_current_effect_chain_nodes() {
         let mut config = MixerConfig::default();
         let channel = config
@@ -13068,7 +16900,7 @@ mod tests {
     fn stale_cleanup_excludes_supervised_filter_chain_child_for_active_helper() {
         let active_helper = StaleProcess {
             pid: "100".into(),
-            command: "/home/dusky/.local/bin/wavelinux5-dsp-helper --run-filter-chain".into(),
+            command: "/home/dusky/.local/bin/wavelinux6-audio-core --run-filter-chain".into(),
         };
         let supervised_pipewire_child = StaleProcess {
             pid: "200".into(),
@@ -13148,6 +16980,7 @@ mod tests {
             node_name: None,
             media_name: None,
             managed: None,
+            dont_move: false,
         };
         let wrong_sink_input = sink_input_for_module(&wrong_endpoint);
 
@@ -13720,6 +17553,19 @@ mod tests {
     }
 
     #[test]
+    fn wavelinux6_keeps_all_mix_bridges_active_without_consumers() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+
+        let active_mixes = active_mix_ids_for_routes(&config, &RuntimeGraph::default(), &[], &[]);
+
+        assert_eq!(
+            active_mixes,
+            BTreeSet::from(["monitor".into(), "stream".into()])
+        );
+    }
+
+    #[test]
     fn newly_active_browser_routes_use_incremental_mix_sync() {
         let mut config = MixerConfig::default();
         config
@@ -13849,6 +17695,29 @@ mod tests {
             "Event 'change' on client #12"
         ));
         assert!(!audio_subscription_event_relevant("garbled output"));
+        assert_eq!(
+            parse_audio_subscription_event("Event 'new' on sink-input #42"),
+            Some(AudioSubscriptionEvent::PlaybackStream)
+        );
+        assert_eq!(
+            parse_audio_subscription_event("Event 'change' on source-output #5"),
+            None
+        );
+        assert_eq!(
+            parse_audio_subscription_event("Event 'change' on card #7"),
+            Some(AudioSubscriptionEvent::Device)
+        );
+    }
+
+    #[test]
+    fn pulse_subscription_coalescing_preserves_the_broadest_refresh() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        tx.try_send(AudioSubscriptionEvent::PlaybackStream).unwrap();
+        tx.try_send(AudioSubscriptionEvent::Device).unwrap();
+        assert_eq!(
+            coalesce_audio_subscription_events(AudioSubscriptionEvent::PlaybackStream, &rx),
+            AudioSubscriptionEvent::Device
+        );
     }
 
     #[test]
@@ -13959,6 +17828,42 @@ mod tests {
     }
 
     #[test]
+    fn graph_sink_level_commands_skip_converged_sinks() {
+        let config = MixerConfig::default();
+        let mut levels = BTreeMap::new();
+        for mix in &config.mixes {
+            levels.insert(
+                mix.virtual_sink_name.clone(),
+                SinkLevelState {
+                    volume_percent: Some((mix.volume.clamp(0.0, 1.0) * 100.0).round() as u8),
+                    muted: mix.muted,
+                },
+            );
+        }
+        for channel in &config.channels {
+            levels.insert(
+                channel.virtual_sink_name.clone(),
+                SinkLevelState {
+                    volume_percent: Some(100),
+                    muted: false,
+                },
+            );
+        }
+
+        assert!(graph_sink_level_commands(&config, &levels).is_empty());
+
+        let mix = &config.mixes[0];
+        let level = levels.get_mut(&mix.virtual_sink_name).unwrap();
+        level.volume_percent = Some(12);
+        level.muted = !mix.muted;
+        let commands = graph_sink_level_commands(&config, &levels);
+        assert_eq!(commands.len(), 2);
+        assert!(commands
+            .iter()
+            .all(|command| command.args.get(1) == Some(&mix.virtual_sink_name)));
+    }
+
+    #[test]
     fn stale_managed_route_stream_level_command_is_skipped() {
         let command = plan_set_route_sink_input_volume("gone-stream", 1.0);
         assert_eq!(command_stream_id(&command), Some("gone-stream"));
@@ -13978,6 +17883,34 @@ mod tests {
             output.stderr,
             "stream gone-stream disappeared before the command could apply"
         );
+    }
+
+    #[test]
+    fn stale_capture_stream_move_is_skipped_without_failure_backoff() {
+        let engine = test_engine();
+        let command = plan_move_capture_stream_to_source("gone-capture", "wavelinux-mic");
+        assert_eq!(command_stream_id(&command), Some("gone-capture"));
+        let output = command_execution_with_stale_stream_skip(
+            command.clone(),
+            Err(PwError::CommandFailed {
+                program: "pactl".into(),
+                args: command.args.clone(),
+                stderr: "Failure: No such entity".into(),
+            }),
+        );
+
+        engine
+            .remember_failed_capture_moves(&[(
+                "gone-capture".into(),
+                "alsa_input.usb_mic->wavelinux-mic".into(),
+                output.clone(),
+            )])
+            .unwrap();
+
+        assert!(output.skipped);
+        assert_eq!(output.error, None);
+        assert!(!engine
+            .capture_move_recently_failed("gone-capture", "alsa_input.usb_mic->wavelinux-mic"));
     }
 
     #[test]
@@ -14051,6 +17984,7 @@ mod tests {
             node_name: Some("Discord input".into()),
             media_name: Some("RecordStream".into()),
             managed: None,
+            dont_move: false,
         };
         let commands = capture_stream_move_commands_to_locked_default_input(
             &effective,
@@ -14113,7 +18047,7 @@ mod tests {
     fn default_device_lock_drift_is_separate_from_route_repair() {
         let mut config = MixerConfig::default();
         config.settings.lock_default_input = true;
-        let route_repair = auto_device_route_repair_needed(&config, None, None, &[], &[]);
+        let route_repair = auto_device_route_repair_needed(&config, None, None, &[], &[], &[]);
         let lock_repair =
             default_device_lock_repair_needed(&config, Some("alsa_input.usb_mic"), None);
 
@@ -14139,6 +18073,7 @@ mod tests {
             node_name: Some("Discord input".into()),
             media_name: Some("RecordStream".into()),
             managed: None,
+            dont_move: false,
         };
 
         assert!(capture_stream_move_commands_to_locked_default_input(
@@ -14226,10 +18161,37 @@ mod tests {
         let loopback_route = SourceOutputRoute {
             node_name: Some("input.loopback-2169-33".into()),
             media_name: Some("loopback-2169-33 input".into()),
-            ..route
+            ..route.clone()
         };
         assert!(
             capture_stream_move_commands_to_locked_default_input(&config, &[loopback_route])
+                .is_empty()
+        );
+
+        let audio_core_capture = SourceOutputRoute {
+            source_name: Some("alsa_input.usb_mic".into()),
+            application_name: Some("WaveLinux 6".into()),
+            node_name: Some("wavelinux6-input-target-hardware_in".into()),
+            media_name: Some("WaveLinux 6 Input hardware input".into()),
+            managed: Some("1".into()),
+            dont_move: true,
+            ..route.clone()
+        };
+        assert!(capture_stream_move_commands_to_locked_default_input(
+            &config,
+            &[audio_core_capture]
+        )
+        .is_empty());
+
+        let native_meter = SourceOutputRoute {
+            dont_move: true,
+            application_name: None,
+            node_name: Some("pipewire-native-meter".into()),
+            media_name: Some("Capture".into()),
+            ..route
+        };
+        assert!(
+            capture_stream_move_commands_to_locked_default_input(&config, &[native_meter])
                 .is_empty()
         );
     }
@@ -14427,6 +18389,7 @@ mod tests {
                 active_sink: Some("alsa_output.realtek"),
                 managed_modules: &[stale_low_latency_route],
                 source_outputs: &[],
+                sink_inputs: &[],
             }
         ));
 
@@ -14479,6 +18442,7 @@ mod tests {
                 active_sink: Some("alsa_output.realtek"),
                 managed_modules: &[current_input_route, current_profile_latency_route],
                 source_outputs: &source_outputs,
+                sink_inputs: &[],
             }
         ));
     }
@@ -14672,6 +18636,7 @@ mod tests {
             &config,
             Some("bluez_output.sony"),
             &[old_route],
+            &[],
             &[]
         ));
         assert!(!auto_output_repair_needed(
@@ -14679,6 +18644,7 @@ mod tests {
             Some("bluez_output.sony"),
             std::slice::from_ref(&current_route),
             std::slice::from_ref(&live_current_route),
+            &[],
         ));
     }
 
@@ -14714,6 +18680,7 @@ mod tests {
             node_name: None,
             media_name: None,
             managed: None,
+            dont_move: false,
         };
         let unrelated_live_route = SourceOutputRoute {
             id: "92".into(),
@@ -14730,6 +18697,7 @@ mod tests {
             node_name: None,
             media_name: None,
             managed: None,
+            dont_move: false,
         };
 
         assert!(auto_output_repair_needed(
@@ -14737,12 +18705,14 @@ mod tests {
             Some("bluez_output.sony"),
             std::slice::from_ref(&current_route),
             std::slice::from_ref(&unrelated_live_route),
+            &[],
         ));
         assert!(!auto_output_repair_needed(
             &config,
             Some("bluez_output.sony"),
             std::slice::from_ref(&current_route),
             std::slice::from_ref(&live_route),
+            &[],
         ));
     }
 
@@ -14908,6 +18878,7 @@ mod tests {
                 active_sink: Some("alsa_output.speaker"),
                 managed_modules: &[current_monitor_route, stale_music_route],
                 source_outputs: &source_outputs,
+                sink_inputs: &[],
             }
         ));
     }
@@ -15013,6 +18984,7 @@ mod tests {
                 active_sink: None,
                 managed_modules: &[],
                 source_outputs: &[],
+                sink_inputs: &[],
             }
         ));
     }
@@ -15110,6 +19082,7 @@ mod tests {
             AdaptiveLatencySignal::CpuPressure,
             0.92,
             0,
+            0,
             start,
         );
         assert_eq!(status.target_msec, 40);
@@ -15121,6 +19094,7 @@ mod tests {
             AdaptiveLatencySignal::AudioTrouble,
             0.30,
             2,
+            128,
             start + Duration::from_secs(1),
         );
         assert_eq!(status.target_msec, 80);
@@ -15132,6 +19106,7 @@ mod tests {
             AdaptiveLatencySignal::Clean,
             0.20,
             0,
+            0,
             start + Duration::from_secs(10),
         );
         assert_eq!(status.target_msec, 80);
@@ -15141,10 +19116,68 @@ mod tests {
             AdaptiveLatencySignal::Clean,
             0.10,
             0,
+            0,
             start + Duration::from_secs(45),
         );
         assert_eq!(status.target_msec, 60);
         assert_eq!(status.last_reason, "clean_recovery");
+    }
+
+    #[test]
+    fn adaptive_quantum_learns_failed_recovery_floor_per_output() {
+        let mut controller = AdaptiveQuantumController::default();
+        let start = Instant::now();
+
+        assert_eq!(
+            controller.update(1024, 0, "alsa_output.usb", start),
+            (1024, 0, false)
+        );
+        assert_eq!(
+            controller.update(512, 0, "alsa_output.usb", start + Duration::from_secs(15)),
+            (512, 0, false)
+        );
+        assert_eq!(
+            controller.update(0, 0, "alsa_output.usb", start + Duration::from_secs(30)),
+            (0, 0, false)
+        );
+        assert_eq!(
+            controller.update(1024, 2, "alsa_output.usb", start + Duration::from_secs(31)),
+            (1024, 512, true)
+        );
+        assert_eq!(
+            controller.update(0, 0, "alsa_output.usb", start + Duration::from_secs(60)),
+            (512, 512, false)
+        );
+
+        assert_eq!(
+            controller.update(
+                0,
+                0,
+                "alsa_output.bluetooth",
+                start + Duration::from_secs(61)
+            ),
+            (0, 0, false)
+        );
+    }
+
+    #[test]
+    fn adaptive_quantum_floor_cache_round_trips_and_filters_invalid_entries() {
+        let temp = tempfile::tempdir().expect("temporary engine root");
+        let path = temp.path().join(ADAPTIVE_QUANTUM_FLOORS_FILE);
+        let cache = AdaptiveQuantumFloorCache {
+            version: ADAPTIVE_QUANTUM_FLOORS_VERSION,
+            floors: BTreeMap::from([
+                ("alsa_output.usb".into(), 512),
+                ("invalid".into(), 300),
+                ("<no-monitor-output>".into(), 1024),
+            ]),
+        };
+        write_json(&path, &cache).expect("write learned floors");
+
+        assert_eq!(
+            load_adaptive_quantum_floors(&path).expect("load learned floors"),
+            BTreeMap::from([("alsa_output.usb".into(), 512)])
+        );
     }
 
     #[test]
@@ -15158,6 +19191,7 @@ mod tests {
             AdaptiveLatencySignal::PipeWireTrouble,
             0.20,
             1,
+            0,
             start,
         );
         assert_eq!(status.target_msec, 28);
@@ -15168,6 +19202,7 @@ mod tests {
             AdaptiveLatencySignal::PipeWireTrouble,
             0.20,
             1,
+            0,
             start + Duration::from_secs(3),
         );
         assert_eq!(status.target_msec, 40);
@@ -15180,19 +19215,12 @@ mod tests {
             trigger_mode: wavelinux_model::AdaptiveLatencyTriggerMode::AudioOnly,
             ..Default::default()
         };
-        let diagnostics = vec![Diagnostic {
-            code: "pipewire.audio_health.recent_buffer_resync".into(),
-            severity: DiagnosticSeverity::Warning,
-            message: "PipeWire recently reported audio graph trouble (8 out-of-buffer, 0 resync)"
-                .into(),
-            action: None,
-        }];
-
-        let (signal, _cpu_pressure, pipewire_warning_delta) =
-            adaptive_latency_signal(&settings, &diagnostics);
+        let (signal, _cpu_pressure, pipewire_warning_delta, underrun_delta) =
+            adaptive_latency_signal(&settings, &[], 0.20, 1, 0);
 
         assert_eq!(signal, AdaptiveLatencySignal::Clean);
         assert_eq!(pipewire_warning_delta, 1);
+        assert_eq!(underrun_delta, 0);
     }
 
     #[test]
@@ -15201,20 +19229,239 @@ mod tests {
             trigger_mode: wavelinux_model::AdaptiveLatencyTriggerMode::AudioOnly,
             ..Default::default()
         };
-        let diagnostics = vec![Diagnostic {
-            code: "pipewire.audio_health.wavelinux_owned_buffer_resync".into(),
-            severity: DiagnosticSeverity::Warning,
-            message:
-                "PipeWire recently reported audio graph trouble (1 out-of-buffer, 1 WaveLinux-owned log mention)"
-                    .into(),
-            action: None,
-        }];
-
-        let (signal, _cpu_pressure, pipewire_warning_delta) =
-            adaptive_latency_signal(&settings, &diagnostics);
+        let (signal, _cpu_pressure, pipewire_warning_delta, underrun_delta) =
+            adaptive_latency_signal(&settings, &[], 0.20, 1, 1);
 
         assert_eq!(signal, AdaptiveLatencySignal::PipeWireTrouble);
         assert_eq!(pipewire_warning_delta, 1);
+        assert_eq!(underrun_delta, 0);
+    }
+
+    #[test]
+    fn adaptive_latency_signal_uses_live_core_discontinuities() {
+        let settings = wavelinux_model::AdaptiveLatencySettings {
+            trigger_mode: wavelinux_model::AdaptiveLatencyTriggerMode::AudioOnly,
+            ..Default::default()
+        };
+        let audio_core = vec![AudioCoreChannelStatus {
+            channel_id: "hardware_in".into(),
+            online: true,
+            underrun_delta: 256,
+            ..AudioCoreChannelStatus::default()
+        }];
+
+        let (signal, _cpu_pressure, pipewire_warning_delta, underrun_delta) =
+            adaptive_latency_signal(&settings, &audio_core, 0.20, 0, 0);
+
+        assert_eq!(signal, AdaptiveLatencySignal::AudioTrouble);
+        assert_eq!(pipewire_warning_delta, 0);
+        assert_eq!(underrun_delta, 256);
+    }
+
+    #[test]
+    fn audio_core_integrity_diagnostics_report_contained_invalid_output() {
+        let statuses = vec![AudioCoreChannelStatus {
+            channel_id: "hardware_in".into(),
+            online: true,
+            non_finite_blocks: 2,
+            non_finite_samples: 128,
+            non_finite_effect_mask: 1,
+            chain_recoveries: 1,
+            ..AudioCoreChannelStatus::default()
+        }];
+
+        let diagnostics = audio_core_integrity_diagnostics(&statuses);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "audio_core.non_finite.hardware_in");
+        assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Warning);
+        assert!(diagnostics[0].message.contains("effect_mask=0x1"));
+        assert!(diagnostics[0].message.contains("recoveries=1"));
+    }
+
+    #[test]
+    fn audio_core_integrity_diagnostics_ignore_clean_online_endpoint() {
+        let statuses = vec![AudioCoreChannelStatus {
+            channel_id: "mix:stream".into(),
+            online: true,
+            ..AudioCoreChannelStatus::default()
+        }];
+
+        assert!(audio_core_integrity_diagnostics(&statuses).is_empty());
+    }
+
+    #[test]
+    fn audio_core_integrity_diagnostics_report_offline_endpoint_error() {
+        let statuses = vec![AudioCoreChannelStatus {
+            channel_id: "mix:monitor".into(),
+            error: Some("connection refused".into()),
+            ..AudioCoreChannelStatus::default()
+        }];
+
+        let diagnostics = audio_core_integrity_diagnostics(&statuses);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "audio_core.offline.mix:monitor");
+        assert!(diagnostics[0]
+            .action
+            .as_deref()
+            .is_some_and(|action| action.contains("connection refused")));
+    }
+
+    #[test]
+    fn pipewire_health_deltas_do_not_repeat_old_warnings() {
+        let previous = PipeWireAudioHealthStatus {
+            warning_events: 4,
+            owned_events: 2,
+            ..Default::default()
+        };
+        let current = PipeWireAudioHealthStatus {
+            warning_events: 5,
+            owned_events: 3,
+            ..Default::default()
+        };
+        assert_eq!(pipewire_health_deltas(&previous, &current), (1, 1));
+        assert_eq!(pipewire_health_deltas(&current, &current), (0, 0));
+    }
+
+    #[test]
+    fn pipewire_health_tracker_counts_relevant_and_owned_events() {
+        let tracker = PipeWireAudioHealthTracker::default();
+        assert!(!tracker.observe_line("ordinary PipeWire status", "wavelinux6"));
+        assert!(tracker.observe_line("wavelinux6-mic: out of buffers; resync", "wavelinux6"));
+        assert!(tracker.observe_line("link failed to activate", "wavelinux6"));
+        let status = tracker.snapshot();
+        assert_eq!(status.warning_events, 2);
+        assert_eq!(status.out_of_buffers, 1);
+        assert_eq!(status.resyncs, 1);
+        assert_eq!(status.link_failures, 1);
+        assert_eq!(status.owned_events, 1);
+        assert!(status.last_event_unix.is_some());
+    }
+
+    #[test]
+    fn pipewire_profiler_uses_first_sample_as_baseline_and_counts_deltas() {
+        let tracker = PipeWireAudioHealthTracker::default();
+        assert!(!tracker.observe_profiler_line(
+            "S   ID  QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME",
+            "wavelinux6"
+        ));
+        assert!(!tracker.observe_profiler_line(
+            "C 130 0 0 --- --- --- --- 0 wavelinux6-input-target",
+            "wavelinux6"
+        ));
+        assert!(!tracker.observe_profiler_line(
+            "S   ID  QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME",
+            "wavelinux6"
+        ));
+        assert!(!tracker.observe_profiler_line(
+            "R 130 256 48000 10us 20us 0.0 0.0 4 F32LE 2 48000 wavelinux6-input-target",
+            "wavelinux6"
+        ));
+        assert!(!tracker.observe_profiler_line(
+            "S   ID  QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME",
+            "wavelinux6"
+        ));
+        assert!(!tracker.observe_profiler_line(
+            "R 130 256 48000 10us 20us 0.0 0.0 4 F32LE 2 48000 wavelinux6-input-target",
+            "wavelinux6"
+        ));
+        assert!(tracker.observe_profiler_line(
+            "R 130 256 48000 10us 20us 0.0 0.0 6 F32LE 2 48000 wavelinux6-input-target",
+            "wavelinux6"
+        ));
+
+        let status = tracker.snapshot();
+        assert_eq!(status.profiler_samples, 3);
+        assert_eq!(status.direct_errors, 2);
+        assert_eq!(status.owned_direct_errors, 2);
+        assert_eq!(status.warning_events, 2);
+        assert_eq!(status.xruns, 2);
+        assert_eq!(status.owned_events, 2);
+    }
+
+    #[test]
+    fn pipewire_profiler_ignores_non_audio_nodes_with_error_counters() {
+        let tracker = PipeWireAudioHealthTracker::default();
+        for line in [
+            "S ID QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME",
+            "S ID QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME",
+            "S ID QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME",
+        ] {
+            assert!(!tracker.observe_profiler_line(line, "wavelinux6"));
+        }
+        assert!(!tracker.observe_profiler_line(
+            "R 210 0 0 131.5us 15.9us 0.05 0.01 18 BGRA 2100x1400 plasmashell",
+            "wavelinux6"
+        ));
+        assert_eq!(tracker.snapshot().direct_errors, 0);
+    }
+
+    #[test]
+    fn pipewire_profiler_uses_idle_error_changes_as_a_running_baseline() {
+        let tracker = PipeWireAudioHealthTracker::default();
+        for line in [
+            "S ID QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME",
+            "S ID QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME",
+            "S ID QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME",
+        ] {
+            assert!(!tracker.observe_profiler_line(line, "wavelinux6"));
+        }
+        assert!(!tracker.observe_profiler_line(
+            "I 61 512 48000 4us 5us 0.0 0.0 0 S32LE 2 48000 built-in-speaker",
+            "wavelinux6"
+        ));
+        assert!(!tracker.observe_profiler_line(
+            "I 61 512 48000 4us 5us 0.0 0.0 4 S32LE 2 48000 built-in-speaker",
+            "wavelinux6"
+        ));
+        assert!(!tracker.observe_profiler_line(
+            "R 61 512 48000 4us 5us 0.0 0.0 4 S32LE 2 48000 built-in-speaker",
+            "wavelinux6"
+        ));
+        assert!(tracker.observe_profiler_line(
+            "R 61 512 48000 4us 5us 0.0 0.0 5 S32LE 2 48000 built-in-speaker",
+            "wavelinux6"
+        ));
+
+        let status = tracker.snapshot();
+        assert_eq!(status.direct_errors, 1);
+        assert_eq!(status.warning_events, 1);
+    }
+
+    #[test]
+    fn pipewire_profiler_resets_baseline_when_a_node_id_is_reused() {
+        let tracker = PipeWireAudioHealthTracker::default();
+        for line in [
+            "S ID QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME",
+            "S ID QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME",
+            "S ID QUANT RATE WAIT BUSY W/Q B/Q ERR FORMAT NAME",
+        ] {
+            assert!(!tracker.observe_profiler_line(line, "wavelinux6"));
+        }
+        assert!(!tracker.observe_profiler_line(
+            "R 130 256 48000 10us 20us 0.0 0.0 9 F32LE 2 48000 old-node",
+            "wavelinux6"
+        ));
+        assert!(!tracker.observe_profiler_line(
+            "R 130 256 48000 10us 20us 0.0 0.0 1 F32LE 2 48000 wavelinux6-new-node",
+            "wavelinux6"
+        ));
+        assert!(tracker.observe_profiler_line(
+            "R 130 256 48000 10us 20us 0.0 0.0 2 F32LE 2 48000 wavelinux6-new-node",
+            "wavelinux6"
+        ));
+        let status = tracker.snapshot();
+        assert_eq!(status.direct_errors, 1);
+        assert_eq!(status.owned_direct_errors, 1);
+    }
+
+    #[test]
+    fn proc_stat_cpu_pressure_uses_busy_time_delta() {
+        let previous = parse_proc_stat_cpu("cpu  100 0 50 800 50 0 0 0 0 0\n").unwrap();
+        let current = parse_proc_stat_cpu("cpu  130 0 70 840 60 0 0 0 0 0\n").unwrap();
+        let pressure = cpu_pressure_between(previous, current).unwrap();
+        assert!((pressure - 0.5).abs() < 0.001);
     }
 
     #[test]
@@ -15235,6 +19482,7 @@ mod tests {
             AdaptiveLatencySignal::AudioTrouble,
             0.35,
             1,
+            64,
             controller.last_change + Duration::from_secs(2),
         );
         let after = input_route_revision(&config.settings, channel);
@@ -15287,6 +19535,7 @@ mod tests {
                 active_sink: None,
                 managed_modules: &[],
                 source_outputs: &[],
+                sink_inputs: &[],
             }
         ));
     }
@@ -15593,6 +19842,47 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_auto_output_keeps_stable_reason_metadata() {
+        let config = MixerConfig::default();
+        let outputs = vec![device(
+            "alsa_output.usb_interface",
+            "USB Audio Interface",
+            true,
+        )];
+        let previous = resolved_auto_devices_for_config(
+            &config,
+            &[],
+            &outputs,
+            &[],
+            None,
+            Some("alsa_output.usb_interface"),
+            None,
+        );
+        let mut next = resolved_auto_devices_for_config(
+            &config,
+            &[],
+            &outputs,
+            &[],
+            None,
+            None,
+            Some("alsa_output.usb_interface"),
+        );
+        let before = next
+            .iter()
+            .find(|device| device.kind == AutoDeviceKind::Output)
+            .unwrap();
+        assert_eq!(before.reason, AutoDeviceReason::ActiveOutput);
+
+        stabilize_auto_device_reasons(&previous, &mut next);
+
+        let after = next
+            .iter()
+            .find(|device| device.kind == AutoDeviceKind::Output)
+            .unwrap();
+        assert_eq!(after.reason, AutoDeviceReason::SystemDefault);
+    }
+
+    #[test]
     fn auto_input_repair_triggers_when_higher_priority_device_appears() {
         let config = MixerConfig::default();
         let inputs = vec![
@@ -15626,6 +19916,7 @@ mod tests {
                 active_sink: None,
                 managed_modules: std::slice::from_ref(&stale_module),
                 source_outputs: &[source_output_for_module(&stale_module)],
+                sink_inputs: &[],
             }
         ));
     }
@@ -15664,6 +19955,7 @@ mod tests {
                 active_sink: None,
                 managed_modules: std::slice::from_ref(&current_module),
                 source_outputs: &[source_output_for_module(&current_module)],
+                sink_inputs: &[],
             }
         ));
     }
@@ -15747,6 +20039,7 @@ mod tests {
             node_name: Some("Discord input".into()),
             media_name: Some("RecordStream".into()),
             managed: None,
+            dont_move: false,
         };
 
         let commands = capture_stream_move_commands_for_bluetooth_protection(
@@ -15767,6 +20060,17 @@ mod tests {
             &cards,
         );
         assert!(bluetooth_fallback.is_empty());
+
+        let fixed_native_stream = SourceOutputRoute {
+            dont_move: true,
+            ..route.clone()
+        };
+        assert!(capture_stream_move_commands_for_bluetooth_protection(
+            &[fixed_native_stream],
+            Some("alsa_input.usb_dji"),
+            &cards,
+        )
+        .is_empty());
 
         let wavelinux_owned = SourceOutputRoute {
             application_name: Some("WaveLinux filter-chain".into()),
@@ -15798,6 +20102,7 @@ mod tests {
             node_name: Some("browser-capture".into()),
             media_name: Some("CaptureStream".into()),
             managed: None,
+            dont_move: false,
         };
         let failed_move = CommandExecution {
             command: plan_move_capture_stream_to_source("77", "wavelinux_mix_stream_source"),
@@ -15808,7 +20113,11 @@ mod tests {
         };
 
         engine
-            .remember_failed_capture_moves(&[failed_move], std::slice::from_ref(&route))
+            .remember_failed_capture_moves(&[(
+                "77".into(),
+                "alsa_input.usb_mic->wavelinux_mix_stream_source".into(),
+                failed_move,
+            )])
             .unwrap();
         assert!(engine
             .capture_move_recently_failed("77", "alsa_input.usb_mic->wavelinux_mix_stream_source"));
@@ -15866,105 +20175,6 @@ mod tests {
     }
 
     #[test]
-    fn startup_microphone_level_reset_targets_real_non_bluetooth_sources() {
-        let cards = vec![BluetoothAudioCard {
-            name: "bluez_card.AC_80_0A_72_BD_10".into(),
-            device_key: "AC_80_0A_72_BD_10".into(),
-            active_profile: Some("headset-head-unit".into()),
-            preferred_a2dp_profile: Some("a2dp-sink".into()),
-            profiles: Vec::new(),
-        }];
-        let mut usb = device("alsa_input.usb_mic", "USB Microphone", true);
-        usb.bus = Some(wavelinux_model::DeviceBus::Usb);
-        let mut monitor = device("alsa_output.pci.monitor", "Monitor of Speakers", false);
-        monitor.bus = Some(wavelinux_model::DeviceBus::Pci);
-        let mut virtual_source = device("wavelinux_mix_stream_source", "WaveLinux Stream", false);
-        virtual_source.is_virtual = true;
-        let mut bluetooth = device(
-            "bluez_input.AC:80:0A:72:BD:10",
-            "WH-1000XM4 Bluetooth Headset Microphone",
-            false,
-        );
-        bluetooth.bus = Some(wavelinux_model::DeviceBus::Bluetooth);
-
-        let commands = startup_microphone_level_reset_commands(
-            &[usb, monitor, virtual_source, bluetooth],
-            &cards,
-        );
-
-        assert_eq!(commands.len(), 2);
-        assert_eq!(
-            commands[0].args,
-            ["set-source-volume", "alsa_input.usb_mic", "100%"]
-        );
-        assert_eq!(
-            commands[1].args,
-            ["set-source-mute", "alsa_input.usb_mic", "0"]
-        );
-    }
-
-    #[test]
-    fn startup_microphone_level_reset_uses_safe_internal_mic_gain() {
-        let mut internal = device(
-            "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source",
-            "700 Series Chipset Family HD Audio Controller Digital Microphone",
-            true,
-        );
-        internal.bus = Some(wavelinux_model::DeviceBus::Pci);
-
-        let commands = startup_microphone_level_reset_commands(&[internal], &[]);
-
-        assert_eq!(commands.len(), 2);
-        assert_eq!(
-            commands[0].args,
-            [
-                "set-source-volume",
-                "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source",
-                "46%"
-            ]
-        );
-        assert_eq!(
-            commands[1].args,
-            [
-                "set-source-mute",
-                "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source",
-                "0"
-            ]
-        );
-    }
-
-    #[test]
-    fn startup_microphone_level_reset_skips_unavailable_hda_headset_mono() {
-        let headset = unavailable_alsa_headset_mono("alsa_input.pci_headset");
-
-        let commands = startup_microphone_level_reset_commands(&[headset], &[]);
-
-        assert!(commands.is_empty());
-    }
-
-    #[test]
-    fn startup_microphone_level_reset_allows_safe_usb_availability_override() {
-        let mut usb = device("alsa_input.usb_cm01", "CM01 Mono", false);
-        usb.is_available = false;
-        usb.bus = Some(wavelinux_model::DeviceBus::Usb);
-        usb.vendor_id = Some("1234".into());
-        usb.matched_profile_id = Some("ttgk.cm01".into());
-        usb.profile_confidence = Some(wavelinux_model::ProfileConfidence::High);
-
-        let commands = startup_microphone_level_reset_commands(&[usb], &[]);
-
-        assert_eq!(commands.len(), 2);
-        assert_eq!(
-            commands[0].args,
-            ["set-source-volume", "alsa_input.usb_cm01", "100%"]
-        );
-        assert_eq!(
-            commands[1].args,
-            ["set-source-mute", "alsa_input.usb_cm01", "0"]
-        );
-    }
-
-    #[test]
     fn effective_config_drops_bluetooth_input_that_would_force_hfp() {
         let mut config = MixerConfig::default();
         let hardware = config
@@ -16019,6 +20229,9 @@ mod tests {
         assert_eq!(dsp_config.input_node_name, "wavelinux_fx_hardware_in_input");
         assert_eq!(dsp_config.output_node_name, "wavelinux-mic");
         assert_eq!(dsp_config.property_prefix, "wavelinux");
+        let socket_path = PathBuf::from(dsp_config.control_socket_path.unwrap());
+        assert!(socket_path.starts_with(engine.paths.control_sockets_dir()));
+        assert!(!socket_path.starts_with(engine.paths.data_dir.clone()));
 
         engine
             .bypass_effect("hardware_in".into(), limiter.instance_id, true)
@@ -16026,6 +20239,258 @@ mod tests {
         engine.rebuild_effect_chain_configs().unwrap();
         assert!(!path.exists());
         assert!(!dsp_path.exists());
+    }
+
+    #[test]
+    fn native_mix_config_preserves_bus_policy_and_public_source() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+        config
+            .set_mix_outputs(
+                "stream",
+                vec![
+                    "alsa_output.usb_primary".into(),
+                    "bluez_output.secondary".into(),
+                ],
+            )
+            .unwrap();
+        config.channels[0]
+            .mix_buses
+            .get_mut("stream")
+            .unwrap()
+            .muted = true;
+        config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "music")
+            .unwrap()
+            .mix_buses
+            .get_mut("stream")
+            .unwrap()
+            .enabled = false;
+        let stream = config.mixes.iter().find(|mix| mix.id == "stream").unwrap();
+
+        let mix = dsp_mix_config(stream, &config);
+
+        assert_eq!(mix.output_node_name, "wavelinux6_mix_stream_source");
+        assert_eq!(
+            mix.output_target_node_names,
+            vec![
+                "alsa_output.usb_primary".to_string(),
+                "bluez_output.secondary".to_string(),
+            ]
+        );
+        let expected_latency_msec = config
+            .channels
+            .iter()
+            .filter(|channel| {
+                channel
+                    .mix_buses
+                    .get("stream")
+                    .is_some_and(|bus| bus.enabled)
+            })
+            .map(|channel| channel_mix_latency_msec(channel, stream, &config.settings))
+            .max()
+            .unwrap();
+        assert_eq!(expected_latency_msec, 80);
+        assert_eq!(mix.latency_frames, u32::from(expected_latency_msec) * 48);
+        assert!(
+            mix.buses
+                .iter()
+                .find(|bus| bus.channel_id == "hardware_in")
+                .unwrap()
+                .muted
+        );
+        assert!(
+            !mix.buses
+                .iter()
+                .find(|bus| bus.channel_id == "music")
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[test]
+    fn monitor_manifest_uses_persisted_quantum_floor_for_exact_output_set() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+        config
+            .set_mix_outputs("monitor", vec!["alsa_output.usb_cm01".into()])
+            .unwrap();
+        let monitor = config.mixes.iter().find(|mix| mix.id == "monitor").unwrap();
+        let floors = BTreeMap::from([("alsa_output.usb_cm01".into(), 512)]);
+
+        assert_eq!(learned_quantum_floor_for_mix(monitor, &floors), 512);
+        let stream = config.mixes.iter().find(|mix| mix.id == "stream").unwrap();
+        assert_eq!(learned_quantum_floor_for_mix(stream, &floors), 0);
+    }
+
+    #[test]
+    fn audio_core_manifest_preserves_effective_input_target_and_mono_mode() {
+        let engine = test_engine();
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+        config
+            .set_channel_input("hardware_in", Some("alsa_input.usb_cm01_mono".into()))
+            .unwrap();
+        config
+            .set_channel_input_mode("hardware_in", ChannelInputMode::SumMono)
+            .unwrap();
+        config
+            .set_mix_outputs(
+                "monitor",
+                vec!["alsa_output.usb_cm01".into(), "bluez_output.xm4".into()],
+            )
+            .unwrap();
+
+        engine
+            .rebuild_effect_chain_configs_from_config(&config, "wavelinux6")
+            .unwrap();
+        let manifest: wavelinux_dsp::DspCoreManifest = serde_json::from_str(
+            &fs::read_to_string(
+                engine
+                    .paths
+                    .effect_chains_dir()
+                    .join(AUDIO_CORE_MANIFEST_FILE),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let hardware = manifest
+            .channels
+            .iter()
+            .find(|channel| channel.channel_id == "hardware_in")
+            .unwrap();
+        let monitor = manifest
+            .mixes
+            .iter()
+            .find(|mix| mix.mix_id == "monitor")
+            .unwrap();
+
+        assert_eq!(
+            hardware.input_target_node_name.as_deref(),
+            Some("alsa_input.usb_cm01_mono")
+        );
+        assert!(hardware.input_target_capable);
+        assert!(hardware.input_role.is_none());
+        assert_eq!(hardware.input_mode, wavelinux_dsp::DspInputMode::SumMono);
+        assert_eq!(hardware.input_channels, 1);
+        assert_eq!(
+            monitor.output_target_node_names,
+            vec![
+                "alsa_output.usb_cm01".to_string(),
+                "bluez_output.xm4".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn hardware_target_names_do_not_change_audio_core_topology_revision() {
+        let engine = test_engine();
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+        config
+            .set_channel_input("hardware_in", Some("alsa_input.first".into()))
+            .unwrap();
+        config
+            .set_channel_input_mode("hardware_in", ChannelInputMode::SumMono)
+            .unwrap();
+        config
+            .set_mix_outputs("monitor", vec!["alsa_output.first".into()])
+            .unwrap();
+        engine
+            .rebuild_effect_chain_configs_from_config(&config, "wavelinux6")
+            .unwrap();
+        let manifest = engine
+            .paths
+            .effect_chains_dir()
+            .join(AUDIO_CORE_MANIFEST_FILE);
+        let first = audio_core_topology_revision(&manifest).unwrap();
+
+        config
+            .set_channel_input("hardware_in", Some("alsa_input.second".into()))
+            .unwrap();
+        config
+            .set_mix_outputs("monitor", vec!["alsa_output.second".into()])
+            .unwrap();
+        engine
+            .rebuild_effect_chain_configs_from_config(&config, "wavelinux6")
+            .unwrap();
+        let retargeted = audio_core_topology_revision(&manifest).unwrap();
+        assert_eq!(retargeted, first);
+
+        let mut latency_adjusted: wavelinux_dsp::DspCoreManifest =
+            serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+        for channel in &mut latency_adjusted.channels {
+            channel.latency_frames = channel.latency_frames.saturating_mul(2);
+        }
+        for mix in &mut latency_adjusted.mixes {
+            mix.latency_frames = mix.latency_frames.saturating_mul(2);
+        }
+        write_json(&manifest, &latency_adjusted).unwrap();
+        assert_eq!(audio_core_topology_revision(&manifest).unwrap(), first);
+
+        config.set_channel_input("hardware_in", None).unwrap();
+        engine
+            .rebuild_effect_chain_configs_from_config(&config, "wavelinux6")
+            .unwrap();
+        assert_eq!(audio_core_topology_revision(&manifest).unwrap(), first);
+
+        config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap()
+            .name = "Renamed hardware input".into();
+        engine
+            .rebuild_effect_chain_configs_from_config(&config, "wavelinux6")
+            .unwrap();
+        assert_ne!(audio_core_topology_revision(&manifest).unwrap(), first);
+    }
+
+    #[test]
+    fn persistent_core_target_sync_detects_target_changes_without_topology_repair() {
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+        config
+            .set_channel_input("hardware_in", Some("alsa_input.usb_new".into()))
+            .unwrap();
+        config
+            .set_mix_outputs("monitor", vec!["alsa_output.usb_new".into()])
+            .unwrap();
+        let old_input = native_input_target_route("hardware_in", "alsa_input.usb_old");
+        let old_output = native_mix_output_target_route("monitor", "alsa_output.usb_old");
+
+        assert!(persistent_core_target_routes_need_sync(
+            &config,
+            std::slice::from_ref(&old_input),
+            std::slice::from_ref(&old_output),
+        ));
+
+        let new_input = native_input_target_route("hardware_in", "alsa_input.usb_new");
+        let new_output = native_mix_output_target_route("monitor", "alsa_output.usb_new");
+        assert!(persistent_core_target_routes_need_sync(
+            &config,
+            &[old_input.clone(), new_input.clone()],
+            &[old_output.clone(), new_output.clone()],
+        ));
+        assert!(!persistent_core_target_routes_need_sync(
+            &config,
+            std::slice::from_ref(&new_input),
+            std::slice::from_ref(&new_output),
+        ));
+
+        config.set_channel_input("hardware_in", None).unwrap();
+        assert!(persistent_core_target_routes_need_sync(
+            &config,
+            std::slice::from_ref(&new_input),
+            std::slice::from_ref(&new_output),
+        ));
+        assert!(!persistent_core_target_routes_need_sync(
+            &config,
+            &[],
+            std::slice::from_ref(&new_output),
+        ));
     }
 
     #[test]
@@ -16188,6 +20653,7 @@ mod tests {
     fn native_fx_bridge_underrun_delta_is_reported_in_diagnostics() {
         let engine = test_engine();
         let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
         config
             .set_effect_chain("hardware_in", vec![EffectInstance::new("rnnoise")])
             .unwrap();
@@ -16199,8 +20665,8 @@ mod tests {
         fs::write(
             engine.effect_chain_log_path(channel),
             concat!(
-                "wavelinux5-dsp-helper native_stats captured_frames=48000 rendered_frames=48000 dropped_frames=0 underrun_frames=0 process_calls=100 buffered_frames=1344 target_latency_msec=28 reason=initial\n",
-                "wavelinux5-dsp-helper native_stats captured_frames=96000 rendered_frames=97024 dropped_frames=0 underrun_frames=64 process_calls=200 buffered_frames=64 target_latency_msec=28 reason=initial\n",
+                "wavelinux6-audio-core native_stats channel_id=hardware_in captured_frames=48000 rendered_frames=48000 dropped_frames=0 underrun_frames=0 process_calls=100 buffered_frames=1344 target_latency_msec=28 reason=initial\n",
+                "wavelinux6-audio-core native_stats channel_id=hardware_in captured_frames=96000 rendered_frames=97024 dropped_frames=0 underrun_frames=64 process_calls=200 buffered_frames=64 target_latency_msec=28 reason=initial\n",
             ),
         )
         .unwrap();
@@ -16217,6 +20683,7 @@ mod tests {
     fn flat_native_fx_bridge_underrun_counter_is_not_current_failure() {
         let engine = test_engine();
         let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
         config
             .set_effect_chain("hardware_in", vec![EffectInstance::new("rnnoise")])
             .unwrap();
@@ -16228,8 +20695,8 @@ mod tests {
         fs::write(
             engine.effect_chain_log_path(channel),
             concat!(
-                "wavelinux5-dsp-helper native_stats captured_frames=48000 rendered_frames=48000 dropped_frames=0 underrun_frames=64 process_calls=100 buffered_frames=1344 target_latency_msec=60 reason=audio_trouble\n",
-                "wavelinux5-dsp-helper native_stats captured_frames=96000 rendered_frames=96000 dropped_frames=0 underrun_frames=64 process_calls=200 buffered_frames=2688 target_latency_msec=60 reason=audio_trouble\n",
+                "wavelinux6-audio-core native_stats channel_id=hardware_in captured_frames=48000 rendered_frames=48000 dropped_frames=0 underrun_frames=64 process_calls=100 buffered_frames=1344 target_latency_msec=60 reason=audio_trouble\n",
+                "wavelinux6-audio-core native_stats channel_id=hardware_in captured_frames=96000 rendered_frames=96000 dropped_frames=0 underrun_frames=64 process_calls=200 buffered_frames=2688 target_latency_msec=60 reason=audio_trouble\n",
             ),
         )
         .unwrap();
@@ -16239,6 +20706,43 @@ mod tests {
         assert!(!diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "effects.underrun.hardware_in"));
+    }
+
+    #[test]
+    fn consolidated_core_diagnostics_are_scoped_to_the_failing_channel() {
+        let engine = test_engine();
+        let mut config = MixerConfig::default();
+        wavelinux_model::apply_graph_namespace_with_prefix(&mut config, "wavelinux6");
+        config
+            .set_effect_chain("hardware_in", vec![EffectInstance::new("rnnoise")])
+            .unwrap();
+        config
+            .set_effect_chain("music", vec![EffectInstance::new("eq")])
+            .unwrap();
+        let hardware = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "hardware_in")
+            .unwrap();
+        fs::write(
+            engine.effect_chain_log_path(hardware),
+            concat!(
+                "wavelinux6-audio-core native_stats channel_id=hardware_in underrun_frames=0\n",
+                "wavelinux6-audio-core native_stats channel_id=hardware_in underrun_frames=0\n",
+                "wavelinux6-audio-core native_stats channel_id=music underrun_frames=0\n",
+                "wavelinux6-audio-core native_stats channel_id=music underrun_frames=64\n",
+            ),
+        )
+        .unwrap();
+
+        let diagnostics = engine.effect_chain_diagnostics(&config, &RuntimeGraph::default());
+
+        assert!(!diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "effects.underrun.hardware_in"));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "effects.underrun.music"));
     }
 
     #[test]
@@ -16765,6 +21269,19 @@ mod tests {
     }
 
     #[test]
+    fn healthy_noop_routing_does_not_request_another_host_snapshot() {
+        assert!(!runtime_route_resnapshot_needed(
+            false, false, false, false, false
+        ));
+        assert!(runtime_route_resnapshot_needed(
+            false, false, false, false, true
+        ));
+        assert!(runtime_route_resnapshot_needed(
+            true, false, false, false, false
+        ));
+    }
+
+    #[test]
     fn transient_desktop_event_streams_do_not_enter_the_mixer() {
         let engine = test_engine();
         let config = MixerConfig::default();
@@ -17028,6 +21545,36 @@ mod tests {
         };
 
         assert_eq!(configured_volume_for_stream(&config, &stream), Some(0.42));
+    }
+
+    #[test]
+    fn routing_preserves_stream_volume_without_a_changed_preset() {
+        let mut config = MixerConfig::default();
+        let stream = AppStream {
+            id: "1".into(),
+            app_id: Some("brave".into()),
+            binary: Some("brave".into()),
+            process_name: Some("brave".into()),
+            window_class: Some("Brave-browser".into()),
+            display_name: "Brave".into(),
+            media_name: Some("Playback".into()),
+            routed_channel_id: None,
+            volume: 0.37,
+            muted: false,
+        };
+
+        assert_eq!(configured_volume_update_for_stream(&config, &stream), None);
+        config
+            .set_app_volume_preset(AppMatcher::from_app_id("brave"), 0.37)
+            .unwrap();
+        assert_eq!(configured_volume_update_for_stream(&config, &stream), None);
+        config
+            .set_app_volume_preset(AppMatcher::from_app_id("brave"), 0.42)
+            .unwrap();
+        assert_eq!(
+            configured_volume_update_for_stream(&config, &stream),
+            Some(0.42)
+        );
     }
 
     #[test]
@@ -17533,7 +22080,7 @@ mod tests {
                         &[
                             ("vad_threshold", 25.0),
                             ("hold_ms", 200.0),
-                            ("lead_in_ms", 0.0),
+                            ("minimum_voice_level_db", -70.0),
                         ],
                     ),
                 ],

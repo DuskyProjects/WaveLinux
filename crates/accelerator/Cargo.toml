@@ -1,0 +1,32 @@
+[package]
+name = "wavelinux-accelerator"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+provider-runtime = ["dep:ort"]
+
+[[bin]]
+name = "wavelinux6-onnx-provider"
+path = "src/bin/wavelinux6-onnx-provider.rs"
+required-features = ["provider-runtime"]
+
+[[bin]]
+name = "wavelinux6-accelerator-qualify"
+path = "src/bin/wavelinux6-accelerator-qualify.rs"
+
+[dependencies]
+libc.workspace = true
+memmap2.workspace = true
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24"], optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

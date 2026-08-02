@@ -6,7 +6,7 @@ _wavelinux_prewarm_hardware_profiles() {
 
   if [[ -z "$user" || "$user" == "root" ]]; then
     echo "WaveLinux will download signed hardware profiles on first launch."
-    echo "To prewarm them now, run: wavelinux --prewarm-hardware-profiles"
+    echo "To prewarm them now, run: wavelinux6 --prewarm-hardware-profiles"
     return 0
   fi
 
@@ -17,7 +17,7 @@ _wavelinux_prewarm_hardware_profiles() {
 
   if [[ -z "$uid" || -z "$home" || ! -d "$runtime_dir" ]]; then
     echo "WaveLinux will download signed hardware profiles on first launch."
-    echo "To prewarm them after logging in, run: wavelinux --prewarm-hardware-profiles"
+    echo "To prewarm them after logging in, run: wavelinux6 --prewarm-hardware-profiles"
     return 0
   fi
 
@@ -27,12 +27,12 @@ _wavelinux_prewarm_hardware_profiles() {
       USER="$user" \
       LOGNAME="$user" \
       XDG_RUNTIME_DIR="$runtime_dir" \
-      wavelinux --prewarm-hardware-profiles >/dev/null 2>&1 || {
+      wavelinux6 --prewarm-hardware-profiles >/dev/null 2>&1 || {
         echo "WaveLinux hardware profile prewarm was skipped; it will retry on first launch."
       }
   else
     echo "WaveLinux will download signed hardware profiles on first launch."
-    echo "To prewarm them now, run: wavelinux --prewarm-hardware-profiles"
+    echo "To prewarm them now, run: wavelinux6 --prewarm-hardware-profiles"
   fi
 }
 

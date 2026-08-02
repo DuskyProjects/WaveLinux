@@ -1,3 +1,31 @@
+# WaveLinux 6.0.0-alpha.1
+
+WaveLinux 6 is an unpublished local alpha that replaces WaveLinux5 with a
+persistent native audio core and a `wavelinux6` runtime namespace.
+
+## Current Alpha Work
+
+- Adds one persistent `wavelinux6-audio-core` process with stable per-channel
+  PipeWire sources and native RNNoise, high-pass, eight-band EQ, compressor,
+  gate, limiter, and Karaoke Stage effects.
+- Applies effect changes through latest-wins prepared chain swaps and 20 ms
+  crossfades without replacing app-facing source nodes.
+- Adds live adaptive core latency targets, jack-aware device ranking, temporary
+  microphone fallback/restoration, event-driven stream routing, state deltas,
+  and visibility-aware meters.
+- Replaces complex standard-effect controls with one Strength slider plus
+  optional advanced controls; EQ and Karaoke keep their domain-specific UI.
+- Fixes near-silent high-pass/EQ denormal state that consumed nearly half a CPU
+  core, and removes per-frame decibel conversions from gate/compressor hot paths.
+- Makes audio-core control sockets event-driven instead of polling while idle.
+- Prevents AppImage WebKit white screens on current Arch/CachyOS by excluding
+  bundled Wayland libraries and validating a real non-root pixel render.
+- Rewrites WaveLinux 6 architecture, audio-core, setup, testing, and
+  troubleshooting documentation and removes stale DeepFilterNet claims.
+
+This alpha has not been published and must not be promoted until local audio,
+CI, distro smoke, and stress gates pass.
+
 # WaveLinux 5.0.2
 
 WaveLinux 5.0.2 finishes clean-distro AppImage coverage for the WaveLinux5

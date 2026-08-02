@@ -22,7 +22,8 @@
             "airpods"
           ]
         }
-      ]
+      ],
+      "sha256": "78f54986d47917bc1c52f7b8c72f5408b87131e07f98bca18bc65f6d2477419b"
     },
     {
       "id": "audient.id4-mkii",
@@ -44,7 +45,8 @@
             "id4"
           ]
         }
-      ]
+      ],
+      "sha256": "799bd896ac08ce76b689f8f7cf1619af71c17578b43e236b6c6770e979c9dfef"
     },
     {
       "id": "audio-technica.at2020usb-x",
@@ -65,7 +67,8 @@
             "2020"
           ]
         }
-      ]
+      ],
+      "sha256": "1f8d924561e85547d7e117ac1360dd40756180a4acce4109a9053879df110691"
     },
     {
       "id": "avermedia.live-gamer-portable-2-plus",
@@ -86,7 +89,8 @@
             "audio"
           ]
         }
-      ]
+      ],
+      "sha256": "21c3e5f7e59a3aaac34eca737af04d82cdcfb01705374607dbebcdcbe0bf3c6e"
     },
     {
       "id": "behringer.umc202hd",
@@ -107,7 +111,8 @@
             "202"
           ]
         }
-      ]
+      ],
+      "sha256": "f0717f8c97d2122ecb8aa583844ca70da915b1e68de1b2fac0b4bbd5f0e5cd57"
     },
     {
       "id": "blue.snowball",
@@ -129,7 +134,8 @@
             "microphone"
           ]
         }
-      ]
+      ],
+      "sha256": "38a471e2a9fceefc7f45e87780284451fc08d4005f9c095e1a7248eea6aaccbe"
     },
     {
       "id": "blue.yeti",
@@ -151,7 +157,8 @@
             "microphone"
           ]
         }
-      ]
+      ],
+      "sha256": "98a78f4332e67a483d3ac3401cd3a87f197c11499367b22469e3ce8e9098c2a6"
     },
     {
       "id": "bose.quietcomfort-ultra",
@@ -172,7 +179,8 @@
             "qc ultra"
           ]
         }
-      ]
+      ],
+      "sha256": "45b4d29cf1111ceff4398bd596c4a052b71d58d2d087c0c17b950227e4703b9a"
     },
     {
       "id": "corsair.virtuoso-usb",
@@ -193,7 +201,8 @@
             "virtuoso"
           ]
         }
-      ]
+      ],
+      "sha256": "d14dd3558ffcac120c7e775cde6a069bdf11eafdb79638ca705b0332bf3e3193"
     },
     {
       "id": "dji.wireless-mic-rx",
@@ -220,7 +229,8 @@
             "wireless_mic"
           ]
         }
-      ]
+      ],
+      "sha256": "f996a7ed0bcfa4cfc2237069a2acf10744524c5768e32bc02276748e3ce31b76"
     },
     {
       "id": "elgato.cam-link-4k",
@@ -242,7 +252,8 @@
             "cam link"
           ]
         }
-      ]
+      ],
+      "sha256": "25c0ca2a210f7880b6e01a1b3774e1b2988b48f50217f4c4ae3bf6b3f6ed170f"
     },
     {
       "id": "elgato.hd60-x",
@@ -263,7 +274,8 @@
             "hd60"
           ]
         }
-      ]
+      ],
+      "sha256": "d3349c05148d7eeb1f29117fd987240de46dda805e1ddba69cf0e9d9a6f3316d"
     },
     {
       "id": "elgato.wave-3",
@@ -284,7 +296,8 @@
             "wave"
           ]
         }
-      ]
+      ],
+      "sha256": "215f387e7e8d09ae39877308813f47a6a04128091152f3528315638c7d3f6519"
     },
     {
       "id": "elgato.wave-xlr",
@@ -305,7 +318,8 @@
             "xlr"
           ]
         }
-      ]
+      ],
+      "sha256": "1013dc699f632fde7e94df3c73e288a6c036ae3c62696e7f1c927c6d9e1e4ea4"
     },
     {
       "id": "focusrite.scarlett-2i2-3rd-gen",
@@ -327,7 +341,8 @@
             "2i2"
           ]
         }
-      ]
+      ],
+      "sha256": "ac1809724810627cb79ab54b138f7dcef1e407bd5ab292c5df4a1225e28703f9"
     },
     {
       "id": "focusrite.scarlett-2i2-4th-gen",
@@ -349,7 +364,8 @@
             "scarlett 2i2"
           ]
         }
-      ]
+      ],
+      "sha256": "e5c49db9a1653cdc45a443f1079707c984828dda2362e3f6e3f9f9f8b0649b99"
     },
     {
       "id": "focusrite.scarlett-4i4-3rd-gen",
@@ -371,7 +387,8 @@
             "4i4"
           ]
         }
-      ]
+      ],
+      "sha256": "50a5aaa4e4128d90de4b0943006c655f58452e2acbd96a5d14e108f272fab099"
     },
     {
       "id": "focusrite.scarlett-solo-3rd-gen",
@@ -393,7 +410,8 @@
             "solo"
           ]
         }
-      ]
+      ],
+      "sha256": "e693b5177b0dc895a2e0ee15f033623d1b052bc37346b6fd1764612d6a1e780e"
     },
     {
       "id": "focusrite.vocaster-two",
@@ -414,7 +432,8 @@
             "vocaster"
           ]
         }
-      ]
+      ],
+      "sha256": "093cb8c20a188ba834e52531caf1dc57b3e95fd77acc1267bc55eacf36ed4967"
     },
     {
       "id": "hyperx.cloud-ii-usb",
@@ -436,7 +455,8 @@
             "usb"
           ]
         }
-      ]
+      ],
+      "sha256": "9513cd3ae13fddcaffab3bfce397ecb2aae4a5d51f11742c2a9ad46bdecdeeed"
     },
     {
       "id": "hyperx.quadcast",
@@ -457,7 +477,8 @@
             "quadcast"
           ]
         }
-      ]
+      ],
+      "sha256": "a702769c1fcf6322924f398753c325bc38e9254c8e5e5dedd901143aab0c87a5"
     },
     {
       "id": "jds-labs.element-ii",
@@ -485,7 +506,8 @@
             "element_ii"
           ]
         }
-      ]
+      ],
+      "sha256": "062ec77acd17c1534b202ef05fa387e2ae1143fa89317ca06cd761c5cc025c5d"
     },
     {
       "id": "logitech.brio-webcam-audio",
@@ -507,7 +529,8 @@
             "brio"
           ]
         }
-      ]
+      ],
+      "sha256": "d31455e58c28b560999cccf1475d585868cf1b3c0b2e4518d9dca6704af0edbd"
     },
     {
       "id": "logitech.c920-webcam-audio",
@@ -529,7 +552,8 @@
             "hd pro webcam"
           ]
         }
-      ]
+      ],
+      "sha256": "e26bfdda6a3f3a19dc601b505bc53c7b8d370dd3c7383c8b4920b06608229313"
     },
     {
       "id": "logitech.g-pro-x-usb-headset",
@@ -559,7 +583,8 @@
             "blue voice"
           ]
         }
-      ]
+      ],
+      "sha256": "76fc51120ec1c7409b755273ea5408aedf344751d33cbbe381aff1481b133b0a"
     },
     {
       "id": "logitech.usb-webcam-audio",
@@ -590,7 +615,8 @@
             "microphone"
           ]
         }
-      ]
+      ],
+      "sha256": "3bbaeb3624a203586bc3377691860a6439018980636af05f4256aed00b0f4cad"
     },
     {
       "id": "massdrop-fostex.th-x00",
@@ -609,7 +635,8 @@
             "fostex"
           ]
         }
-      ]
+      ],
+      "sha256": "4029a32c9e0d9959b18da2350963b63fa94c5132514112f63c162c9ee4984177"
     },
     {
       "id": "motu.m2",
@@ -631,7 +658,8 @@
             "m2"
           ]
         }
-      ]
+      ],
+      "sha256": "3add47826cd7a23be7f9265cc9e661b1eb1e21daf50bbecc62048061e1a96462"
     },
     {
       "id": "nvidia.ad106m-hda-hdmi",
@@ -659,7 +687,8 @@
             "nvidia"
           ]
         }
-      ]
+      ],
+      "sha256": "27eacec6e6e305f124e1a119c15d62667d792a4cd26022bf5e82d23c0d05501a"
     },
     {
       "id": "presonus.audiobox-usb96",
@@ -681,7 +710,8 @@
             "usb96"
           ]
         }
-      ]
+      ],
+      "sha256": "267ced8db7efdee7924fd22ceeedfc9e188700a470f6e0a23e93abb76b035200"
     },
     {
       "id": "realtek.alc3254-hda",
@@ -729,7 +759,8 @@
             "alsa.mixer_name=Realtek ALC3254"
           ]
         }
-      ]
+      ],
+      "sha256": "9793bee016498b8a781daf6d8bf62671351ee78f3569b7c48a9c2e5cb5a672aa"
     },
     {
       "id": "rode.nt-usb-mini",
@@ -750,7 +781,8 @@
             "mini"
           ]
         }
-      ]
+      ],
+      "sha256": "fd2fe58673f765f779afede629b6f2491cf30af1a95ca3fdcee44ef6273e1e2e"
     },
     {
       "id": "rode.nt-usb-plus",
@@ -771,7 +803,8 @@
             "nt-usb"
           ]
         }
-      ]
+      ],
+      "sha256": "0dc4637ea68bf1b4f2a216e00ec95bf44707256f2f72464ae5631d07800d0826"
     },
     {
       "id": "samson.q2u",
@@ -792,7 +825,8 @@
             "q2u"
           ]
         }
-      ]
+      ],
+      "sha256": "3caa21d560502a9f8f46f48d54b461ab362b90127bc98c2f98975a47702b3f0c"
     },
     {
       "id": "sennheiser.momentum-4",
@@ -813,7 +847,8 @@
             "momentum"
           ]
         }
-      ]
+      ],
+      "sha256": "7822ede8301537d2ae9fb023dddaa4e9ed2cedc39be16d0dea9326021523fbaf"
     },
     {
       "id": "shure.mv7",
@@ -834,7 +869,8 @@
             "mv7"
           ]
         }
-      ]
+      ],
+      "sha256": "08c94d000dc3fbc34331c79e71485ba92427752618548c655a012dc52fae7b8e"
     },
     {
       "id": "solid-state-logic.ssl2",
@@ -854,7 +890,8 @@
             "solid state logic"
           ]
         }
-      ]
+      ],
+      "sha256": "fcdf2d7b925e3fe967ac0bacd78c8d6087152c0742da89b28cdf09cfea684035"
     },
     {
       "id": "sony.wh-1000xm4",
@@ -878,7 +915,8 @@
             "0d58"
           ]
         }
-      ]
+      ],
+      "sha256": "ccd432ef72b3badfa7eec9cc8afc22b23f20ac895afa1798e058cbdeceaae5e4"
     },
     {
       "id": "sony.wh-1000xm5",
@@ -901,7 +939,8 @@
             "1000xm5"
           ]
         }
-      ]
+      ],
+      "sha256": "5689018fd5574599d344ab06e4e3201c000c543125d286cb1e37397c4142935e"
     },
     {
       "id": "steelseries.arctis-7-usb",
@@ -923,7 +962,8 @@
             "chat"
           ]
         }
-      ]
+      ],
+      "sha256": "98c33f8e99df1e4baab3412b1140dcdb19dac790e98e6d70ffaa9ce034f27277"
     },
     {
       "id": "steelseries.arctis-nova-pro-wireless-bluetooth",
@@ -944,7 +984,8 @@
             "nova"
           ]
         }
-      ]
+      ],
+      "sha256": "5d656b41f04b25136155b4d1364c20d436d9c1ba0080d17cee3faa6980058c82"
     },
     {
       "id": "steinberg.ur22c",
@@ -965,7 +1006,8 @@
             "ur22"
           ]
         }
-      ]
+      ],
+      "sha256": "63adf12c0dbe665b3c522d9722b64c72c9e82941d807524218c3fbd755d34862"
     },
     {
       "id": "tascam.us-2x2hr",
@@ -986,7 +1028,8 @@
             "2x2"
           ]
         }
-      ]
+      ],
+      "sha256": "9d41d9656fb525b59337f07b3d6052ae96236c0d7325417786517b822819d824"
     },
     {
       "id": "tc-helicon.goxlr-mini",
@@ -1007,7 +1050,8 @@
             "mini"
           ]
         }
-      ]
+      ],
+      "sha256": "0dc5aa948563c6a53b1d7e93b296438044b88dffdc82b85ab04f7bd567058561"
     },
     {
       "id": "tc-helicon.goxlr",
@@ -1028,7 +1072,8 @@
             "xlr"
           ]
         }
-      ]
+      ],
+      "sha256": "45c324a91b7fbed58564c2cdfddf59bccecc3bc8c4d950dd1f0ffca93e9f6380"
     },
     {
       "id": "ttgk.cm01",
@@ -1050,7 +1095,8 @@
             "TTGK_Technology_Co._Ltd_CM01"
           ]
         }
-      ]
+      ],
+      "sha256": "3ffff8f00bbf8cee43699e4173a04292cd1a90f063e87918c7f35fffe0a0e740"
     },
     {
       "id": "universal-audio.volt-2",
@@ -1072,7 +1118,8 @@
             "volt"
           ]
         }
-      ]
+      ],
+      "sha256": "4b39c880f9a4e58455e23ddf92e95afef6901568d2e52f4bede560741f20531a"
     },
     {
       "id": "yamaha.ag03",
@@ -1093,7 +1140,8 @@
             "ag"
           ]
         }
-      ]
+      ],
+      "sha256": "11ec9faea5b044f07fc4d3439ac5baa2c175adf3f86a6387234fbcfedd45183c"
     }
   ]
 }

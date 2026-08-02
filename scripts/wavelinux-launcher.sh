@@ -3,16 +3,24 @@ set -euo pipefail
 
 PROGRAM_NAME="$(basename "$0")"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
-if [[ "$PROGRAM_NAME" == "wavelinux5" ]]; then
-  SUPPORT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wavelinux5"
-  PRODUCT_NAME="WaveLinux5"
-  export WAVELINUX_XDG_APP_NAME="${WAVELINUX_XDG_APP_NAME:-WaveLinux5}"
-  export WAVELINUX_GRAPH_PREFIX="${WAVELINUX_GRAPH_PREFIX:-wavelinux5}"
-  export WAVELINUX_GRAPH_PROPERTY_PREFIX="${WAVELINUX_GRAPH_PROPERTY_PREFIX:-wavelinux5}"
-  export WAVELINUX_APP_DISPLAY_NAME="${WAVELINUX_APP_DISPLAY_NAME:-WaveLinux5}"
-  LOCAL_DSP_HELPER="$BIN_DIR/wavelinux5-dsp-helper"
+if [[ "$PROGRAM_NAME" == "wavelinux6" ]]; then
+  SUPPORT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wavelinux6"
+  PRODUCT_NAME="WaveLinux6"
+  export WAVELINUX_XDG_APP_NAME="${WAVELINUX_XDG_APP_NAME:-WaveLinux6}"
+  export WAVELINUX_GRAPH_PREFIX="${WAVELINUX_GRAPH_PREFIX:-wavelinux6}"
+  export WAVELINUX_GRAPH_PROPERTY_PREFIX="${WAVELINUX_GRAPH_PROPERTY_PREFIX:-wavelinux6}"
+  export WAVELINUX_APP_DISPLAY_NAME="${WAVELINUX_APP_DISPLAY_NAME:-WaveLinux 6}"
+  # Auto mode remains on native CPU unless a provider pack has passed every
+  # machine-local numerical, continuity, latency, fallback, and CPU gate.
+  export WAVELINUX_AUDIO_RUNTIME="${WAVELINUX_AUDIO_RUNTIME:-dsp_auto}"
+  export WAVELINUX_DSP_PROVIDER="${WAVELINUX_DSP_PROVIDER:-auto}"
+  LOCAL_DSP_HELPER="$BIN_DIR/wavelinux6-audio-core"
   if [[ -x "$LOCAL_DSP_HELPER" ]]; then
     export WAVELINUX_DSP_HELPER="${WAVELINUX_DSP_HELPER:-$LOCAL_DSP_HELPER}"
+  fi
+  LOCAL_PERIPHERAL_PLUGIN="$BIN_DIR/wavelinux6-peripheral-plugin"
+  if [[ -x "$LOCAL_PERIPHERAL_PLUGIN" ]]; then
+    export WAVELINUX_PERIPHERAL_PLUGIN="${WAVELINUX_PERIPHERAL_PLUGIN:-$LOCAL_PERIPHERAL_PLUGIN}"
   fi
   if [[ -z "${WAVELINUX_FILTER_CHAIN_PIPEWIRE:-}" ]]; then
     if HOST_PIPEWIRE="$(command -v pipewire 2>/dev/null)" && [[ -x "$HOST_PIPEWIRE" ]]; then

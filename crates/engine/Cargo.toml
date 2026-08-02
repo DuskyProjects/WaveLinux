@@ -7,19 +7,23 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+base64.workspace = true
 directories.workspace = true
+ed25519-dalek.workspace = true
+include_dir.workspace = true
 libc = "0.2"
 pipewire = { version = "0.9", features = ["v0_3_44"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true
 wavelinux-model = { path = "../model" }
 wavelinux-pw = { path = "../pw" }
 wavelinux-dsp = { path = "../dsp" }
+wavelinux-accelerator = { path = "../accelerator" }
 
 [dev-dependencies]
-include_dir.workspace = true
 tempfile.workspace = true

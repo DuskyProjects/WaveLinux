@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "release": "5.0.3",
+  "scenario": "CM01 mono hardware input, tuned RNNoise voice chain, 28 ms target latency",
+  "observed_fx_helper_cpu_percent": 17.0,
+  "measurement_precision": "approximately one percentage point",
+  "source": "Local WaveLinux5 bug/log audit recorded before the WaveLinux 6 branch",
+  "comparison_rule": "WaveLinux 6 active audio-core CPU must be at least 30 percent lower on the same host and voice path"
+}
