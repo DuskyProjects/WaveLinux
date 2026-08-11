@@ -353,18 +353,21 @@ jobs:
           overwrite_files: true
           fail_on_unmatched_files: true
           files: |
-            target/release/gate/assets/*.AppImage
-            target/release/gate/assets/*.AppImage.tar.gz
-            target/release/gate/assets/*.AppImage.tar.gz.sig
-            target/release/gate/assets/*.deb
-            target/release/gate/assets/*.rpm
-            target/release/gate/assets/*.sh
-            target/release/gate/assets/latest.json
-            target/release/gate/assets/SHA256SUMS
-            target/release/gate/assets/BUILD-INFO.txt
-            target/release/gate/assets/BUILD-MANIFEST.json
-            target/release/gate/assets/PKGBUILD
-            target/release/gate/assets/wavelinux.SRCINFO
+            target/release/gate/assets/*
+
+      - name: Verify published release asset inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.linux-bundles.outputs.release_tag }}
+        shell: bash
+        run: |
+          expected="$(mktemp)"
+          actual="$(mktemp)"
+          trap 'rm -f "$expected" "$actual"' EXIT
+          find target/release/gate/assets -maxdepth 1 -type f -printf '%f\n' | sort > "$expected"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            --jq '.assets[].name' | sort > "$actual"
+          diff -u "$expected" "$actual"
 
       - name: Mark malformed 6.0 prerelease as superseded
         env:
