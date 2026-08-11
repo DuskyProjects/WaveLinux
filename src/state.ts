@@ -64,7 +64,6 @@ let operationRevision = 0;
 let meters: LevelMeter[] = [];
 let meterLevels = new Map<string, number>();
 let meterPaintFrame: number | null = null;
-let lastMeterPaintAt: number | null = null;
 const paintedMeterLevels = new WeakMap<HTMLElement, number>();
 const stateListeners = new Set<() => void>();
 const meterListeners = new Set<() => void>();
@@ -172,32 +171,23 @@ function replaceMeters(next: LevelMeter[]): void {
 function scheduleMeterPaint(): void {
   if (typeof window === "undefined" || typeof document === "undefined") return;
   if (meterPaintFrame !== null) return;
-  meterPaintFrame = window.requestAnimationFrame((timestamp) => {
+  meterPaintFrame = window.requestAnimationFrame(() => {
     meterPaintFrame = null;
-    const elapsed = lastMeterPaintAt === null ? 1 / 60 : Math.min(0.1, (timestamp - lastMeterPaintAt) / 1000);
-    lastMeterPaintAt = timestamp;
-    let continueAnimating = false;
     for (const element of document.querySelectorAll<HTMLElement>("[data-meter-id]")) {
       const meterId = element.dataset.meterId;
       if (!meterId) continue;
       const target = Math.max(0, Math.min(1, meterLevels.get(meterId) ?? 0));
       const previous = paintedMeterLevels.get(element);
-      const timeConstant = target > (previous ?? target) ? 0.045 : 0.18;
-      const blend = 1 - Math.exp(-elapsed / timeConstant);
-      let level = previous === undefined ? target : previous + (target - previous) * blend;
-      if (Math.abs(target - level) < 0.001) level = target;
-      else continueAnimating = true;
-      if (previous !== undefined && Math.abs(previous - level) < 0.0005) continue;
-      paintedMeterLevels.set(element, level);
+      if (previous !== undefined && Math.abs(previous - target) < 0.0005) continue;
+      paintedMeterLevels.set(element, target);
       if (element.classList.contains("vu-fill")) {
-        element.style.transform = `scaleY(${level})`;
+        element.style.transform = `scaleY(${target})`;
       } else if (element.classList.contains("vu-cap")) {
-        element.style.transform = `translateY(${(1 - level) * 100}%)`;
+        element.style.transform = `translateY(${(1 - target) * 100}%)`;
       } else {
-        element.style.transform = `scaleX(${level})`;
+        element.style.transform = `scaleX(${target})`;
       }
     }
-    if (continueAnimating) scheduleMeterPaint();
   });
 }
 

@@ -1,6 +1,6 @@
 # WaveLinux 6 Architecture
 
-This document describes the current WaveLinux 6 alpha implementation. It is a
+This document describes the current WaveLinux 6 implementation. It is a
 maintenance map, not a statement that every item in the long-term WaveLinux 6
 design is complete. The final section records the remaining architectural work.
 
@@ -73,7 +73,11 @@ metadata; `pactl` is retained for clients whose `client.api` is
 The binary meter socket is independent of control traffic. Health also reads
 direct error deltas from one persistent PipeWire profiler subscription;
 journal monitoring remains supplemental context rather than the source of
-truth for adaptive latency.
+truth for adaptive latency. The predictive pressure signal combines aggregate
+CPU busy time, Linux CPU PSI scheduler stalls, and normalized one-minute load.
+This lets the controller increase its buffer before an xrun when runnable or
+I/O-blocked work is backing up even though average CPU utilization is below the
+busy-time threshold.
 
 ## Current Audio Graph
 
@@ -275,8 +279,9 @@ shipping features:
 - Qualify isolated CUDA, OpenVINO, and AMD provider packs on representative
   hardware. Qualified RNNoise neural stages can run on channel workers with
   exact CPU fallback; ordinary filters, dynamics, delays, and mixing remain CPU.
-- Complete the final 60-minute audio discontinuity stress gate for the exact
-  stable release artifact.
+- Complete the final isolated 60-minute audio discontinuity stress gate for the
+  exact stable release artifact; continuity fixtures must never be injected
+  into a desktop graph with a physical monitor target.
 
 ## Change Rules
 
@@ -287,5 +292,5 @@ shipping features:
   USB availability.
 - Preserve host-bound PipeWire libraries in every AppImage.
 - Add regression tests for any migration, routing, retry, or DSP behavior.
-- Do not publish an alpha until local audio, safe tests, package checks, and
+- Do not publish a release until local audio, safe tests, package checks, and
   distro smoke gates pass.

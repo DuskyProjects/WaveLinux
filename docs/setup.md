@@ -4,12 +4,18 @@ WaveLinux 6 targets PipeWire desktop sessions. The app can start missing user
 services, but it cannot replace missing host libraries or a distro configured
 for PulseAudio without PipeWire compatibility.
 
+For normal installation, use the checksum-verified standalone installer shown
+first in the project README. Run it as the desktop user; it elevates only its
+package-manager transaction and verifies the live audio graph before reporting
+success.
+
 ## Host Requirements
 
 Required runtime pieces are:
 
 - PipeWire, `pipewire-pulse`, and WirePlumber;
 - `pactl`, `wpctl`, `pw-cli`, `pw-dump`, `pw-metadata`, and `pw-top`;
+- Procps (`ps` and `pgrep`) for exact WaveLinux process ownership checks;
 - ALSA tools for legacy-device discovery;
 - GTK/WebKitGTK, portals, fonts, and graphics libraries required by Tauri;
 - RNNoise, supplied by the WaveLinux release/runtime bundle.
@@ -92,7 +98,7 @@ Check a built AppImage directly:
 
 ```bash
 APPIMAGE_EXTRACT_AND_RUN=1 \
-  target/release/bundle/appimage/WaveLinux6_6.0.0-alpha.1_amd64.AppImage \
+  target/release/bundle/appimage/WaveLinux6_6.0.0_amd64.AppImage \
   --check-runtime-dependencies
 ```
 
@@ -100,7 +106,7 @@ Request host package installation:
 
 ```bash
 APPIMAGE_EXTRACT_AND_RUN=1 \
-  target/release/bundle/appimage/WaveLinux6_6.0.0-alpha.1_amd64.AppImage \
+  target/release/bundle/appimage/WaveLinux6_6.0.0_amd64.AppImage \
   --install-runtime-dependencies
 ```
 
@@ -217,4 +223,20 @@ probe used by clean distro containers; it verifies that the actual packaged
 binary can load, rather than accepting metadata alone.
 
 Use `APPIMAGE_EXTRACT_AND_RUN=1` when FUSE is unavailable. Publishing and signing
-are separate release steps; a local alpha build must not be pushed implicitly.
+are separate release steps; a local build must not be pushed implicitly.
+
+## Installer Verification And Recovery
+
+The standalone installer waits for PipeWire and Pulse connectivity, a running
+`wavelinux6-audio-core`, its user-only control socket, and all public microphone,
+mix, and channel nodes. Re-run the installed verifier with:
+
+```bash
+~/.local/share/wavelinux6/verify-install.sh --timeout 30
+```
+
+Installed AppImage logs are under `~/.config/wavelinux6`; package/service status
+and graph inspection commands are printed when verification fails. A file-only
+installation for imaging or offline preparation is available with
+`--no-launch`. openSUSE should use the standalone installer rather than the
+Fedora-targeted RPM.

@@ -67,4 +67,9 @@ if [[ ! -x "$APPIMAGE" ]]; then
   exit 1
 fi
 
+if [[ -z "${APPIMAGE_EXTRACT_AND_RUN+x}" \
+  && (! -c /dev/fuse || ! -r /dev/fuse || ! -w /dev/fuse) ]]; then
+  export APPIMAGE_EXTRACT_AND_RUN=1
+fi
+
 exec "$APPIMAGE" "$@"

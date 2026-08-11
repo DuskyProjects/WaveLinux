@@ -8,9 +8,8 @@ TypeScript, and PipeWire. WaveLinux 6 provides persistent virtual channels,
 Monitor and Stream mixes, automatic application routing, live meters, and a
 native real-time microphone DSP core.
 
-WaveLinux 6 is currently an alpha development line. It replaces a local
-WaveLinux5 installation and intentionally uses a new `wavelinux6` application,
-configuration, and PipeWire namespace.
+WaveLinux 6 replaces a local WaveLinux5 installation and intentionally uses a
+new `wavelinux6` application, configuration, and PipeWire namespace.
 
 ## Features
 
@@ -31,48 +30,71 @@ migrated to RNNoise and it does not appear in the effect catalog.
 
 ## Install
 
-### Automatic distro-aware installer
+### Verified standalone installer
 
-Download and run the installer as your normal desktop user:
+Run these commands as your normal desktop user. The installer requests
+administrator permission only when it installs missing system dependencies.
 
 ```bash
-curl -fL \
-  https://raw.githubusercontent.com/DuskyProjects/WaveLinux/master/install.sh \
-  -o wavelinux6-install.sh
+curl -fLO https://github.com/DuskyProjects/WaveLinux/releases/latest/download/WaveLinux6_amd64_Installer.sh
+curl -fLO https://github.com/DuskyProjects/WaveLinux/releases/latest/download/SHA256SUMS
+grep 'WaveLinux6_amd64_Installer.sh$' SHA256SUMS | sha256sum -c -
+chmod +x WaveLinux6_amd64_Installer.sh
+./WaveLinux6_amd64_Installer.sh
+```
+
+Do not run `sudo ./WaveLinux6_amd64_Installer.sh`. The installer detects `apt`,
+`dnf`, `pacman`, or `zypper`, refreshes package metadata, installs the complete
+PipeWire desktop runtime, installs WaveLinux in your home directory, starts it,
+and verifies the audio core, control socket, and public PipeWire nodes.
+
+Supported package families include:
+
+- Debian 13, Ubuntu 24.04, and compatible `apt` distributions;
+- current Fedora and compatible `dnf` distributions;
+- Arch Linux, CachyOS, Manjaro, EndeavourOS, and compatible `pacman`
+  distributions;
+- openSUSE through the standalone AppImage installer and `zypper` dependencies.
+
+Use `--no-launch` when preparing a machine without starting the application:
+
+```bash
+./WaveLinux6_amd64_Installer.sh --no-launch
+```
+
+On failure, the installer names the missing service, helper, library, socket, or
+PipeWire node and points to the relevant logs under `~/.config/wavelinux6`.
+
+### Network bootstrap and direct packages
+
+The small repository bootstrap downloads the same standalone installer and
+verifies it against the published `SHA256SUMS` file:
+
+```bash
+curl -fL https://raw.githubusercontent.com/DuskyProjects/WaveLinux/master/install.sh -o wavelinux6-install.sh
 chmod +x wavelinux6-install.sh
 ./wavelinux6-install.sh
 ```
 
-Do not run the whole installer with `sudo`. It requests administrator
-permission only when the detected package manager needs it.
-
-The installer resolves the newest published GitHub release, downloads
-`SHA256SUMS`, verifies the selected package, and then chooses:
-
-- Debian, Ubuntu, Linux Mint, Pop!_OS, KDE neon, elementary OS, and Zorin OS:
-  the release `.deb`, installed through `apt-get` with dependencies.
-- Fedora, RHEL-family distributions, and openSUSE: the release `.rpm`, installed
-  through `dnf`, `yum`, or `zypper` with dependencies.
-- Arch Linux, CachyOS, Manjaro, EndeavourOS, and Garuda: the release AppImage,
-  the required host packages through `pacman`, and separately installed
-  `wavelinux6-audio-core` and peripheral helper binaries extracted from the
-  AppImage.
-- Other x86_64 distributions: the AppImage fallback with a warning listing the
-  host runtime that may need to be installed manually.
-
-Install a specific release instead of the newest published release with:
+Select a specific release or inspect the chosen assets without changing the
+machine:
 
 ```bash
-./wavelinux6-install.sh --tag v6.0.0-alpha.1
-```
-
-Preview what it would choose without installing anything:
-
-```bash
+./wavelinux6-install.sh --tag v6.0.0
 ./wavelinux6-install.sh --dry-run
 ```
 
-### Offline application payload / standalone installer
+The release also contains direct AppImage, DEB, RPM, and AUR metadata. The DEB
+is for Debian/Ubuntu families and the RPM is for Fedora families. openSUSE uses
+the standalone installer because the published RPM targets Fedora package
+names. Direct native installs remain available through:
+
+```bash
+./wavelinux6-install.sh --tag v6.0.0 --format deb
+./wavelinux6-install.sh --tag v6.0.0 --format rpm
+```
+
+### Building the standalone installer
 
 A maintainer with a fully working local build can create one self-extracting
 installer containing that exact AppImage, audio core, peripheral helper,
@@ -91,8 +113,8 @@ The generated file is:
 dist/WaveLinux6_<version>_amd64_Installer.sh
 ```
 
-Send that single file to the target computer. The recipient installs it as
-their normal desktop user:
+The generated versioned file and stable alias are independently extractable and
+contain payload checksums. Install either as the normal desktop user:
 
 ```bash
 chmod +x WaveLinux6_<version>_amd64_Installer.sh
@@ -162,8 +184,8 @@ current user session. See [Test suites](docs/testing.md).
 ## Runtime Requirements
 
 WaveLinux expects PipeWire, WirePlumber, `pipewire-pulse`, `pactl`, `wpctl`,
-`pw-cli`, `pw-dump`, `pw-metadata`, and `pw-top`, plus the normal GTK/WebKit
-desktop runtime. Standard
+`pw-cli`, `pw-dump`, `pw-metadata`, and `pw-top`, plus Procps (`ps` and
+`pgrep`) and the normal GTK/WebKit desktop runtime. Standard
 effects and RNNoise are bundled for release builds; installing microphone
 effects must not require administrator access.
 

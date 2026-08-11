@@ -143,6 +143,7 @@ const DEFAULT_TOKIO_WORKER_THREADS: &str = "4";
 const RUNTIME_INSTALL_SKIP_ENV: &str = "WAVELINUX_SKIP_RUNTIME_INSTALL";
 const RUNTIME_INSTALL_FORCE_ENV: &str = "WAVELINUX_INSTALL_RUNTIME_ON_START";
 const RUNTIME_DEPS_ASSUME_ENV: &str = "WAVELINUX_ASSUME_RUNTIME_DEPS";
+const RUNTIME_DEPENDENCY_HELPER_ENV: &str = "WAVELINUX_RUNTIME_DEPENDENCY_HELPER";
 const AUDIO_SERVICE_START_SKIP_ENV: &str = "WAVELINUX_SKIP_AUDIO_SERVICE_START";
 const AUDIO_DAEMON_FALLBACK_DISABLE_ENV: &str = "WAVELINUX_DISABLE_AUDIO_DAEMON_FALLBACK";
 const HOST_COMMAND_ENV_REMOVE: &[&str] = &[
@@ -266,200 +267,6 @@ const WAYLAND_HOST_STACK_PROBES: &[(&str, &[&str])] = &[
             "/usr/lib/x86_64-linux-gnu/libwayland-server.so.0",
         ],
     ),
-];
-const APT_RUNTIME_PACKAGES: &[&str] = &[
-    "pipewire",
-    "wireplumber",
-    "pipewire-pulse",
-    "pipewire-bin",
-    "pulseaudio-utils",
-    "alsa-utils",
-    "libwebkit2gtk-4.1-0",
-    "libayatana-appindicator3-1",
-    "libusb-1.0-0",
-    "bubblewrap",
-    "xdg-dbus-proxy",
-    "xwayland",
-    "libegl1",
-    "libgl1",
-    "libgbm1",
-    "libdrm2",
-    "libwayland-client0",
-    "libwayland-cursor0",
-    "libwayland-egl1",
-    "libwayland-server0",
-    "gstreamer1.0-plugins-base",
-    "gstreamer1.0-plugins-good",
-    "fonts-dejavu-core",
-    "xdg-desktop-portal",
-];
-const APT_APPIMAGE_HOST_PACKAGES: &[&str] = &[
-    "pipewire",
-    "wireplumber",
-    "pipewire-pulse",
-    "pipewire-bin",
-    "pulseaudio-utils",
-    "alsa-utils",
-    "xwayland",
-    "libegl1",
-    "libgl1",
-    "libgbm1",
-    "libdrm2",
-    "libwayland-client0",
-    "libwayland-cursor0",
-    "libwayland-egl1",
-    "libwayland-server0",
-    "fonts-dejavu-core",
-    "xdg-desktop-portal",
-];
-const APT_PORTAL_BACKENDS: &[&str] = &[
-    "xdg-desktop-portal-gtk",
-    "xdg-desktop-portal-kde",
-    "xdg-desktop-portal-gnome",
-    "xdg-desktop-portal-wlr",
-];
-const DNF_RUNTIME_PACKAGES: &[&str] = &[
-    "pipewire",
-    "pipewire-utils",
-    "wireplumber",
-    "pipewire-pulseaudio",
-    "pulseaudio-utils",
-    "alsa-utils",
-    "webkit2gtk4.1",
-    "libappindicator-gtk3",
-    "libusb1",
-    "bubblewrap",
-    "xdg-dbus-proxy",
-    "xorg-x11-server-Xwayland",
-    "mesa-libEGL",
-    "mesa-libGL",
-    "mesa-libgbm",
-    "libdrm",
-    "libwayland-client",
-    "libwayland-cursor",
-    "libwayland-egl",
-    "libwayland-server",
-    "gstreamer1-plugins-base",
-    "gstreamer1-plugins-good",
-    "google-noto-sans-fonts",
-    "xdg-desktop-portal",
-];
-const DNF_APPIMAGE_HOST_PACKAGES: &[&str] = &[
-    "pipewire",
-    "pipewire-utils",
-    "wireplumber",
-    "pipewire-pulseaudio",
-    "pulseaudio-utils",
-    "alsa-utils",
-    "xorg-x11-server-Xwayland",
-    "mesa-libEGL",
-    "mesa-libGL",
-    "mesa-libgbm",
-    "libdrm",
-    "libwayland-client",
-    "libwayland-cursor",
-    "libwayland-egl",
-    "libwayland-server",
-    "google-noto-sans-fonts",
-    "xdg-desktop-portal",
-];
-const DNF_PORTAL_BACKENDS: &[&str] = &[
-    "xdg-desktop-portal-gtk",
-    "xdg-desktop-portal-kde",
-    "xdg-desktop-portal-gnome",
-    "xdg-desktop-portal-wlr",
-    "xdg-desktop-portal-hyprland",
-];
-const ARCH_RUNTIME_PACKAGES: &[&str] = &[
-    "pipewire",
-    "wireplumber",
-    "pipewire-pulse",
-    "libpulse",
-    "alsa-utils",
-    "webkit2gtk-4.1",
-    "bubblewrap",
-    "xdg-dbus-proxy",
-    "xorg-xwayland",
-    "mesa",
-    "libglvnd",
-    "wayland",
-    "gtk3",
-    "gstreamer",
-    "gst-plugins-base-libs",
-    "gst-plugins-good",
-    "noto-fonts",
-    "libayatana-appindicator",
-    "libusb",
-    "xdg-desktop-portal",
-];
-const ARCH_APPIMAGE_HOST_PACKAGES: &[&str] = &[
-    "pipewire",
-    "wireplumber",
-    "pipewire-pulse",
-    "libpulse",
-    "alsa-utils",
-    "xorg-xwayland",
-    "mesa",
-    "libglvnd",
-    "wayland",
-    "noto-fonts",
-    "xdg-desktop-portal",
-];
-const ARCH_PORTAL_BACKENDS: &[&str] = &[
-    "xdg-desktop-portal-gtk",
-    "xdg-desktop-portal-kde",
-    "xdg-desktop-portal-hyprland",
-    "xdg-desktop-portal-wlr",
-    "xdg-desktop-portal-gnome",
-];
-const ZYPPER_RUNTIME_PACKAGES: &[&str] = &[
-    "pipewire",
-    "wireplumber",
-    "pipewire-pulseaudio",
-    "pulseaudio-utils",
-    "alsa",
-    "libwebkit2gtk-4_1-0",
-    "typelib-1_0-AyatanaAppIndicator3-0_1",
-    "libusb-1_0-0",
-    "bubblewrap",
-    "xdg-dbus-proxy",
-    "xwayland",
-    "Mesa-libEGL1",
-    "Mesa-libGL1",
-    "libgbm1",
-    "libdrm2",
-    "libwayland-client0",
-    "libwayland-cursor0",
-    "libwayland-egl1",
-    "libwayland-server0",
-    "gstreamer-plugins-base",
-    "gstreamer-plugins-good",
-    "google-noto-sans-fonts",
-    "xdg-desktop-portal",
-];
-const ZYPPER_APPIMAGE_HOST_PACKAGES: &[&str] = &[
-    "pipewire",
-    "wireplumber",
-    "pipewire-pulseaudio",
-    "pulseaudio-utils",
-    "alsa",
-    "xwayland",
-    "Mesa-libEGL1",
-    "Mesa-libGL1",
-    "libgbm1",
-    "libdrm2",
-    "libwayland-client0",
-    "libwayland-cursor0",
-    "libwayland-egl1",
-    "libwayland-server0",
-    "google-noto-sans-fonts",
-    "xdg-desktop-portal",
-];
-const ZYPPER_PORTAL_BACKENDS: &[&str] = &[
-    "xdg-desktop-portal-gtk",
-    "xdg-desktop-portal-kde",
-    "xdg-desktop-portal-gnome",
-    "xdg-desktop-portal-wlr",
 ];
 fn prepare_appimage_bundled_runtime() {
     let Some(runtime_dir) = appimage_bundled_runtime_dir() else {
@@ -718,58 +525,101 @@ fn session_bus_path_status() -> Option<(String, bool)> {
     Some((path.to_string(), Path::new(path).exists()))
 }
 
-fn is_arch_like_system() -> bool {
-    [
-        "/etc/arch-release",
-        "/etc/cachyos-release",
-        "/etc/manjaro-release",
-    ]
-    .into_iter()
-    .any(|path| Path::new(path).exists())
-}
-
-fn pacman_package_installed(package: &str) -> bool {
-    host_command("pacman")
-        .args(["-Qq", package])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn missing_arch_runtime_packages() -> Vec<&'static str> {
-    if !is_arch_like_system() || !command_exists("pacman") {
-        return Vec::new();
+fn runtime_dependency_helper_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os(RUNTIME_DEPENDENCY_HELPER_ENV) {
+        candidates.push(PathBuf::from(path));
+        return candidates;
     }
 
-    let packages = if is_appimage_install() {
-        ARCH_APPIMAGE_HOST_PACKAGES
-    } else {
-        ARCH_RUNTIME_PACKAGES
-    };
+    if let Some(runtime_dir) = appimage_bundled_runtime_dir() {
+        candidates.push(runtime_dir.join("bin/check-dependencies.sh"));
+    }
+    candidates.push(PathBuf::from("/usr/lib/wavelinux6/check-dependencies.sh"));
 
-    packages
+    for root in std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .into_iter()
+        .chain(std::env::current_dir().ok())
+        .flat_map(|path| path.ancestors().map(Path::to_path_buf).collect::<Vec<_>>())
+    {
+        candidates.push(root.join("scripts/check-dependencies.sh"));
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn runtime_dependency_helper() -> Result<PathBuf, String> {
+    let candidates = runtime_dependency_helper_candidates();
+    candidates
         .iter()
-        .copied()
-        .filter(|package| !pacman_package_installed(package))
-        .chain(
-            (!ARCH_PORTAL_BACKENDS
-                .iter()
-                .any(|package| pacman_package_installed(package)))
-            .then_some("xdg-desktop-portal-gtk"),
-        )
-        .collect()
+        .find(|path| path.is_file())
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "the authoritative dependency helper was not found; checked: {}",
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+fn run_runtime_dependency_helper(args: &[&str]) -> Result<Output, String> {
+    let helper = runtime_dependency_helper()?;
+    host_command("bash")
+        .arg(&helper)
+        .args(args)
+        .output()
+        .map_err(|err| format!("could not run {}: {err}", helper.display()))
+}
+
+fn run_runtime_dependency_helper_interactive(args: &[&str]) -> Result<(), String> {
+    let helper = runtime_dependency_helper()?;
+    let status = host_command("bash")
+        .arg(&helper)
+        .args(args)
+        .status()
+        .map_err(|err| format!("could not run {}: {err}", helper.display()))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("{} exited with status {status}", helper.display()))
+}
+
+fn dependency_output_text(output: &Output) -> String {
+    let mut text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(stderr);
+    }
+    text
 }
 
 fn print_runtime_dependency_report() -> i32 {
-    let manager = detect_package_manager();
-    let missing_runtime = if manager == PackageManager::Unknown {
-        Vec::new()
-    } else {
-        missing_runtime_packages_for_manager(manager)
-    };
-    let missing_arch = missing_arch_runtime_packages();
+    let helper_result = run_runtime_dependency_helper(&["--strict-runtime"]);
+    let helper_ok = helper_result
+        .as_ref()
+        .is_ok_and(|output| output.status.success());
+    match &helper_result {
+        Ok(output) => {
+            let text = dependency_output_text(output);
+            if !text.is_empty() {
+                println!("{text}");
+            }
+        }
+        Err(err) => eprintln!("WaveLinux dependency check failed: {err}"),
+    }
+
     let missing_helpers = missing_webkit_sandbox_helpers();
     let session_bus = session_bus_path_status();
     let missing_pipewire_stack = missing_pipewire_client_stack();
@@ -777,8 +627,13 @@ fn print_runtime_dependency_report() -> i32 {
     let appimage_pipewire_conflicts = appimage_bundled_pipewire_conflicts();
     let appimage_wayland_conflicts = appimage_bundled_wayland_conflicts();
 
-    println!("WaveLinux runtime dependency check");
-    println!("Package manager: {}", manager.id());
+    println!("WaveLinux application runtime diagnostics");
+    println!(
+        "Dependency helper: {}",
+        runtime_dependency_helper()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|err| format!("unavailable ({err})"))
+    );
     println!("AppImage runtime: {}", is_appimage_install());
     println!(
         "AppImage bundled runtime: {}",
@@ -786,8 +641,6 @@ fn print_runtime_dependency_report() -> i32 {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "unavailable".into())
     );
-    println!("Arch-like system: {}", is_arch_like_system());
-    println!("pacman available: {}", command_exists("pacman"));
     println!("bwrap available: {}", command_exists("bwrap"));
     println!(
         "xdg-dbus-proxy available: {}",
@@ -817,27 +670,15 @@ fn print_runtime_dependency_report() -> i32 {
         std::env::var("LADSPA_PATH").unwrap_or_default()
     );
 
-    if manager == PackageManager::Unknown {
-        println!("Runtime packages: package manager unsupported");
-    } else if missing_runtime.is_empty() {
+    if helper_ok {
         println!("Runtime packages: ok");
     } else {
-        println!("Runtime packages missing: {}", missing_runtime.join(" "));
-        println!(
-            "Install command: {}",
-            install_command_for_user(manager, &missing_runtime)
-        );
+        println!("Runtime packages: missing or dependency helper unavailable");
     }
-
-    if missing_arch.is_empty() {
-        println!("Arch runtime packages: ok");
-    } else {
-        println!("Arch runtime packages missing: {}", missing_arch.join(" "));
-        println!(
-            "Install on Arch/CachyOS: sudo pacman -Syu --needed {}",
-            missing_arch.join(" ")
-        );
-    }
+    println!(
+        "Arch runtime packages: {}",
+        if helper_ok { "ok" } else { "check failed" }
+    );
 
     if missing_pipewire_stack.is_empty() {
         println!("PipeWire client stack: ok");
@@ -884,8 +725,7 @@ fn print_runtime_dependency_report() -> i32 {
         );
     }
 
-    if missing_runtime.is_empty()
-        && missing_arch.is_empty()
+    if helper_ok
         && missing_helpers.is_empty()
         && missing_pipewire_stack.is_empty()
         && missing_wayland_stack.is_empty()
@@ -900,42 +740,8 @@ fn print_runtime_dependency_report() -> i32 {
 }
 
 fn install_runtime_dependencies_from_cli() -> i32 {
-    let manager = detect_package_manager();
-    if manager == PackageManager::Unknown {
-        eprintln!("WaveLinux setup: no supported package manager was found.");
-        return 1;
-    }
-
-    let missing_runtime = missing_runtime_packages_for_manager(manager);
-    let packages = missing_runtime.clone();
-
-    if packages.is_empty() {
-        println!("WaveLinux runtime packages are already installed.");
-        return 0;
-    }
-
-    println!(
-        "Installing WaveLinux setup packages with {}: {}",
-        manager.id(),
-        packages.join(" ")
-    );
-    if !packages.is_empty() {
-        println!("Command: {}", install_command_for_user(manager, &packages));
-    }
-    match install_system_packages(manager, &packages) {
-        Ok(_) => {
-            let missing_after = missing_runtime_packages_for_manager(manager);
-            if missing_after.is_empty() {
-                println!("WaveLinux runtime dependency install completed.");
-                0
-            } else {
-                eprintln!(
-                    "WaveLinux setup: install completed, but these packages still look missing: {}",
-                    missing_after.join(" ")
-                );
-                1
-            }
-        }
+    match run_runtime_dependency_helper_interactive(&["--install", "--strict-runtime"]) {
+        Ok(()) => 0,
         Err(err) => {
             eprintln!("WaveLinux setup: dependency install failed: {err}");
             1
@@ -951,70 +757,62 @@ fn ensure_runtime_dependencies_before_ui() {
         return;
     }
 
-    let manager = detect_package_manager();
-    if manager == PackageManager::Unknown {
-        eprintln!(
-            "WaveLinux setup: no supported package manager was found for AppImage runtime preflight."
-        );
-        return;
-    }
+    let check = match run_runtime_dependency_helper(&["--strict-runtime"]) {
+        Ok(output) if output.status.success() => return,
+        Ok(output) => dependency_output_text(&output),
+        Err(err) => {
+            show_runtime_setup_message(
+                "WaveLinux setup failed",
+                &format!("WaveLinux cannot check its host dependencies: {err}"),
+                RuntimeSetupMessageKind::Error,
+            );
+            std::process::exit(1);
+        }
+    };
 
-    let missing_runtime = missing_runtime_packages_for_manager(manager);
-    let packages = missing_runtime.clone();
-
-    if packages.is_empty() {
-        return;
-    }
-
-    let commands = install_command_for_user(manager, &packages);
     let prompt = format!(
-        "WaveLinux needs setup packages for this Linux install.\n\nPackages:\n{}\n\nWaveLinux will ask for administrator permission and run:\n\n{}",
-        missing_runtime.join(" "),
-        commands
+        "WaveLinux needs host audio and desktop packages for this Linux install.\n\n{check}\n\nWaveLinux will request administrator permission only for those system packages."
     );
 
     if !confirm_runtime_dependency_install(&prompt) {
-        let message = format!(
-            "WaveLinux setup was cancelled. Install these packages, then open WaveLinux again:\n\n{commands}"
-        );
         show_runtime_setup_message(
             "WaveLinux setup cancelled",
-            &message,
+            "Dependency installation was cancelled. Run the WaveLinux installer again from a terminal for package-manager details.",
             RuntimeSetupMessageKind::Error,
         );
         std::process::exit(1);
     }
 
-    match install_system_packages(manager, &packages) {
-        Ok(_) => {
-            let missing_after = missing_runtime_packages_for_manager(manager);
-            if missing_after.is_empty() {
+    match run_runtime_dependency_helper_interactive(&["--install", "--strict-runtime"]) {
+        Ok(()) => match run_runtime_dependency_helper(&["--strict-runtime"]) {
+            Ok(output) if output.status.success() => {
                 show_runtime_setup_message(
                     "WaveLinux setup complete",
                     "Runtime packages were installed. WaveLinux will continue launching now.",
                     RuntimeSetupMessageKind::Info,
                 );
-            } else {
-                let message = format!(
-                    "WaveLinux tried to install required packages, but these still look missing:\n\n{}\n\nManual command:\n{}",
-                    missing_after.join(" "),
-                    install_command_for_user(manager, &missing_after)
-                );
+            }
+            Ok(output) => {
                 show_runtime_setup_message(
                     "WaveLinux setup incomplete",
-                    &message,
+                    &dependency_output_text(&output),
                     RuntimeSetupMessageKind::Error,
                 );
                 std::process::exit(1);
             }
-        }
+            Err(err) => {
+                show_runtime_setup_message(
+                    "WaveLinux setup incomplete",
+                    &err,
+                    RuntimeSetupMessageKind::Error,
+                );
+                std::process::exit(1);
+            }
+        },
         Err(err) => {
-            let message = format!(
-                "WaveLinux could not install required runtime packages.\n\n{err}\n\nManual command:\n{commands}"
-            );
             show_runtime_setup_message(
                 "WaveLinux setup failed",
-                &message,
+                &format!("WaveLinux could not install required runtime packages.\n\n{err}"),
                 RuntimeSetupMessageKind::Error,
             );
             std::process::exit(1);
@@ -1296,27 +1094,6 @@ struct UpdateInstallResult {
     installed: bool,
     version: Option<String>,
     message: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PackageManager {
-    Apt,
-    Dnf,
-    Pacman,
-    Zypper,
-    Unknown,
-}
-
-impl PackageManager {
-    fn id(self) -> &'static str {
-        match self {
-            Self::Apt => "apt",
-            Self::Dnf => "dnf",
-            Self::Pacman => "pacman",
-            Self::Zypper => "zypper",
-            Self::Unknown => "unknown",
-        }
-    }
 }
 
 #[tauri::command]
@@ -2593,257 +2370,6 @@ fn ensure_elgato_wave_xlr_detected(engine: &WaveLinuxEngine) -> Result<(), Strin
     }
 }
 
-fn push_unique(packages: &mut Vec<String>, package: &str) {
-    if packages.iter().all(|item| item != package) {
-        packages.push(package.into());
-    }
-}
-
-fn detect_package_manager() -> PackageManager {
-    if command_exists("apt-get") {
-        PackageManager::Apt
-    } else if command_exists("dnf") {
-        PackageManager::Dnf
-    } else if command_exists("pacman") {
-        PackageManager::Pacman
-    } else if command_exists("zypper") {
-        PackageManager::Zypper
-    } else {
-        PackageManager::Unknown
-    }
-}
-
-fn runtime_packages_for_manager(manager: PackageManager) -> &'static [&'static str] {
-    if is_appimage_install() {
-        return match manager {
-            PackageManager::Apt => APT_APPIMAGE_HOST_PACKAGES,
-            PackageManager::Dnf => DNF_APPIMAGE_HOST_PACKAGES,
-            PackageManager::Pacman => ARCH_APPIMAGE_HOST_PACKAGES,
-            PackageManager::Zypper => ZYPPER_APPIMAGE_HOST_PACKAGES,
-            PackageManager::Unknown => &[],
-        };
-    }
-
-    match manager {
-        PackageManager::Apt => APT_RUNTIME_PACKAGES,
-        PackageManager::Dnf => DNF_RUNTIME_PACKAGES,
-        PackageManager::Pacman => ARCH_RUNTIME_PACKAGES,
-        PackageManager::Zypper => ZYPPER_RUNTIME_PACKAGES,
-        PackageManager::Unknown => &[],
-    }
-}
-
-fn portal_backend_packages_for_manager(manager: PackageManager) -> &'static [&'static str] {
-    match manager {
-        PackageManager::Apt => APT_PORTAL_BACKENDS,
-        PackageManager::Dnf => DNF_PORTAL_BACKENDS,
-        PackageManager::Pacman => ARCH_PORTAL_BACKENDS,
-        PackageManager::Zypper => ZYPPER_PORTAL_BACKENDS,
-        PackageManager::Unknown => &[],
-    }
-}
-
-fn runtime_package_available(manager: PackageManager, package: &str) -> bool {
-    if manager == PackageManager::Pacman {
-        return true;
-    }
-    package_available(manager, package)
-}
-
-fn package_installed(manager: PackageManager, package: &str) -> bool {
-    match manager {
-        PackageManager::Apt => host_command("dpkg-query")
-            .args(["-W", "-f=${Status}", package])
-            .output()
-            .is_ok_and(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains("install ok installed")
-            }),
-        PackageManager::Dnf | PackageManager::Zypper => {
-            command_status_success("rpm", &["-q", package])
-        }
-        PackageManager::Pacman => pacman_package_installed(package),
-        PackageManager::Unknown => false,
-    }
-}
-
-fn missing_runtime_packages_for_manager(manager: PackageManager) -> Vec<String> {
-    let mut packages = Vec::new();
-    for package in runtime_packages_for_manager(manager) {
-        if runtime_package_available(manager, package) && !package_installed(manager, package) {
-            push_unique(&mut packages, package);
-        }
-    }
-
-    let portal_backends = portal_backend_packages_for_manager(manager);
-    if !portal_backends.is_empty()
-        && !portal_backends
-            .iter()
-            .any(|package| package_installed(manager, package))
-    {
-        if let Some(package) = portal_backends
-            .iter()
-            .find(|package| runtime_package_available(manager, package))
-        {
-            if !package_installed(manager, package) {
-                push_unique(&mut packages, package);
-            }
-        }
-    }
-
-    packages
-}
-
-fn install_command_for_user(manager: PackageManager, packages: &[String]) -> String {
-    let package_list = packages.join(" ");
-    match manager {
-        PackageManager::Apt => {
-            format!("sudo apt-get update && sudo apt-get install -y {package_list}")
-        }
-        PackageManager::Dnf => format!("sudo dnf install -y {package_list}"),
-        PackageManager::Pacman => format!("sudo pacman -Syu --needed {package_list}"),
-        PackageManager::Zypper => {
-            format!("sudo zypper --non-interactive install --no-recommends {package_list}")
-        }
-        PackageManager::Unknown => format!("install manually: {package_list}"),
-    }
-}
-
-fn package_available(manager: PackageManager, package: &str) -> bool {
-    let (program, args): (&str, Vec<&str>) = match manager {
-        PackageManager::Apt => ("apt-cache", vec!["show", package]),
-        PackageManager::Dnf => ("dnf", vec!["-q", "info", package]),
-        PackageManager::Pacman => ("pacman", vec!["-Si", package]),
-        PackageManager::Zypper => (
-            "zypper",
-            vec!["--non-interactive", "search", "--exact-match", package],
-        ),
-        PackageManager::Unknown => return false,
-    };
-    command_status_success(program, &args)
-}
-
-fn install_system_packages(
-    manager: PackageManager,
-    packages: &[String],
-) -> Result<Vec<Output>, String> {
-    let mut outputs = Vec::new();
-    match manager {
-        PackageManager::Apt => {
-            outputs.push(run_privileged_command("apt-get", &["update".into()])?);
-            let mut args = vec!["install".into(), "-y".into()];
-            args.extend(packages.iter().cloned());
-            outputs.push(run_privileged_command("apt-get", &args)?);
-        }
-        PackageManager::Dnf => {
-            let mut args = vec!["install".into(), "-y".into()];
-            args.extend(packages.iter().cloned());
-            outputs.push(run_privileged_command("dnf", &args)?);
-        }
-        PackageManager::Pacman => {
-            let mut args = vec!["-Syu".into(), "--needed".into(), "--noconfirm".into()];
-            args.extend(packages.iter().cloned());
-            outputs.push(run_privileged_command("pacman", &args)?);
-        }
-        PackageManager::Zypper => {
-            let mut args = vec![
-                "--non-interactive".into(),
-                "install".into(),
-                "--no-recommends".into(),
-            ];
-            args.extend(packages.iter().cloned());
-            outputs.push(run_privileged_command("zypper", &args)?);
-        }
-        PackageManager::Unknown => {}
-    }
-    Ok(outputs)
-}
-
-fn run_privileged_command(program: &str, args: &[String]) -> Result<Output, String> {
-    if running_as_root() {
-        return run_command_capture(program, args);
-    }
-
-    let helpers = privilege_helper_order(
-        command_exists("sudo"),
-        command_exists("pkexec"),
-        stdin_is_terminal(),
-    );
-    let mut failures = Vec::new();
-    for helper in helpers {
-        let mut helper_args = vec![program.to_string()];
-        helper_args.extend(args.iter().cloned());
-        match run_command_capture(helper, &helper_args) {
-            Ok(output) => return Ok(output),
-            Err(err) => failures.push(err),
-        }
-    }
-
-    if failures.is_empty() {
-        Err("No sudo or pkexec command is available for privileged package installation".into())
-    } else {
-        Err(format!(
-            "privileged package installation failed after trying {}: {}",
-            privilege_failure_subject(&failures),
-            failures.join("; ")
-        ))
-    }
-}
-
-fn privilege_helper_order(
-    sudo_available: bool,
-    pkexec_available: bool,
-    stdin_is_terminal: bool,
-) -> Vec<&'static str> {
-    let preferred = if stdin_is_terminal {
-        ["sudo", "pkexec"]
-    } else {
-        ["pkexec", "sudo"]
-    };
-    preferred
-        .into_iter()
-        .filter(|helper| match *helper {
-            "sudo" => sudo_available,
-            "pkexec" => pkexec_available,
-            _ => false,
-        })
-        .collect()
-}
-
-fn privilege_failure_subject(failures: &[String]) -> &'static str {
-    match failures.len() {
-        1 => "one helper",
-        _ => "multiple helpers",
-    }
-}
-
-fn run_command_capture(program: &str, args: &[String]) -> Result<Output, String> {
-    let output = host_command(program)
-        .args(args)
-        .output()
-        .map_err(|err| format!("{program} failed to start: {err}"))?;
-    if output.status.success() {
-        Ok(output)
-    } else {
-        Err(format!(
-            "{} {} exited with status {}: {}",
-            program,
-            args.join(" "),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-fn command_status_success(program: &str, args: &[&str]) -> bool {
-    host_command(program)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 fn host_command(program: &str) -> Command {
     let mut command = Command::new(program);
     sanitize_host_command_env(&mut command);
@@ -2854,14 +2380,6 @@ fn sanitize_host_command_env(command: &mut Command) {
     for key in HOST_COMMAND_ENV_REMOVE {
         command.env_remove(key);
     }
-}
-
-fn running_as_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
-}
-
-fn stdin_is_terminal() -> bool {
-    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
 fn ui_theme_preference_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -3706,22 +3224,6 @@ mod updater_tests {
                 .unwrap()
                 .to_string(),
             "4.3.0-testing.7"
-        );
-    }
-
-    #[test]
-    fn privileged_install_prefers_sudo_in_terminal() {
-        assert_eq!(
-            privilege_helper_order(true, true, true),
-            vec!["sudo", "pkexec"]
-        );
-    }
-
-    #[test]
-    fn privileged_install_prefers_pkexec_without_terminal() {
-        assert_eq!(
-            privilege_helper_order(true, true, false),
-            vec!["pkexec", "sudo"]
         );
     }
 

@@ -1,6 +1,6 @@
 {
   "name": "wavelinux6",
-  "version": "6.0.0-alpha.1",
+  "version": "6.0.0",
   "private": true,
   "license": "GPL-3.0-only",
   "type": "module",

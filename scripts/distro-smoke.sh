@@ -9,6 +9,9 @@ TARGET="${WAVELINUX_SMOKE_TARGET:-appimage}"
 RELEASE_TAG="${WAVELINUX_SMOKE_RELEASE_TAG:-latest}"
 CONTAINER_ENGINE="${WAVELINUX_CONTAINER_ENGINE:-}"
 LOCAL_ASSET_DIR="${WAVELINUX_SMOKE_LOCAL_ASSET_DIR:-}"
+CONTAINER_MEMORY="${WAVELINUX_SMOKE_MEMORY:-4g}"
+CONTAINER_MEMORY_SWAP="${WAVELINUX_SMOKE_MEMORY_SWAP:-6g}"
+CONTAINER_CPUS="${WAVELINUX_SMOKE_CPUS:-4}"
 INSIDE=0
 
 usage() {
@@ -16,13 +19,14 @@ usage() {
 Run WaveLinux release smoke tests in clean Linux containers.
 
 Usage:
-  bash scripts/distro-smoke.sh [--distro NAME|--all] [--target appimage|native|source-helper] [--release-tag vX.Y.Z]
+  bash scripts/distro-smoke.sh [--distro NAME|--all] [--target appimage|standalone|native|source-helper] [--release-tag vX.Y.Z]
 
 Distros:
-  debian13, ubuntu2404, fedora, arch, cachyos
+  debian13, ubuntu2404, fedora, arch, cachyos, opensuse
 
 Targets:
   appimage       Download the release AppImage, run its dependency installer, then check runtime deps.
+  standalone      Run the canonical installer in an isolated non-root desktop audio session.
   native         Install the release deb/rpm package and check runtime deps. Arch is skipped.
   source-helper  Run scripts/check-dependencies.sh --install --strict-runtime from the checkout.
 
@@ -31,6 +35,9 @@ Targets:
   WAVELINUX_SMOKE_PRODUCT_NAME=WaveLinux6
   WAVELINUX_SMOKE_ARTIFACT_VERSION=6.0.0
   WAVELINUX_SMOKE_PRIVILEGED=0  Disable privileged container mode.
+  WAVELINUX_SMOKE_MEMORY=4g     Container memory ceiling.
+  WAVELINUX_SMOKE_MEMORY_SWAP=6g
+  WAVELINUX_SMOKE_CPUS=4        Container CPU ceiling.
 HELP
 }
 
@@ -74,6 +81,7 @@ image_for_distro() {
     fedora) echo "fedora:latest" ;;
     arch) echo "archlinux:latest" ;;
     cachyos) echo "cachyos/cachyos:latest" ;;
+    opensuse) echo "opensuse/tumbleweed:latest" ;;
     *)
       echo "Unknown distro: $1" >&2
       return 1
@@ -88,13 +96,15 @@ manager_id() {
     echo dnf
   elif command -v pacman >/dev/null 2>&1; then
     echo pacman
+  elif command -v zypper >/dev/null 2>&1; then
+    echo zypper
   else
     echo unknown
   fi
 }
 
 bootstrap_container_tools() {
-  local manager
+  local manager keyrings
   manager="$(manager_id)"
   case "$manager" in
     apt)
@@ -113,8 +123,19 @@ bootstrap_container_tools() {
         && ! grep -Eq '^[[:space:]]*DisableSandboxNetwork([[:space:]]|$)' /etc/pacman.conf; then
         sed -i '/^\[options\]$/a DisableSandboxNetwork' /etc/pacman.conf
       fi
+      if ! pacman-key --list-secret-keys --with-colons 2>/dev/null | grep -q '^sec'; then
+        pacman-key --init
+      fi
+      keyrings=(archlinux)
+      [[ -f /usr/share/pacman/keyrings/cachyos.gpg ]] && keyrings+=(cachyos)
+      pacman-key --populate "${keyrings[@]}"
       pacman -Sy --needed --noconfirm archlinux-keyring
       pacman -Syu --needed --noconfirm bash ca-certificates curl coreutils file
+      ;;
+    zypper)
+      zypper --non-interactive refresh
+      zypper --non-interactive install --no-recommends \
+        bash ca-certificates curl coreutils file findutils gawk
       ;;
     *)
       echo "No supported package manager in smoke container" >&2
@@ -252,20 +273,56 @@ install_ui_smoke_dependencies() {
   case "$manager" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
-      apt-get install -y --no-install-recommends dbus-x11 imagemagick xvfb x11-apps passwd
+      apt-get install -y --no-install-recommends \
+        dbus-x11 imagemagick xvfb x11-apps passwd sudo
       ;;
     dnf)
       dnf install -y --setopt=install_weak_deps=False dbus-daemon ImageMagick \
-        xorg-x11-server-Xvfb xorg-x11-apps shadow-utils
+        xorg-x11-server-Xvfb xwd shadow-utils sudo
       ;;
     pacman)
-      pacman -S --needed --noconfirm dbus imagemagick xorg-server-xvfb xorg-xwd shadow
+      pacman -S --needed --noconfirm \
+        dbus imagemagick xorg-server-xvfb xorg-xwd shadow sudo
+      ;;
+    zypper)
+      zypper --non-interactive install --no-recommends \
+        dbus-1 dbus-1-daemon ImageMagick xorg-x11-server-Xvfb xwd shadow sudo
       ;;
     *)
       echo "No UI smoke dependency path for package manager: $manager" >&2
       return 1
       ;;
   esac
+}
+
+smoke_standalone() {
+  local tag version artifact_version asset installer user output
+  tag="$(resolve_latest_tag)"
+  version="${tag#v}"
+  artifact_version="${WAVELINUX_SMOKE_ARTIFACT_VERSION:-$version}"
+  asset="${PRODUCT_NAME}_${artifact_version}_amd64_Installer.sh"
+  installer="/tmp/$asset"
+  user="wavelinux-install-smoke"
+  output="/tmp/wavelinux-standalone-smoke-output"
+
+  obtain_release_asset "$tag" "$asset" "$installer"
+  chmod 0755 "$installer"
+  bash "$ROOT_DIR/scripts/check-standalone-installer.sh" "$installer"
+  install_ui_smoke_dependencies
+
+  id "$user" >/dev/null 2>&1 || useradd --create-home "$user"
+  install -d -m 0750 /etc/sudoers.d
+  printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$user" >"/etc/sudoers.d/$user"
+  chmod 0440 "/etc/sudoers.d/$user"
+  install -d -m 0700 -o "$user" -g "$user" "$output"
+  chown "$user:$user" "$installer"
+
+  echo "Installing dependencies and files as an unprivileged desktop user:"
+  runuser -u "$user" -- "$installer" --no-launch
+
+  echo "Launching and verifying in an isolated non-root desktop audio session:"
+  runuser -u "$user" -- \
+    bash "$ROOT_DIR/scripts/standalone-session-smoke.sh" "$installer" "$output"
 }
 
 smoke_appimage_ui() {
@@ -282,7 +339,7 @@ smoke_appimage_ui() {
 }
 
 smoke_native() {
-  local tag version artifact_version manager asset package
+  local tag version artifact_version manager asset package command_path user output
   tag="$(resolve_latest_tag)"
   version="${tag#v}"
   artifact_version="${WAVELINUX_SMOKE_ARTIFACT_VERSION:-${version%%-*}}"
@@ -312,7 +369,6 @@ smoke_native() {
       ;;
   esac
 
-  local command_path
   command_path="$(installed_wavelinux_command)" || {
     echo "No WaveLinux command was installed by the native package" >&2
     return 1
@@ -327,6 +383,16 @@ smoke_native() {
     return 1
   }
   run_runtime_check "native package $tag" "$command_path" --check-runtime-dependencies
+
+  install_ui_smoke_dependencies
+  user="wavelinux-native-smoke"
+  output="/tmp/wavelinux-native-smoke-output"
+  id "$user" >/dev/null 2>&1 || useradd --create-home "$user"
+  install -d -m 0700 -o "$user" -g "$user" "$output"
+  runuser -u "$user" -- env \
+    WAVELINUX_SMOKE_VERIFY_SCRIPT=/usr/lib/wavelinux6/verify-install.sh \
+    bash "$ROOT_DIR/scripts/standalone-session-smoke.sh" \
+      --native "$command_path" "$output"
 }
 
 smoke_source_helper() {
@@ -338,11 +404,25 @@ inside_main() {
     echo "Skipping native package smoke on Arch; WaveLinux publishes AppImage plus AUR metadata, not a pacman package."
     return 0
   fi
+  if [[ "$TARGET" == "native" ]] && command -v zypper >/dev/null 2>&1; then
+    echo "Skipping native package smoke on openSUSE; use the supported standalone AppImage installer."
+    return 0
+  fi
+  if [[ "$TARGET" == "source-helper" ]]; then
+    if command -v pacman >/dev/null 2>&1 \
+      && [[ "$WAVELINUX_SMOKE_DISTRO" == "cachyos" ]] \
+      && ! grep -Eq '^[[:space:]]*DisableSandboxNetwork([[:space:]]|$)' /etc/pacman.conf; then
+      sed -i '/^\[options\]$/a DisableSandboxNetwork' /etc/pacman.conf
+    fi
+    smoke_source_helper
+    return 0
+  fi
+
   bootstrap_container_tools
   case "$TARGET" in
     appimage) smoke_appimage ;;
+    standalone) smoke_standalone ;;
     native) smoke_native ;;
-    source-helper) smoke_source_helper ;;
     *)
       echo "Unknown smoke target: $TARGET" >&2
       exit 1
@@ -367,7 +447,7 @@ host_main() {
   local engine distros distro image
   engine="$(choose_container_engine)"
   if [[ "$DISTRO" == "all" ]]; then
-    distros=(debian13 ubuntu2404 fedora arch cachyos)
+    distros=(debian13 ubuntu2404 fedora arch cachyos opensuse)
   else
     distros=("$DISTRO")
   fi
@@ -375,7 +455,15 @@ host_main() {
   for distro in "${distros[@]}"; do
     image="$(image_for_distro "$distro")"
     echo "==> WaveLinux distro smoke: distro=$distro image=$image target=$TARGET tag=$RELEASE_TAG"
-    container_args=(run --rm -v "$ROOT_DIR:/work:ro" -w /work)
+    container_args=(
+      run --rm
+      --memory "$CONTAINER_MEMORY"
+      --memory-swap "$CONTAINER_MEMORY_SWAP"
+      --cpus "$CONTAINER_CPUS"
+      --pids-limit 4096
+      -v "$ROOT_DIR:/work:ro"
+      -w /work
+    )
     if [[ -n "$LOCAL_ASSET_DIR" ]]; then
       container_args+=(
         -v "$LOCAL_ASSET_DIR:/wavelinux-artifacts:ro"
@@ -397,7 +485,9 @@ host_main() {
       "$image"
       bash scripts/distro-smoke.sh --inside
     )
-    "$engine" "${container_args[@]}"
+    engine_args=()
+    [[ "$engine" == podman ]] && engine_args+=(--runtime crun)
+    "$engine" "${engine_args[@]}" "${container_args[@]}"
   done
 }
 

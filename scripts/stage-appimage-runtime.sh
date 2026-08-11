@@ -87,18 +87,13 @@ stage_repo_binary wavelinux6-audio-core
 stage_repo_binary wavelinux6-peripheral-plugin
 install -m 0755 "$ROOT_DIR/scripts/check-dependencies.sh" "$BIN_DIR/check-dependencies.sh"
 echo "Staged AppImage runtime helper: check-dependencies.sh"
-stage_binary bwrap
-stage_binary xdg-dbus-proxy
+install -m 0755 "$ROOT_DIR/scripts/runtime-dependencies.sh" "$BIN_DIR/runtime-dependencies.sh"
+echo "Staged AppImage runtime helper: runtime-dependencies.sh"
 
 stage_library libusb-1.0.so.0 \
   /usr/lib/x86_64-linux-gnu/libusb-1.0.so.0 \
   /usr/lib64/libusb-1.0.so.0 \
   /usr/lib/libusb-1.0.so.0
-
-stage_library libcap.so.2 \
-  /usr/lib/x86_64-linux-gnu/libcap.so.2 \
-  /usr/lib64/libcap.so.2 \
-  /usr/lib/libcap.so.2
 
 stage_startup_library libfribidi.so.0 \
   /usr/lib/x86_64-linux-gnu/libfribidi.so.0 \

@@ -4,6 +4,8 @@
 /.vite/
 /playwright-report/
 /test-results/
+__pycache__/
+*.pyc
 /.idea/
 /.vscode/
 *.log

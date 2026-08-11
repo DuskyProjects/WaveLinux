@@ -6,7 +6,7 @@ on:
       tag:
         description: Existing release tag to build and publish
         required: true
-        default: v6.0.0-alpha.1
+        default: v6.0.0
         type: string
   push:
     tags:
@@ -97,11 +97,7 @@ jobs:
             exit 1
           fi
 
-          if [[ "$version" == "6.0.0-alpha.1" ]]; then
-            release_name="WaveLinux 6 Alpha 1"
-            prerelease="true"
-            make_latest="false"
-          elif [[ "$version" == *-* ]]; then
+          if [[ "$version" == *-* ]]; then
             release_name="WaveLinux $version"
             prerelease="true"
             make_latest="false"
@@ -111,22 +107,27 @@ jobs:
             make_latest="true"
           fi
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
-          echo "release_name=$release_name" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-          echo "make_latest=$make_latest" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "release_tag=$release_tag"
+            echo "release_name=$release_name"
+            echo "prerelease=$prerelease"
+            echo "make_latest=$make_latest"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Run source release gate
         run: |
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p wavelinux-accelerator --all-features --all-targets -- -D warnings
           cargo test --workspace --locked
+          cargo test -p wavelinux-accelerator --all-features --all-targets --locked
           yarn test
           yarn web:build
           yarn test:e2e
-          shellcheck scripts/*.sh
+          shellcheck install.sh scripts/*.sh
           bash scripts/check-docs.sh
+          bash scripts/test-installers.sh
 
       - name: Build AppImage, Debian, RPM, and updater bundles
         env:
@@ -193,28 +194,59 @@ jobs:
       - name: Stage AUR package metadata
         run: bash scripts/build-aur.sh
 
+      - name: Build and verify the standalone installers
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p target/release/gate/assets
+          appimage="target/release/bundle/appimage/WaveLinux6_${VERSION}_amd64.AppImage"
+          test -s "$appimage"
+          WAVELINUX_INSTALLER_OUTPUT_DIR=target/release/gate/assets \
+          WAVELINUX_INSTALLER_APPIMAGE="$appimage" \
+          WAVELINUX_INSTALLER_AUDIO_CORE=target/release/wavelinux6-audio-core \
+          WAVELINUX_INSTALLER_PERIPHERAL_PLUGIN=target/release/wavelinux6-peripheral-plugin \
+            bash scripts/build-standalone-installer.sh
+          bash scripts/check-standalone-installer.sh \
+            "target/release/gate/assets/WaveLinux6_${VERSION}_amd64_Installer.sh"
+          bash scripts/check-standalone-installer.sh \
+            target/release/gate/assets/WaveLinux6_amd64_Installer.sh
+          cmp \
+            "target/release/gate/assets/WaveLinux6_${VERSION}_amd64_Installer.sh" \
+            target/release/gate/assets/WaveLinux6_amd64_Installer.sh
+
       - name: Prepare release files
         env:
           VERSION: ${{ steps.version.outputs.version }}
           RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
           RELEASE_NAME: ${{ steps.version.outputs.release_name }}
         run: |
-          mkdir -p target/release/gate/assets
           cp target/release/bundle/appimage/*.AppImage* target/release/gate/assets/
           cp target/release/bundle/deb/*.deb* target/release/gate/assets/
           cp target/release/bundle/rpm/*.rpm* target/release/gate/assets/
           cp target/release/bundle/latest.json target/release/gate/assets/
+          cp install.sh target/release/gate/assets/install.sh
           cp target/aur/wavelinux/PKGBUILD target/release/gate/assets/
           cp target/aur/wavelinux/.SRCINFO target/release/gate/assets/wavelinux.SRCINFO
           printf 'Release: %s\nVersion: %s\nTag: %s\nCommit: %s\n' \
             "$RELEASE_NAME" "$VERSION" "$RELEASE_TAG" "$(git rev-parse HEAD)" \
             > target/release/gate/assets/BUILD-INFO.txt
+          python3 scripts/build-release-manifest.py \
+            --assets target/release/gate/assets \
+            --output target/release/gate/assets/BUILD-MANIFEST.json \
+            --version "$VERSION" \
+            --tag "$RELEASE_TAG" \
+            --commit "$(git rev-parse HEAD)"
+          checksum_file=target/release/gate/SHA256SUMS.tmp
           (
             cd target/release/gate/assets
             find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
               | sort -z \
-              | xargs -0 sha256sum \
-              > SHA256SUMS
+              | xargs -0 sha256sum
+          ) > "$checksum_file"
+          mv "$checksum_file" target/release/gate/assets/SHA256SUMS
+          (
+            cd target/release/gate/assets
+            sha256sum --check --strict SHA256SUMS
           )
           awk -v version="$VERSION" '
             $0 == "# WaveLinux " version { in_section = 1; found = 1 }
@@ -247,6 +279,22 @@ jobs:
             target: appimage
           - distro: arch
             target: appimage
+          - distro: cachyos
+            target: appimage
+          - distro: opensuse
+            target: appimage
+          - distro: debian13
+            target: standalone
+          - distro: ubuntu2404
+            target: standalone
+          - distro: fedora
+            target: standalone
+          - distro: arch
+            target: standalone
+          - distro: cachyos
+            target: standalone
+          - distro: opensuse
+            target: standalone
           - distro: debian13
             target: native
           - distro: ubuntu2404
@@ -286,6 +334,12 @@ jobs:
           test -n "$(find target/release/gate/assets -maxdepth 1 -name '*.AppImage' -print -quit)"
           test -n "$(find target/release/gate/assets -maxdepth 1 -name '*.deb' -print -quit)"
           test -n "$(find target/release/gate/assets -maxdepth 1 -name '*.rpm' -print -quit)"
+          test -s "target/release/gate/assets/WaveLinux6_${{ needs.linux-bundles.outputs.version }}_amd64_Installer.sh"
+          test -s target/release/gate/assets/WaveLinux6_amd64_Installer.sh
+          test -s target/release/gate/assets/install.sh
+          test -s target/release/gate/assets/BUILD-MANIFEST.json
+          test -s target/release/gate/assets/SHA256SUMS
+          (cd target/release/gate/assets && sha256sum --check --strict SHA256SUMS)
           find target/release/gate/assets -maxdepth 1 -type f -printf '%f\n' | sort
 
       - name: Publish packages into GitHub release
@@ -304,8 +358,22 @@ jobs:
             target/release/gate/assets/*.AppImage.tar.gz.sig
             target/release/gate/assets/*.deb
             target/release/gate/assets/*.rpm
+            target/release/gate/assets/*.sh
             target/release/gate/assets/latest.json
             target/release/gate/assets/SHA256SUMS
             target/release/gate/assets/BUILD-INFO.txt
+            target/release/gate/assets/BUILD-MANIFEST.json
             target/release/gate/assets/PKGBUILD
             target/release/gate/assets/wavelinux.SRCINFO
+
+      - name: Mark malformed 6.0 prerelease as superseded
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view 6.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit 6.0 \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "WaveLinux 6.0 (superseded)" \
+              --notes "This empty prerelease used an invalid tag and is not installable. Use v6.0.0 or the latest stable release." \
+              --prerelease
+          fi

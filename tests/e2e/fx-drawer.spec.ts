@@ -14,6 +14,23 @@ async function expectPageScreenshot(page: Page, name: string) {
   expect(screenshot).toMatchSnapshot(name, { maxDiffPixels: 300 });
 }
 
+async function setScrollPosition(
+  scrollOwner: ReturnType<Page["locator"]>,
+  position: "start" | "end",
+) {
+  await scrollOwner.evaluate((element, target) => {
+    element.scrollTop = target === "start" ? 0 : element.scrollHeight - element.clientHeight;
+  }, position);
+  await expect
+    .poll(() =>
+      scrollOwner.evaluate((element, target) => {
+        const expected = target === "start" ? 0 : element.scrollHeight - element.clientHeight;
+        return Math.abs(element.scrollTop - expected);
+      }, position),
+    )
+    .toBeLessThanOrEqual(1);
+}
+
 test("FX drawer remains usable and contained at desktop scaling", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Mixer" })).toBeVisible();
@@ -59,12 +76,10 @@ test("FX drawer remains usable and contained at desktop scaling", async ({ page 
   expect(dimensions.scrollHeight).toBeGreaterThan(dimensions.clientHeight);
   expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth + 1);
 
+  await setScrollPosition(scrollOwner, "start");
   await expectPageScreenshot(page, "fx-drawer-page.png");
 
-  await scrollOwner.evaluate((element) => {
-    element.scrollTop = element.scrollHeight;
-  });
-  await expect.poll(() => scrollOwner.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  await setScrollPosition(scrollOwner, "end");
   await expect(drawer.getByText("Catalog", { exact: true })).toBeVisible();
 
   const documentOverflow = await page.evaluate(() => ({

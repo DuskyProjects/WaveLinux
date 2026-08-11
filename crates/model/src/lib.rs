@@ -147,7 +147,7 @@ pub struct MixerSettings {
     pub start_at_login: bool,
     #[serde(default)]
     pub keep_running_in_tray: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub restore_audio_graph_on_launch: bool,
     #[serde(default = "default_true")]
     pub monitor_follows_default_output: bool,
@@ -178,7 +178,7 @@ impl Default for MixerSettings {
             theme: ThemeMode::System,
             start_at_login: false,
             keep_running_in_tray: true,
-            restore_audio_graph_on_launch: false,
+            restore_audio_graph_on_launch: true,
             monitor_follows_default_output: true,
             lock_default_input: false,
             lock_default_output: false,
@@ -4455,7 +4455,7 @@ mod tests {
         let config: MixerConfig = serde_json::from_str(raw).unwrap();
         let config = config.normalized().unwrap();
         assert!(config.settings.auto_check_updates);
-        assert!(!config.settings.restore_audio_graph_on_launch);
+        assert!(config.settings.restore_audio_graph_on_launch);
         assert!(!config.settings.lock_default_output);
         assert_eq!(config.audio.sample_rate_hz, SAMPLE_RATE_HZ);
         assert_eq!(

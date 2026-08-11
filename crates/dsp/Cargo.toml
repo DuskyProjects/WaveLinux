@@ -19,3 +19,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 wavelinux-accelerator = { path = "../accelerator" }
 wavelinux-model = { path = "../model" }
+
+[dev-dependencies]
+tempfile.workspace = true

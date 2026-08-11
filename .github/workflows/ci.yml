@@ -55,7 +55,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pipewire-bin pipewire-pulse ripgrep shellcheck
-      - run: shellcheck scripts/*.sh
+      - run: shellcheck install.sh scripts/*.sh
       - run: bash scripts/check-docs.sh
       - run: bash scripts/check-dependencies.sh
+      - run: bash scripts/test-installers.sh
       - run: git diff --check

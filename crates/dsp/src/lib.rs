@@ -1095,6 +1095,57 @@ impl DspCoreManifest {
     }
 }
 
+/// Hash only endpoint topology. Live targets, levels, latency, and effect
+/// parameters are intentionally excluded because the running core applies
+/// those without replacing its PipeWire nodes.
+pub fn core_topology_revision(manifest: &DspCoreManifest) -> String {
+    let mut topology = format!("protocol:{}|", manifest.protocol_version);
+    topology.push_str(
+        &manifest
+            .channels
+            .iter()
+            .map(|channel| {
+                format!(
+                    "{}:{}:{}:{}:{}:{:?}:{}:{:?}:{}:{}",
+                    channel.channel_id,
+                    channel.channel_name,
+                    channel.input_node_name,
+                    channel.output_node_name,
+                    channel.input_channels,
+                    channel.input_mode,
+                    channel.input_target_capable,
+                    channel.input_role,
+                    channel.sample_rate_hz,
+                    channel.property_prefix,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|"),
+    );
+    for mix in &manifest.mixes {
+        topology.push('|');
+        topology.push_str(&format!(
+            "mix:{}:{}:{}:{}:{}",
+            mix.mix_id,
+            mix.mix_name,
+            mix.output_node_name,
+            mix.sample_rate_hz,
+            mix.buses
+                .iter()
+                .map(|bus| bus.channel_id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in topology.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChainMetrics {
     pub frames: usize,

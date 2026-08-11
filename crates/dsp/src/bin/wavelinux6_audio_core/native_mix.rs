@@ -2139,7 +2139,7 @@ mod tests {
             format!("wavelinux6_fx_{channel_id}_source"),
             Vec::new(),
         );
-        let channel = Arc::new(NativeShared::new(&channel_config, None));
+        let channel = Arc::new(NativeShared::new(&channel_config, None, ""));
         for _ in 0..write_frames {
             channel.history.push([0.0, 0.0]);
         }
@@ -2236,7 +2236,7 @@ mod tests {
             "wavelinux6_fx_music_source",
             Vec::new(),
         );
-        let channel = Arc::new(NativeShared::new(&channel_config, None));
+        let channel = Arc::new(NativeShared::new(&channel_config, None, ""));
         channel.meter.publish(0.5, 0.25, 0.3, 0.15, 256);
         let mix = Arc::new(NativeMixShared::new(&mix_config()));
         let registry = NativeMixRegistry {

@@ -130,11 +130,18 @@ remove_obsolete_runtime_artifacts() {
     -type f \
     \( -iname '*deep_filter*' -o -iname '*deepfilter*' \) \
     -delete 2>/dev/null || true
+
+  # WebKit must use host-installed sandbox tools. Copies inside an AppImage
+  # lose the host capabilities/user-namespace context and fail at runtime.
+  find "$APPDIR" -type f \
+    \( -name bwrap -o -name xdg-dbus-proxy \) \
+    -delete 2>/dev/null || true
 }
 
 install_appimage_apprun() {
   install -d "$APPDIR/usr/wavelinux-runtime/bin"
   install -m 0755 "$ROOT_DIR/scripts/check-dependencies.sh" "$APPDIR/usr/wavelinux-runtime/bin/check-dependencies.sh"
+  install -m 0755 "$ROOT_DIR/scripts/runtime-dependencies.sh" "$APPDIR/usr/wavelinux-runtime/bin/runtime-dependencies.sh"
   if [[ ! -x "$APPDIR/AppRun.wrapped" ]]; then
     echo "Missing linuxdeploy AppRun payload: $APPDIR/AppRun.wrapped" >&2
     echo "Run the Tauri AppImage build step before finalizing the AppImage." >&2

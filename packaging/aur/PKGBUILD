@@ -8,11 +8,17 @@ url="https://github.com/DuskyProjects/WaveLinux"
 license=('GPL-3.0-only')
 install=$pkgname.install
 depends=(
+  'gawk'
+  'procps-ng'
   'pipewire'
+  'pipewire-audio'
+  'pipewire-alsa'
   'pipewire-pulse'
   'wireplumber'
   'libpulse'
   'alsa-utils'
+  'alsa-plugins'
+  'rtkit'
   'webkit2gtk-4.1'
   'gtk3'
   'libayatana-appindicator'
@@ -23,11 +29,14 @@ depends=(
   'mesa'
   'libglvnd'
   'wayland'
+  'libdrm'
+  'fontconfig'
   'gstreamer'
   'gst-plugins-base-libs'
   'gst-plugins-good'
   'noto-fonts'
   'xdg-desktop-portal'
+  'xdg-desktop-portal-gtk'
 )
 makedepends=(
   'git'
@@ -48,6 +57,7 @@ build() {
   node node_modules/.bin/tsc --noEmit
   node node_modules/.bin/vite build
   cargo build --release --locked -p wavelinux-app --bin wavelinux6
+  cargo build --release --locked -p wavelinux-app --bin wavelinux6-peripheral-plugin
   cargo build --release --locked -p wavelinux-dsp --bin wavelinux6-audio-core
 }
 
@@ -60,6 +70,11 @@ package() {
   cd "WaveLinux-$pkgver"
   install -Dm755 target/release/wavelinux6 "$pkgdir/usr/bin/wavelinux6"
   install -Dm755 target/release/wavelinux6-audio-core "$pkgdir/usr/bin/wavelinux6-audio-core"
+  install -Dm755 target/release/wavelinux6-peripheral-plugin "$pkgdir/usr/bin/wavelinux6-peripheral-plugin"
+  install -Dm755 scripts/check-dependencies.sh "$pkgdir/usr/lib/wavelinux6/check-dependencies.sh"
+  install -Dm755 scripts/runtime-dependencies.sh "$pkgdir/usr/lib/wavelinux6/runtime-dependencies.sh"
+  install -Dm755 scripts/wavelinux-processes.sh "$pkgdir/usr/lib/wavelinux6/wavelinux-processes.sh"
+  install -Dm755 scripts/verify-install.sh "$pkgdir/usr/lib/wavelinux6/verify-install.sh"
   install -Dm644 crates/app/icons/icon.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/wavelinux6.png"
   install -Dm644 crates/app/icons/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/wavelinux6.svg"
   install -Dm644 crates/app/appimage-extra/usr/share/metainfo/io.github.duskyprojects.WaveLinux6.appdata.xml \

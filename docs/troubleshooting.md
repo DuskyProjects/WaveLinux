@@ -158,7 +158,8 @@ journalctl --user --since '5 minutes ago' --no-pager | \
 ```
 
 Health should raise adaptive latency after real underrun evidence without a
-`repair.*` event, public-node replacement, or helper restart. CPU pressure alone
+`repair.*` event, public-node replacement, or helper restart. Predictive system
+pressure (CPU busy time, Linux CPU PSI stalls, or normalized run-queue load)
 raises one level at a time; real discontinuities can jump two.
 
 ## Socket ACL Errors

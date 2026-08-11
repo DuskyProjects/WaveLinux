@@ -107,7 +107,21 @@ Required outcomes:
 - at least 30% active-core CPU reduction from the recorded WaveLinux5 baseline;
 - no microphone latency regression.
 
-The current alpha has not completed the full 60-minute automated gate.
+Stable promotion requires completing the full 60-minute automated gate on the
+exact release candidate artifacts.
+
+Run it with:
+
+```bash
+WAVELINUX_STRESS_DURATION_SEC=3600 bash scripts/stress-audio-isolated.sh \
+  target/release/bundle/appimage/WaveLinux6_6.0.0_amd64.AppImage
+```
+
+The harness starts a separate D-Bus, PipeWire, PipeWire-Pulse, and policy-only
+WirePlumber session. Its monitor may target only a null/dummy sink, so the
+continuity pilot cannot reach the desktop user's headphones or speakers.
+`scripts/stress-audio-runtime.sh` rejects physical monitor targets by default;
+its override is for unattended lab hardware only.
 
 ## Packaging And Distro Smoke
 

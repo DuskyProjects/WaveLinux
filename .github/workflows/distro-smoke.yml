@@ -41,29 +41,43 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           tag="$INPUT_TAG"
-          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
-            tag="$WORKFLOW_RUN_HEAD_BRANCH"
-          fi
-          if [[ -z "$tag" || "$tag" == "latest" ]]; then
+          if [[ "$EVENT_NAME" == "workflow_run" || -z "$tag" || "$tag" == "latest" ]]; then
             tag="$(gh release view --repo "$REPO" --json tagName --jq .tagName)"
           fi
-          if [[ "$tag" != v* ]]; then
+          if [[ ! "$tag" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
             echo "Resolved smoke target is not a stable release tag: $tag" >&2
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-  appimage-runtime:
+  standalone-runtime:
     needs: resolve-tag
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        distro: [debian13, ubuntu2404, fedora, arch, cachyos]
+        distro: [debian13, ubuntu2404, fedora, arch, cachyos, opensuse]
     steps:
       - uses: actions/checkout@v6
-      - name: Smoke AppImage runtime installer on ${{ matrix.distro }}
+      - name: Run the live standalone installer on ${{ matrix.distro }}
+        run: |
+          bash scripts/distro-smoke.sh \
+            --distro "${{ matrix.distro }}" \
+            --target standalone \
+            --release-tag "${{ needs.resolve-tag.outputs.tag }}"
+
+  direct-appimage:
+    needs: resolve-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian13, ubuntu2404, fedora, arch, cachyos, opensuse]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Smoke the direct AppImage on ${{ matrix.distro }}
         run: |
           bash scripts/distro-smoke.sh \
             --distro "${{ matrix.distro }}" \

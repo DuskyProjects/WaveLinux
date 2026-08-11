@@ -10,14 +10,17 @@ local build/install never pushes, tags, or publishes by itself.
 3. Build unsigned acceptance artifacts with `bash scripts/build-portable.sh`.
 4. Run `bash scripts/check-package-contents.sh target/portable/release/bundle`
    and verify the reported glibc requirements do not exceed 2.39.
-5. Run AppImage and native-package smoke tests for Debian, Ubuntu, Fedora,
-   Arch, and CachyOS through `scripts/distro-smoke.sh`. Confirm the CachyOS
-   WebKit pixel-render gate passes.
+5. Run standalone installer and AppImage smoke tests for Debian, Ubuntu,
+   Fedora, Arch, CachyOS, and openSUSE through `scripts/distro-smoke.sh`.
+   Run native-package tests on Debian, Ubuntu, and Fedora, and confirm the
+   CachyOS WebKit pixel-render gate passes.
 6. Install locally through `scripts/install-local.sh` and verify public nodes,
    routing, meters, microphone, Stream aggregation, effect swaps, hotplug, and
    current Health/log output.
-7. Complete the 60-minute `scripts/stress-audio-runtime.sh` gate and retain its
-   JSON result.
+7. Complete the 60-minute `scripts/stress-audio-isolated.sh` gate against the
+   exact AppImage and retain its JSON result. The isolated PipeWire policy
+   session has no physical output; the lower-level runtime gate refuses a real
+   monitor target unless a controlled lab explicitly overrides that guard.
 
 Any unexplained discontinuity, owned underrun, failed link, graph rebuild,
 silent interval, or missed performance threshold blocks release.
@@ -51,15 +54,18 @@ After explicit authorization:
 1. create one intentional release commit;
 2. push the validated branch to `master` without discarding remote history;
 3. create and push the exact version tag;
-4. allow the release workflow to build, validate, and upload the AppImage,
-   Debian package, RPM package, updater artifacts, and AUR metadata;
+4. allow the release workflow to build, validate, and upload the standalone
+   installers, bootstrap installer, AppImage, Debian package, RPM package,
+   updater artifacts, manifest, checksums, and AUR metadata;
 5. publish versions containing a prerelease suffix as GitHub prereleases and
    stable versions as normal releases;
 6. verify CI, distro smoke, release upload, checksums/signatures, and downloadable
    package contents from GitHub.
 
-For WaveLinux 6 Alpha 1, the exact version is `6.0.0-alpha.1`, the exact tag is
-`v6.0.0-alpha.1`, and the GitHub release title is `WaveLinux 6 Alpha 1`.
+For the first stable WaveLinux 6 release, the exact version is `6.0.0`, the exact
+tag is `v6.0.0`, and the GitHub release title is `WaveLinux 6.0.0`. The malformed
+empty `6.0` prerelease is retained only as a superseded historical marker; its
+tag is never moved or reused.
 
 Do not mark the release complete while a required GitHub check is queued,
 cancelled, or failing.

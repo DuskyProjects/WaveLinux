@@ -5,6 +5,15 @@ this_dir="$(readlink -f "$(dirname "$0")")"
 runtime_dir="$this_dir/usr/wavelinux-runtime"
 runtime_bin_dir="$runtime_dir/bin"
 dependency_script="$runtime_bin_dir/check-dependencies.sh"
+audio_core="$runtime_bin_dir/wavelinux6-audio-core"
+peripheral_plugin="$runtime_bin_dir/wavelinux6-peripheral-plugin"
+
+for helper in "$audio_core" "$peripheral_plugin"; do
+  if [[ ! -x "$helper" ]]; then
+    echo "WaveLinux AppImage runtime helper is missing or not executable: $helper" >&2
+    exit 1
+  fi
+done
 
 run_dependency_helper() {
   if [[ ! -x "$dependency_script" ]]; then
@@ -53,6 +62,17 @@ if [[ "${WAVELINUX_SKIP_APPIMAGE_PREFLIGHT:-0}" != "1" ]]; then
     fi
   fi
   rm -f "$preflight_log"
+  export WAVELINUX_ASSUME_RUNTIME_DEPS=1
+fi
+
+# The audio core and optional peripheral process are selected explicitly. This
+# avoids accidental resolution to an older user or system binary while still
+# allowing deliberate development overrides.
+export WAVELINUX_DSP_HELPER="${WAVELINUX_DSP_HELPER:-$audio_core}"
+export WAVELINUX_PERIPHERAL_PLUGIN="${WAVELINUX_PERIPHERAL_PLUGIN:-$peripheral_plugin}"
+if [[ -z "${WAVELINUX_FILTER_CHAIN_PIPEWIRE:-}" ]] && command -v pipewire >/dev/null 2>&1; then
+  host_pipewire="$(command -v pipewire)"
+  export WAVELINUX_FILTER_CHAIN_PIPEWIRE="$host_pipewire"
 fi
 
 source_hook_if_present() {

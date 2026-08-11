@@ -2,16 +2,22 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/wavelinux-processes.sh
+source "$ROOT_DIR/scripts/wavelinux-processes.sh"
 DURATION_SEC="${WAVELINUX_STRESS_DURATION_SEC:-3600}"
 CPU_COUNT="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"
-# Leave scheduler capacity for PipeWire, the capture oracle, disk I/O, and the
-# network workload. Saturating every remaining CPU measures recorder starvation
-# instead of WaveLinux continuity.
-CPU_WORKERS="${WAVELINUX_STRESS_CPU_WORKERS:-$((CPU_COUNT > 3 ? CPU_COUNT * 2 / 3 : 1))}"
+# The parallel network stream consumes several additional cores. Keep half the
+# machine free for PipeWire, recording, disk I/O, and that network workload so
+# the gate measures audio continuity instead of total scheduler starvation.
+CPU_WORKERS="${WAVELINUX_STRESS_CPU_WORKERS:-$((CPU_COUNT > 3 ? CPU_COUNT / 2 : 1))}"
 DISK_MIB="${WAVELINUX_STRESS_DISK_MIB:-512}"
 NETWORK_PARALLEL="${WAVELINUX_STRESS_NETWORK_PARALLEL:-4}"
-TONE_FREQUENCY="${WAVELINUX_STRESS_TONE_HZ:-4000}"
-TONE_AMPLITUDE="${WAVELINUX_STRESS_TONE_AMPLITUDE:-8000}"
+TONE_FREQUENCY="${WAVELINUX_STRESS_TONE_HZ:-400}"
+# Keep the deterministic pilot near -42 dBFS. It remains well above the
+# analyzer floor but cannot become a dangerous full-volume signal if a host
+# policy unexpectedly links the fixture to physical monitoring.
+TONE_AMPLITUDE="${WAVELINUX_STRESS_TONE_AMPLITUDE:-256}"
+TONE_SILENCE_THRESHOLD="$((TONE_AMPLITUDE > 16 ? TONE_AMPLITUDE / 8 : 1))"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUTPUT_DIR="${WAVELINUX_STRESS_OUTPUT_DIR:-$ROOT_DIR/target/stress/$TIMESTAMP}"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wavelinux6"
@@ -56,6 +62,18 @@ for command_name in "${required_commands[@]}"; do
 done
 if [[ ! -f "$MANIFEST" ]]; then
   echo "WaveLinux 6 audio-core manifest is missing: $MANIFEST" >&2
+  exit 2
+fi
+
+unsafe_monitor_target_count="$(jq '[
+  .mixes[]
+  | select(.mix_id == "monitor")
+  | .output_target_node_names[]?
+  | select(test("(^|[._-])(auto_null|null|dummy)($|[._-])"; "i") | not)
+] | length' "$MANIFEST")"
+if ((unsafe_monitor_target_count > 0)) && [[ "${WAVELINUX_STRESS_ALLOW_PHYSICAL_MONITOR:-0}" != 1 ]]; then
+  echo "Refusing to inject a continuity pilot into a graph connected to physical monitoring." >&2
+  echo "Run scripts/stress-audio-isolated.sh, or set WAVELINUX_STRESS_ALLOW_PHYSICAL_MONITOR=1 only in a controlled lab." >&2
   exit 2
 fi
 if [[ ! -f "$BASELINE_FILE" ]]; then
@@ -110,14 +128,8 @@ live_pid_by_comm() {
   ps -eo pid=,stat=,comm= | awk -v name="$name" '$2 !~ /^Z/ && $3 == name { print $1; exit }'
 }
 
-live_pid_by_args() {
-  local pattern="$1"
-  ps -eo pid=,stat=,comm=,args= | awk -v pattern="$pattern" \
-    '$2 !~ /^Z/ && $3 != "awk" && index($0, pattern) { print $1; exit }'
-}
-
-app_pid="$(live_pid_by_comm wavelinux6 || true)"
-core_pid="$(live_pid_by_args 'wavelinux6-audio-core --run-core' || true)"
+app_pid="${WAVELINUX_STRESS_APP_PID:-$(wavelinux_collect_process_pids app-runtime | head -n1 || true)}"
+core_pid="${WAVELINUX_STRESS_CORE_PID:-$(wavelinux_collect_process_pids audio-core | head -n1 || true)}"
 pipewire_pid="$(live_pid_by_comm pipewire || true)"
 pulse_pid="$(live_pid_by_comm pipewire-pulse || true)"
 if [[ -z "$app_pid" || -z "$core_pid" ]]; then
@@ -170,7 +182,7 @@ stop_background_loads() {
 }
 
 # Invoked indirectly by the EXIT/INT/TERM trap.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup_on_exit() {
   stop_background_loads
   if ((cleanup_complete == 0)); then
@@ -309,7 +321,7 @@ capture_core_diagnostics() {
 graph_identity() {
   local destination="$1"
   {
-    printf 'core_pid %s\n' "$(live_pid_by_args 'wavelinux6-audio-core --run-core' || true)"
+    printf 'core_pid %s\n' "$core_pid"
     pactl list short sources | awk '$2 ~ /^wavelinux6[-_]/ {print "source " $1 " " $2}'
     pactl list short sinks | awk '$2 ~ /^wavelinux6[-_]/ {print "sink " $1 " " $2}'
     pactl list modules short | grep -E 'wavelinux6[._-]' | sed 's/^/module /' || true
@@ -395,6 +407,7 @@ setsid bash -c '
       --stream-name="Continuity Fixture" \
       --property=application.id=wavelinux6-stress-tone \
       --property=application.process.binary=wavelinux6-stress-tone \
+      --property=wavelinux6.managed=1 \
       --property=media.role=production
 ' _ "$ROOT_DIR/scripts/generate-stress-tone.py" "$TONE_FREQUENCY" "$TONE_AMPLITUDE" "$STRESS_CHANNEL_SINK" >"$TONE_LOG" 2>&1 &
 tone_group_pid=$!
@@ -560,7 +573,14 @@ PROCESS_GROUPS=()
 
 copy_log_delta "$ENGINE_LOG" "$ENGINE_START_LINES" "$ENGINE_DELTA"
 copy_log_delta "$CORE_LOG" "$CORE_START_LINES" "$CORE_DELTA"
-journalctl --user --since "@$START_EPOCH" --until "@$END_EPOCH" --no-pager > "$JOURNAL_FILE" 2>/dev/null || :
+if [[ -n "${WAVELINUX_STRESS_SERVICE_LOG_DIR:-}" ]]; then
+  find "$WAVELINUX_STRESS_SERVICE_LOG_DIR" -maxdepth 1 -type f \
+    \( -name 'pipewire*.log' -o -name 'wireplumber*.log' \) -print0 \
+    | sort -z \
+    | xargs -0r cat > "$JOURNAL_FILE"
+else
+  journalctl --user --since "@$START_EPOCH" --until "@$END_EPOCH" --no-pager > "$JOURNAL_FILE" 2>/dev/null || :
+fi
 grep -Eai '(out of buffers|xrun|underrun|resync|failed to (link|activate)|link[^ ]* failure|buffer[^ ]* error)' "$JOURNAL_FILE" \
   | grep -Eai '(pipewire|wireplumber|wavelinux|pw\.)' > "$WARNING_FILE" || :
 
@@ -571,13 +591,18 @@ if python3 "$ROOT_DIR/scripts/analyze-stress-audio.py" \
   --channels 2 \
   --frequency "$TONE_FREQUENCY" \
   --amplitude "$TONE_AMPLITUDE" \
+  --silence-threshold "$TONE_SILENCE_THRESHOLD" \
   --channel-mode antiphase \
   --expected-duration "$RECORD_EXPECTED_SEC" \
   > "$ANALYSIS_FILE"; then
   audio_analysis_ok=true
 fi
 
-grep -oE 'estimated_event_to_route_ms=[0-9]+' "$ENGINE_DELTA" | cut -d= -f2 > "$ROUTE_TIMINGS_FILE" || :
+{
+  grep -oE 'estimated_event_to_route_ms=[0-9]+' "$ENGINE_DELTA" | cut -d= -f2 || :
+  grep -oE '\[route[.]streams[.]fast\] moved=[0-9]+ elapsed_ms=[0-9]+' "$ENGINE_DELTA" \
+    | sed 's/.*elapsed_ms=//' || :
+} > "$ROUTE_TIMINGS_FILE"
 route_p95="$(percentile_from_file "$ROUTE_TIMINGS_FILE" 95)"
 readiness_ms="$(grep '\[repair.end\]' "$ENGINE_LOG" | sed -n 's/.*elapsed_ms=\([0-9][0-9]*\).*/\1/p' | tail -n 1)"
 readiness_ms="${readiness_ms:-null}"
@@ -637,8 +662,9 @@ fi
 
 public_nodes_ok=true
 while IFS= read -r node_name; do
-  if ! pactl list short sources | awk '{print $2}' | grep -Fxq "$node_name" \
-    && ! pactl list short sinks | awk '{print $2}' | grep -Fxq "$node_name"; then
+  node_count="$({ pactl list short sources; pactl list short sinks; } \
+    | awk -v expected="$node_name" '$2 == expected { count++ } END { print count+0 }')"
+  if [[ "$node_count" != 1 ]]; then
     public_nodes_ok=false
     break
   fi

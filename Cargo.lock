@@ -5420,7 +5420,7 @@ dependencies = [
 
 [[package]]
 name = "wavelinux-app"
-version = "6.0.0-alpha.1"
+version = "6.0.0"
 dependencies = [
  "libc",
  "libloading 0.8.9",
@@ -5449,6 +5449,7 @@ dependencies = [
  "pipewire",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "wavelinux-accelerator",
  "wavelinux-model",

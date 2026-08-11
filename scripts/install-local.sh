@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/wavelinux-processes.sh
+source "$ROOT_DIR/scripts/wavelinux-processes.sh"
 APPIMAGE_DIR="$ROOT_DIR/target/release/bundle/appimage"
 APPIMAGE="$({ find "$APPIMAGE_DIR" -maxdepth 1 -type f -name 'WaveLinux6_*_amd64.AppImage' -print 2>/dev/null || true; } | sort -V | tail -n1)"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
@@ -16,6 +18,7 @@ DSP_HELPER="$BIN_DIR/wavelinux6-audio-core"
 PERIPHERAL_PLUGIN="$BIN_DIR/wavelinux6-peripheral-plugin"
 INSTALLED_APPIMAGE="$SUPPORT_DIR/$(basename "${APPIMAGE:-WaveLinux6.AppImage}")"
 INSTALLED_SANITIZER="$SUPPORT_DIR/sanitize-runtime-env.sh"
+INSTALLED_PROCESS_MATCHER="$SUPPORT_DIR/wavelinux-processes.sh"
 LOCAL_PROFILE_SEED_DIR="$CONFIG_DIR/hardware-profiles/v1/local/wavelinux6-local-seed"
 
 if [[ -z "$APPIMAGE" || ! -f "$APPIMAGE" ]]; then
@@ -85,44 +88,31 @@ stop_previous_wavelinux_processes() {
     fi
   }
 
-  mapfile -t app_pids < <(
-    ps -eo pid=,args= | awk '
-      $0 !~ /awk / && $0 !~ /install-local\.sh/ &&
-      (/(^|[\/ ])wavelinux6([ ]|$)/ ||
-       /WaveLinux6_[^ ]*_amd64\.AppImage/) { print $1 }
-    ' | sort -u
+  mapfile -t app_pids < <(wavelinux_collect_process_pids app | sort -u)
+  mapfile -t legacy_app_pids < <(wavelinux_collect_process_pids legacy-app | sort -u)
+  mapfile -t app_child_pids < <(
+    collect_descendant_pids "${app_pids[@]}" "${legacy_app_pids[@]}"
   )
-  mapfile -t app_child_pids < <(collect_descendant_pids "${app_pids[@]}")
   # Stop the graph owner first. Killing its helpers while it is still alive can
   # make the engine reconstruct them during installation.
   stop_pids "WaveLinux app" TERM "${app_pids[@]}"
+  stop_pids "WaveLinux5 app" TERM "${legacy_app_pids[@]}"
   stop_pids "WaveLinux app child" KILL "${app_child_pids[@]}"
 
-  mapfile -t helper_pids < <(
-    ps -eo pid=,args= | awk '
-      $0 !~ /awk / && $0 !~ /install-local\.sh/ &&
-      /wavelinux6-audio-core/ { print $1 }
-    ' | sort -u
-  )
+  mapfile -t helper_pids < <(wavelinux_collect_process_pids audio-core | sort -u)
   stop_pids "WaveLinux audio core" TERM "${helper_pids[@]}"
 
-  mapfile -t peripheral_pids < <(
-    ps -eo pid=,args= | awk '
-      $0 !~ /awk / && $0 !~ /install-local\.sh/ &&
-      /wavelinux6-peripheral-plugin/ { print $1 }
-    ' | sort -u
-  )
+  mapfile -t legacy_helper_pids < <(wavelinux_collect_process_pids legacy-helper | sort -u)
+  stop_pids "WaveLinux5 DSP helper" TERM "${legacy_helper_pids[@]}"
+
+  mapfile -t peripheral_pids < <(wavelinux_collect_process_pids peripheral | sort -u)
   stop_pids "WaveLinux peripheral plugin" TERM "${peripheral_pids[@]}"
 
-  mapfile -t filter_chain_pids < <(
-    ps -eo pid=,args= | awk '
-      $0 !~ /awk / && $0 !~ /install-local\.sh/ &&
-      /pipewire -c .*\/wavelinux6\/effects\/wavelinux6-chain-/ {
-        print $1
-      }
-    ' | sort -u
-  )
+  mapfile -t filter_chain_pids < <(wavelinux_collect_filter_chain_pids | sort -u)
   stop_pids "WaveLinux filter-chain" KILL "${filter_chain_pids[@]}"
+
+  mapfile -t legacy_filter_chain_pids < <(wavelinux_collect_legacy_filter_chain_pids | sort -u)
+  stop_pids "WaveLinux5 filter-chain" KILL "${legacy_filter_chain_pids[@]}"
 
 }
 
@@ -180,6 +170,9 @@ else
   echo "Warning: missing wavelinux6-peripheral-plugin; run bash scripts/build-local.sh to build it." >&2
 fi
 install -m 0755 "$ROOT_DIR/scripts/check-dependencies.sh" "$SUPPORT_DIR/check-dependencies.sh"
+install -m 0755 "$ROOT_DIR/scripts/runtime-dependencies.sh" "$SUPPORT_DIR/runtime-dependencies.sh"
+install -m 0755 "$ROOT_DIR/scripts/verify-install.sh" "$SUPPORT_DIR/verify-install.sh"
+install -m 0755 "$ROOT_DIR/scripts/wavelinux-processes.sh" "$INSTALLED_PROCESS_MATCHER"
 install -m 0755 "$ROOT_DIR/scripts/install-alsa-aliases.sh" "$SUPPORT_DIR/install-alsa-aliases.sh"
 install -m 0755 "$ROOT_DIR/scripts/remove-alsa-aliases.sh" "$SUPPORT_DIR/remove-alsa-aliases.sh"
 install -m 0644 "$ROOT_DIR/scripts/sanitize-runtime-env.sh" "$INSTALLED_SANITIZER"

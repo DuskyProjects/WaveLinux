@@ -84,7 +84,10 @@ use hardware_profiles::{
     HardwareProfileCatalog,
 };
 #[cfg(test)]
-use health::{cpu_pressure_between, parse_proc_stat_cpu};
+use health::{
+    cpu_pressure_between, parse_proc_load_pressure, parse_proc_pressure_total, parse_proc_stat_cpu,
+    stall_pressure_between,
+};
 use health::{pipewire_health_deltas, CpuPressureSampler, PipeWireAudioHealthTracker};
 use registry_actor::{run_native_registry_connection, NativeRegistryHooks};
 
@@ -1776,6 +1779,8 @@ struct AudioCoreDiagnosticsResponse {
     protocol_version: u16,
     #[serde(default)]
     route_id: String,
+    #[serde(default)]
+    core_topology_revision: String,
     #[serde(default = "default_sample_rate_hz")]
     sample_rate_hz: u32,
     #[serde(default)]
@@ -2445,7 +2450,10 @@ impl WaveLinuxEngine {
                     engine.options.dry_run,
                     engine.options.auto_repair_on_start,
                     engine.options.poll_interval.as_millis(),
-                    config.settings.restore_audio_graph_on_launch,
+                    should_restore_audio_graph_on_launch(
+                        &graph_prefix(),
+                        config.settings.restore_audio_graph_on_launch,
+                    ),
                     config.settings.lock_default_input,
                     config.settings.lock_default_output,
                     engine.startup_defaults.sink.as_deref().unwrap_or("<none>"),
@@ -2461,10 +2469,12 @@ impl WaveLinuxEngine {
             );
         }
         engine.log_runtime_identity();
-        let restore_on_launch = engine
+        let configured_restore_on_launch = engine
             .read_config()
             .map(|config| config.settings.restore_audio_graph_on_launch)
             .unwrap_or(false);
+        let restore_on_launch =
+            should_restore_audio_graph_on_launch(&graph_prefix(), configured_restore_on_launch);
         let startup_graph_reusable = engine.options.auto_repair_on_start
             && restore_on_launch
             && engine.startup_audio_graph_reusable().unwrap_or(false);
@@ -5617,6 +5627,56 @@ impl WaveLinuxEngine {
             self.stop_tracked_effect_chain_process(AUDIO_CORE_PROCESS_KEY);
         }
 
+        if running_revision.is_none() {
+            let existing_manifest = read_json::<wavelinux_dsp::DspCoreManifest>(&manifest_path);
+            if let Ok(existing_manifest) = existing_manifest {
+                if let Some(channel) = existing_manifest.channels.first() {
+                    let socket_path = self.paths.channel_control_socket(&channel.channel_id);
+                    if let Ok(response) =
+                        query_audio_core_diagnostics(&socket_path, &channel.channel_id)
+                    {
+                        if response.core_topology_revision == topology_revision {
+                            match self.wait_for_persistent_audio_core_ready(&manifest_path) {
+                                Ok(ready) => {
+                                    self.refresh_persistent_effect_revisions();
+                                    return CommandExecution {
+                                        command,
+                                        stdout: String::new(),
+                                        stderr: format!(
+                                            "adopted existing persistent audio core; readiness acknowledged for {ready} endpoints"
+                                        ),
+                                        skipped: true,
+                                        error: None,
+                                    };
+                                }
+                                Err(error) => self.log_engine_event(
+                                    "effects.ready",
+                                    format!(
+                                        "existing audio core was incomplete; requesting a controlled restart: {error}"
+                                    ),
+                                ),
+                            }
+                        } else {
+                            self.log_engine_event(
+                                "effects.ready",
+                                format!(
+                                    "existing audio core topology {} does not match {}; requesting a controlled restart",
+                                    response.core_topology_revision, topology_revision
+                                ),
+                            );
+                        }
+                        if let Err(error) = request_audio_core_shutdown(
+                            &socket_path,
+                            &channel.channel_id,
+                            EFFECT_CORE_READY_TIMEOUT,
+                        ) {
+                            return command_execution(Err(PwError::Io(error)));
+                        }
+                    }
+                }
+            }
+        }
+
         let log_path = self.paths.config_dir.join(AUDIO_CORE_LOG_FILE);
         let result = (|| -> Result<CommandOutput, PwError> {
             let stdout = OpenOptions::new()
@@ -5692,6 +5752,13 @@ impl WaveLinuxEngine {
                 &channel.channel_id,
                 EFFECT_CORE_READY_TIMEOUT,
             )?;
+            if response.core_topology_revision != wavelinux_dsp::core_topology_revision(&manifest) {
+                return Err(format!(
+                    "audio core topology {} does not match expected {}",
+                    response.core_topology_revision,
+                    wavelinux_dsp::core_topology_revision(&manifest)
+                ));
+            }
             self.observe_effect_core_ready(channel, &response);
             self.log_engine_event(
                 "effects.ready",
@@ -11595,6 +11662,10 @@ fn normalized_profile_routing(policy: RoutingPolicy) -> RoutingPolicy {
     policy
 }
 
+fn should_restore_audio_graph_on_launch(graph_namespace: &str, configured: bool) -> bool {
+    graph_namespace == "wavelinux6" || configured
+}
+
 fn settings_affect_audio_graph(previous: &MixerSettings, next: &MixerSettings) -> bool {
     previous.monitor_follows_default_output != next.monitor_follows_default_output
         || previous.lock_default_input != next.lock_default_input
@@ -12960,6 +13031,41 @@ fn query_audio_core_diagnostics(
 }
 
 #[cfg(unix)]
+fn request_audio_core_shutdown(
+    socket_path: &Path,
+    route_id: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "protocol_version": wavelinux_dsp::CORE_CONTROL_PROTOCOL_VERSION,
+        "command": "shutdown",
+        "request_id": Uuid::new_v4().to_string(),
+        "route_id": route_id,
+    });
+    send_core_control_request(socket_path, &payload)?;
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if query_audio_core_diagnostics(socket_path, route_id).is_err() {
+            return Ok(());
+        }
+        thread::sleep(EFFECT_CORE_RETRY_MIN);
+    }
+    Err(format!(
+        "audio core did not stop within {} ms after shutdown acknowledgement",
+        timeout.as_millis()
+    ))
+}
+
+#[cfg(not(unix))]
+fn request_audio_core_shutdown(
+    _socket_path: &Path,
+    _route_id: &str,
+    _timeout: Duration,
+) -> Result<(), String> {
+    Err("WaveLinux audio-core shutdown requires Unix sockets".into())
+}
+
+#[cfg(unix)]
 fn wait_for_audio_core_ready(
     socket_path: &Path,
     route_id: &str,
@@ -13190,45 +13296,7 @@ fn audio_core_topology_revision(manifest_path: &Path) -> Result<String, String> 
     let raw = fs::read_to_string(manifest_path).map_err(|err| err.to_string())?;
     let manifest: wavelinux_dsp::DspCoreManifest =
         serde_json::from_str(&raw).map_err(|err| err.to_string())?;
-    let mut topology = format!("protocol:{}|", manifest.protocol_version);
-    topology.push_str(
-        &manifest
-            .channels
-            .iter()
-            .map(|channel| {
-                format!(
-                    "{}:{}:{}:{}:{}:{:?}:{}:{:?}:{}:{}",
-                    channel.channel_id,
-                    channel.channel_name,
-                    channel.input_node_name,
-                    channel.output_node_name,
-                    channel.input_channels,
-                    channel.input_mode,
-                    channel.input_target_capable,
-                    channel.input_role,
-                    channel.sample_rate_hz,
-                    channel.property_prefix,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("|"),
-    );
-    for mix in &manifest.mixes {
-        topology.push('|');
-        topology.push_str(&format!(
-            "mix:{}:{}:{}:{}:{}",
-            mix.mix_id,
-            mix.mix_name,
-            mix.output_node_name,
-            mix.sample_rate_hz,
-            mix.buses
-                .iter()
-                .map(|bus| bus.channel_id.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        ));
-    }
-    Ok(content_revision(&topology))
+    Ok(wavelinux_dsp::core_topology_revision(&manifest))
 }
 
 fn effect_chain_launch_command(
@@ -13596,10 +13664,11 @@ fn stream_identity_contains_any(stream: &AppStream, tokens: &[&str]) -> bool {
 }
 
 fn app_stream_is_transient_event(stream: &AppStream) -> bool {
-    stream_identity_contains_any(
-        stream,
-        &["libcanberra", "canberra-gtk-play", "desktop event sound"],
-    )
+    stream_identity_values(stream).any(|value| value.to_ascii_lowercase().contains("wavelinux"))
+        || stream_identity_contains_any(
+            stream,
+            &["libcanberra", "canberra-gtk-play", "desktop event sound"],
+        )
 }
 
 fn stream_identity_values(stream: &AppStream) -> impl Iterator<Item = &str> {
@@ -14875,10 +14944,21 @@ mod tests {
     #[test]
     fn install_script_process_matching_never_targets_stable_wavelinux() {
         let script = include_str!("../../../scripts/install-local.sh");
+        let process_matcher = include_str!("../../../scripts/wavelinux-processes.sh");
         assert!(script.contains("stop_previous_wavelinux_processes"));
         assert!(script.contains("cleanup_previous_wavelinux_audio_modules"));
-        assert!(script.contains("WaveLinux6_[^ ]*_amd64"));
-        assert!(script.contains(r"\/wavelinux6\/effects\/wavelinux6-chain-"));
+        assert!(script.contains("source \"$ROOT_DIR/scripts/wavelinux-processes.sh\""));
+        assert!(process_matcher.contains("app:wavelinux6|app:WaveLinux6_*_amd64.AppImage"));
+        assert!(process_matcher.contains("app-runtime:wavelinux6"));
+        assert!(process_matcher
+            .contains("legacy-app:wavelinux5|legacy-app:WaveLinux5_*_amd64.AppImage"));
+        assert!(process_matcher.contains("wavelinux_collect_owned_filter_chain_pids"));
+        assert!(process_matcher
+            .contains("wavelinux_collect_owned_filter_chain_pids wavelinux6 wavelinux6-chain-"));
+        assert!(process_matcher
+            .contains("wavelinux_collect_owned_filter_chain_pids wavelinux5 wavelinux5-chain-"));
+        assert!(!process_matcher.contains("app:wavelinux|"));
+        assert!(!process_matcher.contains("*/wavelinux/effects/wavelinux-chain-*"));
         assert!(!script.contains("wavelinux(5|6)"));
         assert!(!script.contains("WaveLinux(5|6)"));
         assert!(!script.contains("wavelinux6-audio-core|wavelinux5-dsp-helper"));
@@ -15162,6 +15242,13 @@ mod tests {
         let second_refresh = engine.read_runtime().unwrap().refreshed_at.unwrap();
 
         assert_eq!(first_refresh, second_refresh);
+    }
+
+    #[test]
+    fn persistent_wavelinux6_core_starts_even_when_legacy_restore_is_disabled() {
+        assert!(should_restore_audio_graph_on_launch("wavelinux6", false));
+        assert!(should_restore_audio_graph_on_launch("wavelinux6", true));
+        assert!(!should_restore_audio_graph_on_launch("wavelinux5", false));
     }
 
     #[test]
@@ -19465,6 +19552,28 @@ mod tests {
     }
 
     #[test]
+    fn proc_scheduler_pressure_uses_stalled_time_delta() {
+        let total = parse_proc_pressure_total(
+            "some avg10=12.50 avg60=4.00 avg300=1.00 total=1900000\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        assert_eq!(total, 1_900_000);
+        let pressure = stall_pressure_between(1_000_000, total, Duration::from_secs(1)).unwrap();
+        assert!((pressure - 0.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn proc_load_pressure_normalizes_by_available_cpus() {
+        let pressure = parse_proc_load_pressure("18.00 12.00 6.00 8/2400 1\n", 24).unwrap();
+        assert!((pressure - 0.75).abs() < 0.001);
+        assert_eq!(
+            parse_proc_load_pressure("48.00 1.00 1.00 1/1 1\n", 24),
+            Some(1.0)
+        );
+    }
+
+    #[test]
     fn adaptive_latency_target_changes_do_not_change_route_revisions() {
         let mut config = MixerConfig::default();
         config.settings.low_latency_mic_monitoring = true;
@@ -21319,6 +21428,31 @@ mod tests {
                 &[],
             )
             .unwrap());
+    }
+
+    #[test]
+    fn wavelinux_diagnostic_streams_never_enter_user_routes() {
+        let engine = test_engine();
+        let config = MixerConfig::default();
+        let stream = AppStream {
+            id: "continuity-fixture".into(),
+            app_id: Some("wavelinux6-stress-tone".into()),
+            binary: Some("wavelinux6-stress-tone".into()),
+            process_name: Some("paplay".into()),
+            window_class: None,
+            display_name: "WaveLinux 6 Stress Tone".into(),
+            media_name: Some("Continuity Fixture".into()),
+            routed_channel_id: None,
+            volume: 1.0,
+            muted: false,
+        };
+
+        assert!(route_stream_to_configured_channel(&config, &stream).is_none());
+        assert!(active_app_channel_id_for_stream(&config, &stream).is_none());
+        assert!(!engine
+            .remember_observed_apps(std::slice::from_ref(&stream))
+            .unwrap());
+        assert!(engine.read_config().unwrap().app_history.is_empty());
     }
 
     #[test]

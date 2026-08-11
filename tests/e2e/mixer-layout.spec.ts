@@ -14,6 +14,19 @@ async function expectPageScreenshot(page: Page, name: string) {
   expect(screenshot).toMatchSnapshot(name, { maxDiffPixels: 300 });
 }
 
+async function scrollToEnd(scrollOwner: ReturnType<Page["locator"]>) {
+  await scrollOwner.evaluate((element) => {
+    element.scrollTop = element.scrollHeight - element.clientHeight;
+  });
+  await expect
+    .poll(() =>
+      scrollOwner.evaluate((element) =>
+        Math.abs(element.scrollTop - (element.scrollHeight - element.clientHeight)),
+      ),
+    )
+    .toBeLessThanOrEqual(1);
+}
+
 test("mixer mutations stay responsive and long labels remain contained", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Mixer" })).toBeVisible();
@@ -62,9 +75,7 @@ test("mixer mutations stay responsive and long labels remain contained", async (
   expect(documentOverflow.vertical).toBeLessThanOrEqual(1);
 
   await expect(page.getByText("Source added", { exact: true })).toBeHidden({ timeout: 5_000 });
-  await page.locator(".wl-matrix-scroll").evaluate((element) => {
-    element.scrollTop = element.scrollHeight;
-  });
+  await scrollToEnd(page.locator(".wl-matrix-scroll"));
   await expect(sourceName).toBeVisible();
   await expectPageScreenshot(page, "mixer-long-label-page.png");
 });

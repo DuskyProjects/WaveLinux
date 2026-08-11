@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use time::OffsetDateTime;
 use wavelinux_model::PipeWireAudioHealthStatus;
@@ -32,14 +33,42 @@ pub(crate) struct CpuTimes {
 
 #[derive(Debug, Default)]
 pub(crate) struct CpuPressureSampler {
-    previous: Option<CpuTimes>,
+    previous_cpu: Option<CpuTimes>,
+    previous_scheduler_stall: Option<(u64, Instant)>,
 }
 
 impl CpuPressureSampler {
     pub(crate) fn sample(&mut self) -> Option<f32> {
-        let current = parse_proc_stat_cpu(&fs::read_to_string("/proc/stat").ok()?)?;
-        let previous = self.previous.replace(current)?;
-        cpu_pressure_between(previous, current)
+        let now = Instant::now();
+        let busy_pressure = fs::read_to_string("/proc/stat")
+            .ok()
+            .and_then(|stat| parse_proc_stat_cpu(&stat))
+            .and_then(|current| {
+                self.previous_cpu
+                    .replace(current)
+                    .and_then(|previous| cpu_pressure_between(previous, current))
+            });
+        let scheduler_pressure = fs::read_to_string("/proc/pressure/cpu")
+            .ok()
+            .and_then(|pressure| parse_proc_pressure_total(&pressure))
+            .and_then(|current| {
+                self.previous_scheduler_stall
+                    .replace((current, now))
+                    .and_then(|(previous, sampled_at)| {
+                        stall_pressure_between(previous, current, now.duration_since(sampled_at))
+                    })
+            });
+        let load_pressure = fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|loadavg| {
+                let cpu_count = std::thread::available_parallelism().ok()?.get();
+                parse_proc_load_pressure(&loadavg, cpu_count)
+            });
+
+        [busy_pressure, scheduler_pressure, load_pressure]
+            .into_iter()
+            .flatten()
+            .reduce(f32::max)
     }
 }
 
@@ -221,4 +250,32 @@ pub(crate) fn cpu_pressure_between(previous: CpuTimes, current: CpuTimes) -> Opt
     }
     let idle = current.idle.saturating_sub(previous.idle).min(total);
     Some(((total - idle) as f64 / total as f64).clamp(0.0, 1.0) as f32)
+}
+
+pub(crate) fn parse_proc_pressure_total(pressure: &str) -> Option<u64> {
+    pressure
+        .lines()
+        .find(|line| line.starts_with("some "))?
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("total="))?
+        .parse()
+        .ok()
+}
+
+pub(crate) fn stall_pressure_between(
+    previous_total_micros: u64,
+    current_total_micros: u64,
+    elapsed: Duration,
+) -> Option<f32> {
+    let elapsed_micros = elapsed.as_micros();
+    if elapsed_micros == 0 {
+        return None;
+    }
+    let stalled_micros = current_total_micros.saturating_sub(previous_total_micros);
+    Some((stalled_micros as f64 / elapsed_micros as f64).clamp(0.0, 1.0) as f32)
+}
+
+pub(crate) fn parse_proc_load_pressure(loadavg: &str, cpu_count: usize) -> Option<f32> {
+    let one_minute_load = loadavg.split_whitespace().next()?.parse::<f32>().ok()?;
+    Some((one_minute_load / cpu_count.max(1) as f32).clamp(0.0, 1.0))
 }

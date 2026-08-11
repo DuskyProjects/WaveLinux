@@ -19,5 +19,12 @@
   <provides>
     <binary>wavelinux6</binary>
   </provides>
+  <releases>
+    <release version="6.0.0" date="2026-08-10">
+      <description>
+        <p>Persistent native PipeWire audio core, live DSP, adaptive latency, and verified cross-distribution installation.</p>
+      </description>
+    </release>
+  </releases>
   <content_rating type="oars-1.1" />
 </component>

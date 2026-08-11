@@ -1,6 +1,9 @@
 use std::env;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::mem;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -52,6 +55,57 @@ const RT_CALLBACK_BUCKETS: usize = 256;
 const EMPTY_SEQUENCE: u64 = u64::MAX;
 const WRITING_SEQUENCE: u64 = u64::MAX - 1;
 static TERMINATE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug)]
+struct PersistentCoreLock {
+    _file: File,
+}
+
+fn acquire_persistent_core_lock(
+    runtime_root: &Path,
+    topology_revision: &str,
+) -> Result<PersistentCoreLock, String> {
+    std::fs::create_dir_all(runtime_root).map_err(|err| {
+        format!(
+            "failed to create audio-core runtime directory {}: {err}",
+            runtime_root.display()
+        )
+    })?;
+    let lock_path = runtime_root.join("wavelinux6-audio-core.lock");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| format!("failed to open {}: {err}", lock_path.display()))?;
+    let started = Instant::now();
+    loop {
+        let lock_result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if lock_result == 0 {
+            break;
+        }
+        if started.elapsed() >= Duration::from_secs(2) {
+            return Err(format!(
+                "another WaveLinux 6 audio core owns {}",
+                lock_path.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    file.set_len(0)
+        .map_err(|err| format!("failed to reset {}: {err}", lock_path.display()))?;
+    writeln!(
+        file,
+        "pid={} topology_revision={topology_revision}",
+        process::id()
+    )
+    .map_err(|err| format!("failed to write {}: {err}", lock_path.display()))?;
+    file.sync_data()
+        .map_err(|err| format!("failed to sync {}: {err}", lock_path.display()))?;
+    let _ = std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600));
+    Ok(PersistentCoreLock { _file: file })
+}
 
 #[derive(Debug, Serialize)]
 struct ProbeReport {
@@ -148,6 +202,13 @@ fn run_persistent_core(args: &[String]) -> Result<(), String> {
     .map_err(|err| format!("failed to parse audio-core manifest: {err}"))?;
     manifest.resolve_control_socket_paths()?;
     manifest.validate()?;
+    let topology_revision = wavelinux_dsp::core_topology_revision(&manifest);
+    let runtime_root = manifest
+        .runtime_root
+        .as_deref()
+        .map(Path::new)
+        .ok_or_else(|| "persistent audio-core manifest has no runtime root".to_string())?;
+    let _instance_lock = acquire_persistent_core_lock(runtime_root, &topology_revision)?;
     let mut status = probe_backend_from_env();
     let runtime_root = manifest.runtime_root.as_deref().map(PathBuf::from);
     let acceleration = resolve_acceleration_config(&mut status, runtime_root.as_deref());
@@ -187,6 +248,7 @@ fn run_persistent_core(args: &[String]) -> Result<(), String> {
         manifest.mixes,
         manifest.control_socket_path,
         meter_socket_path,
+        topology_revision,
         status,
         acceleration,
     );
@@ -859,6 +921,7 @@ impl InputTargetControl {
 #[derive(Debug)]
 struct NativeShared {
     channel_id: String,
+    core_topology_revision: String,
     raw_history: FixedAudioHistory,
     history: FixedAudioHistory,
     meter: NativeMeter,
@@ -883,7 +946,11 @@ struct NativeShared {
 }
 
 impl NativeShared {
-    fn new(config: &DspChannelConfig, acceleration_config: Option<DspAccelerationConfig>) -> Self {
+    fn new(
+        config: &DspChannelConfig,
+        acceleration_config: Option<DspAccelerationConfig>,
+        core_topology_revision: &str,
+    ) -> Self {
         let adaptive = &config.adaptive_latency;
         let max_msec = adaptive.max_msec.max(adaptive.min_msec).max(28);
         let min_msec = adaptive.min_msec.min(max_msec).max(5);
@@ -899,6 +966,7 @@ impl NativeShared {
             .store(config.generation, Ordering::Relaxed);
         Self {
             channel_id: config.channel_id.clone(),
+            core_topology_revision: core_topology_revision.to_string(),
             raw_history: FixedAudioHistory::new(
                 capacity_frames.max(MAX_NATIVE_CALLBACK_FRAMES.saturating_mul(2)),
             ),
@@ -1384,7 +1452,15 @@ fn run_pipewire_native_graph(
     status: DspBackendStatus,
     acceleration: Option<DspAccelerationConfig>,
 ) -> Result<(), String> {
-    run_pipewire_native_core(vec![config], Vec::new(), None, None, status, acceleration)
+    run_pipewire_native_core(
+        vec![config],
+        Vec::new(),
+        None,
+        None,
+        String::new(),
+        status,
+        acceleration,
+    )
 }
 
 fn run_pipewire_native_core(
@@ -1392,6 +1468,7 @@ fn run_pipewire_native_core(
     mix_configs: Vec<wavelinux_dsp::DspMixConfig>,
     control_socket_path: Option<String>,
     meter_socket_path: Option<String>,
+    core_topology_revision: String,
     _status: DspBackendStatus,
     acceleration: Option<DspAccelerationConfig>,
 ) -> Result<(), String> {
@@ -1405,7 +1482,9 @@ fn run_pipewire_native_core(
         .map_err(|err| format!("PipeWire native DSP core connection failed: {err}"))?;
     let mut channels = configs
         .into_iter()
-        .map(|config| prepare_native_channel(&core, config, acceleration.clone()))
+        .map(|config| {
+            prepare_native_channel(&core, config, acceleration.clone(), &core_topology_revision)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let channel_map = channels
         .iter()
@@ -1465,10 +1544,15 @@ fn prepare_native_channel<'core>(
     core: &'core pw::core::Core,
     config: DspChannelConfig,
     acceleration: Option<DspAccelerationConfig>,
+    core_topology_revision: &str,
 ) -> Result<NativeChannelRuntime<'core>, String> {
     let chain = build_replacement_chain(&config, acceleration.as_ref())
         .map_err(|error| format!("native DSP chain initialization failed: {error}"))?;
-    let shared = Arc::new(NativeShared::new(&config, acceleration));
+    let shared = Arc::new(NativeShared::new(
+        &config,
+        acceleration,
+        core_topology_revision,
+    ));
     let dsp_worker = start_dsp_worker(
         Arc::clone(&shared),
         PreparedChain {
@@ -1497,6 +1581,7 @@ fn prepare_native_channel<'core>(
     insert_common_native_props(&mut public_capture_props, &config, input_role);
 
     let capture_uses_target = channel_uses_input_target(&config);
+    apply_capture_idle_policy(&mut public_capture_props, capture_uses_target);
     let capture_props = if capture_uses_target {
         let mut props = properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
@@ -1822,6 +1907,18 @@ fn insert_common_native_props(
         format!("{}.effect_config_revision", config.property_prefix),
         config.revision.clone(),
     );
+}
+
+fn apply_capture_idle_policy(props: &mut pw::properties::PropertiesBox, capture_uses_target: bool) {
+    if capture_uses_target {
+        return;
+    }
+
+    // Application buses keep a silent clock while idle. This prevents a
+    // browser or game resuming from activating a new node in an established
+    // real-time graph; the DSP worker already skips quickly over idle input.
+    props.insert(*pw::keys::NODE_PAUSE_ON_IDLE, "false");
+    props.insert("node.always-process", "true");
 }
 
 fn parse_audio_format_param(
@@ -2854,6 +2951,7 @@ fn handle_core_control_command(
                 "ok": true,
                 "request_id": command.request_id,
                 "route_id": channel_id,
+                "core_topology_revision": shared.core_topology_revision.as_str(),
                 "target_msec": target_msec,
             })
         }
@@ -2933,6 +3031,7 @@ fn handle_core_control_command(
                 "ok": true,
                 "request_id": command.request_id,
                 "route_id": channel_id,
+                "core_topology_revision": shared.core_topology_revision.as_str(),
                 "sample_rate_hz": shared.sample_rate_hz,
                 "target_latency_msec": shared.target_latency_msec.load(Ordering::Relaxed),
                 "current_buffer_frames": shared.current_buffer_frames.load(Ordering::Relaxed),
@@ -2974,6 +3073,16 @@ fn handle_core_control_command(
                 response.extend(acceleration);
             }
             response
+        }
+        "shutdown" => {
+            TERMINATE.store(true, Ordering::SeqCst);
+            serde_json::json!({
+                "protocol_version": CORE_CONTROL_PROTOCOL_VERSION,
+                "ok": true,
+                "request_id": command.request_id,
+                "route_id": channel_id,
+                "operation": "shutdown_requested",
+            })
         }
         _ => control_error(
             command.request_id,
@@ -3459,20 +3568,21 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        apply_dsp_input_mode, begin_latency_transition, channel_uses_input_target,
-        decode_interleaved_stereo_into, desired_rate_correction, duration_micros,
-        insert_common_native_props, native_meter_release, native_stream_restore_id,
-        playback_render_frames, recover_poisoned_chain, render_native_frame,
-        replace_non_finite_with_dry, sanitize_non_finite_in_place, ChainSwapControl, DspWorkerData,
-        FixedAudioHistory, InputEndpointStatus, InputTargetControl, NativeMeter,
-        NativePlaybackData, NativeShared, PreparedChain, RealtimeTimingStats, CHAIN_CROSSFADE_MSEC,
-        DSP_WORKER_BLOCK_FRAMES, LATENCY_CROSSFADE_MSEC, NATIVE_METER_STALE_AFTER,
+        acquire_persistent_core_lock, apply_capture_idle_policy, apply_dsp_input_mode,
+        begin_latency_transition, channel_uses_input_target, decode_interleaved_stereo_into,
+        desired_rate_correction, duration_micros, insert_common_native_props, native_meter_release,
+        native_stream_restore_id, playback_render_frames, recover_poisoned_chain,
+        render_native_frame, replace_non_finite_with_dry, sanitize_non_finite_in_place,
+        ChainSwapControl, DspWorkerData, FixedAudioHistory, InputEndpointStatus,
+        InputTargetControl, NativeMeter, NativePlaybackData, NativeShared, PreparedChain,
+        RealtimeTimingStats, CHAIN_CROSSFADE_MSEC, DSP_WORKER_BLOCK_FRAMES, LATENCY_CROSSFADE_MSEC,
+        NATIVE_METER_STALE_AFTER,
     };
     use pipewire as pw;
     use wavelinux_dsp::{DspChain, DspChannelConfig, DspInputMode};
 
     fn test_worker_data(config: &DspChannelConfig) -> DspWorkerData {
-        let shared = Arc::new(NativeShared::new(config, None));
+        let shared = Arc::new(NativeShared::new(config, None, ""));
         let chain = DspChain::new_with_channels(&[], config.sample_rate_hz, config.input_channels);
         assert!(chain.is_fully_initialized());
         DspWorkerData {
@@ -3494,6 +3604,17 @@ mod tests {
             shadow_dry_scratch: vec![0.0; DSP_WORKER_BLOCK_FRAMES * 2].into_boxed_slice(),
             acceleration_metrics_countdown: 0,
         }
+    }
+
+    #[test]
+    fn persistent_core_lock_rejects_a_second_owner() {
+        let runtime = tempfile::tempdir().unwrap();
+        let first = acquire_persistent_core_lock(runtime.path(), "topology-a").unwrap();
+        let duplicate = acquire_persistent_core_lock(runtime.path(), "topology-a").unwrap_err();
+        assert!(duplicate.contains("another WaveLinux 6 audio core owns"));
+
+        drop(first);
+        acquire_persistent_core_lock(runtime.path(), "topology-b").unwrap();
     }
 
     #[test]
@@ -3572,7 +3693,7 @@ mod tests {
             "wavelinux6-mic",
             Vec::new(),
         );
-        let shared = NativeShared::new(&config, None);
+        let shared = NativeShared::new(&config, None, "");
         shared
             .recovery_requested
             .store(true, std::sync::atomic::Ordering::Release);
@@ -3689,7 +3810,7 @@ mod tests {
             "wavelinux6-mic",
             Vec::new(),
         );
-        let shared = Arc::new(NativeShared::new(&config, None));
+        let shared = Arc::new(NativeShared::new(&config, None, ""));
         for index in 0..10_000_u64 {
             shared.history.push([index as f32, index as f32]);
         }
@@ -3729,7 +3850,7 @@ mod tests {
             "wavelinux6_fx_game_source",
             Vec::new(),
         );
-        let shared = Arc::new(NativeShared::new(&config, None));
+        let shared = Arc::new(NativeShared::new(&config, None, ""));
         shared
             .capture_streaming
             .store(true, std::sync::atomic::Ordering::Release);
@@ -3792,7 +3913,7 @@ mod tests {
             "wavelinux6_fx_browser_source",
             Vec::new(),
         );
-        let shared = Arc::new(NativeShared::new(&config, None));
+        let shared = Arc::new(NativeShared::new(&config, None, ""));
         let mut playback = NativePlaybackData {
             shared,
             last_frame: [0.5, -0.5],
@@ -3986,7 +4107,7 @@ mod tests {
     }
 
     #[test]
-    fn native_channel_nodes_pause_processing_when_unlinked() {
+    fn application_channel_sinks_keep_their_clock_warm_when_unlinked() {
         let config = DspChannelConfig::new(
             "music",
             "Music",
@@ -4000,8 +4121,31 @@ mod tests {
         let mut props = pipewire::properties::PropertiesBox::new();
 
         insert_common_native_props(&mut props, &config, "effect_input");
+        apply_capture_idle_policy(&mut props, false);
+
+        assert_eq!(props.get("node.pause-on-idle"), Some("false"));
+        assert_eq!(props.get("node.always-process"), Some("true"));
+    }
+
+    #[test]
+    fn hardware_target_capture_retains_idle_suspension() {
+        let config = DspChannelConfig::new(
+            "hardware_in",
+            "Input",
+            "wavelinux6",
+            "wavelinux6",
+            "WaveLinux 6",
+            "wavelinux6_channel_hardware_in",
+            "wavelinux6-mic",
+            Vec::new(),
+        );
+        let mut props = pipewire::properties::PropertiesBox::new();
+
+        insert_common_native_props(&mut props, &config, "input_target");
+        apply_capture_idle_policy(&mut props, true);
 
         assert_eq!(props.get("node.pause-on-idle"), Some("true"));
+        assert_eq!(props.get("node.always-process"), None);
     }
 
     #[test]
@@ -4104,7 +4248,7 @@ mod tests {
             Vec::new(),
         );
         config.generation = 42;
-        let shared = NativeShared::new(&config, None);
+        let shared = NativeShared::new(&config, None, "");
         shared
             .chain_control
             .submitted_generation

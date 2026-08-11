@@ -1,9 +1,9 @@
-# WaveLinux 6.0.0-alpha.1
+# WaveLinux 6.0.0
 
-WaveLinux 6 is an unpublished local alpha that replaces WaveLinux5 with a
-persistent native audio core and a `wavelinux6` runtime namespace.
+WaveLinux 6 replaces WaveLinux5 with a persistent native audio core and a
+`wavelinux6` runtime namespace.
 
-## Current Alpha Work
+## Highlights
 
 - Adds one persistent `wavelinux6-audio-core` process with stable per-channel
   PipeWire sources and native RNNoise, high-pass, eight-band EQ, compressor,
@@ -22,9 +22,10 @@ persistent native audio core and a `wavelinux6` runtime namespace.
   bundled Wayland libraries and validating a real non-root pixel render.
 - Rewrites WaveLinux 6 architecture, audio-core, setup, testing, and
   troubleshooting documentation and removes stale DeepFilterNet claims.
-
-This alpha has not been published and must not be promoted until local audio,
-CI, distro smoke, and stress gates pass.
+- Adds a checksum-verified standalone installer with complete dependency
+  setup and live PipeWire graph verification across supported distro families.
+- Packages the audio core, peripheral helper, installer diagnostics, desktop
+  metadata, and host-ABI-safe AppImage runtime as one release set.
 
 # WaveLinux 5.0.2
 

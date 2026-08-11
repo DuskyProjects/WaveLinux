@@ -13,9 +13,10 @@ node node_modules/.bin/tsc --noEmit
 node node_modules/.bin/vitest run
 node node_modules/.bin/vite build
 node node_modules/.bin/playwright test
-shellcheck scripts/*.sh
+shellcheck install.sh scripts/*.sh
 bash scripts/check-docs.sh
 bash scripts/check-dependencies.sh
+bash scripts/test-installers.sh
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
