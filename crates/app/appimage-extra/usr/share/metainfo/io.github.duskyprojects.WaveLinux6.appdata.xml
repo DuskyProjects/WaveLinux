@@ -20,6 +20,11 @@
     <binary>wavelinux6</binary>
   </provides>
   <releases>
+    <release version="6.0.1" date="2026-08-11">
+      <description>
+        <p>Security-focused Rust and frontend dependency updates with a stable updater feed.</p>
+      </description>
+    </release>
     <release version="6.0.0" date="2026-08-10">
       <description>
         <p>Persistent native PipeWire audio core, live DSP, adaptive latency, and verified cross-distribution installation.</p>

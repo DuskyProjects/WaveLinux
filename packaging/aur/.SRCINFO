@@ -1,6 +1,6 @@
 pkgbase = wavelinux
 	pkgdesc = Rust and PipeWire creator audio mixer for Linux
-	pkgver = 6.0.0
+	pkgver = 6.0.1
 	pkgrel = 1
 	url = https://github.com/DuskyProjects/WaveLinux
 	install = wavelinux.install
@@ -43,7 +43,7 @@ pkgbase = wavelinux
 	depends = noto-fonts
 	depends = xdg-desktop-portal
 	depends = xdg-desktop-portal-gtk
-	source = wavelinux-6.0.0.tar.gz::https://github.com/DuskyProjects/WaveLinux/archive/refs/tags/v6.0.0.tar.gz
+	source = wavelinux-6.0.1.tar.gz::https://github.com/DuskyProjects/WaveLinux/archive/refs/tags/v6.0.1.tar.gz
 	sha256sums = SKIP
 
 pkgname = wavelinux

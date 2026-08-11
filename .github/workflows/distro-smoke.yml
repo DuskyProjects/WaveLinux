@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to test, such as v6.0.0. Use latest for the latest stable release."
+        description: "Release tag to test, such as v6.0.1. Use latest for the latest stable release."
         required: false
         default: latest
   workflow_run:

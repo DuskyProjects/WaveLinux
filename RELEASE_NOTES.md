@@ -1,3 +1,18 @@
+# WaveLinux 6.0.1
+
+WaveLinux 6.0.1 is a security and dependency maintenance release. It does not
+change the WaveLinux audio graph, DSP behavior, or user configuration schema.
+
+## Fixes
+
+- Updates `postcss` to 8.5.25 and `undici` to 7.29.0, including upstream fixes
+  for source-map handling, request-header validation, cache parsing, cookies,
+  retries, and shared-cache information disclosure.
+- Updates `quinn-proto` to 0.11.16 and `serde_with` to 3.21.0, including safer
+  collection allocation and serialization behavior for malformed input.
+- Uses GitHub's latest stable updater manifest instead of a version-pinned
+  release URL so future WaveLinux 6 patches can be discovered automatically.
+
 # WaveLinux 6.0.0
 
 WaveLinux 6 replaces WaveLinux5 with a persistent native audio core and a

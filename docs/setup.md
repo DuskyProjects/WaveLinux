@@ -98,7 +98,7 @@ Check a built AppImage directly:
 
 ```bash
 APPIMAGE_EXTRACT_AND_RUN=1 \
-  target/release/bundle/appimage/WaveLinux6_6.0.0_amd64.AppImage \
+  target/release/bundle/appimage/WaveLinux6_6.0.1_amd64.AppImage \
   --check-runtime-dependencies
 ```
 
@@ -106,7 +106,7 @@ Request host package installation:
 
 ```bash
 APPIMAGE_EXTRACT_AND_RUN=1 \
-  target/release/bundle/appimage/WaveLinux6_6.0.0_amd64.AppImage \
+  target/release/bundle/appimage/WaveLinux6_6.0.1_amd64.AppImage \
   --install-runtime-dependencies
 ```
 
