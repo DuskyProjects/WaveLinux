@@ -2322,7 +2322,7 @@ fn apply_highpass(effect: &EffectInstance, sample_rate_hz: u32, data: &mut [f32]
     let mut prev_x = [0.0_f32; 2];
     let mut prev_y = [0.0_f32; 2];
 
-    for frame in data.chunks_exact_mut(2) {
+    for frame in data.as_chunks_mut::<2>().0 {
         for ch in 0..2 {
             let x = frame[ch];
             let y = alpha * (prev_y[ch] + x - prev_x[ch]);
@@ -2343,7 +2343,7 @@ fn apply_eq(effect: &EffectInstance, sample_rate_hz: u32, data: &mut [f32]) {
         let freq = freq.clamp(20.0, sample_rate_hz as f32 * 0.45);
         let mut left = Biquad::peaking(sample_rate_hz as f32, freq, q, gain);
         let mut right = Biquad::peaking(sample_rate_hz as f32, freq, q, gain);
-        for frame in data.chunks_exact_mut(2) {
+        for frame in data.as_chunks_mut::<2>().0 {
             frame[0] = left.process(frame[0]);
             frame[1] = right.process(frame[1]);
         }
@@ -2359,7 +2359,7 @@ fn apply_compressor(effect: &EffectInstance, sample_rate_hz: u32, data: &mut [f3
     let release = smoothing_coeff(param(effect, "release_ms", 100.0), sample_rate_hz);
     let mut gain = 1.0_f32;
 
-    for frame in data.chunks_exact_mut(2) {
+    for frame in data.as_chunks_mut::<2>().0 {
         let level = frame[0].abs().max(frame[1].abs()).max(1.0e-9);
         let level_db = amp_to_db(level);
         let target_gain = if level_db > threshold_db {
@@ -2386,7 +2386,7 @@ fn apply_gate(effect: &EffectInstance, sample_rate_hz: u32, data: &mut [f32]) {
     let mut gain = 1.0_f32;
     let mut hold = 0_usize;
 
-    for frame in data.chunks_exact_mut(2) {
+    for frame in data.as_chunks_mut::<2>().0 {
         let level = frame[0].abs().max(frame[1].abs()).max(1.0e-9);
         let open = amp_to_db(level) >= threshold_db;
         if open {
@@ -2822,7 +2822,9 @@ mod tests {
 
         assert!(data[960..].iter().any(|sample| sample.abs() > 1.0e-6));
         assert!(data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .all(|frame| (frame[0] - frame[1]).abs() < 1.0e-6));
     }
 

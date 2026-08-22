@@ -1997,7 +1997,7 @@ fn process_capture_buffer_inner(stream: &pw::stream::Stream, user_data: &mut Nat
         if decoded == 0 {
             break;
         }
-        for frame in user_data.scratch[..decoded * 2].chunks_exact(2) {
+        for frame in user_data.scratch[..decoded * 2].as_chunks::<2>().0 {
             user_data.shared.raw_history.push([frame[0], frame[1]]);
         }
         user_data
@@ -2036,7 +2036,7 @@ fn process_discard_capture_buffer(
 }
 
 fn apply_dsp_input_mode(samples: &mut [f32], mode: DspInputMode) {
-    for frame in samples.chunks_exact_mut(2) {
+    for frame in samples.as_chunks_mut::<2>().0 {
         let left = frame[0];
         let right = frame[1];
         match mode {
@@ -2337,7 +2337,7 @@ fn publish_dsp_block(data: &DspWorkerData, frames: usize) {
     let mut peak_right = 0.0_f32;
     let mut square_sum_left = 0.0_f32;
     let mut square_sum_right = 0.0_f32;
-    for frame in data.active_scratch[..frames * 2].chunks_exact(2) {
+    for frame in data.active_scratch[..frames * 2].as_chunks::<2>().0 {
         peak_left = peak_left.max(frame[0].abs());
         peak_right = peak_right.max(frame[1].abs());
         square_sum_left += frame[0] * frame[0];
