@@ -2194,7 +2194,7 @@ fn control_id_from_report(previous: &[u8], report: &[u8]) -> Option<String> {
         if value != old && value != 0 {
             let pressed_bits = (value ^ old) & value;
             let control_value = if pressed_bits != 0 {
-                pressed_bits & pressed_bits.wrapping_neg()
+                1_u8 << pressed_bits.trailing_zeros()
             } else {
                 value
             };
