@@ -57,7 +57,7 @@ for pid in 101 102 103 104 105 106 107 108 109 110 111; do
 done
 ln -s /usr/bin/bash "$process_fixture/proc/101/exe"
 ln -s /tmp/.mount_WaveLinux/usr/bin/wavelinux6 "$process_fixture/proc/102/exe"
-ln -s /home/test/WaveLinux6_6.0.1_amd64.AppImage "$process_fixture/proc/103/exe"
+ln -s /home/test/WaveLinux6_6.0.2_amd64.AppImage "$process_fixture/proc/103/exe"
 ln -s /home/test/.local/bin/wavelinux6-audio-core "$process_fixture/proc/104/exe"
 ln -s /home/test/.local/bin/wavelinux6-peripheral-plugin "$process_fixture/proc/105/exe"
 ln -s /usr/bin/pipewire "$process_fixture/proc/106/exe"
@@ -66,7 +66,7 @@ ln -s /home/test/WaveLinux5_5.0.3_amd64.AppImage "$process_fixture/proc/108/exe"
 ln -s /usr/bin/wavelinux "$process_fixture/proc/109/exe"
 ln -s /home/test/.local/bin/wavelinux5-dsp-helper "$process_fixture/proc/110/exe"
 ln -s /usr/bin/pipewire "$process_fixture/proc/111/exe"
-printf '%s\0' bash /tmp/WaveLinux6_6.0.1_amd64_Installer.sh \
+printf '%s\0' bash /tmp/WaveLinux6_6.0.2_amd64_Installer.sh \
   WaveLinux6_fake_amd64.AppImage >"$process_fixture/proc/101/cmdline"
 printf '%s\0' pipewire -c /home/test/.config/wavelinux6/effects/wavelinux6-chain-input.conf \
   >"$process_fixture/proc/106/cmdline"

@@ -80,7 +80,7 @@ Select a specific release or inspect the chosen assets without changing the
 machine:
 
 ```bash
-./wavelinux6-install.sh --tag v6.0.1
+./wavelinux6-install.sh --tag v6.0.2
 ./wavelinux6-install.sh --dry-run
 ```
 
@@ -90,8 +90,8 @@ the standalone installer because the published RPM targets Fedora package
 names. Direct native installs remain available through:
 
 ```bash
-./wavelinux6-install.sh --tag v6.0.1 --format deb
-./wavelinux6-install.sh --tag v6.0.1 --format rpm
+./wavelinux6-install.sh --tag v6.0.2 --format deb
+./wavelinux6-install.sh --tag v6.0.2 --format rpm
 ```
 
 ### Building the standalone installer

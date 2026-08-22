@@ -114,7 +114,7 @@ Run it with:
 
 ```bash
 WAVELINUX_STRESS_DURATION_SEC=3600 bash scripts/stress-audio-isolated.sh \
-  target/release/bundle/appimage/WaveLinux6_6.0.1_amd64.AppImage
+  target/release/bundle/appimage/WaveLinux6_6.0.2_amd64.AppImage
 ```
 
 The harness starts a separate D-Bus, PipeWire, PipeWire-Pulse, and policy-only

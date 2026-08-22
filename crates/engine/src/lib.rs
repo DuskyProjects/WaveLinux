@@ -4599,7 +4599,16 @@ impl WaveLinuxEngine {
                         );
                         return None;
                     }
-                    Some(StreamRouteBackend::PulseCompatibility) | None => pulse_command,
+                    Some(StreamRouteBackend::PulseCompatibility) => pulse_command,
+                    None => {
+                        self.log_engine_event(
+                            "default.input",
+                            format!(
+                                "stream={source_output_id} skipped because it is no longer present in the PipeWire registry"
+                            ),
+                        );
+                        return None;
+                    }
                 };
                 let result = self.pw.execute(command.clone());
                 let output = command_execution_with_spec(command, result);
@@ -17998,6 +18007,125 @@ mod tests {
         assert_eq!(output.error, None);
         assert!(!engine
             .capture_move_recently_failed("gone-capture", "alsa_input.usb_mic->wavelinux-mic"));
+    }
+
+    fn pulse_capture_route() -> SourceOutputRoute {
+        SourceOutputRoute {
+            id: "99".into(),
+            module_id: None,
+            role: None,
+            channel_id: None,
+            mix_id: None,
+            muted: Some(false),
+            volume_percent: Some(100),
+            source_id: Some("55".into()),
+            source_name: Some("alsa_input.usb_mic".into()),
+            target_object: None,
+            application_name: Some("Discord".into()),
+            node_name: Some("Discord input".into()),
+            media_name: Some("RecordStream".into()),
+            managed: None,
+            dont_move: false,
+        }
+    }
+
+    fn register_pulse_capture_stream(engine: &WaveLinuxEngine) {
+        engine.pipewire_registry.mark_connected(false);
+        engine.pipewire_registry.apply_batch(vec![
+            serde_json::json!({
+                "id": 8,
+                "type": "PipeWire:Interface:Client",
+                "info": {"props": {"client.api": "pipewire-pulse"}}
+            }),
+            serde_json::json!({
+                "id": 21,
+                "type": "PipeWire:Interface:Node",
+                "info": {"props": {
+                    "media.class": "Audio/Source",
+                    "node.name": "wavelinux-mic",
+                    "object.serial": 501
+                }}
+            }),
+            serde_json::json!({
+                "id": 31,
+                "type": "PipeWire:Interface:Node",
+                "info": {"props": {
+                    "media.class": "Stream/Input/Audio",
+                    "node.name": "discord-input",
+                    "client.id": 8,
+                    "object.serial": 99
+                }}
+            }),
+        ]);
+    }
+
+    #[test]
+    fn capture_stream_removed_from_registry_is_skipped_before_pactl() {
+        let engine = test_engine();
+        let mut config = MixerConfig::default();
+        config.settings.lock_default_input = true;
+        let route = pulse_capture_route();
+        register_pulse_capture_stream(&engine);
+        assert_eq!(
+            engine
+                .pipewire_registry
+                .capture_route_backend("99", "wavelinux-mic"),
+            Some(StreamRouteBackend::PulseCompatibility)
+        );
+
+        engine
+            .pipewire_registry
+            .apply_batch(vec![serde_json::json!({"id": 31, "info": null})]);
+        assert_eq!(
+            engine
+                .pipewire_registry
+                .capture_route_backend("99", "wavelinux-mic"),
+            None
+        );
+
+        let outputs = engine
+            .execute_capture_stream_moves_unlocked_with_devices(
+                &config,
+                std::slice::from_ref(&route),
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        assert!(outputs.is_empty());
+        assert!(!engine.capture_move_recently_failed("99", "alsa_input.usb_mic->wavelinux-mic"));
+        assert!(fs::read_to_string(engine.paths.log_file())
+            .unwrap()
+            .contains(
+                "stream=99 skipped because it is no longer present in the PipeWire registry"
+            ));
+    }
+
+    #[test]
+    fn pulse_compatible_capture_stream_move_still_uses_pactl() {
+        let engine = test_engine();
+        let mut config = MixerConfig::default();
+        config.settings.lock_default_input = true;
+        let route = pulse_capture_route();
+        register_pulse_capture_stream(&engine);
+
+        let outputs = engine
+            .execute_capture_stream_moves_unlocked_with_devices(
+                &config,
+                std::slice::from_ref(&route),
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].command.program, "pactl");
+        assert_eq!(
+            outputs[0].command.args,
+            ["move-source-output", "99", "wavelinux-mic"]
+        );
+        assert!(outputs[0].skipped);
+        assert_eq!(outputs[0].error, None);
     }
 
     #[test]

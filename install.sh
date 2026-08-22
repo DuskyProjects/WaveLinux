@@ -15,7 +15,7 @@ Usage:
   ./install.sh [options]
 
 Options:
-  --tag TAG                    Install a specific release tag (for example v6.0.1).
+  --tag TAG                    Install a specific release tag (for example v6.0.2).
   --format auto|appimage|deb|rpm
                                auto and appimage use the canonical self-extracting installer.
   --dry-run                    Print the selected release assets without downloading them.

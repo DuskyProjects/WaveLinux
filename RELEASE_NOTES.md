@@ -1,3 +1,18 @@
+# WaveLinux 6.0.2
+
+WaveLinux 6.0.2 fixes a capture-stream routing race that could repeatedly send
+an invalid move request after a recording client disappeared.
+
+## Fixes
+
+- Skips stale capture routes when the current PipeWire registry can no longer
+  resolve the original stream instead of treating the missing lookup as a
+  Pulse-compatible stream.
+- Prevents avoidable `MOVE_SOURCE_OUTPUT` / `Invalid argument` errors and the
+  associated failed-move backoff churn in PipeWire-Pulse.
+- Preserves native PipeWire routing and `pactl move-source-output` for streams
+  explicitly identified as Pulse-compatible.
+
 # WaveLinux 6.0.1
 
 WaveLinux 6.0.1 is a security and dependency maintenance release. It does not
