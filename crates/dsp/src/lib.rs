@@ -1572,7 +1572,7 @@ impl RnNoiseNode {
     }
 
     fn process(&mut self, data: &mut [f32]) {
-        for frame in data.chunks_exact_mut(2) {
+        for frame in data.as_chunks_mut::<2>().0 {
             let output = if self.output_available {
                 let output = [
                     self.output_left[self.output_index],
@@ -1848,7 +1848,7 @@ impl HighpassNode {
     }
 
     fn process(&mut self, data: &mut [f32]) {
-        for frame in data.chunks_exact_mut(2) {
+        for frame in data.as_chunks_mut::<2>().0 {
             for (ch, sample) in frame.iter_mut().enumerate().take(2) {
                 let x = *sample;
                 let y = self.alpha * (self.prev_y[ch] + x - self.prev_x[ch]);
@@ -1888,7 +1888,7 @@ impl EqNode {
 
     fn process(&mut self, data: &mut [f32]) {
         for band in &mut self.bands {
-            for frame in data.chunks_exact_mut(2) {
+            for frame in data.as_chunks_mut::<2>().0 {
                 frame[0] = band[0].process(frame[0]);
                 frame[1] = band[1].process(frame[1]);
             }
@@ -1936,7 +1936,7 @@ impl CompressorNode {
     }
 
     fn process(&mut self, data: &mut [f32]) {
-        for frame in data.chunks_exact_mut(2) {
+        for frame in data.as_chunks_mut::<2>().0 {
             let level = frame[0].abs().max(frame[1].abs());
             let target_gain = if level > self.threshold_amp {
                 (level / self.threshold_amp).powf(self.gain_exponent)
@@ -1982,7 +1982,7 @@ impl GateNode {
     }
 
     fn process(&mut self, data: &mut [f32]) {
-        for frame in data.chunks_exact_mut(2) {
+        for frame in data.as_chunks_mut::<2>().0 {
             let level = frame[0].abs().max(frame[1].abs());
             let open = level >= self.threshold_amp;
             if open {
@@ -2173,7 +2173,7 @@ impl KaraokeStageNode {
     }
 
     fn process(&mut self, data: &mut [f32]) {
-        for frame in data.chunks_exact_mut(2) {
+        for frame in data.as_chunks_mut::<2>().0 {
             let mut tone = [0.0_f32; 2];
             for channel in 0..2 {
                 tone[channel] = self.lowpass[channel]
