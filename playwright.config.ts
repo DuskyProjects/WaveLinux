@@ -1,4 +1,11 @@
 import { defineConfig } from "@playwright/test";
+import { fileURLToPath } from "node:url";
+
+// Linux snapshots were captured with DejaVu Sans. Keep desktop font choices
+// from changing the browser's fallback metrics during screenshot comparisons.
+if (process.platform === "linux") {
+  process.env.FONTCONFIG_FILE ??= fileURLToPath(new URL("./tests/e2e/fonts.conf", import.meta.url));
+}
 
 export default defineConfig({
   testDir: "./tests/e2e",

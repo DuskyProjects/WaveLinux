@@ -3,9 +3,11 @@ import {
   matcherForStream,
   matcherFromKind,
   matcherKindLabel,
+  offlineRoutingEntries,
   routeKey,
 } from "./routing";
 import type { AppStream } from "./types";
+import { demoState } from "./demo";
 
 function stream(overrides: Partial<AppStream> = {}): AppStream {
   return {
@@ -42,5 +44,35 @@ describe("routing identity helpers", () => {
     expect(matcher.window_class).toBe("Discord");
     expect(routeKey(matcher)).toBe("window_class:discord");
     expect(matcherKindLabel("window_class")).toBe("Window Class");
+  });
+
+  it("keeps an offline browser app visible while a different media app is active", () => {
+    const state = structuredClone(demoState);
+    const active = stream({ app_id: "com.brave.Browser", media_name: "YouTube Music" });
+    state.graph.app_streams = [active];
+    state.config.app_history = [];
+    state.config.app_routes = [
+      { matcher: { app_id: "com.brave.Browser", media_name: "Discord" }, channel_id: "chat" },
+      { matcher: { app_id: "com.brave.Browser", media_name: "YouTube Music" }, channel_id: "music" },
+    ];
+    expect(offlineRoutingEntries(state).map((entry) => entry.channel_id)).toEqual(["chat"]);
+  });
+
+  it("requires every saved matcher field while allowing broad rules and binary fallback", () => {
+    const state = structuredClone(demoState);
+    state.graph.app_streams = [stream({ app_id: "active", process_name: "player" })];
+    state.config.app_history = [];
+    state.config.app_routes = [
+      { matcher: { app_id: "other", process_name: "player" }, channel_id: "chat" },
+      { matcher: { app_id: "active" }, channel_id: "music" },
+      { matcher: { binary: "PLAYER" }, channel_id: "game" },
+    ];
+    expect(offlineRoutingEntries(state).map((entry) => entry.channel_id)).toEqual(["chat"]);
+    state.graph.app_streams = [stream({ process_name: "player" })];
+    expect(offlineRoutingEntries(state).map((entry) => entry.channel_id).sort()).toEqual(["chat", "music"]);
+  });
+
+  it.each(["Stream", "Stream 42", " Audio-src "])("ignores generic media label %s", (media_name) => {
+    expect(matcherForStream(stream({ app_id: "com.brave.Browser", media_name })).media_name).toBeNull();
   });
 });

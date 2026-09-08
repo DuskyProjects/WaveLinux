@@ -130,6 +130,114 @@ if env "${installer_env[@]}" bash "$ROOT_DIR/install.sh" --format deb --dry-run 
   fail "unversioned native package selection should be rejected"
 fi
 
+# Failed preflight must leave the installed app and its audio graph running.
+local_fixture="$process_fixture/local-install"
+mkdir -p "$local_fixture/scripts" "$local_fixture/target/release/bundle/appimage" \
+  "$local_fixture/bin" "$local_fixture/data/wavelinux6"
+cp "$ROOT_DIR/scripts/install-local.sh" "$local_fixture/scripts/"
+cat > "$local_fixture/scripts/wavelinux-processes.sh" <<'SH'
+wavelinux_collect_process_pids() { touch "$WAVELINUX_TEST_STOP_MARKER"; }
+wavelinux_collect_filter_chain_pids() { touch "$WAVELINUX_TEST_STOP_MARKER"; }
+wavelinux_collect_legacy_filter_chain_pids() { touch "$WAVELINUX_TEST_STOP_MARKER"; }
+SH
+cat > "$local_fixture/scripts/check-dependencies.sh" <<'SH'
+#!/usr/bin/env bash
+exit "${WAVELINUX_TEST_DEPENDENCY_STATUS:-0}"
+SH
+cat > "$local_fixture/bin/pactl" <<'SH'
+#!/usr/bin/env bash
+touch "$WAVELINUX_TEST_STOP_MARKER"
+SH
+chmod +x "$local_fixture/bin/pactl"
+printf 'new app\n' > "$local_fixture/target/release/bundle/appimage/WaveLinux6_6.0.2_amd64.AppImage"
+printf 'installed app\n' > "$local_fixture/data/wavelinux6/WaveLinux6_6.0.1_amd64.AppImage"
+local_env=(
+  "PATH=$local_fixture/bin:$PATH"
+  "XDG_BIN_HOME=$local_fixture/installed-bin"
+  "XDG_DATA_HOME=$local_fixture/data"
+  "XDG_CONFIG_HOME=$local_fixture/config"
+  "WAVELINUX_TEST_STOP_MARKER=$local_fixture/stopped"
+  WAVELINUX_INSTALL_ALSA_ALIASES=0
+  WAVELINUX_PREWARM_HARDWARE_PROFILES=0
+)
+if env "${local_env[@]}" bash "$local_fixture/scripts/install-local.sh" \
+  > "$local_fixture/output" 2>&1; then
+  fail "local installer accepted missing audio helpers"
+fi
+[[ ! -e "$local_fixture/stopped" ]] || fail "missing payload stopped the running app"
+grep -Fq 'Missing required helper' "$local_fixture/output" \
+  || fail "missing helper was not identified during preflight"
+for helper in wavelinux6-audio-core wavelinux6-peripheral-plugin; do
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$local_fixture/target/release/$helper"
+  chmod +x "$local_fixture/target/release/$helper"
+done
+if env "${local_env[@]}" WAVELINUX_TEST_DEPENDENCY_STATUS=1 \
+  bash "$local_fixture/scripts/install-local.sh" > "$local_fixture/output" 2>&1; then
+  fail "local installer accepted failed dependency checks"
+fi
+[[ ! -e "$local_fixture/stopped" ]] || fail "dependency failure stopped the running app"
+[[ "$(cat "$local_fixture/data/wavelinux6/WaveLinux6_6.0.1_amd64.AppImage")" == 'installed app' ]] \
+  || fail "failed preflight changed the installed app"
+
+real_install="$(command -v install)"
+cat > "$local_fixture/bin/install" <<'SH'
+#!/usr/bin/env bash
+if [[ "${WAVELINUX_TEST_FAIL_APPIMAGE_COPY:-0}" == 1 && "$*" == *.AppImage* ]]; then
+  printf 'partial copy\n' > "${@: -1}"
+  echo 'Simulated AppImage copy failure' >&2
+  exit 1
+fi
+exec "$WAVELINUX_TEST_REAL_INSTALL" "$@"
+SH
+chmod +x "$local_fixture/bin/install"
+if env "${local_env[@]}" WAVELINUX_TEST_FAIL_APPIMAGE_COPY=1 \
+  "WAVELINUX_TEST_REAL_INSTALL=$real_install" \
+  bash "$local_fixture/scripts/install-local.sh" > "$local_fixture/output" 2>&1; then
+  fail "local installer accepted an incomplete AppImage copy"
+fi
+[[ ! -e "$local_fixture/stopped" ]] || fail "failed AppImage copy stopped the running app"
+[[ -f "$local_fixture/data/wavelinux6/WaveLinux6_6.0.1_amd64.AppImage" ]] \
+  || fail "failed AppImage copy removed the installed app"
+[[ "$(cat "$local_fixture/data/wavelinux6/WaveLinux6_6.0.1_amd64.AppImage")" == 'installed app' ]] \
+  || fail "failed AppImage copy damaged the installed app"
+[[ ! -e "$local_fixture/data/wavelinux6/WaveLinux6_6.0.2_amd64.AppImage" ]] \
+  || fail "failed AppImage copy exposed an incomplete release"
+if compgen -G "$local_fixture/data/wavelinux6/.wavelinux6-appimage.*" >/dev/null; then
+  fail "failed AppImage copy left temporary data behind"
+fi
+
+for script in wavelinux-launcher.sh runtime-dependencies.sh verify-install.sh \
+  install-alsa-aliases.sh remove-alsa-aliases.sh sanitize-runtime-env.sh; do
+  cp "$ROOT_DIR/scripts/$script" "$local_fixture/scripts/$script"
+done
+mkdir -p "$local_fixture/crates/app/icons"
+cp "$ROOT_DIR/crates/app/icons/"* "$local_fixture/crates/app/icons/"
+if ! env "${local_env[@]}" "WAVELINUX_TEST_REAL_INSTALL=$real_install" \
+  bash "$local_fixture/scripts/install-local.sh" > "$local_fixture/output" 2>&1; then
+  cat "$local_fixture/output" >&2
+  fail "complete local payload did not install"
+fi
+[[ "$(cat "$local_fixture/data/wavelinux6/WaveLinux6_6.0.2_amd64.AppImage")" == 'new app' ]] \
+  || fail "successful installation did not publish the complete AppImage"
+[[ ! -e "$local_fixture/data/wavelinux6/WaveLinux6_6.0.1_amd64.AppImage" ]] \
+  || fail "successful installation did not remove the superseded release"
+[[ -x "$local_fixture/installed-bin/wavelinux6-audio-core" ]] \
+  || fail "successful installation omitted its audio helper"
+
+# Reinstalling the same version must preserve its original bytes on failure too.
+rm -f "$local_fixture/stopped"
+if env "${local_env[@]}" WAVELINUX_TEST_FAIL_APPIMAGE_COPY=1 \
+  "WAVELINUX_TEST_REAL_INSTALL=$real_install" \
+  bash "$local_fixture/scripts/install-local.sh" > "$local_fixture/output" 2>&1; then
+  fail "same-version reinstall accepted an incomplete copy"
+fi
+[[ ! -e "$local_fixture/stopped" ]] || fail "failed reinstall stopped the running app"
+[[ "$(cat "$local_fixture/data/wavelinux6/WaveLinux6_6.0.2_amd64.AppImage")" == 'new app' ]] \
+  || fail "failed reinstall damaged the installed AppImage"
+if compgen -G "$local_fixture/data/wavelinux6/.wavelinux6-appimage.*" >/dev/null; then
+  fail "reinstall left temporary AppImage data behind"
+fi
+
 bash "$ROOT_DIR/scripts/check-packaging-metadata.sh"
 
 if [[ -n "${WAVELINUX_TEST_STANDALONE_INSTALLER:-}" ]]; then

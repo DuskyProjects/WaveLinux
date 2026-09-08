@@ -167,18 +167,19 @@ export default function App() {
     void reloadUiThemes().catch(() => undefined);
   }, [reloadUiThemes]);
 
-  const applySnapshot = useCallback((next: AppStateSnapshot) => {
-    replaceWaveLinuxState(next);
+  const applySnapshot = useCallback((next: AppStateSnapshot, requestedAtRevision: number) => {
+    const applied = replaceWaveLinuxState(next, requestedAtRevision);
     setSelectedChannelId((current) =>
-      next.config.channels.some((channel) => channel.id === current)
+      applied.config.channels.some((channel) => channel.id === current)
         ? current
-        : next.config.channels[0]?.id ?? "hardware_in",
+        : applied.config.channels[0]?.id ?? "hardware_in",
     );
   }, []);
 
   const refresh = useCallback(async () => {
+    const requestedAtRevision = waveLinuxRevisions().state;
     const next = await invoke<AppStateSnapshot>("get_state");
-    applySnapshot(next);
+    applySnapshot(next, requestedAtRevision);
   }, [applySnapshot]);
 
   const scheduleRefresh = useCallback((delayMs = 120) => {
@@ -194,8 +195,9 @@ export default function App() {
         return;
       }
       refreshInFlight.current = true;
+      const requestedAtRevision = waveLinuxRevisions().state;
       invoke<AppStateSnapshot>("observe_state")
-        .then(applySnapshot)
+        .then((next) => applySnapshot(next, requestedAtRevision))
         .catch(() => undefined)
         .finally(() => {
           refreshInFlight.current = false;

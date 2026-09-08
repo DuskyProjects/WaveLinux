@@ -146,13 +146,16 @@ impl OutputTargetControl {
             .lock()
             .map_err(|_| "output target state lock poisoned".to_string())?
             == targets;
-        if current_matches && pending.is_none() {
+        let submitted = self.submitted_generation.load(Ordering::Acquire);
+        let applied = self.applied_generation.load(Ordering::Acquire);
+        // Once taken from the queue, a request may still be priming or fading.
+        // Returning to the current output must supersede that in-flight switch.
+        if current_matches && pending.is_none() && submitted == applied {
             if let Ok(mut error) = self.last_error.lock() {
                 *error = None;
             }
-            return Ok(self.applied_generation.load(Ordering::Acquire));
+            return Ok(applied);
         }
-        let submitted = self.submitted_generation.load(Ordering::Acquire);
         let generation = requested_generation.unwrap_or_else(|| submitted.saturating_add(1));
         if generation <= submitted {
             return Err(format!(
@@ -176,6 +179,11 @@ impl OutputTargetControl {
     }
 
     fn acknowledge(&self, request: &PendingOutputTargets) {
+        // Keep queue's target comparison and generation checks consistent with
+        // completion of the route transition.
+        let Ok(_pending) = self.pending.lock() else {
+            return;
+        };
         if let Ok(mut current) = self.current_targets.lock() {
             *current = request.targets.clone();
         }
@@ -2087,6 +2095,25 @@ mod tests {
         assert_eq!(pending.targets, vec!["bluez_output.headphones"]);
         control.acknowledge(&pending);
         assert_eq!(control.current_targets(), vec!["bluez_output.headphones"]);
+    }
+
+    #[test]
+    fn returning_to_current_output_cancels_an_in_flight_switch() {
+        let control = OutputTargetControl::new(vec!["alsa_output.old".into()]);
+        control.queue(vec!["alsa_output.usb".into()], None).unwrap();
+        let switching = control.take_pending().unwrap();
+
+        let generation = control.queue(vec!["alsa_output.old".into()], None).unwrap();
+        assert!(generation > switching.generation);
+        let returning = control.take_pending().expect("return route must be queued");
+        assert_eq!(returning.targets, vec!["alsa_output.old"]);
+        control.acknowledge(&returning);
+        assert_eq!(control.current_targets(), vec!["alsa_output.old"]);
+        assert_eq!(
+            control.queue(vec!["alsa_output.old".into()], None).unwrap(),
+            generation
+        );
+        assert!(control.take_pending().is_none());
     }
 
     #[test]

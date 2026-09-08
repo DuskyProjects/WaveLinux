@@ -789,6 +789,7 @@ impl MixerConfig {
     pub fn set_settings(&mut self, settings: MixerSettings) -> MixerSettings {
         self.settings = settings;
         self.settings.keep_running_in_tray = true;
+        normalize_adaptive_latency_settings(&mut self.settings.adaptive_latency);
         self.settings.stream_sync_delay_msec =
             clamp_sync_delay_msec(self.settings.stream_sync_delay_msec);
         self.settings.monitor_sync_delay_msec =
@@ -1155,6 +1156,9 @@ impl MixerConfig {
             return Err(ModelError::InvalidMatcher);
         }
         let target = self.resolve_app_matcher(&target);
+        if app_matchers_overlap(&source, &target) {
+            return Err(ModelError::InvalidMatcher);
+        }
         let label = self
             .label_for_matcher(&target)
             .or_else(|| {
@@ -1235,12 +1239,21 @@ impl MixerConfig {
     }
 
     pub fn resolve_app_matcher(&self, matcher: &AppMatcher) -> AppMatcher {
-        self.app_identity_overrides
-            .iter()
-            .filter(|override_rule| app_matchers_overlap(&override_rule.source, matcher))
-            .max_by_key(|override_rule| app_matcher_specificity(&override_rule.source))
-            .map(|override_rule| override_rule.target.clone())
-            .unwrap_or_else(|| matcher.clone())
+        let mut resolved = matcher;
+        // An acyclic chain reaches its final identity within this bound. Keep
+        // the original identity if a saved config contains a cycle instead.
+        for _ in 0..=self.app_identity_overrides.len() {
+            let Some(override_rule) = self
+                .app_identity_overrides
+                .iter()
+                .filter(|override_rule| app_matchers_overlap(&override_rule.source, resolved))
+                .max_by_key(|override_rule| app_matcher_specificity(&override_rule.source))
+            else {
+                return resolved.clone();
+            };
+            resolved = &override_rule.target;
+        }
+        matcher.clone()
     }
 
     pub fn label_for_matcher(&self, matcher: &AppMatcher) -> Option<String> {
@@ -4959,6 +4972,63 @@ mod tests {
     }
 
     #[test]
+    fn chained_app_merges_keep_the_original_app_routable() {
+        let mut config = MixerConfig::default();
+        let first = AppMatcher::from_app_id("first");
+        let middle = AppMatcher::from_app_id("middle");
+        let last = AppMatcher::from_app_id("last");
+        config.assign_app_to_channel("game", first.clone()).unwrap();
+        config
+            .merge_app_identity(first.clone(), middle.clone())
+            .unwrap();
+        config.merge_app_identity(middle, last.clone()).unwrap();
+
+        assert_eq!(config.resolve_app_matcher(&first), last);
+        assert_eq!(config.app_routes[0].matcher, last);
+        assert_eq!(
+            config.set_app_volume_preset(first, 0.5).unwrap().matcher,
+            last
+        );
+    }
+
+    #[test]
+    fn merging_into_an_alias_of_the_source_is_rejected_without_changes() {
+        let mut config = MixerConfig::default();
+        let first = AppMatcher::from_app_id("first");
+        let last = AppMatcher::from_app_id("last");
+        config
+            .merge_app_identity(first.clone(), last.clone())
+            .unwrap();
+        let before = config.clone();
+        assert!(matches!(
+            config.merge_app_identity(last, first),
+            Err(ModelError::InvalidMatcher)
+        ));
+        assert_eq!(config, before);
+    }
+
+    #[test]
+    fn cyclic_saved_app_aliases_fall_back_to_the_original_identity() {
+        let first = AppMatcher::from_app_id("first");
+        let second = AppMatcher::from_app_id("second");
+        let config = MixerConfig {
+            app_identity_overrides: vec![
+                AppIdentityOverride {
+                    source: first.clone(),
+                    target: second.clone(),
+                },
+                AppIdentityOverride {
+                    source: second.clone(),
+                    target: first.clone(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(config.resolve_app_matcher(&first), first);
+        assert_eq!(config.resolve_app_matcher(&second), second);
+    }
+
+    #[test]
     fn app_identity_overrides_rewrite_routes_and_raw_removal() {
         let mut config = MixerConfig::default();
         let raw = AppMatcher::from_process_name("Discord");
@@ -5846,6 +5916,24 @@ mod tests {
         status.selected_effect_count = 0;
         status.resolve_state();
         assert_eq!(status.state, EffectRuntimeState::Grey);
+    }
+
+    #[test]
+    fn settings_updates_apply_the_same_latency_validation_as_reload() {
+        let mut config = MixerConfig::default();
+        let mut settings = config.settings.clone();
+        settings.adaptive_latency.min_msec = 40;
+        settings.adaptive_latency.max_msec = 20;
+        settings.adaptive_latency.levels_msec = vec![500, 1, 80, 80];
+        settings.adaptive_latency.enabled = false;
+        let saved = config.set_settings(settings);
+        let reloaded = config.normalized().unwrap().settings;
+        assert_eq!(saved, reloaded);
+        assert_eq!(saved.adaptive_latency.levels_msec, vec![40]);
+        assert_eq!(
+            saved.adaptive_latency.trigger_mode,
+            AdaptiveLatencyTriggerMode::Off
+        );
     }
 
     #[test]

@@ -383,7 +383,7 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return {
       available: false,
       install_supported: false,
-      current_version: "6.0.2",
+      current_version: "6.0.3",
       version: null,
       date: null,
       body: null,

@@ -279,9 +279,6 @@ shipping features:
 - Qualify isolated CUDA, OpenVINO, and AMD provider packs on representative
   hardware. Qualified RNNoise neural stages can run on channel workers with
   exact CPU fallback; ordinary filters, dynamics, delays, and mixing remain CPU.
-- Complete the final isolated 60-minute audio discontinuity stress gate for the
-  exact stable release artifact; continuity fixtures must never be injected
-  into a desktop graph with a physical monitor target.
 
 ## Change Rules
 

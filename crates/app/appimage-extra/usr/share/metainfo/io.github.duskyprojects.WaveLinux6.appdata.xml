@@ -20,6 +20,11 @@
     <binary>wavelinux6</binary>
   </provides>
   <releases>
+    <release version="6.0.3" date="2026-09-08">
+      <description>
+        <p>Fixes device switching, linked volumes, app merge routing, and settings persistence. Improves rapid effect editing and protects existing installs from failed AppImage copies.</p>
+      </description>
+    </release>
     <release version="6.0.2" date="2026-08-21">
       <description>
         <p>Prevents stale capture-stream moves from reaching PipeWire-Pulse after a recording client exits.</p>

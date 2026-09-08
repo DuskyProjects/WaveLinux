@@ -177,4 +177,47 @@ describe("WaveLinux state delivery", () => {
     await expect(delivered).resolves.toBe(false);
     vi.useRealTimers();
   });
+
+  it("preserves newer deltas when an older recovery snapshot arrives late", () => {
+    const initial = structuredClone(demoState);
+    state.initializeWaveLinuxState(initial);
+    const config = structuredClone(initial.config);
+    config.channels[0].name = "Latest name";
+    const engine = { ...initial.engine, healthy: false };
+    state.applyStateDelta({
+      revision: 6, config_revision: 6, graph_revision: 5, config, engine,
+    });
+    const recovered = structuredClone(initial);
+    recovered.graph.app_streams = [];
+    state.reconcileWaveLinuxState(recovered, {
+      state_revision: 5, config_revision: 5, graph_revision: 5,
+    });
+
+    function Probe() {
+      const current = state.useWaveLinuxSelector((snapshot) => snapshot);
+      return <output>{`${current?.config.channels[0].name}:${current?.engine.healthy}:${current?.graph.app_streams.length}`}</output>;
+    }
+    render(<Probe />);
+    expect(screen.getByText("Latest name:false:0")).toBeInTheDocument();
+    expect(state.waveLinuxRevisions()).toMatchObject({ state: 6, config: 6, graph: 5 });
+  });
+
+  it("preserves events received while an ordinary refresh is in flight", () => {
+    const initial = structuredClone(demoState);
+    state.initializeWaveLinuxState(initial);
+    const requestedAtRevision = state.waveLinuxRevisions().state;
+    const config = structuredClone(initial.config);
+    config.channels[0].name = "Latest name";
+    state.applyStateDelta({ revision: 1, config_revision: 1, graph_revision: 0, config });
+    const refreshed = structuredClone(initial);
+    refreshed.engine.healthy = false;
+    state.replaceWaveLinuxState(refreshed, requestedAtRevision);
+
+    function Probe() {
+      const current = state.useWaveLinuxSelector((snapshot) => snapshot);
+      return <output>{`${current?.config.channels[0].name}:${current?.engine.healthy}`}</output>;
+    }
+    render(<Probe />);
+    expect(screen.getByText("Latest name:false")).toBeInTheDocument();
+  });
 });

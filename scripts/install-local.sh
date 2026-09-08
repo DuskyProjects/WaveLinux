@@ -27,6 +27,28 @@ if [[ -z "$APPIMAGE" || ! -f "$APPIMAGE" ]]; then
   exit 1
 fi
 
+for helper in wavelinux6-audio-core wavelinux6-peripheral-plugin; do
+  if [[ ! -x "$ROOT_DIR/target/release/$helper" ]]; then
+    echo "Missing required helper: $ROOT_DIR/target/release/$helper" >&2
+    echo "Run bash scripts/build-local.sh first." >&2
+    exit 1
+  fi
+done
+
+# Complete preflight before stopping the user's working audio graph.
+dependency_args=()
+if [[ "${WAVELINUX_INSTALL_DEPS:-0}" == "1" ]]; then
+  dependency_args+=(--install)
+fi
+bash "$ROOT_DIR/scripts/check-dependencies.sh" "${dependency_args[@]}"
+
+# Copy the largest artifact before shutting down audio. A full disk or read
+# failure must not delete the working release or expose a partial AppImage.
+install -d "$SUPPORT_DIR"
+STAGED_APPIMAGE="$(mktemp "$SUPPORT_DIR/.wavelinux6-appimage.XXXXXX")"
+trap 'rm -f -- "$STAGED_APPIMAGE"' EXIT
+install -m 0755 "$APPIMAGE" "$STAGED_APPIMAGE"
+
 stop_previous_wavelinux_processes() {
   stop_pids() {
     local label="$1"
@@ -149,26 +171,10 @@ cleanup_previous_wavelinux_audio_modules() {
 stop_previous_wavelinux_processes
 cleanup_previous_wavelinux_audio_modules
 
-dependency_args=()
-if [[ "${WAVELINUX_INSTALL_DEPS:-0}" == "1" ]]; then
-  dependency_args+=(--install)
-fi
-bash "$ROOT_DIR/scripts/check-dependencies.sh" "${dependency_args[@]}"
-
 install -d "$BIN_DIR" "$SUPPORT_DIR" "$APP_DIR" "$ICON_BASE/32x32/apps" "$ICON_BASE/128x128/apps" "$ICON_BASE/256x256/apps" "$ICON_BASE/512x512/apps" "$ICON_BASE/scalable/apps"
-rm -f "$SUPPORT_DIR"/WaveLinux6_*_amd64.AppImage
-install -m 0755 "$APPIMAGE" "$INSTALLED_APPIMAGE"
 install -m 0755 "$ROOT_DIR/scripts/wavelinux-launcher.sh" "$LAUNCHER"
-if [[ -x "$ROOT_DIR/target/release/wavelinux6-audio-core" ]]; then
-  install -m 0755 "$ROOT_DIR/target/release/wavelinux6-audio-core" "$DSP_HELPER"
-else
-  echo "Warning: missing wavelinux6-audio-core; run bash scripts/build-local.sh to build it." >&2
-fi
-if [[ -x "$ROOT_DIR/target/release/wavelinux6-peripheral-plugin" ]]; then
-  install -m 0755 "$ROOT_DIR/target/release/wavelinux6-peripheral-plugin" "$PERIPHERAL_PLUGIN"
-else
-  echo "Warning: missing wavelinux6-peripheral-plugin; run bash scripts/build-local.sh to build it." >&2
-fi
+install -m 0755 "$ROOT_DIR/target/release/wavelinux6-audio-core" "$DSP_HELPER"
+install -m 0755 "$ROOT_DIR/target/release/wavelinux6-peripheral-plugin" "$PERIPHERAL_PLUGIN"
 install -m 0755 "$ROOT_DIR/scripts/check-dependencies.sh" "$SUPPORT_DIR/check-dependencies.sh"
 install -m 0755 "$ROOT_DIR/scripts/runtime-dependencies.sh" "$SUPPORT_DIR/runtime-dependencies.sh"
 install -m 0755 "$ROOT_DIR/scripts/verify-install.sh" "$SUPPORT_DIR/verify-install.sh"
@@ -181,6 +187,15 @@ install -m 0644 "$ROOT_DIR/crates/app/icons/128x128.png" "$ICON_BASE/128x128/app
 install -m 0644 "$ROOT_DIR/crates/app/icons/128x128@2x.png" "$ICON_BASE/256x256/apps/wavelinux6.png"
 install -m 0644 "$ROOT_DIR/crates/app/icons/icon.png" "$ICON_BASE/512x512/apps/wavelinux6.png"
 install -m 0644 "$ROOT_DIR/crates/app/icons/icon.svg" "$ICON_BASE/scalable/apps/wavelinux6.svg"
+
+# The staging file is on the destination filesystem, so publishing it is an
+# atomic rename even when the source checkout is on another mount.
+mv -f -- "$STAGED_APPIMAGE" "$INSTALLED_APPIMAGE"
+for previous_appimage in "$SUPPORT_DIR"/WaveLinux6_*_amd64.AppImage; do
+  if [[ "$previous_appimage" != "$INSTALLED_APPIMAGE" ]]; then
+    rm -f -- "$previous_appimage"
+  fi
+done
 
 # Keep the old config until WaveLinux 6 validates its first graph. Everything
 # else from the replaced WaveLinux5 installation can be removed immediately.

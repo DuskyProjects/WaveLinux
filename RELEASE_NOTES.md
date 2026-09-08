@@ -1,3 +1,65 @@
+# WaveLinux 6.0.3
+
+WaveLinux 6.0.3 improves device switching, saved routing, and fast mixer edits.
+It also protects an existing installation when copying an update fails.
+
+## Install or update
+
+Run this as your normal desktop user. It downloads the 6.0.3 `.sh`
+installer, verifies its checksum, installs missing dependencies, and starts
+WaveLinux. Existing WaveLinux 6 settings are preserved.
+
+```bash
+curl -fL https://github.com/DuskyProjects/WaveLinux/releases/download/v6.0.3/install.sh -o wavelinux6-install.sh \
+  && bash wavelinux6-install.sh --tag v6.0.3
+```
+
+Or download `WaveLinux6_6.0.3_amd64_Installer.sh` from the assets below and run it
+with Bash. The installer supports x86_64 Linux desktops; it requests
+administrator permission only for system dependencies.
+
+## Audio routing and settings
+
+- Manual Monitor output choices now disable automatic default-output following
+  and remain saved. Changing Stream outputs preserves the Monitor setting.
+- Quickly switching from device A to B and back to A keeps the final request,
+  including microphone changes and clearing an input while it is connecting.
+- Concurrent configuration saves cannot write an older snapshot over newer
+  settings.
+- Merging app A into B and then B into C preserves A's saved route. Self-merges
+  through aliases are rejected, and cyclic saved aliases terminate safely.
+- Remembered apps with different media identities stay visible even when they
+  share a browser process. Generic stream labels no longer become app identities.
+- Adaptive latency settings apply the same validation immediately and after
+  restarting.
+
+## Mixer responsiveness
+
+- Rapid effect edits are sent in order, with pending slider changes combined
+  into the latest value to reduce redundant engine requests and saves.
+- Linked Monitor and Stream volume edits stay in order. Unlinked mixes retain
+  their separate values, and failed writes recover after pending edits finish.
+- Delayed refresh responses preserve state delivered by newer engine events.
+- EQ faders retain an unfinished drag instead of jumping to a delayed value.
+
+## Installation and testing
+
+- Required helpers and dependencies are checked before stopping a working app.
+- The AppImage is fully copied before shutdown and published with an atomic
+  rename. Failed copies preserve the existing release, including same-version
+  reinstalls, and remove partial staging files.
+- The README now leads with one install/update command and automatic checksum
+  verification.
+- Adds regression coverage for these failures and fixes Linux screenshot font
+  selection without changing the reference images or the app's fonts.
+- Removes mandatory hour-long stress testing from release requirements.
+  Optional audio load diagnostics default to 60 seconds; source, package, and
+  distribution checks remain in place.
+
+This is a patch release in the WaveLinux 6 series. Live audio CPU or latency
+improvements have not been benchmarked; the optimizations reduce redundant
+control requests and configuration writes.
+
 # WaveLinux 6.0.2
 
 WaveLinux 6.0.2 fixes a capture-stream routing race that could repeatedly send

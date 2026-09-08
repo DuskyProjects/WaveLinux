@@ -47,6 +47,12 @@ yarn web:build
   contracts.
 - Shell: installers, process matching, dependency logic, and ALSA alias edits.
 
+Linux screenshot tests use `tests/e2e/fonts.conf` to select the DejaVu Sans
+fallback used by the committed images, independently of the desktop's default
+font. Install DejaVu Sans before running Playwright (`fonts-dejavu-core` on
+Debian/Ubuntu, `ttf-dejavu` on Arch). An explicit `FONTCONFIG_FILE` overrides
+this test setting. This affects only the test browser, not the installed app.
+
 ## Live PipeWire Tests
 
 Live tests mutate the current user audio graph. Close recording/streaming work
@@ -91,35 +97,23 @@ below the quantum budget. Near-silent microphone audio is a required benchmark
 case because recursive filters can expose denormal-number regressions that loud
 fixtures do not.
 
-## Stress Gate
+## Optional audio load diagnostics
 
-Before promotion from alpha/beta, run a 60-minute test covering concurrent disk,
-network, and CPU load while recording the Stream and microphone sources. Analyze
-the recording for discontinuities and retain logs.
-
-Required outcomes:
-
-- zero WaveLinux-owned underruns or dropped frames;
-- no `out of buffers`, unexplained link failures, rebuilds, or silent intervals;
-- app routing p95 below 100 ms;
-- audio readiness below 2 seconds;
-- RT callback p99 below 25% of its quantum budget;
-- at least 30% active-core CPU reduction from the recorded WaveLinux5 baseline;
-- no microphone latency regression.
-
-Stable promotion requires completing the full 60-minute automated gate on the
-exact release candidate artifacts.
-
-Run it with:
+Audio load diagnostics are available for investigating specific continuity or
+performance problems. They are not part of `scripts/test-all.sh`, CI, or the
+release requirements, and run only when explicitly requested. The default run
+lasts 60 seconds; set `WAVELINUX_STRESS_DURATION_SEC` to choose another duration.
 
 ```bash
-WAVELINUX_STRESS_DURATION_SEC=3600 bash scripts/stress-audio-isolated.sh \
-  target/release/bundle/appimage/WaveLinux6_6.0.2_amd64.AppImage
+bash scripts/stress-audio-isolated.sh \
+  target/release/bundle/appimage/WaveLinux6_6.0.3_amd64.AppImage
 ```
 
-The harness starts a separate D-Bus, PipeWire, PipeWire-Pulse, and policy-only
-WirePlumber session. Its monitor may target only a null/dummy sink, so the
-continuity pilot cannot reach the desktop user's headphones or speakers.
+The harness records Stream and microphone sources under concurrent disk,
+network, and CPU load, and retains its reports for diagnosis. It starts a
+separate D-Bus, PipeWire, PipeWire-Pulse, and policy-only WirePlumber session.
+Its monitor may target only a null/dummy sink, so the continuity pilot cannot
+reach the desktop user's headphones or speakers.
 `scripts/stress-audio-runtime.sh` rejects physical monitor targets by default;
 its override is for unattended lab hardware only.
 

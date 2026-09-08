@@ -57,4 +57,25 @@ describe("GraphicEqualizer", () => {
     expect(onUpdateParam).toHaveBeenCalledOnce();
     expect(onUpdateParam).toHaveBeenCalledWith("eq-1", "band_1_gain_db", 5);
   });
+
+  it("preserves an active drag when a delayed parameter update arrives", () => {
+    const onUpdateParam = vi.fn();
+    const { rerender } = render(
+      <GraphicEqualizer definition={definition} effect={effect} onUpdateParam={onUpdateParam} />,
+    );
+    const slider = screen.getByRole("slider", { name: "63 Hz gain" });
+    fireEvent.change(slider, { target: { value: "5" } });
+    rerender(
+      <GraphicEqualizer definition={definition}
+        effect={{ ...effect, params: { band_1_gain_db: 2 } }} onUpdateParam={onUpdateParam} />,
+    );
+    expect(slider).toHaveValue("5");
+    fireEvent.pointerUp(slider);
+    expect(onUpdateParam).toHaveBeenCalledWith("eq-1", "band_1_gain_db", 5);
+    rerender(
+      <GraphicEqualizer definition={definition}
+        effect={{ ...effect, params: { band_1_gain_db: 3 } }} onUpdateParam={onUpdateParam} />,
+    );
+    expect(slider).toHaveValue("3");
+  });
 });

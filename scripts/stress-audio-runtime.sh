@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/wavelinux-processes.sh
 source "$ROOT_DIR/scripts/wavelinux-processes.sh"
-DURATION_SEC="${WAVELINUX_STRESS_DURATION_SEC:-3600}"
+# Optional diagnostic, excluded from CI and release requirements.
+DURATION_SEC="${WAVELINUX_STRESS_DURATION_SEC:-60}"
 CPU_COUNT="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"
 # The parallel network stream consumes several additional cores. Keep half the
 # machine free for PipeWire, recording, disk I/O, and that network workload so

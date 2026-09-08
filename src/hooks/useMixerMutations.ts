@@ -6,6 +6,7 @@ import { invoke } from "../tauri";
 import type {
   AppStream,
   Channel,
+  EffectInstance,
   Mix,
   MixBus,
   MixerSettings,
@@ -15,6 +16,20 @@ import type { SetEffectChain } from "../views/EffectsView";
 type LatestNumberQueue = {
   inFlight: boolean;
   latest: number | null;
+};
+
+type ChannelVolumeQueue = {
+  inFlight: boolean;
+  latest: Map<string, number>;
+  needsRefresh: boolean;
+};
+
+type EffectWrite = {
+  effects: EffectInstance[];
+  waiters: {
+    resolve: (channel: Channel) => void;
+    reject: (error: unknown) => void;
+  }[];
 };
 
 type UseMixerMutationsOptions = {
@@ -28,7 +43,8 @@ export function useMixerMutations({
 }: UseMixerMutationsOptions) {
   const setState = updateWaveLinuxState;
   const mixVolumeQueues = useRef<Record<string, LatestNumberQueue>>({});
-  const channelVolumeQueues = useRef<Record<string, LatestNumberQueue>>({});
+  const channelVolumeQueues = useRef(new Map<string, ChannelVolumeQueue>());
+  const effectQueues = useRef(new Map<string, { inFlight: boolean; latest: EffectWrite | null }>());
   const settingsQueue = useRef<{ inFlight: boolean; latest: MixerSettings | null }>({
     inFlight: false,
     latest: null,
@@ -82,7 +98,12 @@ export function useMixerMutations({
     });
   }, []);
 
-  const patchChannelBusVolume = useCallback((channelId: string, mixId: string, volume: number) => {
+  const patchChannelBusVolume = useCallback((
+    channelId: string,
+    mixId: string,
+    volume: number,
+    newerWrites?: ReadonlyMap<string, number>,
+  ) => {
     setState((current) => {
       if (!current) return current;
       return {
@@ -91,6 +112,9 @@ export function useMixerMutations({
           ...current.config,
           channels: current.config.channels.map((channel) => {
             if (channel.id !== channelId) return channel;
+            if (newerWrites && (channel.linked ? newerWrites.size > 0 : newerWrites.has(mixId))) {
+              return channel;
+            }
             const mixBuses = Object.fromEntries(
               Object.entries(channel.mix_buses).map(([busMixId, bus]) => [
                 busMixId,
@@ -196,41 +220,47 @@ export function useMixerMutations({
   );
 
   const flushChannelVolumeQueue = useCallback(
-    (channelId: string, mixId: string) => {
-      const key = `${channelId}\u0000${mixId}`;
-      const queue = channelVolumeQueues.current[key];
-      if (!queue || queue.inFlight || queue.latest === null) return;
-      const volume = queue.latest;
-      queue.latest = null;
+    (channelId: string) => {
+      const queue = channelVolumeQueues.current.get(channelId);
+      if (!queue || queue.inFlight) return;
+      const next = queue.latest.entries().next().value;
+      if (!next) return;
+      const [mixId, volume] = next;
+      queue.latest.delete(mixId);
       queue.inFlight = true;
       void invoke<MixBus>("set_channel_volume", { channelId, mixId, volume })
         .then((bus) => {
-          if (queue.latest === null) {
-            patchChannelBusVolume(channelId, mixId, bus.volume);
-          }
+          patchChannelBusVolume(channelId, mixId, bus.volume, queue.latest);
         })
         .catch((error) => {
           reportError(String(error));
-          void refresh().catch(() => undefined);
+          queue.needsRefresh = true;
         })
         .finally(() => {
           queue.inFlight = false;
-          if (queue.latest !== null) {
-            flushChannelVolumeQueue(channelId, mixId);
+          if (queue.latest.size > 0) {
+            flushChannelVolumeQueue(channelId);
+          } else {
+            channelVolumeQueues.current.delete(channelId);
+            if (queue.needsRefresh) void refresh().catch(() => undefined);
           }
         });
     },
-    [patchChannelBusVolume, refresh],
+    [patchChannelBusVolume, refresh, reportError],
   );
 
   const setChannelBusVolumeFast = useCallback(
     async (channelId: string, mixId: string, volume: number) => {
       patchChannelBusVolume(channelId, mixId, volume);
-      const key = `${channelId}\u0000${mixId}`;
-      const queue = channelVolumeQueues.current[key] ?? { inFlight: false, latest: null };
-      channelVolumeQueues.current[key] = queue;
-      queue.latest = volume;
-      flushChannelVolumeQueue(channelId, mixId);
+      const queue = channelVolumeQueues.current.get(channelId) ?? {
+        inFlight: false, latest: new Map<string, number>(), needsRefresh: false,
+      };
+      channelVolumeQueues.current.set(channelId, queue);
+      // Keep the latest edit for each bus in submission order, including when
+      // a linked channel is edited through more than one mix's slider.
+      queue.latest.delete(mixId);
+      queue.latest.set(mixId, volume);
+      flushChannelVolumeQueue(channelId);
     },
     [flushChannelVolumeQueue, patchChannelBusVolume],
   );
@@ -338,20 +368,45 @@ export function useMixerMutations({
     [patchChannel, refresh],
   );
 
-  const setEffectChainFast = useCallback<SetEffectChain>(
-    async (channelId, effects) => {
-      patchChannel(channelId, { effects });
-      try {
-        const channel = await invoke<Channel>("set_effect_chain", { channelId, effects });
-        patchChannel(channel.id, { effects: channel.effects });
-        return channel;
-      } catch (error) {
-        reportError(String(error));
-        await refresh().catch(() => undefined);
-        throw error;
-      }
+  const flushEffectQueue = useCallback(
+    (channelId: string) => {
+      const queue = effectQueues.current.get(channelId);
+      if (!queue || queue.inFlight || queue.latest === null) return;
+      const write = queue.latest;
+      queue.latest = null;
+      queue.inFlight = true;
+      void invoke<Channel>("set_effect_chain", { channelId, effects: write.effects })
+        .then((channel) => {
+          if (queue.latest === null) patchChannel(channel.id, { effects: channel.effects });
+          for (const waiter of write.waiters) waiter.resolve(channel);
+        })
+        .catch((error: unknown) => {
+          reportError(String(error));
+          if (queue.latest === null) void refresh().catch(() => undefined);
+          for (const waiter of write.waiters) waiter.reject(error);
+        })
+        .finally(() => {
+          queue.inFlight = false;
+          if (queue.latest !== null) flushEffectQueue(channelId);
+          else effectQueues.current.delete(channelId);
+        });
     },
-    [patchChannel, refresh],
+    [patchChannel, refresh, reportError],
+  );
+
+  const setEffectChainFast = useCallback<SetEffectChain>(
+    (channelId, effects) => {
+      patchChannel(channelId, { effects });
+      return new Promise<Channel>((resolve, reject) => {
+        const queue = effectQueues.current.get(channelId) ?? { inFlight: false, latest: null };
+        effectQueues.current.set(channelId, queue);
+        const waiters = queue.latest?.waiters ?? [];
+        waiters.push({ resolve, reject });
+        queue.latest = { effects, waiters };
+        flushEffectQueue(channelId);
+      });
+    },
+    [flushEffectQueue, patchChannel],
   );
 
   const setChannelEffectsEnabledFast = useCallback(
@@ -407,7 +462,9 @@ export function useMixerMutations({
   const setMixMonitorOutputFast = useCallback(
     async (mixId: string, output: string | null) => {
       patchMix(mixId, { monitor_output: output, output_devices: output ? [output] : [] });
-      patchSettingsFromPartial({ monitor_follows_default_output: false });
+      if (mixId === "monitor") {
+        patchSettingsFromPartial({ monitor_follows_default_output: false });
+      }
       try {
         const mix = await invoke<Mix>("set_mix_monitor_output", { mixId, output });
         patchMix(mix.id, {
@@ -516,4 +573,3 @@ export function useMixerMutations({
     setSettingsFast,
   };
 }
-

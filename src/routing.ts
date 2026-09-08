@@ -186,8 +186,10 @@ function shouldKeepStreamMediaName(stream: AppStream): boolean {
 }
 
 function isGenericMediaName(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "stream" || /^stream \d+$/.test(normalized)) return true;
   return ["audio-src", "audio src", "audio", "playback", "output", "input"].includes(
-    value.trim().toLowerCase(),
+    normalized,
   );
 }
 
@@ -229,19 +231,19 @@ function normalizedMatcherValue(value: string): string {
   return value.trim().toLowerCase();
 }
 
-function matchersOverlap(left: AppMatcher, right: AppMatcher): boolean {
-  if (routeKey(left) === routeKey(right)) return true;
-  const rightEntries = new Map(
-    matcherEntries(right).map(([kind, value]) => [kind, normalizedMatcherValue(value)]),
-  );
-  return matcherEntries(left).some(([kind, value]) => {
-    const rightValue = rightEntries.get(kind);
-    return Boolean(rightValue && rightValue === normalizedMatcherValue(value));
+function matcherMatches(pattern: AppMatcher, candidate: AppMatcher): boolean {
+  const entries = matcherEntries(pattern);
+  return entries.length > 0 && entries.every(([kind, value]) => {
+    const candidateValue = kind === "binary"
+      ? candidate.binary ?? candidate.process_name
+      : candidate[kind];
+    return Boolean(candidateValue &&
+      normalizedMatcherValue(candidateValue) === normalizedMatcherValue(value));
   });
 }
 
 function matcherIsActive(matcher: AppMatcher, activeMatchers: AppMatcher[]): boolean {
-  return activeMatchers.some((activeMatcher) => matchersOverlap(activeMatcher, matcher));
+  return activeMatchers.some((activeMatcher) => matcherMatches(matcher, activeMatcher));
 }
 
 function volumePresetForMatcher(

@@ -61,6 +61,13 @@ let configRevision = 0;
 let graphRevision = 0;
 let meterRevision = 0;
 let operationRevision = 0;
+const lastDeltaRevisions: Record<keyof AppStateSnapshot, number> = {
+  config: 0,
+  graph: 0,
+  diagnostics: 0,
+  engine: 0,
+  catalog: 0,
+};
 let meters: LevelMeter[] = [];
 let meterLevels = new Map<string, number>();
 let meterPaintFrame: number | null = null;
@@ -84,21 +91,45 @@ export function initializeWaveLinuxState(initial: AppStateSnapshot | null): void
   replaceMeters(initial.graph.meters);
 }
 
-export function replaceWaveLinuxState(next: AppStateSnapshot): void {
-  snapshot = next;
+export function replaceWaveLinuxState(
+  next: AppStateSnapshot,
+  requestedAtRevision = stateRevision,
+): AppStateSnapshot {
+  snapshot = snapshotWithNewerDeltas(next, requestedAtRevision);
   if (meterRevision === 0) replaceMeters(next.graph.meters);
   emitState();
   if (pendingDeltas.length > 0) {
     const queued = pendingDeltas.splice(0).sort((left, right) => left.revision - right.revision);
     for (const delta of queued) applyStateDelta(delta);
   }
+  return snapshot;
+}
+
+function snapshotWithNewerDeltas(
+  next: AppStateSnapshot,
+  requestedAtRevision: number,
+): AppStateSnapshot {
+  // A snapshot request can finish after a newer event. Fill missing sections
+  // without replacing data delivered since this request's revision boundary.
+  const current = snapshot;
+  const recover = <K extends keyof AppStateSnapshot>(key: K): AppStateSnapshot[K] =>
+    current !== null && lastDeltaRevisions[key] > requestedAtRevision
+      ? current[key]
+      : next[key];
+  return {
+    config: recover("config"),
+    graph: recover("graph"),
+    diagnostics: recover("diagnostics"),
+    engine: recover("engine"),
+    catalog: recover("catalog"),
+  };
 }
 
 export function reconcileWaveLinuxState(
   next: AppStateSnapshot,
   target: WaveLinuxRevisionTarget,
 ): void {
-  snapshot = next;
+  snapshot = snapshotWithNewerDeltas(next, target.state_revision);
   stateRevision = Math.max(stateRevision, target.state_revision);
   configRevision = Math.max(configRevision, target.config_revision);
   graphRevision = Math.max(graphRevision, target.graph_revision);
@@ -128,6 +159,9 @@ export function applyStateDelta(delta: StateDeltaEvent): void {
     delta.config || delta.graph || delta.diagnostics || delta.engine || delta.catalog,
   );
   if (hasStateChange) {
+    for (const key of Object.keys(lastDeltaRevisions) as (keyof AppStateSnapshot)[]) {
+      if (delta[key] !== undefined) lastDeltaRevisions[key] = delta.revision;
+    }
     const previousMeters = snapshot.graph.meters;
     snapshot = {
       config: delta.config ?? snapshot.config,

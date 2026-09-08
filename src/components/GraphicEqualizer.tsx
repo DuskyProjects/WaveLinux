@@ -48,9 +48,11 @@ function EqualizerBandFader({
 }) {
   const [draft, setDraft] = useState(value);
   const lastCommitted = useRef(value);
+  const hasUncommittedDraft = useRef(false);
   const display = Math.round(draft * 10) / 10;
 
   useEffect(() => {
+    if (hasUncommittedDraft.current) return;
     setDraft(value);
     lastCommitted.current = value;
   }, [value]);
@@ -60,6 +62,7 @@ function EqualizerBandFader({
       const next = Number.isFinite(raw)
         ? Math.max(param.min, Math.min(param.max, raw))
         : value;
+      hasUncommittedDraft.current = false;
       setDraft(next);
       if (lastCommitted.current === next) return;
       lastCommitted.current = next;
@@ -78,7 +81,10 @@ function EqualizerBandFader({
           max={param.max}
           min={param.min}
           onBlur={(event) => commit(Number(event.currentTarget.value))}
-          onChange={(event) => setDraft(Number(event.currentTarget.value))}
+          onChange={(event) => {
+            hasUncommittedDraft.current = true;
+            setDraft(Number(event.currentTarget.value));
+          }}
           onKeyUp={(event) => {
             if (event.key === "Enter") commit(Number(event.currentTarget.value));
           }}

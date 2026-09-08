@@ -866,13 +866,16 @@ impl InputTargetControl {
             .lock()
             .map_err(|_| "input target state lock poisoned".to_string())?
             == target;
-        if current_matches && pending.is_none() {
+        let submitted = self.submitted_generation.load(Ordering::Acquire);
+        let applied = self.applied_generation.load(Ordering::Acquire);
+        // A taken request can still be connecting. Returning to the current
+        // microphone (or no microphone) must cancel that in-flight switch.
+        if current_matches && pending.is_none() && submitted == applied {
             if let Ok(mut error) = self.last_error.lock() {
                 *error = None;
             }
-            return Ok(self.applied_generation.load(Ordering::Acquire));
+            return Ok(applied);
         }
-        let submitted = self.submitted_generation.load(Ordering::Acquire);
         let generation = requested_generation.unwrap_or_else(|| submitted.saturating_add(1));
         if generation <= submitted {
             return Err(format!(
@@ -893,6 +896,9 @@ impl InputTargetControl {
     }
 
     fn acknowledge(&self, request: &PendingInputTarget) {
+        let Ok(_pending) = self.pending.lock() else {
+            return;
+        };
         if let Ok(mut current) = self.current_target.lock() {
             *current = request.target.clone();
         }
@@ -4198,6 +4204,24 @@ mod tests {
         assert!(control.current_target().is_none());
         assert_eq!(control.applied_generation.load(Ordering::Acquire), 4);
         assert_eq!(control.queue(None, None).unwrap(), 4);
+    }
+
+    #[test]
+    fn returning_to_current_input_cancels_an_in_flight_switch() {
+        for initial in [Some("alsa_input.old".to_string()), None] {
+            let control = InputTargetControl::new(initial.clone());
+            control.queue(Some("alsa_input.usb".into()), None).unwrap();
+            let switching = control.take_pending().unwrap();
+
+            let generation = control.queue(initial.clone(), None).unwrap();
+            assert!(generation > switching.generation);
+            let returning = control.take_pending().expect("return route must be queued");
+            assert_eq!(returning.target, initial);
+            control.acknowledge(&returning);
+            assert_eq!(control.current_target(), initial);
+            assert_eq!(control.queue(initial, None).unwrap(), generation);
+            assert!(control.take_pending().is_none());
+        }
     }
 
     #[test]

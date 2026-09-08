@@ -7154,13 +7154,15 @@ impl WaveLinuxEngine {
     }
 
     fn persist_config(&self) -> Result<(), EngineError> {
-        let config = self.read_config()?.clone();
-        let serialized = serde_json::to_string(&config)?;
-        let revision = content_revision(&serialized);
         let mut persisted = self
             .persisted_config_revision
             .lock()
             .map_err(|_| EngineError::LockPoisoned)?;
+        // Serialize saves before taking a snapshot, so an older caller cannot
+        // overwrite a newer config after waiting for the previous disk write.
+        let config = self.read_config()?.clone();
+        let serialized = serde_json::to_string(&config)?;
+        let revision = content_revision(&serialized);
         if persisted.as_deref() == Some(revision.as_str()) && self.paths.config_file().is_file() {
             return Ok(());
         }
@@ -22594,6 +22596,69 @@ mod tests {
         assert!(settings.lock_default_output);
         assert!(!settings.monitor_follows_default_output);
         assert!(settings.keep_running_in_tray);
+    }
+
+    #[test]
+    fn manual_monitor_outputs_disable_default_following_and_persist() {
+        let engine = test_engine();
+        for outputs in [vec!["alsa_output.usb".into()], Vec::new()] {
+            engine
+                .write_config()
+                .unwrap()
+                .settings
+                .monitor_follows_default_output = true;
+            let mix = engine
+                .set_mix_outputs("monitor".into(), outputs.clone())
+                .unwrap();
+            assert_eq!(mix.output_devices, outputs);
+            let saved: MixerConfig = read_json(&engine.paths.config_file()).unwrap();
+            assert!(!saved.settings.monitor_follows_default_output);
+        }
+    }
+
+    #[test]
+    fn stream_output_selection_preserves_monitor_default_following() {
+        let engine = test_engine();
+        engine
+            .write_config()
+            .unwrap()
+            .settings
+            .monitor_follows_default_output = true;
+        engine
+            .set_mix_outputs("stream".into(), vec!["alsa_output.usb".into()])
+            .unwrap();
+        let saved: MixerConfig = read_json(&engine.paths.config_file()).unwrap();
+        assert!(saved.settings.monitor_follows_default_output);
+    }
+
+    #[test]
+    fn config_save_serializes_before_reading_the_snapshot() {
+        let engine = test_engine();
+        let mut config = engine.write_config().unwrap();
+        let saving_engine = Arc::clone(&engine);
+        let saver = thread::spawn(move || saving_engine.persist_config());
+
+        // A saver blocked on this config must already hold the persistence
+        // lock, otherwise an older snapshot can overtake a newer disk write.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let locked = loop {
+            if matches!(
+                engine.persisted_config_revision.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::yield_now();
+        };
+        config.channels[0].name = "Latest saved name".into();
+        drop(config);
+        saver.join().unwrap().unwrap();
+        assert!(locked, "snapshot was read before serializing saves");
+        let saved: MixerConfig = read_json(&engine.paths.config_file()).unwrap();
+        assert_eq!(saved.channels[0].name, "Latest saved name");
     }
 
     #[test]

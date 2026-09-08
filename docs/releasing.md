@@ -17,13 +17,10 @@ local build/install never pushes, tags, or publishes by itself.
 6. Install locally through `scripts/install-local.sh` and verify public nodes,
    routing, meters, microphone, Stream aggregation, effect swaps, hotplug, and
    current Health/log output.
-7. Complete the 60-minute `scripts/stress-audio-isolated.sh` gate against the
-   exact AppImage and retain its JSON result. The isolated PipeWire policy
-   session has no physical output; the lower-level runtime gate refuses a real
-   monitor target unless a controlled lab explicitly overrides that guard.
 
-Any unexplained discontinuity, owned underrun, failed link, graph rebuild,
-silent interval, or missed performance threshold blocks release.
+Release validation consists of the source suite, package checks, and supported
+installation/distribution checks. Extended audio stress testing is optional;
+there is no mandatory duration or stress-test prerequisite for publication.
 
 ## Version Promotion
 

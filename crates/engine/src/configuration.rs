@@ -56,7 +56,13 @@ impl WaveLinuxEngine {
         mix_id: String,
         outputs: Vec<String>,
     ) -> Result<Mix, EngineError> {
-        let mix = self.update_config(|config| config.set_mix_outputs(mix_id, outputs))??;
+        let mix = self.update_config(|config| {
+            let mix = config.set_mix_outputs(mix_id, outputs)?;
+            if mix.id == "monitor" {
+                config.settings.monitor_follows_default_output = false;
+            }
+            Ok(mix)
+        })??;
         let _ = self.repair_audio_graph_if_running();
         Ok(mix)
     }
