@@ -39,3 +39,9 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# tract 0.21.4's debug-only graph-name check rejects shared Conv bias names
+# in the official DFN3 graph. Use the same graph path as the release runtime;
+# WaveLinux still validates audio output and exercises inference in its tests.
+[profile.dev.package.tract-core]
+debug-assertions = false

@@ -2862,11 +2862,17 @@ fn spawn_ui_event_bridge(
 }
 
 fn meter_event_changed(previous: &[LevelMeter], next: &[LevelMeter]) -> bool {
-    previous.len() != next.len()
+    // Compressor history is a time display: even a steady signal needs each
+    // sample. Ordinary channel meters still suppress imperceptible changes.
+    next.iter()
+        .any(|meter| meter.compressor.is_some() || meter.spectrum.is_some())
+        || previous.len() != next.len()
         || previous.iter().zip(next).any(|(left, right)| {
             left.node_id != right.node_id
                 || meter_value_changed(left.peak_left, right.peak_left)
                 || meter_value_changed(left.peak_right, right.peak_right)
+                || left.compressor.is_some() != right.compressor.is_some()
+                || left.spectrum.is_some() != right.spectrum.is_some()
         })
 }
 
@@ -3152,6 +3158,8 @@ mod updater_tests {
     #[test]
     fn meter_events_coalesce_sub_visual_changes() {
         let previous = vec![LevelMeter {
+            spectrum: None,
+            compressor: None,
             node_id: "hardware_in".into(),
             peak_left: 0.2,
             peak_right: 0.2,
@@ -3165,13 +3173,33 @@ mod updater_tests {
     }
 
     #[test]
+    fn compressor_history_receives_steady_samples_and_bypass_transitions() {
+        let active = vec![LevelMeter {
+            spectrum: None,
+            node_id: "mic".into(),
+            peak_left: 0.2,
+            peak_right: 0.2,
+            compressor: Some(wavelinux_model::CompressorMeter::default()),
+        }];
+        assert!(meter_event_changed(&active, &active));
+        let mut bypassed = active.clone();
+        bypassed[0].compressor = None;
+        assert!(meter_event_changed(&active, &bypassed));
+        assert!(!meter_event_changed(&bypassed, &bypassed));
+    }
+
+    #[test]
     fn meter_events_always_publish_zero_transitions() {
         let previous = vec![LevelMeter {
+            spectrum: None,
+            compressor: None,
             node_id: "hardware_in".into(),
             peak_left: METER_EVENT_MIN_DELTA * 0.5,
             peak_right: 0.0,
         }];
         let next = vec![LevelMeter {
+            spectrum: None,
+            compressor: None,
             node_id: "hardware_in".into(),
             peak_left: 0.0,
             peak_right: 0.0,

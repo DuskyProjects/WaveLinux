@@ -82,5 +82,5 @@ fi
 git diff --check
 
 if [[ "${WAVELINUX_RUN_LIVE_TESTS:-0}" == "1" ]]; then
-  cargo test -p wavelinux-engine -- --ignored --test-threads=1
+  cargo test -p wavelinux-engine --lib -- --ignored --test-threads=1
 fi

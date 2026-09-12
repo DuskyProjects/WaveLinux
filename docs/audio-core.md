@@ -55,15 +55,18 @@ or log. New control work is prepared off the callback and published atomically.
 
 At block boundaries, recursive filter state below `1e-20` is reset to zero.
 Do not remove this as an insignificant numeric cleanup: subnormal values caused
-near-silent EQ/high-pass processing to consume almost half a CPU core.
+near-silent EQ/high-pass processing to consume almost half a CPU core. Voice-style
+tone filters also clear tiny state at block boundaries, and room-feedback writes
+clear inaudible values before they circulate through delay lines.
 
 ## Native Effects
 
 | Effect id | Implementation |
 | --- | --- |
 | `rnnoise` | Native feature/synthesis path with an explicit-state WaveLinux CPU neural stage derived from pinned `nnnoiseless` weights. |
+| `deepfilternet3` | Embedded official DFN3 model with the native tract inference runtime. |
 | `highpass` | Stateful first-order high-pass. |
-| `eq` | Eight peaking biquads at 63, 125, 250, 500, 1k, 2k, 4k, and 8k. |
+| `eq` | Eight parametric RBJ biquads with adjustable gain, frequency, Q and shape. |
 | `compressor` | Peak detector, linear-domain transfer curve, attack/release smoothing. |
 | `gate` | Linear threshold, hold, range, and attack/release smoothing. |
 | `limiter` | Input gain and hard output ceiling. |
@@ -73,24 +76,48 @@ Mono microphones instantiate one RNNoise state. The processed mono signal is
 copied to both public channels for client compatibility. Stereo channels use
 two states.
 
-DeepFilterNet is not implemented or installed. Legacy `deepfilternet` config
-entries migrate to RNNoise before a chain is rendered.
+Legacy `deepfilternet` config entries migrate to RNNoise. The native
+`deepfilternet3` effect is a separate supported id; choosing one noise suppressor
+replaces the other without removing EQ or other effects.
 
-## RNNoise Strength
+## Noise Cleanup
 
-The normal UI exposes one Strength slider. At 0-100%, it maps to:
+Both filters expose one Strength slider (0–60 dB attenuation limit), plus
+Gentle (6 dB), Balanced (12 dB), and Strong (36 dB) presets. At zero Strength,
+audio passes through unchanged. The limits bound the model's proposed removal;
+they do not force attenuation on sounds the model identifies as speech.
 
-```text
-VAD threshold:        25 -> 95
-hold:                 250 -> 75 ms
-minimum voice level:  -65 -> -28 dB
-dry mix:              0.12 -> 0.00
-```
+RNNoise clamps its neural spectral gains before synthesis. This avoids mixing
+unaligned dry and wet frames to reduce the effect. Simple controls disable the
+additional speech gate and dry mix. Existing saved configurations retain the
+previous full-strength model and speech-gate behavior. Advanced still exposes
+VAD, hold and minimum voice level for intentional near-field gating. Speech Gate
+is an on/off control; Dry Mix is a percentage. The Advanced dry signal is delayed
+by the same 480-frame analysis window as neural synthesis; the streaming adapter
+adds another 480 frames (20 ms total at 48 kHz). Closed gates advance input history
+and clear muted synthesis overlap, preventing stale audio when speech resumes.
+RNNoise rejects input rates other than 48 kHz rather than processing at the wrong
+speed.
 
-The minimum-level condition complements RNNoise speech probability: speech from
-a television across the room may classify as speech, but an aggressive setting
-also requires near-field energy. Advanced controls remain available for unusual
-microphone gain or distance.
+DeepFilterNet uses the official DFN3 model embedded at build time, pinned to
+upstream revision `d375b2d8309e0935d165700c91da9de862a99c31` and tract 0.21.4.
+Additional post-filtering is off. It requires 48 kHz and handles mono/stereo
+according to the selected channel input mode. The algorithm adds its own
+window/lookahead delay in addition to the channel's normal buffering.
+
+Tract recurrent state is not Send. Each DFN model is created, processed and
+destroyed on a dedicated inference thread. Reusable input/output buffers cross
+bounded channels from the existing DSP worker; the PipeWire capture callback
+never waits. Initialization errors are returned before a chain is published.
+Inference disconnects, non-finite results and a 250 ms worker deadline report
+`processing_errors` and request chain recovery, preserving the dry signal.
+Dropping a chain closes its request channel and lets the inference thread exit.
+
+The gray EQ spectrum is calculated from final processed channel history,
+including all enabled effects, before per-mix volume. Analysis remains on the
+meter connection thread and uses an 8192-frame minimum output-history capacity
+for its 4096-frame window. Compressor telemetry still measures that compressor's
+own input, output and gain reduction.
 
 ## Chain Updates
 

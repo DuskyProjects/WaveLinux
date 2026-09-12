@@ -2326,9 +2326,11 @@ impl Default for EffectCatalog {
             effect(
                 "rnnoise",
                 "Noise Suppression",
-                "RNNoise speech noise suppression",
+                "RNNoise speech cleanup. Choose Gentle for faint hiss.",
                 PluginHint::Native,
                 vec![
+                    param("reduction_db", "Noise Reduction", 0.0, 60.0, 60.0, " dB"),
+                    param("voice_gate", "Speech Gate", 0.0, 1.0, 1.0, ""),
                     param("vad_threshold", "VAD Threshold", 0.0, 99.0, 25.0, "%"),
                     param("hold_ms", "Hold Open", 0.0, 1000.0, 200.0, " ms"),
                     param(
@@ -2339,8 +2341,22 @@ impl Default for EffectCatalog {
                         -70.0,
                         " dB",
                     ),
-                    param("dry_mix", "Dry Mix", 0.0, 1.0, 0.0, ""),
+                    param("dry_mix", "Dry Mix", 0.0, 1.0, 0.0, "%"),
                 ],
+            ),
+            effect(
+                "deepfilternet3",
+                "DeepFilterNet 3",
+                "Natural speech cleanup. Choose Gentle for faint hiss or fans.",
+                PluginHint::Native,
+                vec![param(
+                    "reduction_db",
+                    "Noise Reduction",
+                    0.0,
+                    60.0,
+                    12.0,
+                    " dB",
+                )],
             ),
             effect(
                 "highpass",
@@ -2352,17 +2368,97 @@ impl Default for EffectCatalog {
             effect(
                 "eq",
                 "8-Band EQ",
-                "Graphic tone shaping",
+                "Visual tone shaping",
                 PluginHint::Native,
                 vec![
                     param("band_63_gain_db", "63", -12.0, 12.0, 0.0, " dB"),
+                    param(
+                        "band_63_frequency_hz",
+                        "Frequency",
+                        20.0,
+                        20000.0,
+                        63.0,
+                        " Hz",
+                    ),
+                    param("band_63_q", "Width (Q)", 0.2, 10.0, 0.9, ""),
+                    param("band_63_type", "Shape", 0.0, 4.0, 0.0, ""),
                     param("band_125_gain_db", "125", -12.0, 12.0, 0.0, " dB"),
+                    param(
+                        "band_125_frequency_hz",
+                        "Frequency",
+                        20.0,
+                        20000.0,
+                        125.0,
+                        " Hz",
+                    ),
+                    param("band_125_q", "Width (Q)", 0.2, 10.0, 1.0, ""),
+                    param("band_125_type", "Shape", 0.0, 4.0, 0.0, ""),
                     param("band_250_gain_db", "250", -12.0, 12.0, 0.0, " dB"),
+                    param(
+                        "band_250_frequency_hz",
+                        "Frequency",
+                        20.0,
+                        20000.0,
+                        250.0,
+                        " Hz",
+                    ),
+                    param("band_250_q", "Width (Q)", 0.2, 10.0, 1.0, ""),
+                    param("band_250_type", "Shape", 0.0, 4.0, 0.0, ""),
                     param("band_500_gain_db", "500", -12.0, 12.0, 0.0, " dB"),
+                    param(
+                        "band_500_frequency_hz",
+                        "Frequency",
+                        20.0,
+                        20000.0,
+                        500.0,
+                        " Hz",
+                    ),
+                    param("band_500_q", "Width (Q)", 0.2, 10.0, 1.0, ""),
+                    param("band_500_type", "Shape", 0.0, 4.0, 0.0, ""),
                     param("band_1k_gain_db", "1k", -12.0, 12.0, 0.0, " dB"),
+                    param(
+                        "band_1k_frequency_hz",
+                        "Frequency",
+                        20.0,
+                        20000.0,
+                        1000.0,
+                        " Hz",
+                    ),
+                    param("band_1k_q", "Width (Q)", 0.2, 10.0, 1.0, ""),
+                    param("band_1k_type", "Shape", 0.0, 4.0, 0.0, ""),
                     param("band_2k_gain_db", "2k", -12.0, 12.0, 0.0, " dB"),
+                    param(
+                        "band_2k_frequency_hz",
+                        "Frequency",
+                        20.0,
+                        20000.0,
+                        2000.0,
+                        " Hz",
+                    ),
+                    param("band_2k_q", "Width (Q)", 0.2, 10.0, 1.0, ""),
+                    param("band_2k_type", "Shape", 0.0, 4.0, 0.0, ""),
                     param("band_4k_gain_db", "4k", -12.0, 12.0, 0.0, " dB"),
+                    param(
+                        "band_4k_frequency_hz",
+                        "Frequency",
+                        20.0,
+                        20000.0,
+                        4000.0,
+                        " Hz",
+                    ),
+                    param("band_4k_q", "Width (Q)", 0.2, 10.0, 1.0, ""),
+                    param("band_4k_type", "Shape", 0.0, 4.0, 0.0, ""),
                     param("band_8k_gain_db", "8k", -12.0, 12.0, 0.0, " dB"),
+                    param(
+                        "band_8k_frequency_hz",
+                        "Frequency",
+                        20.0,
+                        20000.0,
+                        8000.0,
+                        " Hz",
+                    ),
+                    param("band_8k_q", "Width (Q)", 0.2, 10.0, 0.9, ""),
+                    param("band_8k_type", "Shape", 0.0, 4.0, 0.0, ""),
                 ],
             ),
             effect(
@@ -2371,7 +2467,7 @@ impl Default for EffectCatalog {
                 "Dynamic range control",
                 PluginHint::Native,
                 vec![
-                    param("threshold_db", "Threshold", -30.0, 0.0, -20.0, " dB"),
+                    param("threshold_db", "Threshold", -60.0, 0.0, -20.0, " dB"),
                     param("ratio", "Ratio", 1.0, 20.0, 4.0, ":1"),
                     param("attack_ms", "Attack", 1.5, 200.0, 5.0, " ms"),
                     param("release_ms", "Release", 5.0, 800.0, 100.0, " ms"),
@@ -2407,7 +2503,7 @@ impl Default for EffectCatalog {
                 "Vocal doubler, slap echo, and room width",
                 PluginHint::Native,
                 vec![
-                    param("dry_mix", "Dry Mix", 0.0, 1.0, 0.78, ""),
+                    param("dry_mix", "Dry Mix", 0.0, 1.0, 0.78, "%"),
                     param(
                         "tone_highpass_hz",
                         "Tone Low Cut",
@@ -2425,7 +2521,7 @@ impl Default for EffectCatalog {
                         " Hz",
                     ),
                     param("tone_gain_db", "Tone Drive", -12.0, 12.0, 0.0, " dB"),
-                    param("double_mix", "Double", 0.0, 1.0, 0.22, ""),
+                    param("double_mix", "Double", 0.0, 1.0, 0.22, "%"),
                     param("double_delay_ms", "Double Delay", 8.0, 80.0, 28.0, " ms"),
                     param("detune_cents", "Detune", 0.0, 25.0, 7.0, " cents"),
                     param("room_size_m", "Room Size", 1.0, 120.0, 38.0, " m"),
@@ -2446,6 +2542,8 @@ impl Default for EffectCatalog {
                         ("hold_ms", 200.0),
                         ("minimum_voice_level_db", -70.0),
                         ("dry_mix", 0.0),
+                        ("reduction_db", 60.0),
+                        ("voice_gate", 1.0),
                     ],
                 ),
                 preset(
@@ -2455,15 +2553,30 @@ impl Default for EffectCatalog {
                         ("hold_ms", 250.0),
                         ("minimum_voice_level_db", -70.0),
                         ("dry_mix", 0.0),
+                        ("reduction_db", 6.0),
+                        ("voice_gate", 0.0),
                     ],
                 ),
                 preset(
-                    "Aggressive",
+                    "Balanced",
                     &[
-                        ("vad_threshold", 75.0),
+                        ("reduction_db", 12.0),
+                        ("voice_gate", 0.0),
+                        ("vad_threshold", 25.0),
+                        ("hold_ms", 200.0),
+                        ("minimum_voice_level_db", -70.0),
+                        ("dry_mix", 0.0),
+                    ],
+                ),
+                preset(
+                    "Strong",
+                    &[
+                        ("vad_threshold", 25.0),
                         ("hold_ms", 150.0),
                         ("minimum_voice_level_db", -70.0),
                         ("dry_mix", 0.0),
+                        ("reduction_db", 36.0),
+                        ("voice_gate", 0.0),
                     ],
                 ),
                 preset(
@@ -2473,8 +2586,19 @@ impl Default for EffectCatalog {
                         ("hold_ms", 100.0),
                         ("minimum_voice_level_db", -42.0),
                         ("dry_mix", 0.0),
+                        ("reduction_db", 60.0),
+                        ("voice_gate", 1.0),
                     ],
                 ),
+            ],
+        );
+        set_presets(
+            &mut effects,
+            "deepfilternet3",
+            vec![
+                preset("Gentle", &[("reduction_db", 6.0)]),
+                preset("Balanced", &[("reduction_db", 12.0)]),
+                preset("Strong", &[("reduction_db", 36.0)]),
             ],
         );
         set_presets(
@@ -2733,6 +2857,7 @@ impl Default for EffectCatalog {
             preferred_order: vec![
                 "highpass".into(),
                 "rnnoise".into(),
+                "deepfilternet3".into(),
                 "eq".into(),
                 "gate".into(),
                 "compressor".into(),
@@ -2996,11 +3121,24 @@ pub struct AppStream {
     pub muted: bool,
 }
 
+/// Measurements at the compressor itself, before later effects or mix gain.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct CompressorMeter {
+    pub input_peak: f32,
+    pub output_peak: f32,
+    pub gain_reduction_db: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LevelMeter {
     pub node_id: String,
     pub peak_left: f32,
     pub peak_right: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compressor: Option<CompressorMeter>,
+    /// Logarithmic 20 Hz–20 kHz channel input spectrum, -90 to 0 dB mapped to 0–1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spectrum: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3091,6 +3229,7 @@ pub struct AudioCoreChannelStatus {
     pub chain_swaps: u64,
     pub non_finite_blocks: u64,
     pub non_finite_samples: u64,
+    pub processing_errors: u64,
     pub non_finite_effect_mask: u64,
     pub chain_recoveries: u64,
     pub chain_swap_replacements: u64,
@@ -3142,6 +3281,7 @@ impl Default for AudioCoreChannelStatus {
             chain_swaps: 0,
             non_finite_blocks: 0,
             non_finite_samples: 0,
+            processing_errors: 0,
             non_finite_effect_mask: 0,
             chain_recoveries: 0,
             chain_swap_replacements: 0,
@@ -3885,6 +4025,8 @@ fn migrate_legacy_eq_params(effect: &mut EffectInstance) {
 
 fn rnnoise_broadcast_params() -> BTreeMap<String, f32> {
     BTreeMap::from([
+        ("reduction_db".into(), 60.0),
+        ("voice_gate".into(), 1.0),
         ("vad_threshold".into(), 25.0),
         ("hold_ms".into(), 200.0),
         ("minimum_voice_level_db".into(), -70.0),
@@ -3941,7 +4083,7 @@ fn keep_one_single_instance_effect_per_channel(
 
 fn single_instance_effect_group(effect_id: &str) -> Option<&'static str> {
     match effect_id {
-        "rnnoise" => Some("noise_suppression"),
+        "rnnoise" | "deepfilternet3" => Some("noise_suppression"),
         "highpass" => Some("highpass"),
         "eq" => Some("eq"),
         "compressor" => Some("compressor"),
@@ -4111,7 +4253,9 @@ fn migrate_hardware_input_chain_to_rnnoise_default(
     catalog: &EffectCatalog,
 ) {
     if effects.is_empty()
-        || effects.iter().any(|effect| effect.effect_id == "rnnoise")
+        || effects
+            .iter()
+            .any(|effect| matches!(effect.effect_id.as_str(), "rnnoise" | "deepfilternet3"))
         || effects
             .iter()
             .any(|effect| !is_standard_voice_effect(&effect.effect_id))
@@ -4183,7 +4327,14 @@ fn reorder_standard_voice_effect_chain(effects: &mut Vec<EffectInstance>, catalo
 fn is_standard_voice_effect(effect_id: &str) -> bool {
     matches!(
         effect_id,
-        "highpass" | "rnnoise" | "eq" | "gate" | "compressor" | "karaoke_stage" | "limiter"
+        "highpass"
+            | "rnnoise"
+            | "deepfilternet3"
+            | "eq"
+            | "gate"
+            | "compressor"
+            | "karaoke_stage"
+            | "limiter"
     )
 }
 
@@ -5363,7 +5514,7 @@ mod tests {
             .iter()
             .find(|param| param.id == "threshold_db")
             .unwrap();
-        assert_eq!(threshold.min, -30.0);
+        assert_eq!(threshold.min, -60.0);
 
         let gate = catalog
             .effects
@@ -5386,7 +5537,7 @@ mod tests {
         assert_eq!(
             eq.params
                 .iter()
-                .filter(|param| param.id.starts_with("band_"))
+                .filter(|param| param.id.starts_with("band_") && param.id.ends_with("_gain_db"))
                 .count(),
             8
         );
@@ -5825,6 +5976,55 @@ mod tests {
         assert!(!effects[0].bypassed);
         assert_eq!(effects[0].effect_id, "rnnoise");
         assert_eq!(effects[0].instance_id, "rnnoise-gentle");
+    }
+
+    #[test]
+    fn deepfilter_selection_replaces_rnnoise_and_survives_config_reload() {
+        let mut config = MixerConfig::default();
+        config
+            .set_effect_chain(
+                "hardware_in",
+                vec![
+                    EffectInstance::new("rnnoise"),
+                    EffectInstance::new("deepfilternet3"),
+                    EffectInstance::new("eq"),
+                ],
+            )
+            .unwrap();
+        let serialized = serde_json::to_string(&config).unwrap();
+        let mut restored: MixerConfig = serde_json::from_str(&serialized).unwrap();
+        restored = restored.normalized().unwrap();
+        let effects = &restored.channels[0].effects;
+        assert_eq!(
+            effects
+                .iter()
+                .map(|effect| effect.effect_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deepfilternet3", "eq"]
+        );
+        assert_eq!(effects[0].params["reduction_db"], 12.0);
+        let mut replacement = effects.clone();
+        replacement.push(EffectInstance::new("rnnoise"));
+        let channel = restored
+            .set_effect_chain("hardware_in", replacement)
+            .unwrap();
+        assert!(!channel
+            .effects
+            .iter()
+            .any(|effect| effect.effect_id == "deepfilternet3"));
+    }
+
+    #[test]
+    fn existing_rnnoise_settings_keep_legacy_strength_and_gate() {
+        let mut config = MixerConfig::default();
+        let mut effect = EffectInstance::new("rnnoise");
+        effect.params.insert("vad_threshold".into(), 42.0);
+        let channel = config
+            .set_effect_chain("hardware_in", vec![effect])
+            .unwrap();
+        assert_eq!(channel.effects[0].params["vad_threshold"], 42.0);
+        assert_eq!(channel.effects[0].params["reduction_db"], 60.0);
+        assert_eq!(channel.effects[0].params["voice_gate"], 1.0);
     }
 
     #[test]

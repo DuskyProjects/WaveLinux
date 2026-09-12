@@ -1512,7 +1512,18 @@ impl NativeMixRegistry {
         let channels = self
             .channels
             .iter()
-            .map(|(channel_id, shared)| meter_json(channel_id, shared.meter.snapshot()))
+            .map(|(channel_id, shared)| {
+                let mut value = meter_json(channel_id, shared.meter.snapshot());
+                let meter = compressor_stream_sample(shared.compressor_meter.snapshot());
+                if meter.rms_right > 0.5 {
+                    value["compressor"] = serde_json::json!({
+                        "input_peak": meter.peak_left,
+                        "output_peak": meter.peak_right,
+                        "gain_reduction_db": meter.rms_left * 60.0,
+                    });
+                }
+                value
+            })
             .collect::<Vec<_>>();
         let mixes = self
             .mixes
@@ -1553,6 +1564,10 @@ impl NativeMixRegistry {
                 kind: MeterStreamSlotKind::Mix,
                 id: mix.mix_id.clone(),
             }))
+            .chain(self.channels.keys().map(|id| MeterStreamSlot {
+                kind: MeterStreamSlotKind::Compressor,
+                id: id.clone(),
+            }))
             .collect()
     }
 
@@ -1570,6 +1585,11 @@ impl NativeMixRegistry {
                     };
                 meter_stream_sample(snapshot)
             }))
+            .chain(
+                self.channels
+                    .values()
+                    .map(|shared| compressor_stream_sample(shared.compressor_meter.snapshot())),
+            )
             .collect()
     }
 
@@ -1621,8 +1641,16 @@ fn meter_json(id: &str, snapshot: NativeMeterSnapshot) -> serde_json::Value {
     })
 }
 
+fn compressor_stream_sample(snapshot: NativeMeterSnapshot) -> MeterStreamSample {
+    if snapshot.frames == 0 || snapshot.age_micros > EXACT_MIX_METER_MAX_AGE_MICROS {
+        return MeterStreamSample::default();
+    }
+    meter_stream_sample(snapshot)
+}
+
 fn meter_stream_sample(snapshot: NativeMeterSnapshot) -> MeterStreamSample {
     MeterStreamSample {
+        spectrum: None,
         peak_left: snapshot.peak_left,
         peak_right: snapshot.peak_right,
         rms_left: snapshot.rms_left,
@@ -1747,9 +1775,36 @@ fn serve_meter_stream_client(
         let mut next_tick = Instant::now();
         let mut sequence = 0_u64;
         let mut bytes = Vec::new();
+        let mut analysers: Vec<_> = registry
+            .channels
+            .values()
+            .map(|_| wavelinux_dsp::spectrum::SpectrumAnalyzer::default())
+            .collect();
         while !TERMINATE.load(Ordering::SeqCst) {
             sequence = sequence.wrapping_add(1).max(1);
-            let samples = registry.meter_samples();
+            let mut samples = registry.meter_samples();
+            for ((shared, analyser), sample) in registry
+                .channels
+                .values()
+                .zip(&mut analysers)
+                .zip(&mut samples)
+            {
+                // Observe the final effect-chain output, before mix volume.
+                let end = shared.history.write_sequence();
+                let frames = wavelinux_dsp::spectrum::SPECTRUM_FRAMES as u64;
+                let meter = shared.meter.snapshot();
+                if shared.capture_streaming.load(Ordering::Acquire)
+                    && meter.frames > 0
+                    && meter.age_micros <= EXACT_MIX_METER_MAX_AGE_MICROS
+                    && end >= frames
+                {
+                    sample.spectrum = analyser.analyse(shared.sample_rate_hz, |i| {
+                        shared.history.get(end - frames + i as u64)
+                    });
+                } else {
+                    analyser.reset();
+                }
+            }
             encode_meter_stream_frame_into(
                 sequence,
                 started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
@@ -2252,6 +2307,30 @@ mod tests {
     }
 
     #[test]
+    fn compressor_readings_disappear_when_capture_is_stale() {
+        let snapshot = NativeMeterSnapshot {
+            peak_left: 0.5,
+            peak_right: 0.25,
+            rms_left: 0.1,
+            rms_right: 1.0,
+            frames: 256,
+            age_micros: 0,
+        };
+        assert_eq!(compressor_stream_sample(snapshot).rms_right, 1.0);
+        assert_eq!(
+            compressor_stream_sample(NativeMeterSnapshot {
+                age_micros: EXACT_MIX_METER_MAX_AGE_MICROS + 1,
+                ..snapshot
+            }),
+            MeterStreamSample::default()
+        );
+        assert_eq!(
+            compressor_stream_sample(NativeMeterSnapshot::default()),
+            MeterStreamSample::default()
+        );
+    }
+
+    #[test]
     fn estimated_mix_meter_applies_bus_and_master_gain_once() {
         let channel_config = DspChannelConfig::new(
             "music",
@@ -2265,6 +2344,7 @@ mod tests {
         );
         let channel = Arc::new(NativeShared::new(&channel_config, None, ""));
         channel.meter.publish(0.5, 0.25, 0.3, 0.15, 256);
+        channel.compressor_meter.publish(0.8, 0.4, 0.1, 1.0, 256);
         let mix = Arc::new(NativeMixShared::new(&mix_config()));
         let registry = NativeMixRegistry {
             mixes: vec![Arc::clone(&mix)],
@@ -2275,6 +2355,26 @@ mod tests {
             meter_disconnects: AtomicU64::new(0),
         };
 
+        let slots = registry.meter_slots();
+        let samples = registry.meter_samples();
+        assert_eq!(slots.len(), samples.len());
+        let index = slots
+            .iter()
+            .position(|slot| slot.kind == MeterStreamSlotKind::Compressor)
+            .unwrap();
+        assert_eq!(slots[index].id, "music");
+        assert_eq!(samples[index].peak_left, 0.8);
+        assert_eq!(samples[index].peak_right, 0.4);
+        assert_eq!(samples[index].rms_right, 1.0);
+        let response = registry.meter_response(None);
+        assert!(
+            (response["channels"][0]["compressor"]["gain_reduction_db"]
+                .as_f64()
+                .unwrap()
+                - 6.0)
+                .abs()
+                < 0.001
+        );
         let snapshot = registry.estimated_mix_meter(&mix);
         assert!((snapshot.peak_left - 0.2).abs() < 0.000_001);
         assert!((snapshot.peak_right - 0.1).abs() < 0.000_001);

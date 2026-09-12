@@ -4500,56 +4500,27 @@ fn render_param_eq_node(
     definition: &wavelinux_model::EffectDefinition,
 ) -> RenderedEffectNode {
     let name = effect_node_name(effect);
-    let filters = [
-        (
-            "bq_lowshelf",
-            63.0,
-            effect_param(effect, definition, "band_63_gain_db"),
-            0.707,
-        ),
-        (
-            "bq_peaking",
-            125.0,
-            effect_param(effect, definition, "band_125_gain_db"),
-            1.0,
-        ),
-        (
-            "bq_peaking",
-            250.0,
-            effect_param(effect, definition, "band_250_gain_db"),
-            1.0,
-        ),
-        (
-            "bq_peaking",
-            500.0,
-            effect_param(effect, definition, "band_500_gain_db"),
-            1.0,
-        ),
-        (
-            "bq_peaking",
-            1000.0,
-            effect_param(effect, definition, "band_1k_gain_db"),
-            1.0,
-        ),
-        (
-            "bq_peaking",
-            2000.0,
-            effect_param(effect, definition, "band_2k_gain_db"),
-            1.0,
-        ),
-        (
-            "bq_peaking",
-            4000.0,
-            effect_param(effect, definition, "band_4k_gain_db"),
-            1.0,
-        ),
-        (
-            "bq_highshelf",
-            8000.0,
-            effect_param(effect, definition, "band_8k_gain_db"),
-            0.707,
-        ),
-    ];
+    // Match the native editor, including its legacy-compatible defaults.
+    let filters: Vec<_> = ["63", "125", "250", "500", "1k", "2k", "4k", "8k"]
+        .into_iter()
+        .map(|band| {
+            let prefix = format!("band_{band}_");
+            let shape = effect_param(effect, definition, &format!("{prefix}type")).round() as u8;
+            let kind = match shape {
+                1 => "bq_lowshelf",
+                2 => "bq_highshelf",
+                3 => "bq_highpass",
+                4 => "bq_lowpass",
+                _ => "bq_peaking",
+            };
+            (
+                kind,
+                effect_param(effect, definition, &format!("{prefix}frequency_hz")),
+                effect_param(effect, definition, &format!("{prefix}gain_db")),
+                effect_param(effect, definition, &format!("{prefix}q")),
+            )
+        })
+        .collect();
 
     let mut rendered = String::new();
     rendered.push_str("          { type = builtin label = \"param_eq\" name = \"");
@@ -6865,10 +6836,35 @@ mod tests {
         let rendered = render_filter_chain(&config.channels[0], &EffectCatalog::default());
 
         assert!(rendered.contains("label = \"param_eq\" name = \"voice_eq\""));
-        assert!(rendered.contains("type = bq_lowshelf freq = 63.000 gain = -4.000"));
+        assert!(rendered.contains("type = bq_peaking freq = 63.000 gain = -4.000"));
         assert!(rendered.contains("type = bq_peaking freq = 2000.000 gain = 2.500"));
-        assert!(rendered.contains("type = bq_highshelf freq = 8000.000 gain = 1.000"));
+        assert!(rendered.contains("type = bq_peaking freq = 8000.000 gain = 1.000"));
         assert_eq!(rendered.matches("type = bq_").count(), 16);
+    }
+
+    #[test]
+    fn filter_chain_honours_parametric_frequency_width_and_shape() {
+        let mut config = MixerConfig::default();
+        let mut eq = EffectInstance::new("eq");
+        eq.params.insert("band_63_type".into(), 3.0);
+        eq.params.insert("band_63_frequency_hz".into(), 100.0);
+        eq.params.insert("band_63_q".into(), 0.5);
+        eq.params.insert("band_8k_type".into(), 2.0);
+        eq.params.insert("band_8k_gain_db".into(), 3.0);
+        config.channels[0].effects = vec![eq];
+        let rendered = render_filter_chain(&config.channels[0], &EffectCatalog::default());
+        assert_eq!(
+            rendered
+                .matches("type = bq_highpass freq = 100.000 gain = 0.000 q = 0.500")
+                .count(),
+            2
+        );
+        assert_eq!(
+            rendered
+                .matches("type = bq_highshelf freq = 8000.000 gain = 3.000 q = 0.900")
+                .count(),
+            2
+        );
     }
 
     #[test]

@@ -913,17 +913,20 @@ fn registry_node_level(object: &serde_json::Value) -> (f32, bool) {
     let props = object
         .pointer("/info/params/Props")
         .and_then(serde_json::Value::as_array)
-        .and_then(|values| values.first())
-        .and_then(serde_json::Value::as_object);
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    // Adapters can publish an empty initial Props entry followed by their
+    // negotiated channel controls. Reading only the first entry leaves app
+    // levels stuck at 100% and continually reapplies saved volume presets.
     let muted = props
-        .and_then(|props| props.get("mute"))
-        .and_then(serde_json::Value::as_bool)
+        .iter()
+        .rev()
+        .find_map(|props| props.get("mute").and_then(serde_json::Value::as_bool))
         .unwrap_or(false);
     let volume = props
-        .and_then(|props| props.get("channelVolumes"))
-        .and_then(serde_json::Value::as_array)
-        .and_then(|values| values.first())
-        .and_then(serde_json::Value::as_f64)
+        .iter()
+        .rev()
+        .find_map(|props| props.get("channelVolumes")?.as_array()?.first()?.as_f64())
         .map(|value| value.cbrt() as f32)
         .unwrap_or(1.0);
     (volume, muted)
@@ -1054,6 +1057,27 @@ fn audio_names_match(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_levels_use_negotiated_props_after_empty_initial_entry() {
+        let node = serde_json::json!({"info": {"params": {"Props": [
+            {"channelVolumes": [], "mute": false},
+            {"channelVolumes": [0.343, 0.343], "mute": true}
+        ]}}});
+        let (volume, muted) = registry_node_level(&node);
+        assert!((volume - 0.7).abs() < 0.001);
+        assert!(muted);
+    }
+
+    #[test]
+    fn partial_props_keep_existing_channel_level_and_update_mute() {
+        let node = serde_json::json!({"info": {"params": {"Props": [
+            {"channelVolumes": [0.125, 0.125], "mute": false},
+            {"mute": true}
+        ]}}});
+        assert_eq!(registry_node_level(&node), (0.5, true));
+        assert_eq!(registry_node_level(&serde_json::json!({})), (1.0, false));
+    }
 
     #[test]
     fn registry_initialization_wait_survives_connection_thread_startup_race() {

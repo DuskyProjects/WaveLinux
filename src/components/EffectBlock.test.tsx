@@ -5,7 +5,9 @@ import type { EffectInstance } from "../types";
 import { EffectBlock } from "./EffectBlock";
 
 function renderEffect(effect: EffectInstance) {
-  const definition = demoState.catalog.effects.find((item) => item.id === effect.effect_id);
+  const definition = demoState.catalog.effects.find(
+    (item) => item.id === effect.effect_id,
+  );
   const onApplyPreset = vi.fn();
   const onUpdateParam = vi.fn();
   render(
@@ -34,14 +36,23 @@ describe("EffectBlock", () => {
     });
 
     expect(screen.getAllByRole("slider")).toHaveLength(1);
-    expect(screen.getByRole("slider", { name: "Strength" })).toHaveAttribute("step", "0.1");
+    expect(screen.getByRole("slider", { name: "Strength" })).toHaveAttribute(
+      "step",
+      "0.1",
+    );
     expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
       "aria-expanded",
       "false",
     );
-    expect(screen.queryByRole("button", { name: "Broadcast" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Copy effect" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Bypass effect" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Broadcast" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Copy effect" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Bypass effect" }),
+    ).not.toBeInTheDocument();
   });
 
   it("reveals every native parameter through the Advanced control", () => {
@@ -58,8 +69,18 @@ describe("EffectBlock", () => {
       "aria-expanded",
       "true",
     );
-    expect(screen.getAllByRole("slider")).toHaveLength(5);
-    const minimumVoiceLevel = screen.getByRole("slider", { name: "Minimum Voice Level" });
+    expect(screen.getAllByRole("slider")).toHaveLength(6);
+    const speechGate = screen.getByRole("button", { name: "Speech Gate" });
+    expect(speechGate).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(speechGate);
+    expect(onUpdateParam).toHaveBeenCalledWith("rnnoise-advanced", "voice_gate", 0);
+    const dryMix = screen.getByRole("slider", { name: "Dry Mix" });
+    fireEvent.change(dryMix, { target: { value: "25" } });
+    fireEvent.keyUp(dryMix, { key: "ArrowRight" });
+    expect(onUpdateParam).toHaveBeenCalledWith("rnnoise-advanced", "dry_mix", 0.25);
+    const minimumVoiceLevel = screen.getByRole("slider", {
+      name: "Minimum Voice Level",
+    });
     fireEvent.change(minimumVoiceLevel, { target: { value: "-38" } });
     fireEvent.pointerUp(minimumVoiceLevel, { target: { value: "-38" } });
     expect(onUpdateParam).toHaveBeenCalledWith(
@@ -73,7 +94,7 @@ describe("EffectBlock", () => {
     ["highpass", "Voice 80 Hz", { frequency_hz: 80 }],
     [
       "compressor",
-      "Broadcast 4:1",
+      "Broadcast",
       {
         threshold_db: -18,
         ratio: 4,
@@ -94,18 +115,21 @@ describe("EffectBlock", () => {
       },
     ],
     ["limiter", "Broadcast -1 dB", { input_gain_db: 0, ceiling_db: -1 }],
-  ] as const)("keeps %s presets alongside its single Strength slider", (effectId, preset, values) => {
-    const { onApplyPreset } = renderEffect({
-      instance_id: `${effectId}-test`,
-      effect_id: effectId,
-      bypassed: false,
-      params: {},
-    });
+  ] as const)(
+    "keeps %s presets alongside its single Strength slider",
+    (effectId, preset, values) => {
+      const { onApplyPreset } = renderEffect({
+        instance_id: `${effectId}-test`,
+        effect_id: effectId,
+        bypassed: false,
+        params: {},
+      });
 
-    expect(screen.getAllByRole("slider")).toHaveLength(1);
-    fireEvent.click(screen.getByRole("button", { name: preset }));
-    expect(onApplyPreset).toHaveBeenCalledWith(`${effectId}-test`, values);
-  });
+      expect(screen.getAllByRole("slider")).toHaveLength(1);
+      fireEvent.click(screen.getByRole("button", { name: preset }));
+      expect(onApplyPreset).toHaveBeenCalledWith(`${effectId}-test`, values);
+    },
+  );
 
   it("keeps the Karaoke style selector instead of reducing it to Strength", () => {
     renderEffect({
@@ -115,24 +139,68 @@ describe("EffectBlock", () => {
       params: {},
     });
 
-    expect(screen.getByRole("button", { name: "Voice style" })).toBeInTheDocument();
-    expect(screen.queryByRole("slider", { name: "Strength" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Advanced" })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Voice style" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("slider", { name: "Strength" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Advanced" }),
+    ).not.toBeInTheDocument();
   });
 
   it.each([
     ["highpass", { frequency_hz: 20 }, "0% (20 Hz)"],
     ["limiter", { input_gain_db: 0, ceiling_db: -3 }, "0% (-3 dB ceiling)"],
     ["limiter", { input_gain_db: 0, ceiling_db: -1 }, "50% (-1 dB ceiling)"],
-    ["limiter", { input_gain_db: 3, ceiling_db: -0.5 }, "75% (-0.5 dB ceiling)"],
-  ] as const)("shows the effective %s value for %j", (effectId, params, label) => {
-    renderEffect({
-      instance_id: `${effectId}-${label}`,
-      effect_id: effectId,
-      bypassed: false,
-      params,
-    });
+    [
+      "limiter",
+      { input_gain_db: 3, ceiling_db: -0.5 },
+      "75% (-0.5 dB ceiling)",
+    ],
+  ] as const)(
+    "shows the effective %s value for %j",
+    (effectId, params, label) => {
+      renderEffect({
+        instance_id: `${effectId}-${label}`,
+        effect_id: effectId,
+        bypassed: false,
+        params,
+      });
 
-    expect(screen.getByText(label)).toBeInTheDocument();
+      expect(screen.getByText(label)).toBeInTheDocument();
+    },
+  );
+});
+
+it("Flat and Reset EQ restore frequency, width and filter shape together", () => {
+  const { onApplyPreset } = renderEffect({
+    instance_id: "eq-custom",
+    effect_id: "eq",
+    bypassed: false,
+    params: { band_63_type: 3, band_63_frequency_hz: 100, band_63_q: 2 },
   });
+  const flat = screen.getByRole("button", { name: "Flat" });
+  expect(flat).toHaveAttribute("aria-pressed", "false");
+  fireEvent.click(flat);
+  const defaults = onApplyPreset.mock.calls[0][1];
+  expect(defaults).toMatchObject({
+    band_63_gain_db: 0,
+    band_63_type: 0,
+    band_63_frequency_hz: 63,
+    band_63_q: 0.9,
+  });
+  expect(Object.keys(defaults)).toHaveLength(32);
+  fireEvent.click(screen.getByRole("button", { name: "Reset EQ" }));
+  expect(onApplyPreset).toHaveBeenLastCalledWith("eq-custom", defaults);
+});
+
+it.each([
+  ["highpass", { frequency_hz: 500 }, "100% (500 Hz)"],
+  ["gate", { threshold_db: -5 }, "100% (-5 dB)"],
+  ["limiter", { input_gain_db: -5, ceiling_db: -10 }, "0% (-10 dB ceiling)"],
+] as const)("shows actual Advanced values for %s outside the simple scale", (effect_id, params, label) => {
+  renderEffect({ instance_id: "advanced-range", effect_id, bypassed: false, params });
+  expect(screen.getByText(label)).toBeInTheDocument();
 });

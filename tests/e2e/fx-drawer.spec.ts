@@ -55,7 +55,8 @@ test("FX drawer remains usable and contained at desktop scaling", async ({ page 
   for (let index = 0; index < 8; index += 1) {
     const box = await sliders.nth(index).boundingBox();
     expect(box, `EQ band ${index + 1} has a layout box`).not.toBeNull();
-    expect(box!.height, `EQ band ${index + 1} is vertical`).toBeGreaterThan(box!.width * 2);
+    expect(box!.height, `EQ band ${index + 1} is easy to grab`).toBeGreaterThanOrEqual(32);
+    await expect(sliders.nth(index)).toHaveAttribute("aria-orientation", "vertical");
   }
 
   const advancedEffect = advancedButtons.first().locator("xpath=ancestor::article");

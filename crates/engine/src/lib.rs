@@ -740,6 +740,8 @@ struct NativeCoreMeterReading {
     id: String,
     peak_left: f32,
     peak_right: f32,
+    #[serde(default)]
+    compressor: Option<wavelinux_model::CompressorMeter>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -836,6 +838,7 @@ impl MeterTransportTracker {
 struct CoreMeterTarget {
     node_id: String,
     slot_index: usize,
+    compressor_slot_index: Option<usize>,
     gain: f32,
 }
 
@@ -1211,6 +1214,8 @@ impl MeterProcess {
         let now = Instant::now();
         let gain = if target.muted { 0.0 } else { target.gain }.clamp(0.0, 1.5);
         Some(LevelMeter {
+            spectrum: None,
+            compressor: None,
             node_id: target.node_id.clone(),
             peak_left: meter_output_level(
                 stale_adjusted_meter_peak(sample.peak_left, sample.updated_at, now),
@@ -1568,9 +1573,15 @@ fn level_meters_from_native_response(
                 (mixes.get(&target.node_id)?, 1.0)
             };
             Some(LevelMeter {
+                spectrum: None,
                 node_id: target.node_id.clone(),
                 peak_left: meter_output_level(reading.peak_left, gain),
                 peak_right: meter_output_level(reading.peak_right, gain),
+                compressor: if bus_channel_id.is_none() {
+                    reading.compressor
+                } else {
+                    None
+                },
             })
         })
         .collect()
@@ -1840,6 +1851,8 @@ struct AudioCoreDiagnosticsResponse {
     #[serde(default)]
     non_finite_samples: u64,
     #[serde(default)]
+    processing_errors: u64,
+    #[serde(default)]
     non_finite_effect_mask: u64,
     #[serde(default)]
     chain_recoveries: u64,
@@ -1916,6 +1929,8 @@ pub struct WaveLinuxEngine {
     audio_core_underrun_counters: Mutex<BTreeMap<String, u64>>,
     adaptive_core_discontinuity_counters: Mutex<BTreeMap<String, u64>>,
     startup_repair_pending: AtomicBool,
+    audio_graph_requested: AtomicBool,
+    server_repair_pending: AtomicBool,
     startup_initialization_in_progress: AtomicBool,
     stop: AtomicBool,
 }
@@ -2428,6 +2443,8 @@ impl WaveLinuxEngine {
             audio_core_underrun_counters: Mutex::new(BTreeMap::new()),
             adaptive_core_discontinuity_counters: Mutex::new(BTreeMap::new()),
             startup_repair_pending: AtomicBool::new(false),
+            audio_graph_requested: AtomicBool::new(false),
+            server_repair_pending: AtomicBool::new(false),
             startup_initialization_in_progress: AtomicBool::new(false),
             paths,
             options,
@@ -2491,6 +2508,7 @@ impl WaveLinuxEngine {
             engine.log_command_executions("startup.cleanup", &startup_cleanup);
         }
         if engine.options.auto_repair_on_start && restore_on_launch {
+            engine.audio_graph_requested.store(true, Ordering::Release);
             engine
                 .startup_initialization_in_progress
                 .store(true, Ordering::Release);
@@ -2689,7 +2707,12 @@ impl WaveLinuxEngine {
                     .ok()
             };
             while !engine.stop.load(Ordering::SeqCst) {
-                let event = match audio_event_rx.recv_timeout(engine.options.poll_interval) {
+                let poll_interval = if engine.server_repair_pending.load(Ordering::Acquire) {
+                    engine.options.poll_interval.min(Duration::from_secs(1))
+                } else {
+                    engine.options.poll_interval
+                };
+                let event = match audio_event_rx.recv_timeout(poll_interval) {
                     Ok(event) => {
                         let settle = match event {
                             AudioSubscriptionEvent::PlaybackStream
@@ -2708,6 +2731,12 @@ impl WaveLinuxEngine {
                     }
                 };
                 if !engine.stop.load(Ordering::SeqCst) {
+                    if engine.server_repair_pending.swap(false, Ordering::AcqRel) {
+                        if let Err(error) = engine.recover_graph_after_server_reconnect() {
+                            engine.log_engine_event("repair.reconnect", error.to_string());
+                            engine.server_repair_pending.store(true, Ordering::Release);
+                        }
+                    }
                     let result = match event {
                         AudioSubscriptionEvent::PlaybackStream => engine.refresh_playback_streams(),
                         AudioSubscriptionEvent::CaptureStream => engine.refresh_runtime(),
@@ -2791,6 +2820,9 @@ impl WaveLinuxEngine {
                             if batch.initial {
                                 batch_engine.change_signal.notify_state();
                                 if reconnect_bootstrap {
+                                    // Keep this outside the bounded event queue: a device
+                                    // burst must not lose the request to rebuild a lost graph.
+                                    batch_engine.server_repair_pending.store(true, Ordering::Release);
                                     let _ = batch_events.try_send(AudioSubscriptionEvent::Device);
                                 }
                             }
@@ -4228,6 +4260,8 @@ impl WaveLinuxEngine {
             .unwrap_or(false);
         let outputs = {
             let _audio_commands = self.lock_audio_commands()?;
+            self.audio_graph_requested.store(false, Ordering::Release);
+            self.server_repair_pending.store(false, Ordering::Release);
             self.stop_all_tracked_effect_chain_processes();
             let mut outputs = self.cleanup_stale_processes()?;
             outputs.extend(self.cleanup_all_modules_until_clear()?);
@@ -6207,6 +6241,7 @@ impl WaveLinuxEngine {
                             chain_swaps: response.chain_swaps,
                             non_finite_blocks: response.non_finite_blocks,
                             non_finite_samples: response.non_finite_samples,
+                            processing_errors: response.processing_errors,
                             non_finite_effect_mask: response.non_finite_effect_mask,
                             chain_recoveries: response.chain_recoveries,
                             chain_swap_replacements: response.chain_swap_replacements,
@@ -6273,6 +6308,7 @@ impl WaveLinuxEngine {
                         chain_swaps: response.chain_swaps,
                         non_finite_blocks: response.non_finite_blocks,
                         non_finite_samples: response.non_finite_samples,
+                        processing_errors: response.processing_errors,
                         non_finite_effect_mask: response.non_finite_effect_mask,
                         chain_recoveries: response.chain_recoveries,
                         chain_swap_replacements: response.chain_swap_replacements,
@@ -14133,7 +14169,7 @@ fn latency_diagnostics(config: &MixerConfig) -> Vec<Diagnostic> {
                 .filter(|effect| !effect.bypassed)
                 .map(move |effect| (channel, effect.effect_id.as_str()))
         })
-        .filter(|(_, effect_id)| matches!(*effect_id, "rnnoise" | "convolver"))
+        .filter(|(_, effect_id)| matches!(*effect_id, "rnnoise" | "deepfilternet3" | "convolver"))
         .collect::<Vec<_>>();
 
     if let Ok(latency) = std::env::var("PIPEWIRE_LATENCY") {
@@ -14232,17 +14268,19 @@ fn audio_core_integrity_diagnostics(statuses: &[AudioCoreChannelStatus]) -> Vec<
         if status.non_finite_blocks > 0
             || status.non_finite_samples > 0
             || status.chain_recoveries > 0
+            || status.processing_errors > 0
         {
             diagnostics.push(Diagnostic {
                 code: format!("audio_core.non_finite.{}", status.channel_id),
                 severity: DiagnosticSeverity::Warning,
                 message: format!(
-                    "Audio core endpoint {} contained invalid DSP output (blocks={}, samples={}, effect_mask=0x{:x}, recoveries={})",
+                    "Audio core endpoint {} contained invalid DSP output (blocks={}, samples={}, effect_mask=0x{:x}, recoveries={}, processing_errors={})",
                     status.channel_id,
                     status.non_finite_blocks,
                     status.non_finite_samples,
                     status.non_finite_effect_mask,
                     status.chain_recoveries,
+                    status.processing_errors,
                 ),
                 action: Some(
                     "The dry signal was preserved automatically. Disable the affected effect and inspect the Audio Core counters if they continue increasing."
@@ -16401,6 +16439,8 @@ mod tests {
             muted: false,
         };
         let meter = LevelMeter {
+            spectrum: None,
+            compressor: None,
             node_id: "music".into(),
             peak_left: 0.4,
             peak_right: 0.2,
@@ -16438,11 +16478,17 @@ mod tests {
         ];
         let response = NativeCoreMetersResponse {
             channels: vec![NativeCoreMeterReading {
+                compressor: Some(wavelinux_model::CompressorMeter {
+                    input_peak: 0.8,
+                    output_peak: 0.4,
+                    gain_reduction_db: 6.0,
+                }),
                 id: "music".into(),
                 peak_left: 0.4,
                 peak_right: 0.2,
             }],
             mixes: vec![NativeCoreMeterReading {
+                compressor: None,
                 id: "stream".into(),
                 peak_left: 0.3,
                 peak_right: 0.1,
@@ -16451,6 +16497,10 @@ mod tests {
 
         let meters = level_meters_from_native_response(&targets, response);
         assert_eq!(meters.len(), 3);
+        assert_eq!(meters[0].compressor.unwrap().input_peak, 0.8);
+        assert_eq!(meters[0].compressor.unwrap().gain_reduction_db, 6.0);
+        assert!(meters[1].compressor.is_none());
+        assert!(meters[2].compressor.is_none());
         assert_eq!(meters[0].node_id, "music");
         assert_eq!(
             meters[0].peak_left,

@@ -1,3 +1,4 @@
+import { eqDefaults } from "../equalizer-response";
 import {
   ArrowDown,
   ArrowUp,
@@ -21,11 +22,14 @@ import type {
   EffectInstance,
 } from "../types";
 import { AppSelect } from "./AppSelect";
-import { VolumeFader } from "./Controls";
+import { Toggle, VolumeFader } from "./Controls";
 import { GraphicEqualizer } from "./GraphicEqualizer";
+import { Compressor } from "./Compressor";
 
 export function EffectBlock({
   availability,
+  channelId,
+  effectsEnabled = true,
   effect,
   definition,
   index,
@@ -37,6 +41,8 @@ export function EffectBlock({
   onUpdateParam,
 }: {
   availability?: EffectAvailability;
+  channelId?: string;
+  effectsEnabled?: boolean;
   effect: EffectInstance;
   definition?: EffectDefinition;
   index: number;
@@ -50,23 +56,34 @@ export function EffectBlock({
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const isVoiceStyle = definition?.id === "karaoke_stage";
   const isGraphicEq = definition?.id === "eq";
+  const isCompressor = definition?.id === "compressor";
   const hasSimpleStrength = definition
     ? simpleStrengthEffectIds.has(definition.id)
     : false;
   const showsSimplePresets = definition
     ? simplePresetEffectIds.has(definition.id)
     : false;
-  const selectedPreset = definition ? matchingPresetName(definition, effect) : null;
+  const selectedPreset = definition
+    ? matchingPresetName(definition, effect)
+    : null;
   const advancedId = `effect-advanced-${effect.instance_id}`;
 
   return (
-    <article className={effect.bypassed ? "effect-block bypassed" : "effect-block"}>
+    <article
+      className={`effect-block${effect.bypassed ? " bypassed" : ""}${isGraphicEq || isCompressor ? " visual-effect-block" : ""}`}
+    >
       <div className="effect-title">
         <div className="effect-name">
           <GripVertical size={15} />
           <div>
-            <strong>{effect.name || definition?.name || effect.effect_id}</strong>
-            <span>{definition?.description ?? effect.effect_id}</span>
+            <strong>
+              {effect.name ||
+                (isGraphicEq ? "Equalizer" : definition?.name) ||
+                effect.effect_id}
+            </strong>
+            {!isGraphicEq && !isCompressor && (
+              <span>{definition?.description ?? effect.effect_id}</span>
+            )}
           </div>
         </div>
         <div className="effect-actions">
@@ -100,7 +117,11 @@ export function EffectBlock({
             <button
               aria-controls={advancedId}
               aria-expanded={advancedOpen}
-              className={advancedOpen ? "effect-advanced-button active" : "effect-advanced-button"}
+              className={
+                advancedOpen
+                  ? "effect-advanced-button active"
+                  : "effect-advanced-button"
+              }
               onClick={() => setAdvancedOpen((open) => !open)}
               type="button"
             >
@@ -124,7 +145,9 @@ export function EffectBlock({
           <span>{availability.detail}</span>
         </div>
       )}
-      {definition && definition.presets.length > 0 && (!hasSimpleStrength || showsSimplePresets) &&
+      {definition &&
+        definition.presets.length > 0 &&
+        (!hasSimpleStrength || showsSimplePresets) &&
         (isVoiceStyle ? (
           <EffectStyleSelect
             definition={definition}
@@ -133,21 +156,46 @@ export function EffectBlock({
           />
         ) : (
           <div className="preset-row">
-            {definition.presets.map((preset) => (
+            {definition.presets.filter((preset) => definition.id !== "rnnoise" || advancedOpen || ["Gentle", "Balanced", "Strong"].includes(preset.name)).map((preset) => (
               <button
                 aria-pressed={selectedPreset === preset.name}
-                className={selectedPreset === preset.name ? "active" : undefined}
+                className={
+                  selectedPreset === preset.name ? "active" : undefined
+                }
                 key={preset.name}
-                onClick={() => onApplyPreset(effect.instance_id, preset.values)}
+                onClick={() =>
+                  onApplyPreset(
+                    effect.instance_id,
+                    isGraphicEq
+                      ? { ...eqDefaults(definition), ...preset.values }
+                      : preset.values,
+                  )
+                }
                 type="button"
               >
-                {preset.name}
+                {isCompressor
+                  ? preset.name.replace(/ \d+:1$/, "")
+                  : preset.name}
               </button>
             ))}
           </div>
         ))}
       {definition && isGraphicEq ? (
         <GraphicEqualizer
+          channelId={channelId}
+          enabled={effectsEnabled}
+          onApplyValues={onApplyPreset}
+          definition={definition}
+          effect={effect}
+          onUpdateParam={onUpdateParam}
+          onReset={() =>
+            onApplyPreset(effect.instance_id, eqDefaults(definition))
+          }
+        />
+      ) : definition && isCompressor ? (
+        <Compressor
+          channelId={channelId}
+          enabled={effectsEnabled}
           definition={definition}
           effect={effect}
           onUpdateParam={onUpdateParam}
@@ -155,7 +203,15 @@ export function EffectBlock({
       ) : definition && hasSimpleStrength ? (
         <VolumeFader
           compact
-          formatValue={(value) => simpleEffectStrengthLabel(effect.effect_id, value)}
+          formatValue={(value, editing) =>
+            simpleEffectStrengthLabel(
+              effect.effect_id,
+              value,
+              editing ? undefined : Object.fromEntries(
+                definition.params.map((param) => [param.id, effect.params[param.id] ?? param.default]),
+              ),
+            )
+          }
           label="Strength"
           max={100}
           min={0}
@@ -163,7 +219,10 @@ export function EffectBlock({
           unit="%"
           value={simpleEffectStrength(effect, definition)}
           onChange={(value) =>
-            onApplyPreset(effect.instance_id, simpleEffectParams(effect.effect_id, value))
+            onApplyPreset(
+              effect.instance_id,
+              simpleEffectParams(effect.effect_id, value),
+            )
           }
         />
       ) : (
@@ -176,25 +235,38 @@ export function EffectBlock({
             min={param.min}
             unit={param.unit}
             value={effect.params[param.id] ?? param.default}
-            onChange={(value) => onUpdateParam(effect.instance_id, param.id, value)}
+            onChange={(value) =>
+              onUpdateParam(effect.instance_id, param.id, value)
+            }
           />
         ))
       )}
       {definition && hasSimpleStrength && advancedOpen && (
         <div className="effect-advanced-controls" id={advancedId}>
           <strong className="effect-advanced-heading">Parameters</strong>
-          {definition.params.map((param) => (
-            <VolumeFader
-              compact
-              key={param.id}
-              label={param.label}
-              max={param.max}
-              min={param.min}
-              unit={param.unit}
-              value={effect.params[param.id] ?? param.default}
-              onChange={(value) => onUpdateParam(effect.instance_id, param.id, value)}
-            />
-          ))}
+          {definition.params
+            .filter((param) => !isCompressor || param.id !== "threshold_db")
+            .map((param) => param.id === "voice_gate" ? (
+              <Toggle
+                key={param.id}
+                label="Speech Gate"
+                value={(effect.params[param.id] ?? param.default) >= 0.5}
+                onChange={(value) => onUpdateParam(effect.instance_id, param.id, value ? 1 : 0)}
+              />
+            ) : (
+              <VolumeFader
+                compact
+                key={param.id}
+                label={param.label}
+                max={param.max}
+                min={param.min}
+                unit={param.unit}
+                value={effect.params[param.id] ?? param.default}
+                onChange={(value) =>
+                  onUpdateParam(effect.instance_id, param.id, value)
+                }
+              />
+            ))}
         </div>
       )}
     </article>
@@ -213,7 +285,10 @@ function EffectStyleSelect({
   const selectedPreset = matchingPresetName(definition, effect);
   return (
     <div className="effect-style-select">
-      <label className="field-label" htmlFor={`voice-style-${effect.instance_id}`}>
+      <label
+        className="field-label"
+        htmlFor={`voice-style-${effect.instance_id}`}
+      >
         Style
       </label>
       <AppSelect
@@ -241,7 +316,11 @@ function matchingPresetName(
   effect: EffectInstance,
 ): string | null {
   for (const preset of definition.presets) {
-    const matches = Object.entries(preset.values).every(([paramId, expected]) => {
+    const matches = Object.entries(
+      definition.id === "eq"
+        ? { ...eqDefaults(definition), ...preset.values }
+        : preset.values,
+    ).every(([paramId, expected]) => {
       const param = definition.params.find((item) => item.id === paramId);
       const actual = effect.params[paramId] ?? param?.default;
       return typeof actual === "number" && Math.abs(actual - expected) <= 0.001;

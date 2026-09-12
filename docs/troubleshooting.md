@@ -130,9 +130,10 @@ Rapid edits should produce one latest-wins chain swap and a 20 ms crossfade.
 Healthy logs show `effects.sync` with a native-core command and increasing
 `acknowledged_generation`; they do not show module unload/reload churn.
 
-Check for unsupported effect ids or RNNoise load errors in the core log. The
-current catalog contains RNNoise, high-pass, EQ, compressor, gate, limiter, and
-Karaoke Stage. DeepFilterNet is not supported.
+Check for unsupported effect ids or model-load errors in the core log. The
+current test catalog includes RNNoise and DeepFilterNet 3 alongside the standard
+effects. DeepFilterNet runs on the CPU; use RNNoise if it is too demanding for
+your computer. `processing_errors` identifies inference failures and recovery.
 
 ## High CPU At Silence
 

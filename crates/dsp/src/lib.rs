@@ -14,7 +14,10 @@ pub const CORE_CONTROL_PROTOCOL_VERSION: u16 = 3;
 pub const MAX_MIX_OUTPUT_TARGETS: usize = 4;
 pub const CONTROL_DIRECTORY_NAME: &str = "control";
 pub const MIX_CONTROL_SOCKET_FILE: &str = "wavelinux6-audio-core.sock";
-pub const METER_STREAM_PROTOCOL_VERSION: u16 = 1;
+pub const METER_STREAM_PROTOCOL_VERSION: u16 = 3;
+mod deepfilter;
+pub mod spectrum;
+pub const SPECTRUM_BINS: usize = 64;
 
 /// Convert an adaptive buffer target into a PipeWire scheduling request.
 /// Zero releases the stream-level quantum override at the low-latency level.
@@ -40,7 +43,8 @@ const METER_STREAM_HEADER_BYTES: usize = 24;
 const METER_STREAM_SLOT_ID_BYTES: usize = 64;
 const METER_STREAM_DESCRIPTOR_BYTES: usize = 4 + METER_STREAM_SLOT_ID_BYTES;
 const METER_STREAM_FRAME_HEADER_BYTES: usize = 24;
-const METER_STREAM_SAMPLE_BYTES: usize = 16;
+const METER_STREAM_LEGACY_SAMPLE_BYTES: usize = 16;
+const METER_STREAM_SAMPLE_BYTES: usize = 20 + SPECTRUM_BINS * 4;
 
 pub fn control_directory(runtime_root: &Path) -> PathBuf {
     runtime_root.join(CONTROL_DIRECTORY_NAME)
@@ -71,6 +75,9 @@ pub fn meter_stream_socket(runtime_root: &Path) -> PathBuf {
 pub enum MeterStreamSlotKind {
     Channel = 1,
     Mix = 2,
+    /// Same channel id; peak L/R carry compressor input/output amplitudes,
+    /// RMS L carries reduction in dB / 60, and RMS R is the active flag.
+    Compressor = 3,
 }
 
 impl MeterStreamSlotKind {
@@ -78,6 +85,7 @@ impl MeterStreamSlotKind {
         match value {
             1 => Ok(Self::Channel),
             2 => Ok(Self::Mix),
+            3 => Ok(Self::Compressor),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown meter slot kind {value}"),
@@ -98,6 +106,7 @@ pub struct MeterStreamSample {
     pub peak_right: f32,
     pub rms_left: f32,
     pub rms_right: f32,
+    pub spectrum: Option<[f32; SPECTRUM_BINS]>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,12 +119,13 @@ pub struct MeterStreamFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeterStreamHeader {
     pub rate_hz: u16,
+    pub sample_bytes: usize,
     pub slots: Vec<MeterStreamSlot>,
 }
 
 impl MeterStreamHeader {
     pub fn frame_bytes(&self) -> usize {
-        METER_STREAM_FRAME_HEADER_BYTES + self.slots.len() * METER_STREAM_SAMPLE_BYTES
+        METER_STREAM_FRAME_HEADER_BYTES + self.slots.len() * self.sample_bytes
     }
 }
 
@@ -154,7 +164,7 @@ pub fn read_meter_stream_header(reader: &mut impl Read) -> io::Result<MeterStrea
         ));
     }
     let version = read_u16(&prefix, 8)?;
-    if version != METER_STREAM_PROTOCOL_VERSION {
+    if !(1..=METER_STREAM_PROTOCOL_VERSION).contains(&version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -170,10 +180,15 @@ pub fn read_meter_stream_header(reader: &mut impl Read) -> io::Result<MeterStrea
     let frame_bytes = read_u32(&prefix, 20)? as usize;
     if header_bytes != METER_STREAM_HEADER_BYTES
         || descriptor_bytes != METER_STREAM_DESCRIPTOR_BYTES
-        || sample_bytes != METER_STREAM_SAMPLE_BYTES
+        || sample_bytes
+            != (if version >= 3 {
+                METER_STREAM_SAMPLE_BYTES
+            } else {
+                METER_STREAM_LEGACY_SAMPLE_BYTES
+            })
         || slot_count > METER_STREAM_MAX_SLOTS
         || rate_hz == 0
-        || frame_bytes != METER_STREAM_FRAME_HEADER_BYTES + slot_count * METER_STREAM_SAMPLE_BYTES
+        || frame_bytes != METER_STREAM_FRAME_HEADER_BYTES + slot_count * sample_bytes
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -203,7 +218,11 @@ pub fn read_meter_stream_header(reader: &mut impl Read) -> io::Result<MeterStrea
         slots.push(MeterStreamSlot { kind, id });
     }
     validate_meter_stream_slots(&slots)?;
-    Ok(MeterStreamHeader { rate_hz, slots })
+    Ok(MeterStreamHeader {
+        rate_hz,
+        sample_bytes,
+        slots,
+    })
 }
 
 pub fn encode_meter_stream_frame_into(
@@ -234,6 +253,17 @@ pub fn encode_meter_stream_frame_into(
         ] {
             bytes.extend_from_slice(&finite_meter_protocol_value(value).to_le_bytes());
         }
+        bytes.extend_from_slice(
+            &(if sample.spectrum.is_some() {
+                1.0_f32
+            } else {
+                0.0_f32
+            })
+            .to_le_bytes(),
+        );
+        for value in sample.spectrum.unwrap_or([0.0; SPECTRUM_BINS]) {
+            bytes.extend_from_slice(&finite_meter_protocol_value(value).to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -249,8 +279,7 @@ pub fn read_meter_stream_frame(
             "too many expected meter slots",
         ));
     }
-    let frame_bytes = METER_STREAM_FRAME_HEADER_BYTES + expected_slots * METER_STREAM_SAMPLE_BYTES;
-    bytes.resize(frame_bytes, 0);
+    bytes.resize(METER_STREAM_FRAME_HEADER_BYTES, 0);
     reader.read_exact(bytes)?;
     if bytes[..4] != METER_STREAM_FRAME_MAGIC {
         return Err(io::Error::new(
@@ -260,22 +289,41 @@ pub fn read_meter_stream_frame(
     }
     let version = read_u16(bytes, 4)?;
     let slot_count = read_u16(bytes, 6)? as usize;
-    if version != METER_STREAM_PROTOCOL_VERSION || slot_count != expected_slots {
+    if !(1..=METER_STREAM_PROTOCOL_VERSION).contains(&version) || slot_count != expected_slots {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "meter frame does not match negotiated stream",
         ));
     }
+    let sample_bytes = if version >= 3 {
+        METER_STREAM_SAMPLE_BYTES
+    } else {
+        METER_STREAM_LEGACY_SAMPLE_BYTES
+    };
+    bytes.resize(
+        METER_STREAM_FRAME_HEADER_BYTES + expected_slots * sample_bytes,
+        0,
+    );
+    reader.read_exact(&mut bytes[METER_STREAM_FRAME_HEADER_BYTES..])?;
     let sequence = read_u64(bytes, 8)?;
     let monotonic_nanos = read_u64(bytes, 16)?;
     let mut samples = Vec::with_capacity(slot_count);
     for index in 0..slot_count {
-        let offset = METER_STREAM_FRAME_HEADER_BYTES + index * METER_STREAM_SAMPLE_BYTES;
+        let offset = METER_STREAM_FRAME_HEADER_BYTES + index * sample_bytes;
         samples.push(MeterStreamSample {
             peak_left: read_f32(bytes, offset)?,
             peak_right: read_f32(bytes, offset + 4)?,
             rms_left: read_f32(bytes, offset + 8)?,
             rms_right: read_f32(bytes, offset + 12)?,
+            spectrum: if version >= 3 && read_f32(bytes, offset + 16)? > 0.5 {
+                let mut bins = [0.0; SPECTRUM_BINS];
+                for (index, bin) in bins.iter_mut().enumerate() {
+                    *bin = read_f32(bytes, offset + 20 + index * 4)?;
+                }
+                Some(bins)
+            } else {
+                None
+            },
         });
     }
     Ok(MeterStreamFrame {
@@ -301,7 +349,10 @@ fn validate_meter_stream_slots(slots: &[MeterStreamSlot]) -> io::Result<()> {
                 format!("invalid meter slot id {}", slot.id),
             ));
         }
-        if !ids.insert(slot.id.as_str()) {
+        if !ids.insert((
+            slot.kind == MeterStreamSlotKind::Compressor,
+            slot.id.as_str(),
+        )) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("duplicate meter slot id {}", slot.id),
@@ -899,7 +950,14 @@ fn default_chain_generation() -> u64 {
 pub fn native_dsp_effect_supported(effect_id: &str) -> bool {
     matches!(
         effect_id,
-        "rnnoise" | "highpass" | "eq" | "compressor" | "gate" | "karaoke_stage" | "limiter"
+        "rnnoise"
+            | "deepfilternet3"
+            | "highpass"
+            | "eq"
+            | "compressor"
+            | "gate"
+            | "karaoke_stage"
+            | "limiter"
     )
 }
 
@@ -1236,6 +1294,7 @@ const REALTIME_VALIDATION_BLOCKS: u16 = 256;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RealtimeProcessStatus {
     pub non_finite_samples: u32,
+    pub processing_errors: u32,
     pub effect_mask: u64,
 }
 
@@ -1251,6 +1310,9 @@ impl RealtimeProcessStatus {
     }
 
     pub fn merge(&mut self, other: Self) {
+        self.processing_errors = self
+            .processing_errors
+            .saturating_add(other.processing_errors);
         self.non_finite_samples = self
             .non_finite_samples
             .saturating_add(other.non_finite_samples);
@@ -1323,6 +1385,13 @@ impl DspChain {
         self.initialization_failures.is_empty()
     }
 
+    pub fn compressor_meter(&self) -> Option<wavelinux_model::CompressorMeter> {
+        self.nodes.iter().find_map(|node| match node {
+            DspNode::Compressor(compressor) => Some(compressor.meter),
+            _ => None,
+        })
+    }
+
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -1370,7 +1439,10 @@ impl DspChain {
         self.validation_blocks_remaining = self.validation_blocks_remaining.saturating_sub(1);
         let mut status = RealtimeProcessStatus::default();
         for node in &mut self.nodes {
-            node.process(self.sample_rate_hz, interleaved);
+            if !node.process(self.sample_rate_hz, interleaved) {
+                status.processing_errors = status.processing_errors.saturating_add(1);
+                status.effect_mask |= node.diagnostic_mask();
+            }
             if validate_node_outputs {
                 status.record(
                     node.diagnostic_mask(),
@@ -1387,9 +1459,12 @@ impl DspChain {
         // stack so processing never allocates in a PipeWire callback.
         let mut frame_timings = [0.0_f32; 16];
         let mut timing_count = 0_usize;
+        let mut processing_errors = 0_u32;
         for node in &mut self.nodes {
             let effect_started = Instant::now();
-            node.process(self.sample_rate_hz, interleaved);
+            if !node.process(self.sample_rate_hz, interleaved) {
+                processing_errors = processing_errors.saturating_add(1);
+            }
             let per_frame = effect_started.elapsed().as_secs_f64() * 1_000_000.0
                 / frame_count(interleaved).max(1) as f64;
             if let Some(slot) = frame_timings.get_mut(timing_count) {
@@ -1406,7 +1481,7 @@ impl DspChain {
             peak: peak(interleaved),
             rms: rms(interleaved),
             underruns: 0,
-            fallback_count: self.fallback_count,
+            fallback_count: self.fallback_count.saturating_add(processing_errors),
         }
     }
 }
@@ -1414,6 +1489,7 @@ impl DspChain {
 #[derive(Debug)]
 enum DspNode {
     RnNoise(RnNoiseNode),
+    DeepFilter(Box<deepfilter::DeepFilterNode>),
     Highpass(HighpassNode),
     Eq(EqNode),
     Compressor(CompressorNode),
@@ -1430,7 +1506,12 @@ impl DspNode {
         acceleration: Option<&DspAccelerationConfig>,
     ) -> Result<Self, String> {
         match effect.effect_id.as_str() {
+            "rnnoise" if sample_rate_hz != 48_000 => Err("RNNoise requires 48000 Hz audio".into()),
             "rnnoise" => RnNoiseNode::new(effect, input_channels, acceleration).map(Self::RnNoise),
+            "deepfilternet3" => {
+                deepfilter::DeepFilterNode::new(effect, sample_rate_hz, input_channels)
+                    .map(|node| Self::DeepFilter(Box::new(node)))
+            }
             "highpass" => Ok(Self::Highpass(HighpassNode::new(effect, sample_rate_hz))),
             "eq" => Ok(Self::Eq(EqNode::new(effect, sample_rate_hz))),
             "compressor" => Ok(Self::Compressor(CompressorNode::new(
@@ -1447,8 +1528,9 @@ impl DspNode {
         }
     }
 
-    fn process(&mut self, _sample_rate_hz: u32, data: &mut [f32]) {
+    fn process(&mut self, _sample_rate_hz: u32, data: &mut [f32]) -> bool {
         match self {
+            Self::DeepFilter(node) => return node.process(data),
             Self::RnNoise(node) => node.process(data),
             Self::Highpass(node) => node.process(data),
             Self::Eq(node) => node.process(data),
@@ -1457,6 +1539,7 @@ impl DspNode {
             Self::KaraokeStage(node) => node.process(data),
             Self::Limiter(node) => node.process(data),
         }
+        true
     }
 
     fn diagnostic_mask(&self) -> u64 {
@@ -1468,6 +1551,7 @@ impl DspNode {
             Self::Gate(_) => 1 << 4,
             Self::KaraokeStage(_) => 1 << 5,
             Self::Limiter(_) => 1 << 6,
+            Self::DeepFilter(_) => 1 << 7,
         }
     }
 
@@ -1508,6 +1592,8 @@ struct RnNoiseNode {
     output_available: bool,
     input_left: Box<[f32]>,
     input_right: Box<[f32]>,
+    dry_left: Box<[f32]>,
+    dry_right: Box<[f32]>,
     output_left: Box<[f32]>,
     output_right: Box<[f32]>,
     vad_threshold: f32,
@@ -1516,6 +1602,8 @@ struct RnNoiseNode {
     hold_remaining: usize,
     dry_mix: f32,
     wet_envelope: f32,
+    voice_gate: bool,
+    minimum_gain: f32,
 }
 
 impl std::fmt::Debug for RnNoiseNode {
@@ -1553,6 +1641,8 @@ impl RnNoiseNode {
             output_available: false,
             input_left: vec![0.0; frame_size].into_boxed_slice(),
             input_right: vec![0.0; frame_size].into_boxed_slice(),
+            dry_left: vec![0.0; frame_size].into_boxed_slice(),
+            dry_right: vec![0.0; frame_size].into_boxed_slice(),
             output_left: vec![0.0; frame_size].into_boxed_slice(),
             output_right: vec![0.0; frame_size].into_boxed_slice(),
             vad_threshold: param(effect, "vad_threshold", 25.0).clamp(0.0, 99.0) / 100.0,
@@ -1562,6 +1652,15 @@ impl RnNoiseNode {
             hold_remaining: 0,
             dry_mix: param(effect, "dry_mix", 0.1).clamp(0.0, 1.0),
             wet_envelope: 0.0,
+            voice_gate: param(effect, "voice_gate", 1.0) >= 0.5,
+            minimum_gain: {
+                let reduction = param(effect, "reduction_db", 60.0).clamp(0.0, 60.0);
+                if reduction >= 60.0 {
+                    0.0
+                } else {
+                    10.0_f32.powf(-reduction / 20.0)
+                }
+            },
         })
     }
 
@@ -1572,6 +1671,9 @@ impl RnNoiseNode {
     }
 
     fn process(&mut self, data: &mut [f32]) {
+        if self.minimum_gain >= 1.0 && !self.voice_gate {
+            return;
+        }
         for frame in data.as_chunks_mut::<2>().0 {
             let output = if self.output_available {
                 let output = [
@@ -1602,29 +1704,53 @@ impl RnNoiseNode {
     fn process_complete_frame(&mut self) {
         let input_level_db =
             rnnoise_input_level_db(&self.input_left, &self.input_right, self.state_count);
-        if !rnnoise_should_process_frame(
-            input_level_db,
-            self.minimum_voice_level_db,
-            self.hold_remaining,
-            self.wet_envelope,
-        ) {
-            for index in 0..self.frame_size {
-                self.output_left[index] = self.input_left[index] * self.dry_mix / 32_768.0;
-                self.output_right[index] = self.input_right[index] * self.dry_mix / 32_768.0;
+        if self.dry_mix >= 1.0
+            || (self.voice_gate
+                && !rnnoise_should_process_frame(
+                    input_level_db,
+                    self.minimum_voice_level_db,
+                    self.hold_remaining,
+                    self.wet_envelope,
+                ))
+        {
+            // Keep analysis history current while the voice gate is closed.
+            // Otherwise resuming synthesis replays a stale overlap buffer.
+            self.states[0]
+                .as_mut()
+                .unwrap()
+                .features
+                .advance_muted_frame(&self.input_left);
+            if self.state_count == 2 {
+                self.states[1]
+                    .as_mut()
+                    .unwrap()
+                    .features
+                    .advance_muted_frame(&self.input_right);
             }
-            self.output_index = 0;
-            self.output_available = true;
+            for index in 0..self.frame_size {
+                self.output_left[index] = self.dry_left[index] * self.dry_mix / 32_768.0;
+                self.output_right[index] = self.dry_right[index] * self.dry_mix / 32_768.0;
+            }
+            self.finish_frame();
             return;
         }
         let left_probability = self.states[0]
             .as_mut()
             .expect("left RNNoise state is initialized")
-            .process_frame(&mut self.output_left, &self.input_left);
+            .process_frame_with_gain_floor(
+                &mut self.output_left,
+                &self.input_left,
+                self.minimum_gain,
+            );
         let right_probability = if self.state_count == 2 {
             self.states[1]
                 .as_mut()
                 .expect("right RNNoise state is initialized for stereo input")
-                .process_frame(&mut self.output_right, &self.input_right)
+                .process_frame_with_gain_floor(
+                    &mut self.output_right,
+                    &self.input_right,
+                    self.minimum_gain,
+                )
         } else {
             self.output_right.copy_from_slice(&self.output_left);
             left_probability
@@ -1640,7 +1766,7 @@ impl RnNoiseNode {
         } else {
             self.hold_remaining = self.hold_remaining.saturating_sub(1);
         }
-        let target_wet_gain = if voice_active || self.hold_remaining > 0 {
+        let target_wet_gain = if !self.voice_gate || voice_active || self.hold_remaining > 0 {
             1.0 - self.dry_mix
         } else {
             0.0
@@ -1649,13 +1775,25 @@ impl RnNoiseNode {
         for index in 0..self.frame_size {
             self.wet_envelope += wet_step;
             self.output_left[index] = (self.output_left[index] * self.wet_envelope
-                + self.input_left[index] * self.dry_mix)
+                + self.dry_left[index] * self.dry_mix)
                 / 32_768.0;
             self.output_right[index] = (self.output_right[index] * self.wet_envelope
-                + self.input_right[index] * self.dry_mix)
+                + self.dry_right[index] * self.dry_mix)
                 / 32_768.0;
         }
         self.wet_envelope = target_wet_gain;
+        self.finish_frame();
+    }
+
+    fn finish_frame(&mut self) {
+        // Neural synthesis is delayed by one analysis frame. Give the dry
+        // signal the same delay before either goes through the streaming buffer.
+        self.dry_left.copy_from_slice(&self.input_left);
+        self.dry_right.copy_from_slice(if self.state_count == 1 {
+            &self.input_left
+        } else {
+            &self.input_right
+        });
         self.output_index = 0;
         self.output_available = true;
     }
@@ -1738,7 +1876,17 @@ impl ExplicitDenoiseState {
         }))
     }
 
+    #[cfg(test)]
     fn process_frame(&mut self, output: &mut [f32], input: &[f32]) -> f32 {
+        self.process_frame_with_gain_floor(output, input, 0.0)
+    }
+
+    fn process_frame_with_gain_floor(
+        &mut self,
+        output: &mut [f32],
+        input: &[f32],
+        minimum_gain: f32,
+    ) -> f32 {
         self.features.shift_and_filter_input(input);
         if self.features.compute_frame_features() {
             self.features.synthesize_unmodified(output);
@@ -1751,11 +1899,11 @@ impl ExplicitDenoiseState {
             RnNoiseNeuralStage::Cpu(stage) => stage.process(&features),
             RnNoiseNeuralStage::Provider { stage, timeout } => stage.process(&features, *timeout),
         };
-        self.features.apply_denoise_gains_and_synthesize(
-            output,
-            &neural.gains,
-            &mut self.previous_gain,
-        );
+        // Bound attenuation in the spectral domain so the original and filtered
+        // signal share the same delay. This also works with accelerated inference.
+        let gains = neural.gains.map(|gain| gain.max(minimum_gain));
+        self.features
+            .apply_denoise_gains_and_synthesize(output, &gains, &mut self.previous_gain);
         neural.vad_probability
     }
 
@@ -1871,18 +2019,13 @@ struct EqNode {
 
 impl EqNode {
     fn new(effect: &EffectInstance, sample_rate_hz: u32) -> Self {
-        let mut bands = Vec::new();
-        for (freq, gain_key, q) in graphic_eq_bands() {
-            let gain = param(effect, gain_key, 0.0).clamp(-12.0, 12.0);
-            if gain.abs() < 0.01 {
-                continue;
-            }
-            let freq = freq.clamp(20.0, sample_rate_hz as f32 * 0.45);
-            bands.push([
-                Biquad::peaking(sample_rate_hz as f32, freq, q, gain),
-                Biquad::peaking(sample_rate_hz as f32, freq, q, gain),
-            ]);
-        }
+        let bands = graphic_eq_bands()
+            .into_iter()
+            .filter_map(|(frequency, gain_key, q)| {
+                eq_filter(effect, sample_rate_hz, frequency, gain_key, q)
+            })
+            .map(|filter| [filter; 2])
+            .collect();
         Self { bands }
     }
 
@@ -1911,8 +2054,39 @@ fn graphic_eq_bands() -> [(f32, &'static str, f32); 8] {
     ]
 }
 
+// Missing parameters retain the original eight-band response for saved setups.
+fn eq_filter(
+    effect: &EffectInstance,
+    sample_rate: u32,
+    frequency: f32,
+    gain_key: &str,
+    q: f32,
+) -> Option<Biquad> {
+    let prefix = gain_key.trim_end_matches("gain_db");
+    let gain = param(effect, gain_key, 0.0).clamp(-12.0, 12.0);
+    let frequency = param(effect, &format!("{prefix}frequency_hz"), frequency)
+        .clamp(20.0, 20000.0)
+        .min(sample_rate.max(1) as f32 * 0.45);
+    let q = param(effect, &format!("{prefix}q"), q).clamp(0.2, 10.0);
+    let shape = param(effect, &format!("{prefix}type"), 0.0)
+        .round()
+        .clamp(0.0, 4.0) as u8;
+    if shape < 3 && gain.abs() < 0.01 {
+        return None;
+    }
+    let rate = sample_rate as f32;
+    Some(match shape {
+        1 => Biquad::shelf(rate, frequency, q, gain, false),
+        2 => Biquad::shelf(rate, frequency, q, gain, true),
+        3 => Biquad::highpass(rate, frequency, q),
+        4 => Biquad::lowpass(rate, frequency, q),
+        _ => Biquad::peaking(rate, frequency, q, gain),
+    })
+}
+
 #[derive(Debug, Clone)]
 struct CompressorNode {
+    meter: wavelinux_model::CompressorMeter,
     threshold_amp: f32,
     gain_exponent: f32,
     makeup: f32,
@@ -1926,6 +2100,7 @@ impl CompressorNode {
         let threshold_db = param(effect, "threshold_db", -20.0).clamp(-60.0, 0.0);
         let ratio = param(effect, "ratio", 4.0).clamp(1.0, 20.0);
         Self {
+            meter: wavelinux_model::CompressorMeter::default(),
             threshold_amp: db_to_amp(threshold_db),
             gain_exponent: ratio.recip() - 1.0,
             makeup: db_to_amp(param(effect, "makeup_gain_db", 0.0).clamp(0.0, 24.0)),
@@ -1936,8 +2111,12 @@ impl CompressorNode {
     }
 
     fn process(&mut self, data: &mut [f32]) {
+        let mut input_peak = 0.0_f32;
+        let mut output_peak = 0.0_f32;
+        let mut minimum_gain = 1.0_f32;
         for frame in data.as_chunks_mut::<2>().0 {
             let level = frame[0].abs().max(frame[1].abs());
+            input_peak = input_peak.max(level);
             let target_gain = if level > self.threshold_amp {
                 (level / self.threshold_amp).powf(self.gain_exponent)
             } else {
@@ -1952,7 +2131,14 @@ impl CompressorNode {
             let output_gain = self.gain * self.makeup;
             frame[0] *= output_gain;
             frame[1] *= output_gain;
+            output_peak = output_peak.max(frame[0].abs().max(frame[1].abs()));
+            minimum_gain = minimum_gain.min(self.gain);
         }
+        self.meter = wavelinux_model::CompressorMeter {
+            input_peak,
+            output_peak,
+            gain_reduction_db: -20.0 * minimum_gain.clamp(0.001, 1.0).log10(),
+        };
     }
 }
 
@@ -2023,16 +2209,29 @@ impl VariableDelay {
 
     fn push(&mut self, sample: f32) {
         self.samples[self.write_index] = sample;
-        self.write_index = (self.write_index + 1) % self.samples.len();
+        self.write_index += 1;
+        if self.write_index == self.samples.len() {
+            self.write_index = 0;
+        }
     }
 
     fn tap(&self, delay_samples: f32) -> f32 {
         let length = self.samples.len() as f32;
-        let position =
-            (self.write_index as f32 - delay_samples.clamp(1.0, length - 1.0)).rem_euclid(length);
-        let first = position.floor() as usize % self.samples.len();
-        let second = (first + 1) % self.samples.len();
-        let fraction = position - position.floor();
+        let mut position = self.write_index as f32 - delay_samples.clamp(1.0, length - 1.0);
+        if position < 0.0 {
+            position += length;
+        }
+        // Floating-point addition can round a position just below zero to len.
+        if position >= length {
+            position = 0.0;
+        }
+        let first = position as usize;
+        let second = if first + 1 == self.samples.len() {
+            0
+        } else {
+            first + 1
+        };
+        let fraction = position - first as f32;
         self.samples[first] * (1.0 - fraction) + self.samples[second] * fraction
     }
 }
@@ -2059,8 +2258,11 @@ impl FeedbackDelay {
 
     fn process(&mut self, input: f32) -> f32 {
         let delayed = self.samples[self.index];
-        self.samples[self.index] = input + delayed * self.feedback;
-        self.index = (self.index + 1) % self.samples.len();
+        self.samples[self.index] = flush_denormal(input + delayed * self.feedback);
+        self.index += 1;
+        if self.index == self.samples.len() {
+            self.index = 0;
+        }
         delayed
     }
 }
@@ -2177,7 +2379,7 @@ impl KaraokeStageNode {
             let mut tone = [0.0_f32; 2];
             for channel in 0..2 {
                 tone[channel] = self.lowpass[channel]
-                    .process(self.highpass[channel].process(frame[channel]))
+                    .process(self.highpass[channel].process(flush_denormal(frame[channel])))
                     * self.tone_gain;
             }
             let modulation = self.modulation_phase.sin() * self.modulation_depth;
@@ -2187,8 +2389,10 @@ impl KaraokeStageNode {
             ];
             self.delays[0].push(tone[0]);
             self.delays[1].push(tone[1]);
-            self.modulation_phase = (self.modulation_phase + self.modulation_step)
-                .rem_euclid(2.0 * std::f32::consts::PI);
+            self.modulation_phase += self.modulation_step;
+            if self.modulation_phase >= 2.0 * std::f32::consts::PI {
+                self.modulation_phase -= 2.0 * std::f32::consts::PI;
+            }
 
             let room_input = (tone[0] + tone[1]) * 0.5;
             let room = self.room.process(room_input);
@@ -2196,6 +2400,9 @@ impl KaraokeStageNode {
                 tone[0] * self.dry_mix + doubled[1] * self.double_mix + room[0] * self.room_gain;
             frame[1] =
                 tone[1] * self.dry_mix + doubled[0] * self.double_mix + room[1] * self.room_gain;
+        }
+        for filter in self.highpass.iter_mut().chain(self.lowpass.iter_mut()) {
+            filter.flush_denormals();
         }
     }
 }
@@ -2336,13 +2543,10 @@ fn apply_highpass(effect: &EffectInstance, sample_rate_hz: u32, data: &mut [f32]
 #[cfg(test)]
 fn apply_eq(effect: &EffectInstance, sample_rate_hz: u32, data: &mut [f32]) {
     for (freq, gain_key, q) in graphic_eq_bands() {
-        let gain = param(effect, gain_key, 0.0).clamp(-12.0, 12.0);
-        if gain.abs() < 0.01 {
+        let Some(mut left) = eq_filter(effect, sample_rate_hz, freq, gain_key, q) else {
             continue;
-        }
-        let freq = freq.clamp(20.0, sample_rate_hz as f32 * 0.45);
-        let mut left = Biquad::peaking(sample_rate_hz as f32, freq, q, gain);
-        let mut right = Biquad::peaking(sample_rate_hz as f32, freq, q, gain);
+        };
+        let mut right = left;
         for frame in data.as_chunks_mut::<2>().0 {
             frame[0] = left.process(frame[0]);
             frame[1] = right.process(frame[1]);
@@ -2461,6 +2665,35 @@ impl Biquad {
         let a1 = -2.0 * cos;
         let a2 = 1.0 - alpha / a;
         Self::normalized(b0, b1, b2, a0, a1, a2)
+    }
+
+    // RBJ shelf filters: https://www.w3.org/TR/audio-eq-cookbook/
+    fn shelf(rate: f32, frequency: f32, q: f32, gain: f32, high: bool) -> Self {
+        let a = 10.0_f32.powf(gain / 40.0);
+        let w = 2.0 * std::f32::consts::PI * frequency / rate.max(1.0);
+        let c = w.cos();
+        let t = a.sqrt() * w.sin() / q;
+        let p = a + 1.0;
+        let m = a - 1.0;
+        if high {
+            Self::normalized(
+                a * (p + m * c + t),
+                -2.0 * a * (m + p * c),
+                a * (p + m * c - t),
+                p - m * c + t,
+                2.0 * (m - p * c),
+                p - m * c - t,
+            )
+        } else {
+            Self::normalized(
+                a * (p - m * c + t),
+                2.0 * a * (m - p * c),
+                a * (p - m * c - t),
+                p + m * c + t,
+                -2.0 * (m + p * c),
+                p + m * c - t,
+            )
+        }
     }
 
     fn normalized(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
@@ -2627,6 +2860,147 @@ pub fn human_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn catalog_presets_and_parameter_limits_process_finite_audio() {
+        let mut checked = 0;
+        for definition in wavelinux_model::EffectCatalog::default().effects {
+            let defaults = definition
+                .params
+                .iter()
+                .map(|p| (p.id.clone(), p.default))
+                .collect::<BTreeMap<_, _>>();
+            let mut settings = vec![("default".to_string(), defaults.clone())];
+            for preset in &definition.presets {
+                let mut values = defaults.clone();
+                values.extend(preset.values.clone());
+                settings.push((preset.name.clone(), values));
+            }
+            for maximum in [false, true] {
+                settings.push((
+                    format!("limits-{maximum}"),
+                    definition
+                        .params
+                        .iter()
+                        .map(|p| (p.id.clone(), if maximum { p.max } else { p.min }))
+                        .collect(),
+                ));
+            }
+            for (name, params) in settings {
+                let mut config = EffectInstance::new(&definition.id);
+                config.params = params;
+                let mut chain = DspChain::new(&[config], 48_000);
+                assert!(
+                    chain.is_fully_initialized(),
+                    "{} / {name}: {:?}",
+                    definition.id,
+                    chain.initialization_failures()
+                );
+                let mut audio = generated_stereo_fixture(2_880, 48_000);
+                for block in audio.chunks_mut(254) {
+                    assert_eq!(
+                        chain.process_worker_interleaved_stereo(block),
+                        RealtimeProcessStatus::default(),
+                        "{} / {name}",
+                        definition.id
+                    );
+                    assert!(
+                        block.iter().all(|s| s.is_finite()),
+                        "{} / {name}",
+                        definition.id
+                    );
+                }
+                checked += 1;
+            }
+        }
+        eprintln!("Validated {checked} effect/preset/limit combinations");
+    }
+
+    #[test]
+    fn every_effect_keeps_stream_state_across_irregular_audio_blocks() {
+        for definition in wavelinux_model::EffectCatalog::default().effects {
+            let mut config = EffectInstance::new(&definition.id);
+            config.params = definition
+                .params
+                .iter()
+                .map(|p| (p.id.clone(), p.default))
+                .collect();
+            if definition.id == "eq" {
+                config.params.insert("band_1k_gain_db".into(), 6.0);
+            }
+            let input = generated_stereo_fixture(4_800, 48_000);
+            let mut whole = input.clone();
+            let mut split = input.clone();
+            let mut a = DspChain::new(std::slice::from_ref(&config), 48_000);
+            let mut b = DspChain::new(std::slice::from_ref(&config), 48_000);
+            assert_eq!(
+                a.process_worker_interleaved_stereo(&mut whole),
+                RealtimeProcessStatus::default()
+            );
+            for block in split.chunks_mut(254) {
+                assert_eq!(
+                    b.process_worker_interleaved_stereo(block),
+                    RealtimeProcessStatus::default()
+                );
+            }
+            assert!(
+                whole.iter().zip(&split).all(|(a, b)| (a - b).abs() < 1e-6),
+                "{} changes with block size",
+                definition.id
+            );
+            config.bypassed = true;
+            let mut bypassed = input.clone();
+            DspChain::new(&[config], 48_000).process_worker_interleaved_stereo(&mut bypassed);
+            assert_eq!(bypassed, input, "{} bypass must be exact", definition.id);
+        }
+    }
+
+    #[test]
+    fn neural_effects_reject_unresampled_input() {
+        for id in ["rnnoise", "deepfilternet3"] {
+            for rate in [8_000, 44_100, 96_000] {
+                let chain = DspChain::new(&[effect(id, &[])], rate);
+                assert!(
+                    !chain.is_fully_initialized(),
+                    "{id} silently accepted {rate} Hz"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn voice_style_delay_wraps_match_fractional_reference() {
+        let mut delay = VariableDelay::new(113);
+        for index in 0..339 {
+            delay.push((index as f32 * 0.31).sin());
+            for offset in [0.0_f32, 1.0, 1.0000001, 1.5, 37.42, 111.99, 112.0, 150.0] {
+                let pos = (delay.write_index as f32 - offset.clamp(1.0, 112.0)).rem_euclid(113.0);
+                let i = pos.floor() as usize % 113;
+                let fraction = pos - pos.floor();
+                let expected =
+                    delay.samples[i] * (1.0 - fraction) + delay.samples[(i + 1) % 113] * fraction;
+                assert!((delay.tap(offset) - expected).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn voice_style_silence_clears_inaudible_filter_and_feedback_state() {
+        let mut node = KaraokeStageNode::new(&effect("karaoke_stage", &[]), 48_000);
+        let mut input = vec![1e-35; 480];
+        for _ in 0..10 {
+            node.process(&mut input);
+        }
+        assert!(input.iter().all(|s| *s == 0.0));
+        for filter in node.highpass.iter().chain(&node.lowpass) {
+            assert_eq!(filter.z1, 0.0);
+            assert_eq!(filter.z2, 0.0);
+        }
+        for delay in node.room.left.iter().chain(&node.room.right) {
+            assert!(delay.samples.iter().all(|s| *s == 0.0));
+        }
+    }
 
     fn sine(frames: usize, hz: f32, sample_rate_hz: u32, amp: f32) -> Vec<f32> {
         let mut data = Vec::with_capacity(frames * 2);
@@ -2826,6 +3200,75 @@ mod tests {
             .0
             .iter()
             .all(|frame| (frame[0] - frame[1]).abs() < 1.0e-6));
+    }
+
+    #[test]
+    fn rnnoise_reopening_after_silence_does_not_replay_old_audio() {
+        let config = effect(
+            "rnnoise",
+            &[
+                ("dry_mix", 0.0),
+                ("voice_gate", 1.0),
+                ("vad_threshold", 0.0),
+                ("minimum_voice_level_db", -60.0),
+                ("hold_ms", 0.0),
+                ("reduction_db", 0.0),
+            ],
+        );
+        let mut chain = DspChain::new(std::slice::from_ref(&config), 48_000);
+        chain.process_worker_interleaved_stereo(&mut sine(4_800, 173.0, 48_000, 0.25));
+        chain.process_worker_interleaved_stereo(&mut vec![0.0; 4_800 * 2]);
+        let mut resumed = sine(1_440, 971.0, 48_000, 0.25);
+        chain.process_worker_interleaved_stereo(&mut resumed);
+        let mut fresh = sine(1_440, 971.0, 48_000, 0.25);
+        DspChain::new(&[config], 48_000).process_worker_interleaved_stereo(&mut fresh);
+        let error = resumed[..960 * 2]
+            .iter()
+            .zip(&fresh)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            error < 1e-6,
+            "stale overlap differs from fresh input by {error}, peak {} / {}",
+            peak(&resumed[..960 * 2]),
+            peak(&fresh[..960 * 2])
+        );
+        assert!(peak(&resumed[960 * 2..]) > 0.01);
+    }
+
+    #[test]
+    fn rnnoise_dry_blend_matches_the_neural_frame_delay() {
+        let mut wet = effect(
+            "rnnoise",
+            &[("voice_gate", 0.0), ("reduction_db", 6.0), ("dry_mix", 0.0)],
+        );
+        let input = sine(4_800, 173.0, 48_000, 0.25);
+        let mut filtered = input.clone();
+        DspChain::new(&[wet.clone()], 48_000).process_worker_interleaved_stereo(&mut filtered);
+        wet.params.insert("dry_mix".into(), 0.5);
+        let mut mixed = input.clone();
+        DspChain::new(&[wet], 48_000).process_worker_interleaved_stereo(&mut mixed);
+        // One 480-frame analysis delay plus one 480-frame streaming buffer.
+        for (index, (&actual, &processed)) in mixed.iter().zip(&filtered).enumerate() {
+            let dry = index.checked_sub(960 * 2).map_or(0.0, |i| input[i]);
+            assert!(
+                (actual - (processed + dry) * 0.5).abs() < 1e-6,
+                "unaligned dry blend at sample {index}: {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn rnnoise_dry_only_keeps_delay_and_mono_channel_contract() {
+        let config = effect("rnnoise", &[("dry_mix", 1.0)]);
+        let mut input = vec![0.0; 1_920 * 2];
+        input[0] = 0.5;
+        input[1] = -0.25;
+        let mut chain = DspChain::new_with_channels(&[config], 48_000, 1);
+        chain.process_worker_interleaved_stereo(&mut input);
+        assert_eq!(input[960 * 2], 0.5);
+        assert_eq!(input[960 * 2 + 1], 0.5);
+        assert!(input[..960 * 2].iter().all(|s| *s == 0.0));
     }
 
     #[test]
@@ -3082,6 +3525,42 @@ mod tests {
             &mut data,
         );
         assert!(peak(&data) < before);
+    }
+
+    #[test]
+    fn compressor_meter_measures_its_own_input_output_and_reduction() {
+        let compressor = effect(
+            "compressor",
+            &[
+                ("threshold_db", -20.0),
+                ("ratio", 4.0),
+                ("attack_ms", 1.0),
+                ("release_ms", 80.0),
+                ("makeup_gain_db", 6.0),
+            ],
+        );
+        let mut chain = DspChain::new(std::slice::from_ref(&compressor), 48_000);
+        let mut warmup = vec![0.5; 9600];
+        chain.process_realtime_interleaved_stereo(&mut warmup);
+        let mut block = vec![0.5; 512];
+        chain.process_realtime_interleaved_stereo(&mut block);
+        let meter = chain.compressor_meter().unwrap();
+        assert_eq!(meter.input_peak, 0.5);
+        assert!((meter.output_peak - peak(&block)).abs() < 1e-6);
+        // A settled 4:1 compressor reduces the amount above threshold by 3/4.
+        let expected_reduction = (20.0 * 0.5_f32.log10() + 20.0) * 0.75;
+        assert!((meter.gain_reduction_db - expected_reduction).abs() < 0.001);
+        assert!(
+            (20.0 * (meter.output_peak / meter.input_peak).log10() - (6.0 - expected_reduction))
+                .abs()
+                < 0.001
+        );
+        let mut bypassed = compressor;
+        bypassed.bypassed = true;
+        assert!(DspChain::new(&[bypassed], 48_000)
+            .compressor_meter()
+            .is_none());
+        assert!(DspChain::new(&[], 48_000).compressor_meter().is_none());
     }
 
     #[test]
@@ -3408,6 +3887,102 @@ mod tests {
     }
 
     #[test]
+    fn parametric_eq_changes_frequency_width_and_shape_and_preserves_legacy_sound() {
+        fn measured(filter: Biquad, frequency: f32) -> f32 {
+            let mut filter = filter;
+            let mut input = 0.0;
+            let mut output = 0.0;
+            for i in 0..48000 {
+                let x = (std::f32::consts::TAU * frequency * i as f32 / 48000.0).sin() * 0.01;
+                let y = filter.process(x);
+                assert!(y.is_finite());
+                if i > 24000 {
+                    input += x * x;
+                    output += y * y;
+                }
+            }
+            10.0 * (output / input).max(1e-12).log10()
+        }
+        let legacy = effect("eq", &[("band_63_gain_db", 6.0)]);
+        let legacy_filter = eq_filter(&legacy, 48000, 63.0, "band_63_gain_db", 0.9).unwrap();
+        let old = Biquad::peaking(48000.0, 63.0, 0.9, 6.0);
+        assert_eq!(
+            [
+                legacy_filter.b0,
+                legacy_filter.b1,
+                legacy_filter.b2,
+                legacy_filter.a1,
+                legacy_filter.a2
+            ],
+            [old.b0, old.b1, old.b2, old.a1, old.a2]
+        );
+        let mut adjusted = legacy.clone();
+        adjusted
+            .params
+            .insert("band_63_frequency_hz".into(), 1000.0);
+        adjusted.params.insert("band_63_q".into(), 3.0);
+        let narrow = eq_filter(&adjusted, 48000, 63.0, "band_63_gain_db", 0.9).unwrap();
+        assert!((measured(narrow, 1000.0) - 6.0).abs() < 0.05);
+        adjusted.params.insert("band_63_q".into(), 0.5);
+        let wide = eq_filter(&adjusted, 48000, 63.0, "band_63_gain_db", 0.9).unwrap();
+        assert!(measured(wide, 500.0) > measured(narrow, 500.0) + 2.0);
+        adjusted.params.insert("band_63_q".into(), 0.707);
+        for (shape, low, high) in [
+            (1.0, 6.0, 0.0),
+            (2.0, 0.0, 6.0),
+            (3.0, -40.0, 0.0),
+            (4.0, 0.0, -40.0),
+        ] {
+            adjusted.params.insert("band_63_type".into(), shape);
+            let filter = eq_filter(&adjusted, 48000, 63.0, "band_63_gain_db", 0.9).unwrap();
+            let l = measured(filter, 100.0);
+            let h = measured(filter, 10000.0);
+            if low < -30.0 {
+                assert!(l < -35.0);
+            } else {
+                assert!((l - low).abs() < 0.1);
+            }
+            if high < -30.0 {
+                assert!(h < -35.0);
+            } else {
+                assert!((h - high).abs() < 0.1);
+            }
+        }
+    }
+
+    #[test]
+    fn spectrum_protocol_round_trips_silence_and_rejects_invalid_dimensions() {
+        let sample = MeterStreamSample {
+            spectrum: Some([0.5; SPECTRUM_BINS]),
+            ..Default::default()
+        };
+        let silence = MeterStreamSample {
+            spectrum: Some([0.0; SPECTRUM_BINS]),
+            ..Default::default()
+        };
+        let mut encoded = Vec::new();
+        encode_meter_stream_frame_into(
+            1,
+            1,
+            &[sample, silence, MeterStreamSample::default()],
+            &mut encoded,
+        )
+        .unwrap();
+        let decoded =
+            read_meter_stream_frame(&mut std::io::Cursor::new(&encoded), 3, &mut Vec::new())
+                .unwrap();
+        assert_eq!(
+            decoded.samples,
+            vec![sample, silence, MeterStreamSample::default()]
+        );
+        encoded.truncate(encoded.len() - 1);
+        assert!(
+            read_meter_stream_frame(&mut std::io::Cursor::new(encoded), 3, &mut Vec::new())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn meter_stream_protocol_round_trips_header_and_frame() {
         let slots = vec![
             MeterStreamSlot {
@@ -3426,12 +4001,14 @@ mod tests {
 
         let samples = vec![
             MeterStreamSample {
+                spectrum: None,
                 peak_left: 0.75,
                 peak_right: 0.5,
                 rms_left: 0.25,
                 rms_right: 0.125,
             },
             MeterStreamSample {
+                spectrum: None,
                 peak_left: f32::INFINITY,
                 peak_right: -0.5,
                 rms_left: 2.0,
@@ -3453,6 +4030,54 @@ mod tests {
         assert_eq!(frame.samples[1].peak_left, 0.0);
         assert_eq!(frame.samples[1].peak_right, 0.0);
         assert_eq!(frame.samples[1].rms_left, 1.0);
+    }
+
+    #[test]
+    fn meter_stream_accepts_legacy_versions_and_separate_compressor_slots() {
+        let channel = MeterStreamSlot {
+            kind: MeterStreamSlotKind::Channel,
+            id: "mic".into(),
+        };
+        let compressor = MeterStreamSlot {
+            kind: MeterStreamSlotKind::Compressor,
+            id: "mic".into(),
+        };
+        let slots = vec![channel.clone(), compressor.clone()];
+        let encoded = encode_meter_stream_header(&slots).unwrap();
+        assert_eq!(
+            read_meter_stream_header(&mut std::io::Cursor::new(encoded))
+                .unwrap()
+                .slots,
+            slots
+        );
+        assert!(encode_meter_stream_header(&[compressor.clone(), compressor]).is_err());
+        assert!(encode_meter_stream_header(&[channel.clone(), channel.clone()]).is_err());
+
+        let mut old_header = encode_meter_stream_header(&[channel]).unwrap();
+        old_header[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        old_header[14..16].copy_from_slice(&16_u16.to_le_bytes());
+        old_header[20..24].copy_from_slice(&40_u32.to_le_bytes());
+        assert_eq!(
+            read_meter_stream_header(&mut std::io::Cursor::new(old_header))
+                .unwrap()
+                .slots
+                .len(),
+            1
+        );
+        let sample = MeterStreamSample {
+            spectrum: None,
+            peak_left: 0.5,
+            peak_right: 0.25,
+            rms_left: 0.1,
+            rms_right: 1.0,
+        };
+        let mut encoded = Vec::new();
+        encode_meter_stream_frame_into(1, 1, &[sample], &mut encoded).unwrap();
+        encoded[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        encoded.truncate(40);
+        let frame = read_meter_stream_frame(&mut std::io::Cursor::new(encoded), 1, &mut Vec::new())
+            .unwrap();
+        assert_eq!(frame.samples, vec![sample]);
     }
 
     #[test]

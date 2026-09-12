@@ -17,7 +17,7 @@ new `wavelinux6` application, configuration, and PipeWire namespace.
 - Event-driven application routing with saved routing rules.
 - Jack-aware microphone and speaker selection for USB, Bluetooth, HDA jack,
   and internal devices.
-- Native RNNoise, high-pass, eight-band EQ, compressor, gate, limiter, and
+- Native RNNoise, DeepFilterNet 3, high-pass, eight-band EQ, compressor, gate, limiter, and
   Karaoke Stage processing in `wavelinux6-audio-core`.
 - Stable `wavelinux6-mic` and `wavelinux6_mix_stream_source` recording sources.
 - Live effect parameter and topology updates without replacing public client
@@ -25,8 +25,15 @@ new `wavelinux6` application, configuration, and PipeWire namespace.
 - Adaptive 28/40/60/80/100/120 ms core buffering and Health diagnostics.
 - AppImage, deb, rpm, and AUR packaging with host-compatible PipeWire use.
 
-DeepFilterNet is not included. Existing DeepFilterNet config entries are
-migrated to RNNoise and it does not appear in the effect catalog.
+WaveLinux 6.1.0 adds **DeepFilterNet 3** as a second noise-cleanup
+option. Open your microphone’s **FX**, select **DeepFilterNet 3**, and start with
+**Gentle** for faint hiss or fan noise. Choose Balanced or Strong if needed.
+Selecting it replaces RNNoise on that channel. Processing and the model are
+included locally; no Python setup or model download is needed.
+
+The EQ’s gray spectrum shows the selected channel **after its effects**.
+The compressor shows that effect’s live input, output and gain reduction for
+the selected channel, with a vertical threshold control.
 
 ## Install or update
 
@@ -76,11 +83,11 @@ bash wavelinux6-install.sh --no-launch
 bash wavelinux6-install.sh --dry-run
 
 # Install a specific release.
-bash wavelinux6-install.sh --tag v6.0.3
+bash wavelinux6-install.sh --tag v6.1.0
 
 # Native packages for Debian/Ubuntu or Fedora.
-bash wavelinux6-install.sh --tag v6.0.3 --format deb
-bash wavelinux6-install.sh --tag v6.0.3 --format rpm
+bash wavelinux6-install.sh --tag v6.1.0 --format deb
+bash wavelinux6-install.sh --tag v6.1.0 --format rpm
 ```
 
 The release also includes a direct AppImage and AUR metadata. openSUSE should
@@ -89,8 +96,8 @@ use the `.sh` installer; the RPM uses Fedora package names.
 To verify a manually downloaded standalone installer before running it:
 
 ```bash
-curl -fLO https://github.com/DuskyProjects/WaveLinux/releases/download/v6.0.3/WaveLinux6_amd64_Installer.sh
-curl -fLO https://github.com/DuskyProjects/WaveLinux/releases/download/v6.0.3/SHA256SUMS
+curl -fLO https://github.com/DuskyProjects/WaveLinux/releases/download/v6.1.0/WaveLinux6_amd64_Installer.sh
+curl -fLO https://github.com/DuskyProjects/WaveLinux/releases/download/v6.1.0/SHA256SUMS
 grep 'WaveLinux6_amd64_Installer.sh$' SHA256SUMS | sha256sum -c - \
   && bash WaveLinux6_amd64_Installer.sh
 ```

@@ -2,6 +2,7 @@ import type { EffectDefinition, EffectInstance } from "./types";
 
 const singleInstanceEffectIds = new Set([
   "rnnoise",
+  "deepfilternet3",
   "highpass",
   "eq",
   "compressor",
@@ -19,9 +20,10 @@ export function normalizeSourceEffects(
   const singleInstanceIndexes = new Map<string, number[]>();
   for (const [index, effect] of effects.entries()) {
     if (!isSingleInstanceEffect(effect.effect_id)) continue;
-    const indexes = singleInstanceIndexes.get(effect.effect_id) ?? [];
+    const group = ["rnnoise", "deepfilternet3"].includes(effect.effect_id) ? "noise_suppression" : effect.effect_id;
+    const indexes = singleInstanceIndexes.get(group) ?? [];
     indexes.push(index);
-    singleInstanceIndexes.set(effect.effect_id, indexes);
+    singleInstanceIndexes.set(group, indexes);
   }
 
   if (singleInstanceIndexes.size === 0) return structuredClone(effects);

@@ -29,8 +29,11 @@ yarn web:build
 
 ## Coverage Map
 
-- `wavelinux-dsp`: native nodes, mono RNNoise, near-field gating, chain state,
-  denormal handling, control buffering, adaptive latency, and provider policy.
+- `wavelinux-dsp`: native nodes, mono RNNoise, near-field gating, actual attenuation
+  controls, DFN3 inference and faint-hiss reduction, stereo isolation, chain state,
+  denormal handling, dry/wet frame alignment, gate reopening, every catalog preset
+  and parameter limits, bypass transparency, irregular block sizes, control
+  buffering, adaptive latency, and provider policy.
 - `wavelinux-model`: schema migration, effect catalog/defaults, namespaces,
   device ranking, app identity, and DeepFilterNet-to-RNNoise migration.
 - `wavelinux-pw`: snapshot parsing, route planning, ownership, filter config,
@@ -41,10 +44,16 @@ yarn web:build
 - `wavelinux-accelerator`: pack ownership/hash validation, machine-local
   qualification, fixed shared-memory queues, RNNoise numerical fixtures,
   isolated ONNX inference, provider termination, and exact CPU state fallback.
-- Frontend: Vitest/React Testing Library covers effect-strength mapping and UI
-  state contracts; Playwright covers FX scrolling and desktop layouts at 100,
+- Frontend: Vitest/React Testing Library covers effect-strength mapping, EQ filter
+  response (bell, shelves and cuts), stereo FFT analysis, spectrum transport,
+  compressor readings, stale data, pause/resume, channel selection, gesture commits and UI state contracts;
+  Playwright covers saved EQ/threshold dragging, keyboard edits, reset, pause,
+  advanced controls, light/dark themes, FX scrolling and desktop layouts at 100,
   125, and 150% scaling; TypeScript and Vite protect production IPC/build
   contracts.
+  App integration tests use the native event path to verify that microphone
+  telemetry stays active when opening Effects or launching directly into it,
+  and stops when the window is hidden or Settings is selected.
 - Shell: installers, process matching, dependency logic, and ALSA alias edits.
 
 Linux screenshot tests use `tests/e2e/fonts.conf` to select the DejaVu Sans
@@ -53,14 +62,57 @@ font. Install DejaVu Sans before running Playwright (`fonts-dejavu-core` on
 Debian/Ubuntu, `ttf-dejavu` on Arch). An explicit `FONTCONFIG_FILE` overrides
 this test setting. This affects only the test browser, not the installed app.
 
+The compressor interaction check performs actual vertical mouse drags, sideways
+movement, keyboard changes and a save/reopen round trip. When checking native
+WebKitGTK issues, run this test under WebKit as well as Chromium; setting an
+input's value programmatically does not verify its pointer orientation.
+
+With Playwright's WebKit runtime and its host dependencies installed:
+
+```bash
+node node_modules/.bin/playwright test --config playwright.webkit.config.ts
+```
+
+These focused checks also cover Strength key-release commits, pointer release
+outside a slider, accurate Advanced readouts, and switching noise filters. They
+are separate from the default Chromium screenshot suite.
+
+For a short offline timing comparison of each effect on generated audio and
+near-silence (no devices or recording):
+
+```bash
+cargo run --release -p wavelinux-dsp --example effects-bench
+```
+
+This reports initialization and median processing time. Compare builds on the
+same idle machine; it is not a hardware continuity or voice-quality test.
+
 ## Live PipeWire Tests
+
+Short virtual-device acceptance checks can run without changing desktop audio:
+
+```bash
+bash scripts/test-virtual-audio.sh
+```
+
+This optional check uses a private D-Bus/PipeWire/Pulse session, policy-only
+WirePlumber, virtual microphones/speakers and short synthetic tones. It checks
+Music/Game/input separation, compressor reduction, EQ spectrum changes after
+cuts/boosts, native DeepFilterNet selection and processing,
+microphone/speaker removal and reconnection, audio-server recovery, and saved
+effects, routing, volume and device profiles after engine restart. It also
+checks that an intentionally stopped graph stays stopped. Reports go to
+`target/virtual-audio-checks`; pass another report directory as the first argument.
+Build `wavelinux6-audio-core` in release mode first, or set `WAVELINUX_DSP_HELPER`
+to the local helper being tested. No physical microphone audio is recorded.
+These checks do not exercise USB drivers, physical jacks or system suspend.
 
 Live tests mutate the current user audio graph. Close recording/streaming work
 or use an isolated PipeWire session first:
 
 ```bash
 WAVELINUX_RUN_LIVE_TESTS=1 \
-  cargo test -p wavelinux-engine -- --ignored --test-threads=1
+  cargo test -p wavelinux-engine --lib -- --ignored --test-threads=1
 ```
 
 Acceptance scenarios include:

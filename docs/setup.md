@@ -89,8 +89,9 @@ normalize it to schema 14, rewrite owned node names to `wavelinux6`, and clear
 transient route ids. WaveLinux5 config and installation artifacts are removed
 after the new graph validates. There is no long-lived migration backup.
 
-DeepFilterNet effect entries migrate to RNNoise. DeepFilterNet packages or
-models are not downloaded.
+Legacy `deepfilternet` entries migrate to RNNoise. WaveLinux 6.1.0
+adds the genuine `deepfilternet3` option with an embedded model; it requires
+no separate package or runtime model download.
 
 ## AppImage Runtime Preflight
 
@@ -98,7 +99,7 @@ Check a built AppImage directly:
 
 ```bash
 APPIMAGE_EXTRACT_AND_RUN=1 \
-  target/release/bundle/appimage/WaveLinux6_6.0.3_amd64.AppImage \
+  target/release/bundle/appimage/WaveLinux6_6.1.0_amd64.AppImage \
   --check-runtime-dependencies
 ```
 
@@ -106,7 +107,7 @@ Request host package installation:
 
 ```bash
 APPIMAGE_EXTRACT_AND_RUN=1 \
-  target/release/bundle/appimage/WaveLinux6_6.0.3_amd64.AppImage \
+  target/release/bundle/appimage/WaveLinux6_6.1.0_amd64.AppImage \
   --install-runtime-dependencies
 ```
 

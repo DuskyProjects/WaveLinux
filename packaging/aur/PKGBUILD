@@ -1,6 +1,7 @@
 # Maintainer: WaveLinux contributors <https://github.com/DuskyProjects/WaveLinux>
 pkgname=wavelinux
-pkgver=6.0.3
+pkgver=6.1.0
+_upstream_version=6.1.0
 pkgrel=1
 pkgdesc="Rust and PipeWire creator audio mixer for Linux"
 arch=('x86_64')
@@ -48,11 +49,11 @@ makedepends=(
   'librsvg'
   'patchelf'
 )
-source=("$pkgname-$pkgver.tar.gz::https://github.com/DuskyProjects/WaveLinux/archive/refs/tags/v$pkgver.tar.gz")
+source=("$pkgname-$_upstream_version.tar.gz::https://github.com/DuskyProjects/WaveLinux/archive/refs/tags/v$_upstream_version.tar.gz")
 sha256sums=('SKIP')
 
 build() {
-  cd "WaveLinux-$pkgver"
+  cd "WaveLinux-$_upstream_version"
   yarn install --frozen-lockfile
   node node_modules/.bin/tsc --noEmit
   node node_modules/.bin/vite build
@@ -62,12 +63,12 @@ build() {
 }
 
 check() {
-  cd "WaveLinux-$pkgver"
+  cd "WaveLinux-$_upstream_version"
   cargo test --workspace --locked
 }
 
 package() {
-  cd "WaveLinux-$pkgver"
+  cd "WaveLinux-$_upstream_version"
   install -Dm755 target/release/wavelinux6 "$pkgdir/usr/bin/wavelinux6"
   install -Dm755 target/release/wavelinux6-audio-core "$pkgdir/usr/bin/wavelinux6-audio-core"
   install -Dm755 target/release/wavelinux6-peripheral-plugin "$pkgdir/usr/bin/wavelinux6-peripheral-plugin"

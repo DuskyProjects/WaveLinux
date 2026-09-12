@@ -65,7 +65,7 @@ export function WaveLinkEffectsEditor({
           setChannelInput={setChannelInput}
           state={state}
         />
-        <EffectChainList editor={editor} state={state} />
+        <EffectChainList editor={editor} state={state} channel={channel} />
       </div>
       <EffectCatalog
         channel={channel}
@@ -156,7 +156,7 @@ export function EffectsView({
           setChannelInput={setChannelInput}
           state={state}
         />
-        <EffectChainList editor={editor} state={state} />
+        <EffectChainList editor={editor} state={state} channel={selectedChannel} />
       </div>
       <EffectCatalog
         channel={selectedChannel}
@@ -269,9 +269,11 @@ function HardwareSourceCard({
 function EffectChainList({
   editor,
   state,
+  channel,
 }: {
   editor: EffectEditor;
   state: AppStateSnapshot;
+  channel?: Channel;
 }) {
   return (
     <div className="effect-chain">
@@ -281,6 +283,8 @@ function EffectChainList({
         );
         return (
           <EffectBlock
+            channelId={channel?.id}
+            effectsEnabled={channel?.effects_enabled}
             availability={state.graph.effect_availability.find(
               (item) => item.effect_id === effect.effect_id,
             )}

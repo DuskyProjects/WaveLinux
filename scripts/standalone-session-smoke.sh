@@ -83,7 +83,14 @@ dbus-run-session -- bash -c '
       executable="$(readlink "/proc/$candidate_pid/exe" 2>/dev/null || true)"
       case "${executable##*/}" in
         wavelinux6|wavelinux6-audio-core|WaveLinux6_*_amd64.AppImage)
-          wavelinux_pids+=("$candidate_pid")
+          # Another desktop session may have the same executable running.
+          # Cleanup owns only processes using this smoke test runtime.
+          while IFS= read -r -d "" entry; do
+            if [[ "$entry" == "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" ]]; then
+              wavelinux_pids+=("$candidate_pid")
+              break
+            fi
+          done 2>/dev/null < "/proc/$candidate_pid/environ" || true
           ;;
       esac
     done < <(ps -u "$(id -u)" -o pid=)

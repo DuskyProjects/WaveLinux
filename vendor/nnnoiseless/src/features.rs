@@ -103,6 +103,14 @@ impl DenoiseFeatures {
         crate::util::BIQUAD_HP.filter(&mut self.input_mem[new_idx..], &mut self.mem_hp_x, input);
     }
 
+    /// Advance audio history without inference while an external gate is fully
+    /// closed. Discard the inaudible synthesis overlap so it cannot be replayed
+    /// when the gate reopens. Does not allocate or reset neural state.
+    pub fn advance_muted_frame(&mut self, input: &[f32]) {
+        self.shift_and_filter_input(input);
+        self.synthesis_mem.fill(0.0);
+    }
+
     fn find_pitch(&mut self) -> usize {
         let input = &self.input_mem[self.input_mem.len().checked_sub(PITCH_BUF_SIZE).unwrap()..];
         let (pitch, _gain) = self.pitch_finder.process(input);

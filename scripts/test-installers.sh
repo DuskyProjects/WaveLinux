@@ -17,7 +17,10 @@ aur_version="$(sed -n 's/^pkgver=//p' "$ROOT_DIR/packaging/aur/PKGBUILD" | head 
 
 [[ "$package_version" == "$tauri_version" ]] || fail "package.json and Tauri versions differ"
 [[ "$package_version" == "$cargo_version" ]] || fail "package.json and Cargo versions differ"
-[[ "$package_version" == "$aur_version" ]] || fail "package.json and AUR versions differ"
+aur_upstream_version="$(sed -n 's/^_upstream_version=//p' "$ROOT_DIR/packaging/aur/PKGBUILD" | head -n1)"
+[[ "$package_version" == "$aur_upstream_version" ]] || fail "package.json and AUR source versions differ"
+# Arch does not allow hyphens in pkgver; retain the exact upstream tag separately.
+[[ "${package_version//-/}" == "$aur_version" ]] || fail "package.json and AUR versions differ"
 
 for manager in apt dnf pacman zypper; do
   mapfile -t packages < <(wavelinux_runtime_packages "$manager")

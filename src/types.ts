@@ -379,7 +379,15 @@ export interface AppStream {
   muted: boolean;
 }
 
+export interface CompressorMeter {
+  input_peak: number;
+  output_peak: number;
+  gain_reduction_db: number;
+}
+
 export interface LevelMeter {
+  compressor?: CompressorMeter | null;
+  spectrum?: number[] | null;
   node_id: string;
   peak_left: number;
   peak_right: number;
@@ -464,6 +472,7 @@ export interface AudioCoreChannelStatus {
   chain_swaps: number;
   non_finite_blocks: number;
   non_finite_samples: number;
+  processing_errors?: number;
   non_finite_effect_mask: number;
   chain_recoveries: number;
   chain_swap_replacements: number;

@@ -4593,3 +4593,128 @@ button:disabled {
     font-size: 14px;
   }
 }
+
+/* Visual EQ and compressor editors. The response curves are native SVG, so
+   they stay sharp at fractional desktop scaling and follow the selected theme. */
+.visual-eq,
+.visual-compressor {
+  --visual-ink: var(--wl-text, #e8edf3);
+  --visual-muted: var(--wl-muted, #99a5b4);
+  --visual-paper: var(--wl-panel, #12171e);
+  --visual-grid: color-mix(in srgb, var(--visual-ink) 10%, transparent);
+  --visual-blue: #335cf4;
+  min-width: 0;
+  color: var(--visual-ink);
+}
+.visual-effect-guidance { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 14px 0 18px; }
+.visual-effect-guidance p { margin: 0; color: var(--visual-muted); font-size: 12px; line-height: 1.5; }
+.visual-reset { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; border: 0; background: transparent; color: var(--visual-muted); padding: 6px; cursor: pointer; font-size: 11px; }
+.visual-reset:hover { color: var(--visual-ink); }
+.eq-chart-row { display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 8px; padding-right: 12px; }
+.eq-db-scale { display: flex; flex-direction: column; justify-content: space-between; padding: 0; color: var(--visual-muted); text-align: right; font-size: 10px; font-variant-numeric: tabular-nums; }
+.eq-db-scale span { transform: translateY(-50%); height: 0; white-space: nowrap; }
+.eq-plot { height: clamp(210px, 29vw, 310px); position: relative; border: 1px solid var(--visual-grid); border-radius: 7px; background: var(--visual-paper); }
+.eq-plot > svg { width: 100%; height: 100%; display: block; overflow: hidden; border-radius: inherit; }
+.eq-grid { stroke: var(--visual-grid); stroke-width: 1; }
+.eq-zero { stroke: color-mix(in srgb, var(--visual-ink) 26%, transparent); stroke-width: 1; }
+.eq-response { stroke: var(--visual-blue); stroke-width: 2.5; stroke-linejoin: round; }
+.eq-point { position: absolute; z-index: 2; width: 32px; height: 32px; display: grid; place-items: center; padding: 0; border: 2px solid transparent; border-radius: 50%; background: transparent; transform: translate(-50%, -50%); cursor: ns-resize; touch-action: none; outline: none; }
+.eq-point > span { width: 13px; height: 13px; border-radius: 50%; background: var(--band-color); box-shadow: 0 0 0 2px color-mix(in srgb, var(--visual-paper) 80%, transparent); }
+.eq-point.selected { z-index: 3; border-color: color-mix(in srgb, var(--band-color) 45%, transparent); background: color-mix(in srgb, var(--band-color) 9%, transparent); }
+.eq-point:focus-visible { border-color: var(--band-color); box-shadow: 0 0 0 3px var(--visual-paper); }
+.eq-frequency-labels { position: relative; height: 34px; margin: 16px 12px 18px 46px; text-align: center; }
+.eq-frequency-labels > span { position: absolute; transform: translateX(-50%); }
+.eq-frequency-labels strong { display: block; font-size: 10px; font-weight: 500; color: var(--visual-muted); }
+.eq-frequency-labels small { display: block; margin-top: 5px; font-size: 10px; color: var(--visual-muted); }
+.eq-selected-band { display: flex; align-items: center; gap: 9px; min-height: 42px; padding: 8px 10px; background: color-mix(in srgb, var(--visual-ink) 3%, transparent); border-radius: 7px; font-size: 12px; }
+.eq-band-swatch { width: 8px; height: 8px; border-radius: 50%; background: var(--band-color); flex-shrink: 0; }
+.eq-selected-band > span:not(.eq-band-swatch) { color: var(--visual-muted); font-size: 11px; }
+.eq-gain-stepper { display: flex; align-items: center; gap: 5px; margin-left: auto; }
+.eq-gain-stepper button { border: 1px solid var(--visual-grid); border-radius: 5px; background: var(--visual-paper); color: var(--visual-ink); width: 27px; height: 27px; cursor: pointer; }
+.eq-gain-stepper output { min-width: 62px; text-align: center; font-variant-numeric: tabular-nums; font-weight: 600; }
+.eq-keyboard-hint { display: none; }
+.compressor-source-label { flex-shrink: 0; font-size: 10px; font-weight: 600; color: var(--visual-muted); padding: 4px 7px; border: 1px solid var(--visual-grid); border-radius: 4px; }
+.compressor-display { --compressor-height: 238px; display: grid; grid-template-columns: 38px minmax(100px, 1fr) 52px 45px 38px; align-items: start; gap: 12px; padding-top: 2px; }
+.compressor-chart { position: relative; height: var(--compressor-height); margin-top: 28px; border: 1px solid var(--visual-grid); border-radius: 7px; overflow: hidden; background: var(--visual-paper); }
+.compressor-chart > svg { display: block; width: 100%; height: 100%; }
+.compressor-center { stroke: var(--visual-grid); stroke-width: 1; }
+.compressor-wave-before { fill: color-mix(in srgb, var(--visual-ink) 22%, var(--visual-paper)); }
+.compressor-wave-after { fill: var(--visual-blue); opacity: 0.96; }
+.compressor-threshold-line { position: absolute; width: 100%; height: 20px; transform: translateY(-50%); cursor: ns-resize; touch-action: none; z-index: 2; }
+.compressor-threshold-line::after { content: ""; position: absolute; top: 50%; left: 0; width: 100%; height: 1px; background: var(--visual-ink); }
+.compressor-threshold-line span { position: absolute; left: 6px; bottom: 12px; font-size: 9px; padding: 2px 4px; background: var(--visual-paper); color: var(--visual-ink); border-radius: 3px; font-variant-numeric: tabular-nums; }
+.compressor-pause { position: absolute; left: 8px; bottom: 8px; z-index: 3; display: grid; place-items: center; width: 29px; height: 29px; padding: 0; border: 1px solid var(--visual-grid); border-radius: 5px; background: var(--visual-paper); color: var(--visual-muted); cursor: pointer; }
+.compressor-pause:hover { color: var(--visual-ink); }
+.compressor-paused-label { position: absolute; left: 43px; bottom: 15px; font-size: 10px; color: var(--visual-muted); background: var(--visual-paper); }
+.compressor-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--visual-muted); font-size: 12px; pointer-events: none; }
+.compressor-signal-meter,
+.compressor-threshold-column { display: grid; grid-template-rows: 28px var(--compressor-height) 28px; gap: 0; align-items: start; justify-items: center; min-width: 0; color: var(--visual-muted); }
+.compressor-signal-meter > output,
+.compressor-threshold-column > output { font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.compressor-signal-meter > span,
+.compressor-threshold-column > span { padding-top: 10px; font-size: 10px; white-space: nowrap; }
+.compressor-meter-segments { display: flex; flex-direction: column; gap: 3px; width: 24px; height: 100%; }
+.compressor-meter-segments > span { flex: 1; border-radius: 2px; background: color-mix(in srgb, var(--visual-ink) 12%, transparent); min-height: 2px; }
+.compressor-meter-segments > span.lit { background: var(--visual-blue); }
+.compressor-signal-meter.reduction .lit { background: #dd2e4f; }
+.compressor-threshold-track { width: 32px; height: 100%; position: relative; }
+.compressor-threshold-track::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; background: color-mix(in srgb, var(--visual-ink) 45%, transparent); }
+/* Rotate a horizontal native range: WebKitGTK does not consistently orient
+   an appearance:none range with writing-mode alone. Pointer movement and the
+   thumb now share the same vertical coordinate system as the threshold line. */
+.compressor-threshold-track input[type="range"] { position: absolute; appearance: none; writing-mode: horizontal-tb; direction: ltr; width: calc(var(--compressor-height) * var(--threshold-range, .5) + 16px); height: 32px; left: 0; top: calc(var(--compressor-height) * (var(--threshold-offset, 0) + var(--threshold-range, .5)) + 8px); transform: rotate(-90deg); transform-origin: 0 0; margin: 0; padding: 0; border: 0; cursor: ns-resize; background: transparent; }
+.compressor-threshold-track input::-webkit-slider-runnable-track { height: 2px; background: transparent; border: 0; }
+.compressor-threshold-track input::-webkit-slider-thumb { appearance: none; width: 16px; height: 16px; margin-top: -7px; border: 2px solid var(--visual-paper); border-radius: 50%; background: var(--visual-ink); }
+.compressor-threshold-track input::-moz-range-track { height: 2px; background: transparent; border: 0; }
+.compressor-threshold-track input::-moz-range-thumb { width: 12px; height: 12px; border: 2px solid var(--visual-paper); border-radius: 50%; background: var(--visual-ink); }
+.compressor-threshold-track input:focus-visible { outline: 2px solid var(--visual-blue); outline-offset: 2px; border-radius: 4px; }
+.compressor-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 20px; }
+.compressor-footer p { margin: 0; color: var(--visual-muted); font-size: 11px; line-height: 1.5; }
+.compressor-legend { display: flex; gap: 14px; flex-shrink: 0; font-size: 10px; color: var(--visual-muted); }
+.compressor-legend span::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 2px; margin-right: 5px; background: color-mix(in srgb, var(--visual-ink) 25%, var(--visual-paper)); }
+.compressor-legend .after::before { background: var(--visual-blue); }
+@media (min-width: 1100px) { .wl-effects-drawer { width: min(860px, calc(100% - 48px)); } .eq-keyboard-hint { display: inline; margin-left: 10px; } }
+@media (max-width: 600px) { .compressor-display { --compressor-height: 200px; grid-template-columns: 28px minmax(80px, 1fr) 40px 36px 28px; gap: 7px; } .compressor-meter-segments { width: 18px; } .compressor-signal-meter > output, .compressor-threshold-column > output { font-size: 9px; } .compressor-signal-meter > span, .compressor-threshold-column > span { font-size: 9px; } .eq-frequency-labels strong { font-size: 8px; } .eq-frequency-labels small { font-size: 9px; } .compressor-footer { align-items: start; flex-direction: column; gap: 8px; } }
+:root[data-wl-theme-variant="light"] .visual-eq,
+:root[data-wl-theme-variant="light"] .visual-compressor {
+  --visual-ink: var(--wl-text, #242a31);
+  --visual-muted: var(--wl-muted, #66717c);
+  --visual-paper: var(--wl-panel, #ffffff);
+}
+.visual-effect-block .effect-name strong { font-size: 18px; }
+.visual-effect-block { container-type: inline-size; }
+@container (max-width: 600px) {
+  .eq-keyboard-hint { display: none; }
+  .eq-frequency-labels strong { display: none; }
+  .eq-frequency-labels { height: 20px; margin-top: 12px; margin-bottom: 12px; }
+  .compressor-display { --compressor-height: 190px; grid-template-columns: 38px minmax(70px, 1fr) 48px 46px 38px; gap: 6px; }
+  .compressor-meter-segments { width: 18px; }
+  .compressor-footer { flex-direction: column; align-items: start; gap: 8px; }
+}
+@media (max-height: 740px) {
+  .eq-plot { height: 205px; }
+  .compressor-display { --compressor-height: 190px; }
+}
+:root[data-wl-theme-variant="light"] .visual-effect-block .preset-row button {
+  border-color: var(--wl-border, #dce1e6);
+  background: var(--wl-panel, #fff);
+  color: var(--wl-text, #242a31);
+}
+:root[data-wl-theme-variant="light"] .visual-effect-block .preset-row button.active {
+  border-color: #335cf4;
+  background: #edf1ff;
+  color: #254ac8;
+}
+
+/* Parametric EQ controls stay with the selected dot. */
+.eq-spectrum { fill: currentColor; opacity: .26; }
+.eq-point { cursor: move; }
+.eq-tooltip { position: absolute; z-index: 4; transform: translate(-50%, 25px); pointer-events: none; padding: 8px 11px; border-radius: 6px; background: color-mix(in srgb, var(--visual-paper) 92%, var(--visual-ink)); color: var(--visual-ink); box-shadow: 0 3px 12px #0002; font-size: 11px; min-width: 138px; }
+.eq-tooltip span { display: flex; justify-content: space-between; gap: 16px; }
+.eq-tooltip b { font-variant-numeric: tabular-nums; }
+.eq-selected-band { flex-wrap: wrap; }
+.eq-parameter { display: flex; flex-direction: column; gap: 3px; font-size: 10px; color: var(--visual-muted); }
+.eq-parameter input, .eq-parameter select { height: 30px; width: 104px; padding: 3px 7px; border: 1px solid var(--visual-grid); border-radius: 5px; color: var(--visual-ink); background: var(--visual-paper); font: inherit; font-size: 12px; }
+.eq-parameter select { width: 116px; }
+.eq-live-caption { display: flex; justify-content: space-between; gap: 12px; margin-top: 9px; font-size: 10px; color: var(--visual-muted); }
+@container (max-width: 650px) { .eq-selected-band { gap: 9px; } .eq-parameter input { width: 80px; } }

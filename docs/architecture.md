@@ -40,8 +40,8 @@ runtime:       $XDG_RUNTIME_DIR/wavelinux6
 Config schema 14 is normalized on load. The first WaveLinux 6 launch can import
 a WaveLinux5 config transactionally, rewrite owned node names, remove transient
 route ids, validate the WaveLinux 6 graph, and then remove WaveLinux5 artifacts.
-Legacy DeepFilterNet entries migrate to RNNoise; DeepFilterNet is not a runtime
-effect.
+Legacy `deepfilternet` entries still migrate to RNNoise. The genuine embedded
+DeepFilterNet 3 effect uses the distinct `deepfilternet3` id and survives reload.
 
 ## Runtime Owners
 
@@ -148,12 +148,26 @@ See [audio-core.md](audio-core.md) for protocol and DSP details.
 
 ## Effects
 
-Native effects are RNNoise, high-pass, eight-band EQ, compressor, gate,
+Native effects are RNNoise, DeepFilterNet 3, high-pass, eight-band EQ, compressor, gate,
 limiter, and Karaoke Stage. RNNoise uses one state for mono microphones and
 duplicates the processed result to the stereo public source. Standard effects
-except EQ and Karaoke expose exactly one user-facing Strength control. Existing
+except EQ, Compressor and Karaoke expose exactly one user-facing Strength control. Existing
 advanced parameter values remain schema-compatible and are normalized when the
-Strength control is changed.
+Strength control is changed. RNNoise and DeepFilterNet share one suppression
+slot per channel. Gentle, Balanced and Strong set attenuation to 6, 12 and 36 dB.
+RNNoise’s legacy speech gate remains available in Advanced but is disabled by
+the simple presets/Strength control. Existing saved gate settings are preserved.
+
+The EQ’s gray spectrum reads final processed channel history, before mix faders,
+so EQ, compression and noise cleanup are all reflected in the display. Its blue
+curve plots the combined response of eight native parametric filters. Coloured
+dots adjust frequency and gain together; the selected dot exposes width (Q),
+bell, bass/treble shelf, low-cut and high-cut shapes. Keyboard arrows adjust
+frequency/gain, and scrolling a dot adjusts Q. Reset and presets restore all
+filter parameters atomically. Saved eight-band settings keep their original
+frequencies, Q values and peaking shapes when new parameters are absent. The compressor shows measured input/output envelopes and gain reduction,
+with a draggable threshold and advanced ratio, attack, release and makeup controls.
+Pausing freezes the display only. Missing or stale measurements show an idle state.
 
 Parameter edits update saved config and schedule a debounced channel sync.
 The core prepares the replacement chain off the callback, replaces pending
@@ -214,10 +228,24 @@ interpolate attack and release at display refresh rate and update compositor
 transforms directly instead of rerendering the full mixer. WaveLinux 6 channel
 and mix callbacks publish peak/RMS snapshots through atomics already owned by
 the persistent audio core. A non-real-time core thread streams all logical slots
-at 30 Hz over meter protocol v1 while the mixer is visible, so displaying it
+at 30 Hz over meter protocol v3 while Mixer or Effects is visible, so displaying it
 does not create PipeWire recorder clients or repeatedly open and parse JSON
 control requests. Mix snapshots are exact while a mix source is consumed and
 are estimated from channel values plus current bus/master gains while idle.
+
+Version 2 adds a compressor slot per channel: input/output amplitudes, reduction
+normalised to 60 dB, and an active flag. The DSP worker measures these during the
+existing processing pass and suppresses readings during chain crossfades. The app
+accepts version 1 and 2 helpers; older apps fall back to the JSON control response.
+Version 3 extends each 16-byte sample with an availability float and 64 spectrum
+floats (276 bytes total). Channel slots carry input analysis; other slots leave
+it absent. The meter worker reads the channel's existing raw history and applies
+4096-point Hann-windowed stereo FFTs. Logarithmic 20 Hz–20 kHz bins map -90 to
+0 dB to 0–1, with visual smoothing. No FFT runs on an audio callback; analysis
+stops when there are no meter subscribers. Silence is an available zero spectrum,
+while missing/stale input clears it. Each effects editor reads its own channel ID,
+without falling back to a microphone. Steady compressor/spectrum readings still
+emit events so the displays advance at the stream cadence.
 
 The older shared PipeWire reader remains a compatibility fallback for legacy
 graph namespaces. Its callback publishes RMS samples through atomics and does

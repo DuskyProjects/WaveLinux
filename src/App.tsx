@@ -268,7 +268,8 @@ export default function App() {
   }, [autoInstallUpdates, releaseChannel]);
 
   useWaveLinuxRuntime({
-    meterActive: activeView === "mixer",
+    // The Effects page needs the same native feed for compressor history.
+    meterActive: activeView === "mixer" || activeView === "effects",
     refresh,
     reportError: setToast,
   });

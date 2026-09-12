@@ -13,15 +13,7 @@ import type {
   MixBus,
 } from "./types";
 
-const singleInstanceEffectIds = new Set([
-  "rnnoise",
-  "highpass",
-  "eq",
-  "compressor",
-  "gate",
-  "karaoke_stage",
-  "limiter",
-]);
+import { normalizeSourceEffects } from "./effect-chain";
 
 export function invokeDemo<T>(command: string, args?: Record<string, unknown>): T {
   if (command === "get_state" || command === "observe_state") {
@@ -383,7 +375,7 @@ function demoMutation(command: string, args?: Record<string, unknown>): unknown 
     return {
       available: false,
       install_supported: false,
-      current_version: "6.0.3",
+      current_version: "6.1.0",
       version: null,
       date: null,
       body: null,
@@ -969,6 +961,7 @@ const catalog: EffectCatalog = {
   preferred_order: [
     "highpass",
     "rnnoise",
+    "deepfilternet3",
     "eq",
     "gate",
     "compressor",
@@ -979,19 +972,34 @@ const catalog: EffectCatalog = {
     {
       id: "rnnoise",
       name: "Noise Suppression",
-      description: "RNNoise speech cleanup",
+      description: "RNNoise speech cleanup. Choose Gentle for faint hiss.",
       plugin_hint: {},
       params: [
+        { id: "reduction_db", label: "Noise Reduction", min: 0, max: 60, default: 60, unit: " dB" },
+        { id: "voice_gate", label: "Speech Gate", min: 0, max: 1, default: 1, unit: "" },
         { id: "vad_threshold", label: "VAD Threshold", min: 0, max: 99, default: 25, unit: "%" },
         { id: "hold_ms", label: "Hold Open", min: 0, max: 1000, default: 200, unit: " ms" },
         { id: "minimum_voice_level_db", label: "Minimum Voice Level", min: -70, max: -20, default: -70, unit: " dB" },
-        { id: "dry_mix", label: "Dry Mix", min: 0, max: 1, default: 0, unit: "" },
+        { id: "dry_mix", label: "Dry Mix", min: 0, max: 1, default: 0, unit: "%" },
       ],
       presets: [
-        { name: "Broadcast", values: { vad_threshold: 25, hold_ms: 200, minimum_voice_level_db: -70, dry_mix: 0 } },
-        { name: "Gentle", values: { vad_threshold: 25, hold_ms: 250, minimum_voice_level_db: -70, dry_mix: 0 } },
-        { name: "Aggressive", values: { vad_threshold: 75, hold_ms: 150, minimum_voice_level_db: -70, dry_mix: 0 } },
-        { name: "Near-field", values: { vad_threshold: 85, hold_ms: 100, minimum_voice_level_db: -42, dry_mix: 0 } },
+        { name: "Broadcast", values: { reduction_db: 60, voice_gate: 1, vad_threshold: 25, hold_ms: 200, minimum_voice_level_db: -70, dry_mix: 0 } },
+        { name: "Gentle", values: { reduction_db: 6, voice_gate: 0, vad_threshold: 25, hold_ms: 250, minimum_voice_level_db: -70, dry_mix: 0 } },
+        { name: "Balanced", values: { reduction_db: 12, voice_gate: 0, vad_threshold: 25, hold_ms: 200, minimum_voice_level_db: -70, dry_mix: 0 } },
+        { name: "Strong", values: { reduction_db: 36, voice_gate: 0, vad_threshold: 25, hold_ms: 150, minimum_voice_level_db: -70, dry_mix: 0 } },
+        { name: "Near-field", values: { reduction_db: 60, voice_gate: 1, vad_threshold: 85, hold_ms: 100, minimum_voice_level_db: -42, dry_mix: 0 } },
+      ],
+    },
+    {
+      id: "deepfilternet3",
+      name: "DeepFilterNet 3",
+      description: "Natural speech cleanup. Choose Gentle for faint hiss or fans.",
+      plugin_hint: {},
+      params: [{ id: "reduction_db", label: "Noise Reduction", min: 0, max: 60, default: 12, unit: " dB" }],
+      presets: [
+        { name: "Gentle", values: { reduction_db: 6 } },
+        { name: "Balanced", values: { reduction_db: 12 } },
+        { name: "Strong", values: { reduction_db: 36 } },
       ],
     },
     {
@@ -1009,17 +1017,41 @@ const catalog: EffectCatalog = {
     {
       id: "eq",
       name: "8-Band EQ",
-      description: "Graphic tone shaping",
+      description: "Visual tone shaping",
       plugin_hint: {},
       params: [
         { id: "band_63_gain_db", label: "63", min: -12, max: 12, default: 0, unit: " dB" },
+        { id: "band_63_frequency_hz", label: "Frequency", min: 20, max: 20000, default: 63, unit: " Hz" },
+        { id: "band_63_q", label: "Width (Q)", min: 0.2, max: 10, default: 0.9, unit: "" },
+        { id: "band_63_type", label: "Shape", min: 0, max: 4, default: 0, unit: "" },
         { id: "band_125_gain_db", label: "125", min: -12, max: 12, default: 0, unit: " dB" },
+        { id: "band_125_frequency_hz", label: "Frequency", min: 20, max: 20000, default: 125, unit: " Hz" },
+        { id: "band_125_q", label: "Width (Q)", min: 0.2, max: 10, default: 1, unit: "" },
+        { id: "band_125_type", label: "Shape", min: 0, max: 4, default: 0, unit: "" },
         { id: "band_250_gain_db", label: "250", min: -12, max: 12, default: 0, unit: " dB" },
+        { id: "band_250_frequency_hz", label: "Frequency", min: 20, max: 20000, default: 250, unit: " Hz" },
+        { id: "band_250_q", label: "Width (Q)", min: 0.2, max: 10, default: 1, unit: "" },
+        { id: "band_250_type", label: "Shape", min: 0, max: 4, default: 0, unit: "" },
         { id: "band_500_gain_db", label: "500", min: -12, max: 12, default: 0, unit: " dB" },
+        { id: "band_500_frequency_hz", label: "Frequency", min: 20, max: 20000, default: 500, unit: " Hz" },
+        { id: "band_500_q", label: "Width (Q)", min: 0.2, max: 10, default: 1, unit: "" },
+        { id: "band_500_type", label: "Shape", min: 0, max: 4, default: 0, unit: "" },
         { id: "band_1k_gain_db", label: "1k", min: -12, max: 12, default: 0, unit: " dB" },
+        { id: "band_1k_frequency_hz", label: "Frequency", min: 20, max: 20000, default: 1000, unit: " Hz" },
+        { id: "band_1k_q", label: "Width (Q)", min: 0.2, max: 10, default: 1, unit: "" },
+        { id: "band_1k_type", label: "Shape", min: 0, max: 4, default: 0, unit: "" },
         { id: "band_2k_gain_db", label: "2k", min: -12, max: 12, default: 0, unit: " dB" },
+        { id: "band_2k_frequency_hz", label: "Frequency", min: 20, max: 20000, default: 2000, unit: " Hz" },
+        { id: "band_2k_q", label: "Width (Q)", min: 0.2, max: 10, default: 1, unit: "" },
+        { id: "band_2k_type", label: "Shape", min: 0, max: 4, default: 0, unit: "" },
         { id: "band_4k_gain_db", label: "4k", min: -12, max: 12, default: 0, unit: " dB" },
+        { id: "band_4k_frequency_hz", label: "Frequency", min: 20, max: 20000, default: 4000, unit: " Hz" },
+        { id: "band_4k_q", label: "Width (Q)", min: 0.2, max: 10, default: 1, unit: "" },
+        { id: "band_4k_type", label: "Shape", min: 0, max: 4, default: 0, unit: "" },
         { id: "band_8k_gain_db", label: "8k", min: -12, max: 12, default: 0, unit: " dB" },
+        { id: "band_8k_frequency_hz", label: "Frequency", min: 20, max: 20000, default: 8000, unit: " Hz" },
+        { id: "band_8k_q", label: "Width (Q)", min: 0.2, max: 10, default: 0.9, unit: "" },
+        { id: "band_8k_type", label: "Shape", min: 0, max: 4, default: 0, unit: "" },
       ],
       presets: [
         {
@@ -1069,7 +1101,7 @@ const catalog: EffectCatalog = {
       description: "Dynamic range control",
       plugin_hint: {},
       params: [
-        { id: "threshold_db", label: "Threshold", min: -30, max: 0, default: -20, unit: " dB" },
+        { id: "threshold_db", label: "Threshold", min: -60, max: 0, default: -20, unit: " dB" },
         { id: "ratio", label: "Ratio", min: 1, max: 20, default: 4, unit: ":1" },
         { id: "attack_ms", label: "Attack", min: 1.5, max: 200, default: 5, unit: " ms" },
         { id: "release_ms", label: "Release", min: 5, max: 800, default: 100, unit: " ms" },
@@ -1142,11 +1174,11 @@ const catalog: EffectCatalog = {
       description: "Vocal doubler, slap echo, and room width",
       plugin_hint: {},
       params: [
-        { id: "dry_mix", label: "Dry Mix", min: 0, max: 1, default: 0.78, unit: "" },
+        { id: "dry_mix", label: "Dry Mix", min: 0, max: 1, default: 0.78, unit: "%" },
         { id: "tone_highpass_hz", label: "Tone Low Cut", min: 20, max: 1200, default: 40, unit: " Hz" },
         { id: "tone_lowpass_hz", label: "Tone High Cut", min: 1200, max: 20000, default: 16000, unit: " Hz" },
         { id: "tone_gain_db", label: "Tone Drive", min: -12, max: 12, default: 0, unit: " dB" },
-        { id: "double_mix", label: "Double", min: 0, max: 1, default: 0.22, unit: "" },
+        { id: "double_mix", label: "Double", min: 0, max: 1, default: 0.22, unit: "%" },
         { id: "double_delay_ms", label: "Double Delay", min: 8, max: 80, default: 28, unit: " ms" },
         { id: "detune_cents", label: "Detune", min: 0, max: 25, default: 7, unit: " cents" },
         { id: "room_size_m", label: "Room Size", min: 1, max: 120, default: 38, unit: " m" },
@@ -1275,29 +1307,9 @@ function normalizeDemoEffect(effect: EffectInstance): EffectInstance | null {
 }
 
 function normalizeDemoEffectChain(effects: EffectInstance[], preferredInstanceId?: string): EffectInstance[] {
-  const singleInstanceIndexes = new Map<string, number[]>();
-  for (const [index, effect] of effects.entries()) {
-    if (!isSingleInstanceDemoEffect(effect.effect_id)) continue;
-    const indexes = singleInstanceIndexes.get(effect.effect_id) ?? [];
-    indexes.push(index);
-    singleInstanceIndexes.set(effect.effect_id, indexes);
-  }
-  if (singleInstanceIndexes.size === 0) return effects;
-
-  const keepIndexes = new Set<number>();
-  for (const indexes of singleInstanceIndexes.values()) {
-    const preferred = indexes.find((index) => effects[index]?.instance_id === preferredInstanceId);
-    const active = [...indexes].reverse().find((index) => effects[index] && !effects[index].bypassed);
-    const keepIndex = preferred ?? active ?? indexes.at(-1);
-    if (keepIndex !== undefined) keepIndexes.add(keepIndex);
-  }
-
-  return effects.filter((effect, index) => !isSingleInstanceDemoEffect(effect.effect_id) || keepIndexes.has(index));
+  return normalizeSourceEffects(effects, preferredInstanceId);
 }
 
-function isSingleInstanceDemoEffect(effectId: string): boolean {
-  return singleInstanceEffectIds.has(effectId);
-}
 
 function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value)

@@ -1,3 +1,69 @@
+# WaveLinux 6.1.0
+
+WaveLinux 6.1.0 makes audio effects easier to see and adjust, adds gentle noise
+cleanup with native DeepFilterNet 3, and fixes effect timing and audio recovery.
+
+## Install or update
+
+Run this as your normal desktop user:
+
+```bash
+curl -fL https://github.com/DuskyProjects/WaveLinux/releases/download/v6.1.0/install.sh -o wavelinux6-install.sh \
+  && bash wavelinux6-install.sh --tag v6.1.0
+```
+
+The `.sh` installer verifies its download, installs missing dependencies and
+starts WaveLinux. Existing WaveLinux 6 settings are preserved. No source
+checkout, Rust, Node.js, Python or separate effect installation is needed.
+You can also download and run `WaveLinux6_6.1.0_amd64_Installer.sh` directly.
+
+## Visual equalizer and compressor
+
+- Shape the EQ by dragging colored points: sideways changes frequency, up/down
+  changes gain, and width controls adjust Q. Bell, shelf and cut shapes are
+  available, with a response curve, useful frequency labels and saved settings.
+- The EQ spectrum now shows the selected channel **after all its enabled
+  effects**, before mix volume. Music, Game and microphone effects each use
+  their own channel audio.
+- The compressor displays live input, output and gain reduction, with a vertical
+  threshold slider and draggable threshold line. Pause freezes the display;
+  bypass and missing input are represented accurately.
+- Simple presets and Strength controls keep common adjustments easy. Advanced
+  settings remain available, and readouts show their actual values.
+- Keyboard slider edits apply on key release. Dragging outside a slider,
+  cancelling edits and reopening effects work in Chromium and WebKit.
+
+## Gentle noise cleanup
+
+- Added native **DeepFilterNet 3**, with its model included in the application.
+  Gentle, Balanced and Strong presets offer 6, 12 and 36 dB attenuation limits.
+- RNNoise Strength now limits spectral noise attenuation. Simple presets avoid
+  the extra speech gate, helping preserve quiet words. Advanced Speech Gate is
+  a switch, and dry/double mixes are shown as percentages.
+- Choosing a noise suppressor replaces the other on that channel while keeping
+  EQ and other effects. Legacy saved noise settings continue to load.
+- Corrected RNNoise dry/wet timing and mono dry output. Reopening its speech gate
+  no longer replays old synthesis overlap from before a pause.
+- Inference faults are reported to diagnostics and use the existing dry-audio
+  recovery path. Unsupported neural-effect sample rates are rejected clearly.
+
+## Performance and reliability
+
+- Removed the voice-style effect's near-silence processing slowdown by clearing
+  inaudible filter/feedback state and simplifying delay-buffer wrapping.
+- Fixed PipeWire volume reading when adapters publish partial parameter updates,
+  preventing saved application levels from being reapplied repeatedly.
+- Improved audio-server recovery and selected-channel telemetry across device
+  reconnects and application restarts. Intentionally stopped audio stays stopped.
+- Short virtual-device checks cover channel isolation, post-effect EQ,
+  compression, DeepFilterNet, hotplug, audio-server recovery and saved settings.
+  Source checks cover all eight effects, 54 preset/limit combinations, frontend
+  interactions and multiple desktop scales.
+
+Release installers and packages are built from the tagged source and checked
+across the supported distribution matrix before publication. Extended audio
+stress testing is optional and is not a release requirement.
+
 # WaveLinux 6.0.3
 
 WaveLinux 6.0.3 improves device switching, saved routing, and fast mixer edits.

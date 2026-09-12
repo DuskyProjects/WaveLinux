@@ -22,7 +22,7 @@ export function VolumeFader({
   compact?: boolean;
   disabled?: boolean;
   step?: number;
-  formatValue?: (value: number) => string;
+  formatValue?: (value: number, editing: boolean) => string;
   onChange: (value: number) => void | Promise<unknown>;
 }) {
   const normalizedPercent = unit === "%" && min === 0 && max === 1;
@@ -33,7 +33,9 @@ export function VolumeFader({
   const lastCommitted = useRef(incomingSliderValue);
   const hasUncommittedDraft = useRef(false);
   const display = normalizedPercent ? Math.round(draft) : Math.round(draft * 10) / 10;
-  const displayText = formatValue ? formatValue(draft) : `${display}${unit}`;
+  const displayText = formatValue
+    ? formatValue(draft, hasUncommittedDraft.current)
+    : `${display}${unit}`;
   const progress = sliderMax === sliderMin
     ? 0
     : Math.max(0, Math.min(100, ((draft - sliderMin) / (sliderMax - sliderMin)) * 100));
@@ -60,6 +62,12 @@ export function VolumeFader({
     [disabled, incomingSliderValue, normalizedPercent, onChange, sliderMax, sliderMin],
   );
 
+  const cancel = () => {
+    hasUncommittedDraft.current = false;
+    lastCommitted.current = incomingSliderValue;
+    setDraft(incomingSliderValue);
+  };
+
   return (
     <label
       aria-disabled={disabled}
@@ -68,6 +76,7 @@ export function VolumeFader({
       <span>{label}</span>
       <input
         aria-label={label}
+        aria-valuetext={displayText}
         disabled={disabled}
         max={sliderMax}
         min={sliderMin}
@@ -75,6 +84,18 @@ export function VolumeFader({
         onChange={(event) => {
           hasUncommittedDraft.current = true;
           setDraft(Number(event.currentTarget.value));
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            cancel();
+          }
+        }}
+        // The native thumb owns capture, including release outside the input.
+        // Capturing on the input element prevents WebKit's thumb from dragging.
+        onPointerCancel={cancel}
+        onLostPointerCapture={() => {
+          if (hasUncommittedDraft.current) cancel();
         }}
         onKeyUp={(event) => {
           if (shouldCommitSliderKey(event)) commit(Number(event.currentTarget.value));
@@ -103,6 +124,7 @@ export function Toggle({
 }) {
   return (
     <button
+      aria-pressed={value}
       className="toggle-row"
       disabled={disabled}
       onClick={() => onChange(!value)}
@@ -139,5 +161,8 @@ export function EmptyState({ label }: { label: string }) {
 export function shouldCommitSliderKey(
   event: ReactKeyboardEvent<HTMLInputElement>,
 ): boolean {
-  return event.key === "Enter";
+  return [
+    "Enter", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+    "PageUp", "PageDown", "Home", "End",
+  ].includes(event.key);
 }

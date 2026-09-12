@@ -211,7 +211,7 @@ export function DiagnosticsView({
 function LatencySummary({ state }: { state: AppStateSnapshot }) {
   const latencySensitiveFx = state.config.channels.flatMap((channel) =>
     channel.effects
-      .filter((effect) => !effect.bypassed && ["rnnoise", "convolver"].includes(effect.effect_id))
+      .filter((effect) => !effect.bypassed && ["rnnoise", "deepfilternet3", "convolver"].includes(effect.effect_id))
       .map((effect) => `${channelDisplayName(channel)}: ${effect.effect_id}`),
   );
   const activeMixRoutes = state.config.channels.length * state.config.mixes.length;

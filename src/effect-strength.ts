@@ -2,6 +2,7 @@ import type { EffectDefinition, EffectInstance } from "./types";
 
 export const simpleStrengthEffectIds = new Set([
   "rnnoise",
+  "deepfilternet3",
   "highpass",
   "compressor",
   "gate",
@@ -9,6 +10,8 @@ export const simpleStrengthEffectIds = new Set([
 ]);
 
 export const simplePresetEffectIds = new Set([
+  "rnnoise",
+  "deepfilternet3",
   "highpass",
   "compressor",
   "gate",
@@ -46,14 +49,9 @@ export function simpleEffectStrength(
 ): number {
   let normalized = 0;
   switch (effect.effect_id) {
-    case "rnnoise": {
-      const vad = (effectParamValue(effect, definition, "vad_threshold") - 25) / 70;
-      const nearLevel =
-        (effectParamValue(effect, definition, "minimum_voice_level_db") + 65) / 37;
-      // VAD is the best compatibility signal for older configs. The level gate
-      // still contributes so Advanced edits are reflected without making an
-      // existing aggressive setup appear unexpectedly weak.
-      normalized = vad * 0.8 + nearLevel * 0.2;
+    case "rnnoise":
+    case "deepfilternet3": {
+      normalized = effectParamValue(effect, definition, "reduction_db") / 60;
       break;
     }
     case "highpass": {
@@ -112,17 +110,10 @@ export function simpleEffectParams(
   const amount = clampStrength(strength) / 100;
   switch (effectId) {
     case "rnnoise":
-      return {
-        vad_threshold: roundTo(25 + 70 * amount, 0.1),
-        hold_ms: roundTo(250 - 175 * amount, 1),
-        // At the upper end, require near-field voice energy. This rejects speech
-        // from televisions and people across a room while keeping lower settings
-        // suitable for quieter or more distant microphones.
-        minimum_voice_level_db: roundTo(-65 + 37 * amount, 0.1),
-        // Aggressiveness changes detection, not wet/dry balance. Mixing the
-        // untreated mic back in defeats suppression and raises room noise.
-        dry_mix: 0,
-      };
+      // Strength controls spectral attenuation, not a gate that cuts quiet words.
+      return { reduction_db: roundTo(60 * amount, 0.1), voice_gate: 0, dry_mix: 0 };
+    case "deepfilternet3":
+      return { reduction_db: roundTo(60 * amount, 0.1) };
     case "highpass":
       return { frequency_hz: roundTo(20 * Math.pow(10, amount), 0.5) };
     case "compressor":
@@ -160,10 +151,10 @@ export function simpleEffectParams(
   }
 }
 
-export function simpleEffectStrengthLabel(effectId: string, strength: number): string {
+export function simpleEffectStrengthLabel(effectId: string, strength: number, actualParams?: Record<string, number>): string {
   const amount = roundTo(clampStrength(strength), 0.1);
   const percentage = formatControlNumber(amount);
-  const params = simpleEffectParams(effectId, amount);
+  const params = { ...simpleEffectParams(effectId, amount), ...actualParams };
   switch (effectId) {
     case "gate":
       return `${percentage}% (${formatControlNumber(params.threshold_db)} dB)`;

@@ -70,3 +70,26 @@ describe("Toggle", () => {
     expect(onChange).toHaveBeenCalledWith(true);
   });
 });
+
+describe("slider completion and cancellation", () => {
+  it.each(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End"])("applies %s changes on key release", (key) => {
+    const onChange = vi.fn();
+    render(<VolumeFader label="Strength" min={0} max={100} value={30} onChange={onChange} />);
+    const slider = screen.getByRole("slider");
+    fireEvent.change(slider, { target: { value: "40" } });
+    fireEvent.keyUp(slider, { key });
+    fireEvent.blur(slider);
+    expect(onChange).toHaveBeenCalledExactlyOnceWith(40);
+  });
+  it.each(["pointer", "escape"])("discards a cancelled %s edit without saving on blur", (kind) => {
+    const onChange = vi.fn();
+    render(<VolumeFader label="Strength" min={0} max={100} value={30} onChange={onChange} />);
+    const slider = screen.getByRole("slider");
+    fireEvent.change(slider, { target: { value: "90" } });
+    if (kind === "pointer") fireEvent.pointerCancel(slider);
+    else fireEvent.keyDown(slider, { key: "Escape" });
+    expect(slider).toHaveValue("30");
+    fireEvent.blur(slider);
+    expect(onChange).not.toHaveBeenCalled();
+  });
+});

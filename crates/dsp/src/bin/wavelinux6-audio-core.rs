@@ -661,6 +661,7 @@ struct NativeStats {
     chain_swaps: AtomicU64,
     non_finite_blocks: AtomicU64,
     non_finite_samples: AtomicU64,
+    processing_errors: AtomicU64,
     non_finite_effect_mask: AtomicU64,
     chain_recoveries: AtomicU64,
     rate_correction_bits: AtomicU64,
@@ -931,6 +932,7 @@ struct NativeShared {
     raw_history: FixedAudioHistory,
     history: FixedAudioHistory,
     meter: NativeMeter,
+    compressor_meter: NativeMeter,
     stats: NativeStats,
     capture_streaming: AtomicBool,
     sample_rate_hz: u32,
@@ -976,8 +978,11 @@ impl NativeShared {
             raw_history: FixedAudioHistory::new(
                 capacity_frames.max(MAX_NATIVE_CALLBACK_FRAMES.saturating_mul(2)),
             ),
-            history: FixedAudioHistory::new(capacity_frames),
+            history: FixedAudioHistory::new(
+                capacity_frames.max(wavelinux_dsp::spectrum::SPECTRUM_FRAMES * 2),
+            ),
             meter: NativeMeter::default(),
+            compressor_meter: NativeMeter::default(),
             stats: NativeStats::default(),
             capture_streaming: AtomicBool::new(false),
             sample_rate_hz: config.sample_rate_hz,
@@ -2297,7 +2302,7 @@ fn process_prepared_chain(
     apply_dsp_input_mode(processed, prepared.input_mode);
     dry.copy_from_slice(processed);
     let status = prepared.chain.process_worker_interleaved_stereo(processed);
-    if status.non_finite_samples > 0 {
+    if status.non_finite_samples > 0 || status.processing_errors > 0 {
         processed.copy_from_slice(dry);
     }
     status
@@ -2309,11 +2314,15 @@ fn record_dsp_integrity(
     output_non_finite: usize,
     status: RealtimeProcessStatus,
 ) {
+    data.shared
+        .stats
+        .processing_errors
+        .fetch_add(status.processing_errors as u64, Ordering::Relaxed);
     let internal_non_finite = status.non_finite_samples as usize;
     let non_finite_samples = input_non_finite
         .saturating_add(internal_non_finite)
         .saturating_add(output_non_finite);
-    if status.non_finite_samples > 0 {
+    if status.non_finite_samples > 0 || status.processing_errors > 0 {
         data.shared
             .stats
             .non_finite_effect_mask
@@ -2329,7 +2338,7 @@ fn record_dsp_integrity(
             .non_finite_samples
             .fetch_add(non_finite_samples as u64, Ordering::Relaxed);
     }
-    if (internal_non_finite > 0 || output_non_finite > 0)
+    if (internal_non_finite > 0 || output_non_finite > 0 || status.processing_errors > 0)
         && !data.shared.recovery_in_progress.load(Ordering::Acquire)
     {
         data.shared
@@ -2339,6 +2348,28 @@ fn record_dsp_integrity(
 }
 
 fn publish_dsp_block(data: &DspWorkerData, frames: usize) {
+    // The visualizer observes the active compressor on the worker. No extra
+    // audio passes, allocation, IPC or locks are added to the audio callback.
+    // Suppress telemetry during a chain crossfade, when neither chain alone
+    // describes the audible result.
+    let compressor = if data.shadow_chain.is_none() {
+        data.active_chain.chain.compressor_meter()
+    } else {
+        None
+    };
+    if let Some(meter) = compressor {
+        data.shared.compressor_meter.publish(
+            meter.input_peak,
+            meter.output_peak,
+            meter.gain_reduction_db / 60.0,
+            1.0,
+            frames,
+        );
+    } else {
+        data.shared
+            .compressor_meter
+            .publish(0.0, 0.0, 0.0, 0.0, frames);
+    }
     let mut peak_left = 0.0_f32;
     let mut peak_right = 0.0_f32;
     let mut square_sum_left = 0.0_f32;
@@ -3061,6 +3092,7 @@ fn handle_core_control_command(
                 "chain_swaps": shared.stats.chain_swaps.load(Ordering::Relaxed),
                 "non_finite_blocks": shared.stats.non_finite_blocks.load(Ordering::Relaxed),
                 "non_finite_samples": shared.stats.non_finite_samples.load(Ordering::Relaxed),
+                "processing_errors": shared.stats.processing_errors.load(Ordering::Relaxed),
                 "non_finite_effect_mask": shared.stats.non_finite_effect_mask.load(Ordering::Relaxed),
                 "chain_recoveries": shared.stats.chain_recoveries.load(Ordering::Relaxed),
                 "chain_swap_replacements": shared.chain_control.replacements.load(Ordering::Relaxed),
@@ -3136,6 +3168,12 @@ fn build_replacement_chain(
     // chain receives real input only after this preparation is complete.
     let mut silence = vec![0.0_f32; 960 * 2];
     let prime_status = chain.process_worker_interleaved_stereo(&mut silence);
+    if prime_status.processing_errors > 0 {
+        return Err(format!(
+            "replacement chain failed while priming (effect mask {:#x})",
+            prime_status.effect_mask
+        ));
+    }
     if prime_status.non_finite_samples > 0 {
         return Err(format!(
             "replacement chain produced {} non-finite samples while priming (effect mask {:#x})",

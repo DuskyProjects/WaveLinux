@@ -34,19 +34,11 @@ function effect(effectId: string, params: Record<string, number>): EffectInstanc
 }
 
 describe("simple effect strength", () => {
-  it("maps RNNoise strength to the complete tuned near-field control set", () => {
-    expect(simpleEffectParams("rnnoise", 0)).toEqual({
-      vad_threshold: 25,
-      hold_ms: 250,
-      minimum_voice_level_db: -65,
-      dry_mix: 0,
-    });
-    expect(simpleEffectParams("rnnoise", 100)).toEqual({
-      vad_threshold: 95,
-      hold_ms: 75,
-      minimum_voice_level_db: -28,
-      dry_mix: 0,
-    });
+  it("controls actual noise reduction without gating quiet speech", () => {
+    expect(simpleEffectParams("rnnoise", 0)).toEqual({ reduction_db: 0, voice_gate: 0, dry_mix: 0 });
+    expect(simpleEffectParams("rnnoise", 100)).toEqual({ reduction_db: 60, voice_gate: 0, dry_mix: 0 });
+    expect(simpleEffectParams("deepfilternet3", 10)).toEqual({ reduction_db: 6 });
+    expect(simpleEffectParams("deepfilternet3", 20)).toEqual({ reduction_db: 12 });
   });
 
   it("round-trips RNNoise aggressiveness without exposing advanced controls", () => {

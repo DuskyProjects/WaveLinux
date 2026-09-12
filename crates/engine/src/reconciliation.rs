@@ -5,6 +5,7 @@ impl WaveLinuxEngine {
         self.log_engine_event("repair.start", "requested audio graph repair");
         let report = {
             let _audio_commands = self.lock_audio_commands()?;
+            self.audio_graph_requested.store(true, Ordering::Release);
             self.repair_audio_graph_unlocked()?
         };
         let _ = self.refresh_runtime();
@@ -12,6 +13,39 @@ impl WaveLinuxEngine {
             self.finalize_wavelinux5_migration();
         }
         Ok(report)
+    }
+
+    pub(super) fn recover_graph_after_server_reconnect(&self) -> Result<(), EngineError> {
+        let _audio_commands = self.lock_audio_commands()?;
+        // Explicit cleanup must stay stopped, including when it races with a
+        // reconnect notification. Only restore a graph requested this session.
+        if self.stop.load(Ordering::SeqCst)
+            || !self.audio_graph_requested.load(Ordering::Acquire)
+            || graph_prefix() != "wavelinux6"
+        {
+            return Ok(());
+        }
+        let config = self.read_config()?.clone();
+        let graph = self.snapshot_for_config(Some(&config))?;
+        if graph_has_wavelinux_nodes(&graph) {
+            return Ok(());
+        }
+        self.log_engine_event(
+            "repair.reconnect",
+            "audio server returned without the requested graph; restarting the audio core",
+        );
+        // A helper can still answer its control socket after its PipeWire
+        // connection dies. It must reconnect before its nodes can be restored.
+        self.stop_tracked_effect_chain_process(AUDIO_CORE_PROCESS_KEY);
+        let report = self.repair_audio_graph_unlocked()?;
+        if let Some(error) = report
+            .outputs
+            .iter()
+            .find_map(|output| output.error.as_ref())
+        {
+            return Err(EngineError::Io(error.clone()));
+        }
+        Ok(())
     }
 
     fn finalize_wavelinux5_migration(&self) {

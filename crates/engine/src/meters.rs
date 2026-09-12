@@ -132,9 +132,23 @@ impl WaveLinuxEngine {
             .filter_map(|target| {
                 let sample = frame.samples.get(target.slot_index)?;
                 Some(LevelMeter {
+                    spectrum: if target.compressor_slot_index.is_some() {
+                        sample.spectrum.map(|bins| bins.to_vec())
+                    } else {
+                        None
+                    },
                     node_id: target.node_id.clone(),
                     peak_left: meter_output_level(sample.peak_left, target.gain),
                     peak_right: meter_output_level(sample.peak_right, target.gain),
+                    compressor: target
+                        .compressor_slot_index
+                        .and_then(|index| frame.samples.get(index))
+                        .filter(|sample| sample.rms_right > 0.5)
+                        .map(|sample| wavelinux_model::CompressorMeter {
+                            input_peak: sample.peak_left,
+                            output_peak: sample.peak_right,
+                            gain_reduction_db: sample.rms_left * 60.0,
+                        }),
                 })
             })
             .collect())
@@ -176,6 +190,7 @@ impl WaveLinuxEngine {
             .slots
             .iter()
             .enumerate()
+            .filter(|(_, slot)| slot.kind != wavelinux_dsp::MeterStreamSlotKind::Compressor)
             .map(|(index, slot)| (slot.id.as_str(), (index, slot.kind)))
             .collect::<BTreeMap<_, _>>();
         client.targets = targets
@@ -194,10 +209,20 @@ impl WaveLinuxEngine {
                     }
                     // The core mix meter already includes all bus and master gains.
                     wavelinux_dsp::MeterStreamSlotKind::Mix => 1.0,
+                    wavelinux_dsp::MeterStreamSlotKind::Compressor => return None,
+                };
+                let compressor_slot_index = if bus_channel_id.is_none() {
+                    client.header.slots.iter().position(|slot| {
+                        slot.kind == wavelinux_dsp::MeterStreamSlotKind::Compressor
+                            && slot.id == target.node_id
+                    })
+                } else {
+                    None
                 };
                 Some(CoreMeterTarget {
                     node_id: target.node_id,
                     slot_index,
+                    compressor_slot_index,
                     gain,
                 })
             })
