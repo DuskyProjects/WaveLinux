@@ -35,6 +35,8 @@ The EQ’s gray spectrum shows the selected channel **after its effects**.
 The compressor shows that effect’s live input, output and gain reduction for
 the selected channel, with a vertical threshold control.
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S8Q127LMG6)
+
 ## Install or update
 
 **Copy and paste this into a terminal on your Linux desktop:**
